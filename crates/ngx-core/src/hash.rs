@@ -121,20 +121,23 @@ impl<V: Clone> HashKeysArrays<V> {
     /// Add a key with value and flags (NGX_HASH_WILDCARD_KEY, NGX_HASH_READONLY_KEY).
     /// Returns NGX_OK, NGX_BUSY (conflict), or NGX_DECLINED (invalid name).
     pub fn add_key(&mut self, key: Vec<u8>, value: V, flags: u32) -> i64 {
-        let key = key;
         let last = key.len();
 
         if flags & NGX_HASH_WILDCARD_KEY != 0 {
             // Validate wildcard: check for multiple asterisks, double dots, null bytes
             let mut n = 0;
-            for i in 0..key.len() {
+            let mut is_leading_dot = false;
+            let mut is_asterisk_prefix = false;
+            let mut is_asterisk_suffix = false;
+
+            for i in 0..last {
                 if key[i] == b'*' {
                     n += 1;
                     if n > 1 {
                         return NGX_DECLINED;
                     }
                 }
-                if key[i] == b'.' && i + 1 < key.len() && key[i + 1] == b'.' {
+                if key[i] == b'.' && i + 1 < last && key[i + 1] == b'.' {
                     return NGX_DECLINED;
                 }
                 if key[i] == 0 {
@@ -142,24 +145,25 @@ impl<V: Clone> HashKeysArrays<V> {
                 }
             }
 
-            // Check for ".example.com" pattern (leading dot)
-            if key.len() > 1 && key[0] == b'.' {
-                return self.add_wildcard_key(key, value, 1); // skip=1
-            }
-
-            // Check for "*.example.com" pattern
-            if key.len() > 2 && key[0] == b'*' && key[1] == b'.' {
-                return self.add_wildcard_key(key, value, 2); // skip=2
-            }
-
-            // Check for "www.example.*" pattern
-            if key.len() > 2 && key[key.len() - 2] == b'.' && key[key.len() - 1] == b'*' {
-                return self.add_wildcard_key(key, value, 0); // skip=0, last adjusted
-            }
-
-            // Invalid wildcard (has asterisk but doesn't match patterns)
-            if n > 0 {
+            // Determine the pattern (only one can be true at a time)
+            if last > 1 && key[0] == b'.' {
+                is_leading_dot = true;
+            } else if last > 2 && key[0] == b'*' && key[1] == b'.' {
+                is_asterisk_prefix = true;
+            } else if last > 2 && key[last - 2] == b'.' && key[last - 1] == b'*' {
+                is_asterisk_suffix = true;
+            } else if n > 0 {
+                // Invalid wildcard
                 return NGX_DECLINED;
+            }
+
+            // Process the pattern
+            if is_leading_dot {
+                return self.add_wildcard_key_with_last(key, value, 1, last);
+            } else if is_asterisk_prefix {
+                return self.add_wildcard_key_with_last(key, value, 2, last);
+            } else if is_asterisk_suffix {
+                return self.add_wildcard_key_with_last(key, value, 0, last - 2);
             }
         }
 
@@ -199,8 +203,7 @@ impl<V: Clone> HashKeysArrays<V> {
         NGX_OK
     }
 
-    fn add_wildcard_key(&mut self, mut key: Vec<u8>, value: V, skip: usize) -> i64 {
-        let last = key.len();
+    fn add_wildcard_key_with_last(&mut self, mut key: Vec<u8>, value: V, skip: usize, last: usize) -> i64 {
         // Lowercase the part after skip
         let mut k_part = key[skip..].to_vec();
         let mut k = hash_strlow(&mut k_part, &key[skip..]);
@@ -272,9 +275,9 @@ impl<V: Clone> HashKeysArrays<V> {
             p
         } else {
             // "www.example.*" -> "www.example\0"
+            // last is already adjusted to exclude the ".*" suffix
             let mut p = vec![0u8; last];
-            p[..last - 1].copy_from_slice(&key[..last - 1]);
-            p.truncate(last - 1);
+            p[..last].copy_from_slice(&key[..last]);
             p
         };
 
@@ -870,5 +873,71 @@ mod tests {
         let mut ha: HashKeysArrays<&str> = HashKeysArrays::new(HashKind::Small);
         let result = ha.add_key(b"exam*ple.com".to_vec(), "value", NGX_HASH_WILDCARD_KEY);
         assert_eq!(result, NGX_DECLINED);
+    }
+
+    #[test]
+    fn test_exact_key_case_insensitive() {
+        // Keys are lowercased unless READONLY_KEY is set
+        let mut ha: HashKeysArrays<&str> = HashKeysArrays::new(HashKind::Small);
+        ha.add_key(b"ExAmPlE.cOm".to_vec(), "value1", 0);
+        assert_eq!(ha.keys()[0].key, b"example.com");
+    }
+
+    #[test]
+    fn test_wildcard_head_reversal() {
+        // Test that *.example.com gets reversed properly
+        let mut ha: HashKeysArrays<&str> = HashKeysArrays::new(HashKind::Small);
+        ha.add_key(b"*.example.com".to_vec(), "wildcard", NGX_HASH_WILDCARD_KEY);
+        // The reversed key should have labels in reverse order
+        let wc_key = &ha.dns_wc_head()[0].key;
+        // For "*.example.com", it becomes "example.com" which reverses to "com.example."
+        assert!(wc_key.starts_with(b"com"));
+    }
+
+    #[test]
+    fn test_wildcard_tail_no_reversal() {
+        // Test that www.example.* doesn't get reversed
+        let mut ha: HashKeysArrays<&str> = HashKeysArrays::new(HashKind::Small);
+        ha.add_key(b"www.example.*".to_vec(), "tail", NGX_HASH_WILDCARD_KEY);
+        let wc_key = &ha.dns_wc_tail()[0].key;
+        // For "www.example.*", it becomes "www.example" (no reversal)
+        assert_eq!(wc_key, b"www.example");
+    }
+
+    #[test]
+    fn test_wildcard_head_leading_dot_reversal() {
+        // Test that .example.com gets reversed properly
+        let mut ha: HashKeysArrays<&str> = HashKeysArrays::new(HashKind::Small);
+        ha.add_key(b".example.com".to_vec(), "wildcard", NGX_HASH_WILDCARD_KEY);
+        let wc_key = &ha.dns_wc_head()[0].key;
+        // For ".example.com", it becomes "example.com" which reverses to "com.example."
+        assert!(wc_key.starts_with(b"com"));
+    }
+
+    #[test]
+    fn test_hash_strlow_correct_hash() {
+        // Verify that hash_strlow produces the same hash as hash_key_lc
+        let src = b"ExAmPlE.CoM";
+        let mut dst = vec![0u8; src.len()];
+        let h1 = hash_strlow(&mut dst, src);
+        let h2 = hash_key_lc(b"example.com");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_multiple_keys_different_hashes() {
+        // Verify that different keys produce different hashes
+        let h1 = hash_key(b"example.com");
+        let h2 = hash_key(b"example.org");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_ngx_hash_formula() {
+        // Verify the hash formula h = h*31 + c
+        let h1 = hash_key(b"a");
+        assert_eq!(h1, 97); // 'a' = 97
+        let h2 = hash_key(b"ab");
+        assert_eq!(h2, 97 * 31 + 98); // (97 * 31) + 'b'
     }
 }
