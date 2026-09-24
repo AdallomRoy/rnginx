@@ -1,4 +1,5 @@
 // HTTP parsing functions ported from ngx_http_parse.c
+#![allow(non_snake_case, dead_code)]
 
 use ngx_core::rc::*;
 
@@ -536,7 +537,11 @@ pub fn parse_request_line(
                             r.uri_end = Some(p);
                             r.http_minor = 9;
                             p += 1;
-                            goto_done(&mut r, &mut state, &mut p);
+                            if r.request_end == 0 {
+                                r.request_end = p - 2;
+                            }
+                            r.http_version = r.http_major * 1000 + r.http_minor;
+                            state = 0;
                             break;
                         }
                         b'.' => {
@@ -610,7 +615,11 @@ pub fn parse_request_line(
                             r.uri_end = Some(p);
                             r.http_minor = 9;
                             p += 1;
-                            goto_done(&mut r, &mut state, &mut p);
+                            if r.request_end == 0 {
+                                r.request_end = p - 2;
+                            }
+                            r.http_version = r.http_major * 1000 + r.http_minor;
+                            state = 0;
                             break;
                         }
                         b'%' => {
@@ -664,7 +673,11 @@ pub fn parse_request_line(
                             r.uri_end = Some(p);
                             r.http_minor = 9;
                             p += 1;
-                            goto_done(&mut r, &mut state, &mut p);
+                            if r.request_end == 0 {
+                                r.request_end = p - 2;
+                            }
+                            r.http_version = r.http_major * 1000 + r.http_minor;
+                            state = 0;
                             break;
                         }
                         b'#' => {
@@ -696,7 +709,11 @@ pub fn parse_request_line(
                     LF => {
                         r.http_minor = 9;
                         p += 1;
-                        goto_done(&mut r, &mut state, &mut p);
+                        if r.request_end == 0 {
+                            r.request_end = p - 2;
+                        }
+                        r.http_version = r.http_major * 1000 + r.http_minor;
+                        state = 0;
                         break;
                     }
                     b'H' => {
@@ -817,7 +834,7 @@ pub fn parse_request_line(
                     p += 1;
                 } else if ch == LF {
                     p += 1;
-                    goto_done(&mut r, &mut state, &mut p);
+                    if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
                     break;
                 } else if ch == b' ' {
                     state = State::SpacesAfterDigit as usize;
@@ -848,7 +865,7 @@ pub fn parse_request_line(
                     }
                     LF => {
                         p += 1;
-                        goto_done(&mut r, &mut state, &mut p);
+                        if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
                         break;
                     }
                     _ => {
@@ -863,7 +880,7 @@ pub fn parse_request_line(
                 r.request_end = p - 1;
                 if ch == LF {
                     p += 1;
-                    goto_done(&mut r, &mut state, &mut p);
+                    if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
                     break;
                 } else {
                     *pos = p;
@@ -883,22 +900,6 @@ pub fn parse_request_line(
     return NGX_AGAIN;
 }
 
-#[inline]
-fn goto_done(r: &mut ParseRequest, state: &mut usize, p: &mut usize) {
-    *p = *p;
-
-    if r.request_end == 0 {
-        r.request_end = *p - 1;
-    }
-
-    r.http_version = r.http_major * 1000 + r.http_minor;
-    *state = 0;
-
-    // Check for HTTP/0.9 GET-only rule
-    if r.http_version == 9 && r.method != NGX_HTTP_GET {
-        // Will be caught after loop
-    }
-}
 
 /// Parse header line. Returns NGX_OK on header parsed, NGX_HTTP_PARSE_HEADER_DONE on empty line,
 /// NGX_AGAIN if incomplete, or NGX_HTTP_PARSE_INVALID_HEADER.
@@ -943,7 +944,7 @@ pub fn parse_header_line(
                     LF => {
                         r.header_end = p;
                         p += 1;
-                        goto_header_done(&mut r, &mut state, &mut p);
+                        state = 0;
                         break;
                     }
                     _ => {
@@ -1014,7 +1015,7 @@ pub fn parse_header_line(
                     r.header_start = p;
                     r.header_end = p;
                     p += 1;
-                    goto_header_done(&mut r, &mut state, &mut p);
+                    state = 0;
                     break;
                 } else if ch <= 0x20 || ch == 0x7f {
                     r.header_end = p;
@@ -1042,7 +1043,7 @@ pub fn parse_header_line(
                         r.header_start = p;
                         r.header_end = p;
                         p += 1;
-                        goto_header_done(&mut r, &mut state, &mut p);
+                        state = 0;
                         break;
                     }
                     0 => {
@@ -1074,7 +1075,7 @@ pub fn parse_header_line(
                     LF => {
                         r.header_end = p;
                         p += 1;
-                        goto_header_done(&mut r, &mut state, &mut p);
+                        state = 0;
                         break;
                     }
                     0 => {
@@ -1100,7 +1101,7 @@ pub fn parse_header_line(
                     }
                     LF => {
                         p += 1;
-                        goto_header_done(&mut r, &mut state, &mut p);
+                        state = 0;
                         break;
                     }
                     0 => {
@@ -1128,7 +1129,7 @@ pub fn parse_header_line(
                 match ch {
                     LF => {
                         p += 1;
-                        goto_header_done(&mut r, &mut state, &mut p);
+                        state = 0;
                         break;
                     }
                     CR => {
@@ -1145,7 +1146,7 @@ pub fn parse_header_line(
                 // sw_header_almost_done
                 if ch == LF {
                     p += 1;
-                    goto_header_done(&mut r, &mut state, &mut p);
+                    state = 0;
                     break;
                 } else {
                     *pos = p;
@@ -1167,11 +1168,6 @@ pub fn parse_header_line(
     return NGX_AGAIN;
 }
 
-#[inline]
-fn goto_header_done(r: &mut ParseRequest, state: &mut usize, p: &mut usize) {
-    *p = *p;
-    *state = 0;
-}
 
 /// Parse URI to detect complex characteristics
 pub fn parse_uri(r: &mut ParseRequest, buf: &[u8]) -> i64 {
@@ -1635,7 +1631,7 @@ fn case_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Find argument in query string
-pub fn arg(args: &[u8], name: &[u8]) -> Option<&[u8]> {
+pub fn arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     if args.is_empty() {
         return None;
     }
@@ -1645,7 +1641,6 @@ pub fn arg(args: &[u8], name: &[u8]) -> Option<&[u8]> {
 
     while p < last {
         // Find the name
-        let mut found = false;
         if p == 0 || args[p - 1] == b'&' {
             let mut i = 0;
             while i < name.len() && p + i < last {
@@ -1656,7 +1651,6 @@ pub fn arg(args: &[u8], name: &[u8]) -> Option<&[u8]> {
             }
 
             if i == name.len() && p + i < last && args[p + i] == b'=' {
-                found = true;
                 p += i + 1;
 
                 // Find end of value
@@ -1669,14 +1663,12 @@ pub fn arg(args: &[u8], name: &[u8]) -> Option<&[u8]> {
             }
         }
 
-        if !found {
-            // Skip to next '&'
-            while p < last && args[p] != b'&' {
-                p += 1;
-            }
-            if p < last {
-                p += 1;
-            }
+        // Skip to next '&'
+        while p < last && args[p] != b'&' {
+            p += 1;
+        }
+        if p < last {
+            p += 1;
         }
     }
 
@@ -2005,7 +1997,7 @@ fn eq3(m: &[u8], c0: u8, c1: u8, c2: u8) -> bool {
 }
 
 #[inline]
-fn eq3O(m: &[u8], c0: u8, c1: u8, c2: u8, c3: u8) -> bool {
+fn eq3O(m: &[u8], c0: u8, _c1: u8, c2: u8, c3: u8) -> bool {
     m.len() >= 4 && m[0] == c0 && m[2] == c2 && m[3] == c3
 }
 
