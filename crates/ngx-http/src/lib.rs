@@ -45,6 +45,10 @@ pub mod ssi_filter;
 pub mod dav;
 pub mod flv_module;
 pub mod mp4_module;
+pub mod empty_gif;
+pub mod stub_status;
+pub mod mirror;
+pub mod userid;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -534,6 +538,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(autoindex::autoindex_module());
     v.push(index::index_module());
     v.extend(stubs::handler_modules_a());
+    v.push(mirror::mirror_module());
+    v.extend(stubs::handler_modules_b());
     v.push(try_files::try_files_module());
     v.push(auth_request::auth_request_module());
     v.push(auth_basic::auth_basic_module());
@@ -546,6 +552,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(flv_module::flv_module());
     v.push(mp4_module::mp4_module());
     v.extend(stubs::handler_modules_d());
+    v.push(empty_gif::empty_gif_module());
+    v.push(stub_status::stub_status_module());
     v.push(write_filter::write_filter_module());
     v.push(header_filter::header_filter_module());
     v.push(chunked_filter::chunked_filter_module());
@@ -558,6 +566,7 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(copy_filter::copy_filter_module());
     v.push(range_filter::range_body_filter_module());
     v.push(not_modified_filter::not_modified_filter_module());
+    v.push(userid::userid_module());
     v.extend(stubs::filter_modules_d());
     v
 }
