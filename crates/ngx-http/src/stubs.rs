@@ -27,8 +27,18 @@ fn temp_path_module(name: &'static str, directive: &'static str) -> ModuleDef {
     http_module_def(name, def, commands)
 }
 
+fn simple_directive_module(name: &'static str, directive: &'static str, flags: u32, args: u32) -> ModuleDef {
+    let def = HttpModuleDef::default();
+    let commands = vec![
+        Command::new(directive, flags | args, ConfLevel::None, accept),
+    ];
+    http_module_def(name, def, commands)
+}
+
 pub fn early_modules() -> Vec<ModuleDef> {
-    vec![]
+    vec![
+        simple_directive_module("ngx_control_api_module", "control_api", NGX_HTTP_MAIN_CONF, NGX_CONF_FLAG),
+    ]
 }
 
 pub fn handler_modules_a() -> Vec<ModuleDef> {
@@ -45,10 +55,14 @@ pub fn handler_modules_c() -> Vec<ModuleDef> {
 
 pub fn handler_modules_d() -> Vec<ModuleDef> {
     vec![
+        simple_directive_module("ngx_http_proxy_module", "proxy_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF, NGX_CONF_TAKE1),
         temp_path_module("ngx_http_proxy_module", "proxy_temp_path"),
         temp_path_module("ngx_http_fastcgi_module", "fastcgi_temp_path"),
         temp_path_module("ngx_http_uwsgi_module", "uwsgi_temp_path"),
         temp_path_module("ngx_http_scgi_module", "scgi_temp_path"),
+        simple_directive_module("ngx_http_limit_req_module", "limit_req_zone", NGX_HTTP_MAIN_CONF, NGX_CONF_TAKE3),
+        simple_directive_module("ngx_http_limit_req_module", "limit_req", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF, NGX_CONF_TAKE1),
+        simple_directive_module("ngx_http_limit_req_module", "limit_req_log_level", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF, NGX_CONF_TAKE1),
     ]
 }
 
