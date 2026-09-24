@@ -86,16 +86,16 @@ pub fn upstream_log_info(_r: &Request) -> Option<Vec<u8>> {
     None
 }
 
-pub async fn ssl_handshake(_c: &Rc<Connection>, _hc: &Rc<HttpConnection>) -> bool {
-    false
+pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool {
+    crate::http_ssl::ssl_handshake(c, hc).await
 }
 
 pub fn ssl_verify_enabled(_cscf: &Rc<std::cell::RefCell<CoreSrvConf>>) -> bool {
     false
 }
 
-pub fn ssl_process_request_checks(_r: &R) -> Option<i64> {
-    None
+pub fn ssl_process_request_checks(r: &R) -> Option<i64> {
+    crate::http_ssl::ssl_process_request_checks(r)
 }
 
 pub async fn ssl_shutdown(_c: &Rc<Connection>) {}

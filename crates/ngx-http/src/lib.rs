@@ -56,6 +56,7 @@ pub mod geo;
 pub mod split_clients;
 pub mod referer;
 pub mod browser;
+pub mod http_ssl;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -539,6 +540,7 @@ pub fn http_module() -> ModuleDef {
 /// All http modules in nginx order (ngx_modules.c).
 pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module(), upstream::upstream_module()];
+    let mut v = vec![http_module(), core::core_module(), http_ssl::ssl_module(), log::log_module()];
     v.extend(stubs::early_modules());
     v.push(realip::realip_module());
     v.push(static_module::static_module());
