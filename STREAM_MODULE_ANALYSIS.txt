@@ -1,0 +1,914 @@
+NGINX STREAM MODULE - C TO RUST PORT ANALYSIS
+==============================================
+
+This document analyzes the nginx stream module architecture for porting to Rust,
+comparing with the existing HTTP module Rust implementation.
+
+FILES ANALYZED:
+- C Source: /home/ubuntu/rnginx/nginx-c/src/stream/ngx_stream.c
+- C Source: /home/ubuntu/rnginx/nginx-c/src/stream/ngx_stream_core_module.c
+- C Source: /home/ubuntu/rnginx/nginx-c/src/stream/ngx_stream_handler.c
+- C Source: /home/ubuntu/rnginx/nginx-c/src/stream/ngx_stream_variables.c
+- C Header: /home/ubuntu/rnginx/nginx-c/src/stream/ngx_stream.h
+- Rust HTTP: /home/ubuntu/rnginx/crates/ngx-http/src/lib.rs
+- Rust HTTP: /home/ubuntu/rnginx/crates/ngx-http/src/core.rs
+- Rust HTTP: /home/ubuntu/rnginx/crates/ngx-http/src/core_rt.rs
+- Rust Stream (skeleton): /home/ubuntu/rnginx/crates/ngx-stream/src/lib.rs
+
+==============================================================================
+1. CORE STREAM MODULE STRUCTURES
+==============================================================================
+
+1.1 CONFIGURATION CONTEXT STRUCTURES
+------------------------------------
+
+ngx_stream_conf_ctx_t:
+  - main_conf: **void - array of pointers to main config structs
+  - srv_conf: **void - array of pointers to server config structs
+  - Purpose: Holds configuration for stream block context
+
+ngx_stream_core_main_conf_t:
+  - servers: array of ngx_stream_core_srv_conf_t
+  - phase_engine: ngx_stream_phase_engine_t (compiled phase handlers)
+  - variables_hash: hash table for variable lookup
+  - variables: array of ngx_stream_variable_t definitions
+  - prefix_variables: array for prefix-based variables
+  - ncaptures: count of regex captures
+  - server_names_hash_max_size: hash config
+  - server_names_hash_bucket_size: hash config
+  - variables_hash_max_size: hash config
+  - variables_hash_bucket_size: hash config
+  - variables_keys: hash keys arrays for merging
+  - ports: array of ngx_stream_conf_port_t (listening ports)
+  - phases: array[NGX_STREAM_LOG_PHASE + 1] of ngx_stream_phase_t
+           (one for each phase type)
+
+ngx_stream_core_srv_conf_t:
+  - server_names: array of ngx_stream_server_name_t
+  - handler: ngx_stream_content_handler_pt (content phase callback)
+  - ctx: ngx_stream_conf_ctx_t* (server block config context)
+  - file_name: u_char* (source file of server block)
+  - line: ngx_uint_t (source line number)
+  - server_name: ngx_str_t (primary server name)
+  - tcp_nodelay: flag
+  - preread_buffer_size: size_t
+  - preread_timeout: ngx_msec_t
+  - error_log: ngx_log_t*
+  - resolver_timeout: ngx_msec_t
+  - resolver: ngx_resolver_t*
+  - proxy_protocol_timeout: ngx_msec_t
+  - listen: flag (whether this is a listen directive)
+  - captures: flag (PCRE regex captures)
+
+1.2 SESSION (CONNECTION) STRUCTURE
+----------------------------------
+
+ngx_stream_session_t:
+  - signature: uint32_t ("STRM" = 0x4d525453)
+  - connection: ngx_connection_t*
+  - received: off_t (bytes received from client)
+  - start_sec: time_t
+  - start_msec: ngx_msec_t
+  - log_handler: ngx_log_handler_pt
+  - ctx: **void (module-specific context array)
+  - main_conf: **void (stream main config)
+  - srv_conf: **void (stream server config)
+  - virtual_names: ngx_stream_virtual_names_t* (server name lookup)
+  - upstream: ngx_stream_upstream_t* (proxy connection if needed)
+  - upstream_states: array of ngx_stream_upstream_state_t
+  - variables: ngx_stream_variable_value_t* (variable storage)
+  - ncaptures: ngx_uint_t (PCRE)
+  - captures: int* (PCRE capture array)
+  - captures_data: u_char* (PCRE capture data)
+  - phase_handler: ngx_int_t (current phase index)
+  - status: ngx_uint_t (session status code)
+  - ssl: flag
+  - stat_processing: flag
+  - health_check: flag
+  - limit_conn_status: 2-bit flag
+
+Key Difference from HTTP:
+  - Stream has single session per connection (no multiple requests)
+  - No request/response headers separation
+  - No body parsing like HTTP
+  - Bidirectional proxy model (TCP-level)
+
+1.3 PHASE AND HANDLER STRUCTURES
+--------------------------------
+
+ngx_stream_phases (enum):
+  0. NGX_STREAM_POST_ACCEPT_PHASE
+  1. NGX_STREAM_PREACCESS_PHASE
+  2. NGX_STREAM_ACCESS_PHASE
+  3. NGX_STREAM_SSL_PHASE
+  4. NGX_STREAM_PREREAD_PHASE
+  5. NGX_STREAM_CONTENT_PHASE
+  6. NGX_STREAM_LOG_PHASE
+
+ngx_stream_phase_handler_t:
+  - checker: ngx_stream_phase_handler_pt (phase executor function)
+  - handler: ngx_stream_handler_pt (phase-specific handler)
+  - next: ngx_uint_t (index to next handler)
+
+ngx_stream_phase_engine_t:
+  - handlers: ngx_stream_phase_handler_t* (compiled handler array)
+
+ngx_stream_phase_t:
+  - handlers: ngx_array_t (array of ngx_stream_handler_pt)
+
+Handler Function Signatures:
+  ngx_stream_phase_handler_pt: ngx_int_t (*)(ngx_stream_session_t *s,
+                                              ngx_stream_phase_handler_t *ph)
+  ngx_stream_handler_pt: ngx_int_t (*)(ngx_stream_session_t *s)
+  ngx_stream_content_handler_pt: void (*)(ngx_stream_session_t *s)
+
+1.4 LISTENING AND ADDRESS STRUCTURES
+------------------------------------
+
+ngx_stream_listen_opt_t:
+  - sockaddr: struct sockaddr*
+  - socklen: socklen_t
+  - addr_text: ngx_str_t
+  - flags: set, default_server, bind, wildcard, ssl, ipv6only
+  - deferred_accept, reuseport, so_keepalive, proxy_protocol
+  - socket options: backlog, rcvbuf, sndbuf, type, protocol
+  - TCP options: tcp_keepidle, tcp_keepintvl, tcp_keepcnt, setfib, fastopen
+  - accept_filter (BSD specific)
+
+ngx_stream_conf_port_t:
+  - family: int (AF_INET, AF_INET6)
+  - type: int (SOCK_STREAM, SOCK_DGRAM)
+  - port: in_port_t
+  - addrs: ngx_array_t of ngx_stream_conf_addr_t
+
+ngx_stream_conf_addr_t:
+  - opt: ngx_stream_listen_opt_t
+  - protocols: 3-bit field (SSL, PROXY_PROTOCOL, etc)
+  - protocols_set, protocols_changed: flags
+  - hash: ngx_hash_t (exact name matching)
+  - wc_head, wc_tail: ngx_hash_wildcard_t* (prefix/suffix matching)
+  - nregex: ngx_uint_t (regex count, PCRE)
+  - regex: ngx_stream_server_name_t* (regex array)
+  - default_server: ngx_stream_core_srv_conf_t*
+  - servers: ngx_array_t of ngx_stream_core_srv_conf_t*
+
+ngx_stream_port_t:
+  - addrs: void* (ngx_stream_in_addr_t or ngx_stream_in6_addr_t)
+  - naddrs: ngx_uint_t
+
+ngx_stream_in_addr_t (IPv4):
+  - addr: in_addr_t
+  - conf: ngx_stream_addr_conf_t
+
+ngx_stream_in6_addr_t (IPv6):
+  - addr6: struct in6_addr
+  - conf: ngx_stream_addr_conf_t
+
+ngx_stream_addr_conf_t:
+  - default_server: ngx_stream_core_srv_conf_t*
+  - virtual_names: ngx_stream_virtual_names_t*
+  - ssl, proxy_protocol: flags
+
+1.5 VARIABLES
+-------------
+
+ngx_stream_variable_t definition includes:
+  - name: ngx_str_t
+  - get_handler: function pointer
+  - set_handler: function pointer
+  - data: uintptr_t
+  - flags: NGX_STREAM_VAR_* (CHANGEABLE, NOCACHEABLE, NOHASH, WEAK, PREFIX, INDEXED)
+
+Core Stream Variables:
+  - binary_remote_addr
+  - remote_addr, remote_port
+  - proxy_protocol_addr, proxy_protocol_port
+  - proxy_protocol_server_addr, proxy_protocol_server_port
+  - proxy_protocol_tlv_<name> (prefix-based)
+  - server_addr, server_port, server_name
+  - bytes_sent, bytes_received
+  - session_time
+  - status
+  - connection
+  - nginx_version, hostname, pid
+  - msec, time_iso8601, time_local
+  - protocol (tcp/udp)
+
+==============================================================================
+2. MODULE INTERFACE AND LIFECYCLE
+==============================================================================
+
+2.1 MODULE DEFINITION
+---------------------
+
+ngx_stream_module_t:
+  - preconfiguration: ngx_int_t (*)(ngx_conf_t *cf)
+  - postconfiguration: ngx_int_t (*)(ngx_conf_t *cf)
+  - create_main_conf: void* (*)(ngx_conf_t *cf)
+  - init_main_conf: char* (*)(ngx_conf_t *cf, void *conf)
+  - create_srv_conf: void* (*)(ngx_conf_t *cf)
+  - merge_srv_conf: char* (*)(ngx_conf_t *cf, void *parent, void *child)
+
+ngx_module_t (generic module):
+  - version info (NGX_MODULE_V1)
+  - ctx: ngx_stream_module_t* (module-specific context)
+  - commands: ngx_command_t[] (directives)
+  - type: NGX_STREAM_MODULE
+  - lifecycle callbacks (init_master, init_module, init_process, init_thread,
+                        exit_thread, exit_process, exit_master)
+  - padding
+
+2.2 CONFIGURATION PARSING FLOW
+------------------------------
+
+1. ngx_stream_block() called during parse of "stream { }" directive
+2. Creates ngx_stream_conf_ctx_t with main_conf and srv_conf arrays
+3. Calls preconfiguration() on all modules
+4. Parses stream block content (server{} blocks, directives)
+5. Calls init_main_conf() and merge_srv_conf() for each module
+6. Calls postconfiguration() for handler registration
+7. ngx_stream_variables_init_vars() - initializes variables
+8. ngx_stream_init_phase_handlers() - compiles phase handlers into engine
+9. ngx_stream_optimize_servers() - builds listening sockets
+
+2.3 COMMAND CONTEXT FLAGS
+-------------------------
+
+Configuration block types:
+  - NGX_STREAM_MAIN_CONF (0x02000000): can be in stream {} block
+  - NGX_STREAM_SRV_CONF (0x04000000): can be in stream server {} block
+  - NGX_STREAM_UPS_CONF (0x08000000): can be in upstream {} block
+
+Core Directives:
+  - stream: block (main only)
+  - server: block (main only)
+  - listen: SRV_CONF, 1+ args
+  - server_name: SRV_CONF, 1+ args
+  - error_log: MAIN_CONF|SRV_CONF, 1+ args
+  - resolver: MAIN_CONF|SRV_CONF, 1+ args
+  - resolver_timeout: MAIN_CONF|SRV_CONF, 1 arg
+  - proxy_protocol_timeout: MAIN_CONF|SRV_CONF, 1 arg
+  - tcp_nodelay: MAIN_CONF|SRV_CONF, flag
+  - preread_buffer_size: MAIN_CONF|SRV_CONF, size arg
+  - preread_timeout: MAIN_CONF|SRV_CONF, msec arg
+  - variables_hash_max_size: MAIN_CONF, 1 arg
+  - variables_hash_bucket_size: MAIN_CONF, 1 arg
+  - server_names_hash_max_size: MAIN_CONF, 1 arg
+  - server_names_hash_bucket_size: MAIN_CONF, 1 arg
+
+==============================================================================
+3. PHASE EXECUTION MODEL
+==============================================================================
+
+3.1 PHASE HANDLERS AND CHECKERS
+-------------------------------
+
+Phase Handler Checkers (special phase logic):
+  - ngx_stream_core_generic_phase: used by most phases
+    Returns: NGX_OK (stop phase loop)
+             NGX_AGAIN (continue to next handler)
+             NGX_DECLINED (try next handler)
+             NGX_ERROR, NGX_AGAIN, NGX_DONE (finalize)
+
+  - ngx_stream_core_preread_phase: special handling for preread
+    Manages buffer creation, timeout, event handling
+    May return NGX_AGAIN (async read pending)
+
+  - ngx_stream_core_content_phase: special handling for content
+    Calls content_handler_pt which returns void
+
+3.2 SESSION HANDLER FLOW
+-----------------------
+
+ngx_stream_init_connection(ngx_connection_t *c):
+  1. Find server config for address:port
+  2. Create ngx_stream_session_t
+  3. Initialize session context arrays
+  4. Set phase_handler = 0
+  5. Call ngx_stream_core_run_phases(s)
+
+ngx_stream_core_run_phases(ngx_stream_session_t *s):
+  Loop through phases:
+    1. Get current phase_handler index
+    2. Get phase_engine.handlers[index]
+    3. Call phase checker function
+    4. If rc == NGX_OK, stop and return
+    5. Otherwise continue
+
+Phase execution continues via event callbacks:
+  - ngx_stream_session_handler(ngx_event_t *rev)
+    Called on read/write events
+    Calls ngx_stream_core_run_phases() again
+
+3.3 PHASE ORDER AND PURPOSE
+--------------------------
+
+1. POST_ACCEPT: After TCP connection accepted
+   - For protocol detection, real_ip extraction
+   - Early request analysis
+
+2. PREACCESS: Before access checks
+   - Geo-location checks, variable computation
+   - Request classification
+
+3. ACCESS: Access control
+   - Access rules, limit_conn
+
+4. SSL: SSL/TLS handling
+   - SSL handshake, certificate selection
+   - SNI processing
+
+5. PREREAD: Read initial client data
+   - Buffer initial bytes before deciding handler
+   - Protocol detection (SSL, HTTP detection for proxy)
+   - May wait asynchronously for data
+
+6. CONTENT: Main content handler
+   - Route decision (which upstream)
+   - Proxy handling (bidirectional copy)
+   - Response generation
+
+7. LOG: Session logging
+   - Write session stats to log files
+   - Called on session close
+
+Note: Unlike HTTP, stream has NO rewrite phases, NO location matching.
+Server is selected at listen time (address:port) and optionally by
+server_name matching.
+
+==============================================================================
+4. COMPARISON WITH HTTP MODULE
+==============================================================================
+
+4.1 SIMILARITIES
+---------------
+
+HTTP (lib.rs constants):
+  - NGX_HTTP_MAIN_CONF (0x02000000)
+  - NGX_HTTP_SRV_CONF (0x04000000)
+  - NGX_HTTP_LOC_CONF (0x08000000) [Stream has UPS_CONF]
+  - NGX_HTTP_UPS_CONF (0x10000000)
+
+HTTP Phases:
+  0. POST_READ_PHASE
+  1. SERVER_REWRITE_PHASE
+  2. FIND_CONFIG_PHASE
+  3. REWRITE_PHASE
+  4. POST_REWRITE_PHASE
+  5. PREACCESS_PHASE
+  6. ACCESS_PHASE
+  7. POST_ACCESS_PHASE
+  8. PRECONTENT_PHASE
+  9. CONTENT_PHASE
+  10. LOG_PHASE
+  Total: 11 phases
+
+HTTP Core Structures (core.rs):
+  - CoreMainConf: servers, phase_engine, headers_in_hash
+  - PhaseEngine: handlers, server_rewrite_index, location_rewrite_index
+  - Phase: handlers (Vec<HandlerFn>)
+  - PhaseHandler: checker, handler, next
+  - Checker enum: Generic, Rewrite, FindConfig, PostRewrite, Access, PostAccess, Content
+
+HTTP Handler Pattern:
+  HandlerFn = Rc<dyn Fn(R) -> BoxFut<i64>>  (async closure)
+  Returns i64 status code
+
+HTTP Core_rt Pattern (core_rt.rs):
+  - async fn handler(r: R) -> i64
+  - async fn run_phases(r: R) -> i64
+  - PhaseStep enum: Continue, Finalize(i64)
+  - Each checker is an async function
+  - Matches on checker type, awaits handler
+
+4.2 KEY DIFFERENCES
+-------------------
+
+Stream vs HTTP:
+
+Model:
+  HTTP: Multiple requests per connection, request/response model
+  Stream: Single bidirectional session per connection
+
+Configuration:
+  HTTP: 3-level nesting (main/server/location), location tree
+  Stream: 2-level nesting (main/server), address:port selection + optional server_name
+
+Phases:
+  HTTP: 11 phases including rewrite, location matching,
+        PostAccess guard before content
+  Stream: 7 phases, no rewrite/location, simpler flow
+
+Variables:
+  HTTP: Per-request context, function pointers for get/set
+  Stream: Per-session context, simpler variable handling
+
+Headers:
+  HTTP: Complex header parsing, filtering, merging
+  Stream: No headers at core level, bidirectional byte streams
+
+Content Generation:
+  HTTP: Responses must be generated, headers required
+  Stream: Content handler manages bidirectional copy/proxy
+
+Async Model:
+  HTTP: Rust-based with tokio async/await
+  Stream: C-based with event loop, needs async Rust translation
+
+4.3 ASYNC TRANSLATION NOTES
+---------------------------
+
+In C, phases are synchronous with callback-based async:
+  - Phase handler returns NGX_AGAIN to suspend
+  - Event callback re-enters handler later
+  - Multiple entries into same handler with state tracking
+
+In Rust async pattern (based on HTTP):
+  - HandlerFn is async closure
+  - Returns futures
+  - Checker logic becomes async
+  - No re-entry complexity
+
+For Stream preread:
+  C version:
+    1. First call: start read, setup timer, return NGX_AGAIN
+    2. Event fires: re-enter same handler with more data
+    3. Handler decides if enough data or return NGX_AGAIN again
+    4. Eventually: return NGX_OK or NGX_DECLINED
+
+  Rust async version:
+    1. async fn that awaits on socket read
+    2. Returns when enough data present
+    3. No multiple re-entries, natural async flow
+
+==============================================================================
+5. STREAM MODULE LOAD ORDER (REQUIRED SEQUENCE)
+==============================================================================
+
+From /home/ubuntu/rnginx/nginx-c/objs/ngx_modules.c lines 220-242:
+
+1. ngx_stream_module                      (base module, defines stream{} block)
+2. ngx_stream_core_module                 (configuration, phases, listen)
+3. ngx_stream_log_module                  (logging)
+4. ngx_stream_proxy_module                (proxy_pass directive)
+5. ngx_stream_upstream_module             (upstream block/servers)
+6. ngx_stream_write_filter_module         (buffer output to upstream)
+7. ngx_stream_ssl_module                  (ssl directives)
+8. ngx_stream_realip_module               (set_real_ip_from)
+9. ngx_stream_limit_conn_module           (limit_conn directives)
+10. ngx_stream_access_module              (allow/deny directives)
+11. ngx_stream_geo_module                 (geo variables)
+12. ngx_stream_geoip_module               (GeoIP database variables)
+13. ngx_stream_map_module                 (map directive)
+14. ngx_stream_split_clients_module       (split_clients directive)
+15. ngx_stream_return_module              (return directive)
+16. ngx_stream_pass_module                (pass directive - UDP)
+17. ngx_stream_set_module                 (set directive)
+18. ngx_stream_upstream_hash_module       (hash load balancing)
+19. ngx_stream_upstream_least_conn_module (least_conn lb)
+20. ngx_stream_upstream_least_time_module (least_time lb)
+21. ngx_stream_upstream_random_module     (random lb)
+22. ngx_stream_upstream_zone_module       (zone shared memory)
+23. ngx_stream_ssl_preread_module         (SNI preread)
+
+Additional module NOT in main list:
+  - ngx_stream_geoip_module (conditional, deprecated)
+
+Dependencies/Ordering Rules:
+  - core_module must be #2 (config foundation)
+  - upstream_module before any upstream_*_module
+  - Variables (geo, map, split_clients) before usage in handlers
+  - SSL/realip can be early (used in connection init)
+  - Content handlers (proxy, return, pass) later (use preceding modules)
+  - Log module relatively late (output only)
+
+==============================================================================
+6. DIRECTIVES BY MODULE
+==============================================================================
+
+ngx_stream_module:
+  - stream { block }
+
+ngx_stream_core_module:
+  - variables_hash_max_size (MAIN)
+  - variables_hash_bucket_size (MAIN)
+  - server_names_hash_max_size (MAIN)
+  - server_names_hash_bucket_size (MAIN)
+  - server { block } (MAIN)
+  - listen (SRV_CONF)
+  - server_name (SRV_CONF)
+  - error_log (MAIN, SRV_CONF)
+  - resolver (MAIN, SRV_CONF)
+  - resolver_timeout (MAIN, SRV_CONF)
+  - proxy_protocol_timeout (MAIN, SRV_CONF)
+  - tcp_nodelay (MAIN, SRV_CONF)
+  - preread_buffer_size (MAIN, SRV_CONF)
+  - preread_timeout (MAIN, SRV_CONF)
+
+Other modules each define their directive(s):
+  - log_module: access_log
+  - proxy_module: proxy_pass
+  - upstream_module: upstream { }, server directive in upstream
+  - ssl_module: ssl_*, certificate directives
+  - realip_module: set_real_ip_from
+  - limit_conn_module: limit_conn_zone, limit_conn
+  - access_module: allow, deny
+  - geo_module: geo { }
+  - map_module: map { }
+  - split_clients_module: split_clients { }
+  - return_module: return
+  - pass_module: pass
+  - set_module: set
+  - upstream_*_module: load balancing directives
+  - ssl_preread_module: ssl_preread
+
+==============================================================================
+7. KEY IMPLEMENTATION REQUIREMENTS
+==============================================================================
+
+7.1 CORE STRUCTURES TO IMPLEMENT
+--------------------------------
+
+Essential:
+  [x] ngx_stream_conf_ctx_t (already in Rust bindings likely)
+  [x] ngx_stream_core_main_conf_t (configuration state)
+  [x] ngx_stream_core_srv_conf_t (server config)
+  [x] ngx_stream_session_t (connection session state)
+  [x] ngx_stream_phases enum (phase types)
+  [x] Phase handlers and checker functions
+  [x] Variable system
+
+Module context:
+  [] Each module struct (follows HTTP pattern)
+  [] create_main_conf, create_srv_conf callbacks
+  [] init_main_conf, merge_srv_conf callbacks
+  [] preconfiguration, postconfiguration hooks
+
+7.2 PHASE ENGINE COMPILATION
+-----------------------------
+
+Key algorithm (in ngx_stream_init_phase_handlers):
+  1. Collect all handlers registered in each phase
+  2. Create array of phase_handler_t
+  3. For each phase (except LOG):
+     - Iterate handlers in REVERSE order (stack-like)
+     - Set checker based on phase type
+     - Link next pointer to continue chain
+  4. Add content phase handler
+  5. Handlers array forms execution chain
+
+Checkers needed:
+  - generic_phase: standard handler
+  - preread_phase: special buffer/timeout handling
+  - content_phase: content handler wrapper
+
+7.3 RUNTIME SESSION HANDLING
+----------------------------
+
+Entry point: ngx_stream_init_connection(ngx_connection_t *c)
+  1. Determine server config by address:port
+  2. Allocate ngx_stream_session_t
+  3. Copy main_conf, srv_conf pointers
+  4. Call ngx_stream_core_run_phases()
+
+Session loop: ngx_stream_core_run_phases(ngx_stream_session_t *s)
+  Loop:
+    1. Get phase_handler index
+    2. Get handlers[index]
+    3. Call checker function
+    4. Checker returns status:
+       - NGX_OK: stop loop (phase complete or error finalized)
+       - NGX_AGAIN: continue loop
+    5. If handler suspends (NGX_AGAIN returned), break loop
+       and wait for event callback
+
+Event handling:
+  - ngx_stream_session_handler(ngx_event_t *rev)
+  - Re-enters core_run_phases() for same session
+  - Phase index preserved in session->phase_handler
+
+7.4 VARIABLE SYSTEM
+-------------------
+
+Variables hash:
+  - Built from variable definitions during init_main_conf
+  - Maps variable name to ngx_stream_variable_t
+  - Supports exact and prefix matching
+
+Variable value storage:
+  - session->variables array (one per variable)
+  - Lazy evaluation: computed on first access
+  - Cached unless NGX_STREAM_VAR_NOCACHEABLE set
+
+Variable types:
+  - Static: computed once from connection/config
+  - Dynamic: recomputed each access (e.g. time)
+  - Indexed: compiled to index for fast lookup
+  - Prefix: partial name match (e.g. proxy_protocol_tlv_*)
+
+7.5 CRITICAL HANDLERS
+--------------------
+
+Essential to implement early:
+
+listen_handler:
+  - Parse "listen" directive
+  - Create ngx_stream_listen_opt_t
+  - Call ngx_stream_add_listen()
+  - Builds port list for socket binding
+
+server_handler:
+  - Parse "server" directive
+  - Create server config context
+  - Merge with parent config
+
+optimize_servers:
+  - Build listening sockets from port list
+  - Create server name hashes
+  - Allocate socket structures
+
+Session initialization:
+  - Allocate and populate session
+  - Initialize variable array
+  - Start phase execution
+
+Content handler:
+  - Called in CONTENT phase
+  - Application-specific (proxy_pass, return, etc)
+  - Sets connection handlers for bidirectional copy
+
+==============================================================================
+8. SESSION LIFECYCLE AND STATE TRANSITIONS
+==============================================================================
+
+Session Lifetime (Rust async perspective):
+
+Creation:
+  ngx_stream_init_connection()
+    -> Allocate session
+    -> Initialize fields
+    -> Call run_phases() [async]
+
+Phase Loop (async):
+  run_phases(session)
+    Loop:
+      phase_handler_index = session.phase_handler
+      ph = handlers[index]
+
+      result = call checker(session, ph) [await if async]
+
+      if result == NGX_OK:
+        break (phase complete or error)
+      else if result == NGX_AGAIN:
+        continue (try next handler)
+      else:
+        (shouldn't happen)
+
+Async Suspension:
+  When handler returns NGX_AGAIN (read would block):
+    - Return from run_phases()
+    - Setup event for socket read
+    - Session preserved in connection.data
+    - Event fires on socket ready
+    - Re-enter run_phases() for same session
+    - Phase_handler index preserved
+
+Content Phase Execution:
+  Content handler (e.g. proxy_pass):
+    - Initiates upstream connection
+    - Sets up bidirectional copy
+    - Returns void
+    - Subsequent data copied by buffer filters
+
+Session Cleanup:
+  ngx_stream_finalize_session():
+    - Record status/statistics
+    - Close upstream (if any)
+    - Schedule log phase
+    - Trigger LOG phase handlers
+    - Close client connection
+
+Error Handling:
+  NGX_STREAM_INTERNAL_SERVER_ERROR (500):
+    - Finalize immediately
+    - Close both directions
+    - Log error
+
+==============================================================================
+9. CONFIGURATION INITIALIZATION ORDER
+==============================================================================
+
+During Parse (stream block):
+
+1. ngx_stream_block() called
+   Create conf_ctx with arrays for main/srv configs
+
+2. For each module:
+   Call preconfiguration()
+   - Register variables
+   - Setup module hooks
+
+3. Parse directives:
+   - server blocks create srv_conf
+   - listen directives call add_listen()
+   - Other directives fill config structs
+
+4. For each module:
+   Call init_main_conf() [once per stream block]
+   Call merge_srv_conf() [for each server block]
+   - Inherit/override parent settings
+   - Validate configuration
+   - Setup hashes
+
+5. ngx_stream_variables_init_vars()
+   - Build variables hash
+   - Index variables
+   - Setup variable storage
+
+6. For each module:
+   Call postconfiguration()
+   - Register phase handlers
+   - Finalize setup
+
+7. ngx_stream_init_phase_handlers()
+   - Compile phase handlers into engine
+   - Create handler array with checkers
+   - Link handlers in execution order
+
+8. ngx_stream_optimize_servers()
+   - Sort addresses
+   - Build server name hashes
+   - Create listening sockets
+
+Result: Ready for connections on listening sockets
+
+==============================================================================
+10. KEY PATTERNS FOR RUST IMPLEMENTATION
+==============================================================================
+
+Based on HTTP module pattern analysis:
+
+1. Module Definition:
+   Use module_index macro like HTTP:
+     http_module_index!("ngx_http_core_module")
+   For Stream:
+     stream_module_index!("ngx_stream_core_module")
+
+2. Configuration Structs:
+   Use RefCell<T> for interior mutability during config phase
+   See: CoreMainConf, CoreSrvConf in http/core.rs
+
+3. Phase Handlers:
+   type HandlerFn = Rc<dyn Fn(S) -> BoxFut<i64>>
+   Where S is Stream session handle
+   Return i64 status code
+
+4. Phase Checking:
+   enum Checker { Generic, Preread, Content, ... }
+   async fn run_phases(s: S) -> i64
+   Match on checker type, call handler
+
+5. Variable System:
+   Lazy evaluation with caching
+   Variables stored in session array
+   Access via variable index
+
+6. Server Selection:
+   Listen address/port determines server config
+   Optional server_name matching
+   Hash table for fast lookup
+
+7. Connection Initialization:
+   Entry from ngx_core accept handler
+   Allocate session
+   Spawn run_phases() task
+
+8. Async Model:
+   All phase handlers are async
+   Suspension via await on socket operations
+   Event loop resumes on socket ready
+
+==============================================================================
+11. CORE MODULE RESPONSIBILITY BREAKDOWN
+==============================================================================
+
+ngx_stream_module:
+  Purpose: Base stream functionality
+  Provides: stream { } block directive
+  During config: Creates main context
+  During runtime: N/A
+
+ngx_stream_core_module:
+  Purpose: Core configuration and phase management
+  Provides:
+    - listen, server, server_name directives
+    - Configuration hashing and optimization
+    - Phase engine compilation
+    - Default variable definitions
+    - Core callbacks for modules
+  During config:
+    - Creates main/srv conf structs
+    - Initializes phase arrays
+    - Builds variable hash
+    - Optimizes listening sockets
+  During runtime:
+    - run_phases() phase execution loop
+    - Phase checkers (generic, preread, content)
+    - Variable initialization
+
+ngx_stream_log_module:
+  Purpose: Session logging
+  Provides: access_log directive
+  Registers: LOG phase handler
+
+ngx_stream_proxy_module:
+  Purpose: TCP proxy
+  Provides: proxy_pass directive
+  Registers: CONTENT phase handler
+  Functionality: Upstream connection, bidirectional copy
+
+ngx_stream_upstream_module:
+  Purpose: Upstream server pool management
+  Provides: upstream { } block, server directive in upstream
+  Creates: upstream configuration
+  Supports: Dynamic upstream selection, health checks
+
+Other modules follow similar pattern:
+  Register directive -> Register phase handler -> Process in phase
+
+==============================================================================
+SUMMARY FOR RUST PORTING
+==============================================================================
+
+High-Level Architecture Needed:
+
+1. Core Configuration System
+   - Parse stream { } block
+   - Create conf_ctx with main/srv arrays
+   - Handle server { } nesting
+   - Execute module callbacks (pre/post/merge config)
+
+2. Phase Engine
+   - Define 7 stream phases
+   - Support handler registration
+   - Compile handlers into linked array
+   - Execute with 3 checker types
+
+3. Session Management
+   - Connection -> Session creation
+   - Per-session state and variables
+   - Phase progress tracking
+   - Async suspension/resumption
+
+4. Variable System
+   - Variable registration
+   - Hash table lookup
+   - Lazy value computation
+   - Caching with nocache flag
+
+5. Server/Listening Setup
+   - Parse listen directives
+   - Build port/address hierarchy
+   - Create listening sockets
+   - Server name matching
+
+6. Module Interface
+   - ModuleDef trait (from ngx-core)
+   - Preconfiguration hook
+   - Postconfiguration hook
+   - create_main_conf, create_srv_conf
+   - init_main_conf, merge_srv_conf
+   - Directive handlers
+
+7. Runtime Flow
+   - Accept connection
+   - Create session
+   - Execute phases asynchronously
+   - Suspend on I/O
+   - Resume on events
+   - Log and cleanup
+
+Rust-Specific Patterns:
+   - Use tokio for async/await
+   - RefCell for interior mutability during config
+   - Rc for shared ownership
+   - Vec for dynamic arrays (instead of ngx_array_t)
+   - HashMap for hash tables
+   - Closures for handlers
+   - Traits for polymorphism
+
+Current skeleton in /home/ubuntu/rnginx/crates/ngx-stream/src/lib.rs:
+  - Returns empty modules() Vec
+  - Ready for implementation
+
+File locations ready for implementation:
+  /home/ubuntu/rnginx/crates/ngx-stream/src/
+    - lib.rs (module registry)
+    - module.rs (module definitions)
+    - core.rs (config structures)
+    - core_rt.rs (runtime execution)
+    - variables.rs (variable system)
+    - listening.rs (socket binding)
+    - upstream.rs (upstream proxy)
+    (etc. per HTTP module pattern)
+
