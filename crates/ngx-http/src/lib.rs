@@ -50,6 +50,11 @@ pub mod stub_status;
 pub mod mirror;
 pub mod userid;
 pub mod realip;
+pub mod map;
+pub mod geo;
+pub mod split_clients;
+pub mod referer;
+pub mod browser;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -535,6 +540,11 @@ pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module()];
     v.extend(stubs::early_modules());
     v.push(realip::realip_module());
+    v.push(map::map_module());
+    v.push(geo::geo_module());
+    v.push(split_clients::split_clients_module());
+    v.push(referer::referer_module());
+    v.push(browser::browser_module());
     v.push(static_module::static_module());
     v.push(dav::dav_module());
     v.push(autoindex::autoindex_module());
@@ -543,9 +553,6 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(mirror::mirror_module());
     v.extend(stubs::handler_modules_b());
     v.push(try_files::try_files_module());
-    v.push(auth_request::auth_request_module());
-    v.push(auth_basic::auth_basic_module());
-    v.push(access::access_module());
     v.extend(stubs::handler_modules_c());
     v.extend(stubs::handler_modules_b());
     v.push(rewrite::rewrite_module());

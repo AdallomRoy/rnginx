@@ -1701,8 +1701,8 @@ fn disable_symlinks(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> 
 }
 
 fn pool_size_check(cf: &Conf, v: usize) -> ConfResult {
-    if v < 112 {
-        return Err(cf.emerg(format_args!("the pool size must be no less than {}", 112)));
+    if v < 16 {
+        return Err(cf.emerg(format_args!("the pool size must be no less than {}", 16)));
     }
     if v % 16 != 0 {
         return Err(cf.emerg(format_args!("the pool size must be a multiple of {}", 16)));
