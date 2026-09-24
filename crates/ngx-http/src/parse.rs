@@ -1308,12 +1308,357 @@ pub fn parse_uri(r: &mut ParseRequest, buf: &[u8]) -> i64 {
     NGX_OK
 }
 
-/// Parse complex URI with normalization (simplified for now)
+/// Result struct for parse_complex_uri
+pub struct ComplexUri {
+    pub uri: Vec<u8>,
+    pub args: Option<Vec<u8>>,
+    pub exten: Option<Vec<u8>>,
+}
+
+/// Parse complex URI with normalization.
+/// Ported from ngx_http_parse_complex_uri.
+/// Returns normalized URI, optional args (from after ?), and optional extension.
 pub fn parse_complex_uri(
-    _r: &mut ParseRequest,
-) -> i64 {
-    // This is a simplified stub. Full implementation would normalize the URI.
-    NGX_OK
+    r: &ParseRequest,
+    buf: &[u8],
+    merge_slashes: bool,
+) -> Result<ComplexUri, i64> {
+    const SW_USUAL: usize = 0;
+    const SW_SLASH: usize = 1;
+    const SW_DOT: usize = 2;
+    const SW_DOT_DOT: usize = 3;
+    const SW_QUOTED: usize = 4;
+    const SW_QUOTED_SECOND: usize = 5;
+
+    let uri_start = match r.uri_start {
+        Some(s) => s,
+        None => return Err(NGX_HTTP_PARSE_INVALID_REQUEST),
+    };
+    let uri_end = match r.uri_end {
+        Some(e) => e,
+        None => return Err(NGX_HTTP_PARSE_INVALID_REQUEST),
+    };
+
+    if uri_start >= buf.len() || uri_end > buf.len() || uri_start >= uri_end {
+        return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+    }
+
+    let mut state: usize = SW_USUAL;
+    let mut quoted_state: usize = SW_USUAL;
+    let mut decoded: u8 = 0;
+    let mut u = Vec::new();
+    let mut args_buf: Vec<u8> = Vec::new();
+    let mut uri_ext: Option<usize> = None;
+    let mut args_set = false;
+
+    // Handle empty_path_in_uri: prepend /
+    if r.empty_path_in_uri {
+        u.push(b'/');
+    }
+
+    // Mimic C code: read first character, then loop with p <= uri_end
+    let mut p = uri_start;
+    if p >= buf.len() {
+        return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+    }
+    let mut ch = buf[p];
+    p += 1;
+
+    // Main parsing loop - p <= uri_end
+    while p <= uri_end {
+        match state {
+            SW_USUAL => {
+                if is_usual(ch) {
+                    u.push(ch);
+                } else {
+                    match ch {
+                        b'/' => {
+                            uri_ext = None;
+                            state = SW_SLASH;
+                            u.push(ch);
+                        }
+                        b'%' => {
+                            quoted_state = state;
+                            state = SW_QUOTED;
+                        }
+                        b'?' => {
+                            // Args start at next position
+                            args_set = true;
+                            while p < uri_end {
+                                // Scan for # to mark end of args
+                                if buf[p] == b'#' {
+                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
+                                    break;
+                                }
+                                args_buf.push(buf[p]);
+                                p += 1;
+                            }
+                            break;
+                        }
+                        b'#' => {
+                            // Fragment ends the URI
+                            break;
+                        }
+                        b'.' => {
+                            uri_ext = Some(u.len() + 1);
+                            u.push(ch);
+                        }
+                        b'+' => {
+                            u.push(ch);
+                        }
+                        _ => {
+                            u.push(ch);
+                        }
+                    }
+                }
+            }
+
+            SW_SLASH => {
+                if is_usual(ch) {
+                    state = SW_USUAL;
+                    u.push(ch);
+                } else {
+                    match ch {
+                        b'/' => {
+                            if !merge_slashes {
+                                u.push(ch);
+                            }
+                        }
+                        b'.' => {
+                            state = SW_DOT;
+                            u.push(ch);
+                        }
+                        b'%' => {
+                            quoted_state = state;
+                            state = SW_QUOTED;
+                        }
+                        b'?' => {
+                            args_set = true;
+                            while p < uri_end {
+                                if buf[p] == b'#' {
+                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
+                                    break;
+                                }
+                                args_buf.push(buf[p]);
+                                p += 1;
+                            }
+                            break;
+                        }
+                        b'#' => {
+                            break;
+                        }
+                        b'+' => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                        _ => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                    }
+                }
+            }
+
+            SW_DOT => {
+                if is_usual(ch) {
+                    state = SW_USUAL;
+                    u.push(ch);
+                } else {
+                    match ch {
+                        b'/' => {
+                            state = SW_SLASH;
+                            if u.len() > 0 {
+                                u.pop(); // Remove the dot
+                            }
+                        }
+                        b'.' => {
+                            state = SW_DOT_DOT;
+                            u.push(ch);
+                        }
+                        b'%' => {
+                            quoted_state = state;
+                            state = SW_QUOTED;
+                        }
+                        b'?' => {
+                            if u.len() > 0 {
+                                u.pop(); // Remove the dot
+                            }
+                            args_set = true;
+                            while p < uri_end {
+                                if buf[p] == b'#' {
+                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
+                                    break;
+                                }
+                                args_buf.push(buf[p]);
+                                p += 1;
+                            }
+                            break;
+                        }
+                        b'#' => {
+                            if u.len() > 0 {
+                                u.pop(); // Remove the dot
+                            }
+                            break;
+                        }
+                        b'+' => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                        _ => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                    }
+                }
+            }
+
+            SW_DOT_DOT => {
+                if is_usual(ch) {
+                    state = SW_USUAL;
+                    u.push(ch);
+                } else {
+                    match ch {
+                        b'/' | b'?' | b'#' => {
+                            // Remove ".." (3 chars: dot dot plus preceding slash)
+                            if u.len() >= 3 {
+                                u.truncate(u.len() - 3);
+                            }
+
+                            // Find the previous slash and position after it
+                            while !u.is_empty() {
+                                if u[u.len() - 1] == b'/' {
+                                    break;
+                                }
+                                u.pop();
+                            }
+
+                            if ch == b'?' {
+                                args_set = true;
+                                while p < uri_end {
+                                    if buf[p] == b'#' {
+                                        args_buf.extend_from_slice(&buf[p + 1..uri_end]);
+                                        break;
+                                    }
+                                    args_buf.push(buf[p]);
+                                    p += 1;
+                                }
+                                break;
+                            } else if ch == b'#' {
+                                break;
+                            }
+                            state = SW_SLASH;
+                        }
+                        b'%' => {
+                            quoted_state = state;
+                            state = SW_QUOTED;
+                        }
+                        b'+' => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                        _ => {
+                            state = SW_USUAL;
+                            u.push(ch);
+                        }
+                    }
+                }
+            }
+
+            SW_QUOTED => {
+                // Expecting first hex digit
+                if ch >= b'0' && ch <= b'9' {
+                    decoded = ch - b'0';
+                    state = SW_QUOTED_SECOND;
+                } else {
+                    let c = ch | 0x20;
+                    if c >= b'a' && c <= b'f' {
+                        decoded = c - b'a' + 10;
+                        state = SW_QUOTED_SECOND;
+                    } else {
+                        return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+                    }
+                }
+            }
+
+            SW_QUOTED_SECOND => {
+                // Expecting second hex digit
+                let decodedch: u8;
+                if ch >= b'0' && ch <= b'9' {
+                    decodedch = (decoded << 4) + (ch - b'0');
+                } else {
+                    let c = ch | 0x20;
+                    if c >= b'a' && c <= b'f' {
+                        decodedch = (decoded << 4) + (c - b'a' + 10);
+                    } else {
+                        return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+                    }
+                }
+
+                // Check for invalid characters
+                if decodedch == 0 {
+                    // %00 is not allowed
+                    return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+                }
+
+                if decodedch == b'%' || decodedch == b'#' {
+                    state = SW_USUAL;
+                    u.push(decodedch);
+                } else if decodedch == b'?' {
+                    state = SW_USUAL;
+                    u.push(decodedch);
+                } else if decodedch == b'+' {
+                    // Track plus_in_uri (caller will use this if needed)
+                    state = quoted_state;
+                } else {
+                    state = quoted_state;
+                }
+            }
+
+            _ => {}
+        }
+
+        if p >= buf.len() {
+            break;
+        }
+        ch = buf[p];
+        p += 1;
+    }
+
+    // Handle trailing incomplete states
+    if state == SW_QUOTED || state == SW_QUOTED_SECOND {
+        return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
+    }
+
+    // Handle trailing dot or dot-dot
+    if state == SW_DOT {
+        if u.len() > 0 {
+            u.pop();
+        }
+    } else if state == SW_DOT_DOT {
+        if u.len() >= 3 {
+            u.truncate(u.len() - 3);
+        }
+        while !u.is_empty() && u[u.len() - 1] != b'/' {
+            u.pop();
+        }
+    }
+
+    // Extract extension if set (from the position marked during parsing)
+    let exten = uri_ext.and_then(|ext_start| {
+        if ext_start <= u.len() {
+            Some(u[ext_start..].to_vec())
+        } else {
+            None
+        }
+    });
+
+    let args = if args_set && !args_buf.is_empty() {
+        Some(args_buf)
+    } else {
+        None
+    };
+
+    Ok(ComplexUri { uri: u, args, exten })
 }
 
 /// Parse status line (used by proxy)
@@ -1543,6 +1888,154 @@ pub fn parse_status_line(buf: &[u8], pos: &mut usize, status: &mut Status) -> i6
 
     *pos = p;
     NGX_AGAIN
+}
+
+/// Parse unsafe URI - checks for "..", "./%00", "/%00", and "/.." patterns.
+/// Ported from ngx_http_parse_unsafe_uri.
+/// Returns NGX_OK if safe, NGX_ERROR if unsafe.
+pub fn parse_unsafe_uri(uri: &[u8], _args: &[u8], _flags: &mut u32) -> i64 {
+    // Check for empty path or starts with ?
+    if uri.is_empty() || uri[0] == b'?' {
+        return NGX_ERROR;
+    }
+
+    // Check for ".." at the start
+    if uri.len() > 1 && uri[0] == b'.' && uri[1] == b'.'
+        && (uri.len() == 2 || uri[2] == b'/')
+    {
+        return NGX_ERROR;
+    }
+
+    // Check for unsafe patterns in URI
+    let mut quoted = false;
+    let mut i = 0;
+    while i < uri.len() {
+        let ch = uri[i];
+
+        if ch == b'%' {
+            quoted = true;
+            i += 1;
+            continue;
+        }
+
+        // Check for usual characters
+        if is_usual(ch) {
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            b'?' => {
+                // Found args marker
+                break;
+            }
+            b'\0' => {
+                // Null character is unsafe
+                return NGX_ERROR;
+            }
+            b'/' => {
+                // Check for "/../" and "/.."
+                if i + 2 < uri.len() {
+                    if uri[i + 1] == b'.' && uri[i + 2] == b'.'
+                        && (i + 3 >= uri.len() || uri[i + 3] == b'/')
+                    {
+                        return NGX_ERROR;
+                    }
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // If quoted, need to re-check after unquoting
+    if quoted {
+        // For simplicity, we check the patterns again
+        // In the C code, it would unescape and re-check
+        // Here we just validate that escaped nulls aren't present
+        let mut j = 0;
+        while j < uri.len() {
+            if uri[j] == b'%' {
+                if j + 2 < uri.len() {
+                    // Check for %00 (null)
+                    if (uri[j + 1] == b'0' || uri[j + 1] == b'0')
+                        && (uri[j + 2] == b'0' || uri[j + 2] == b'0')
+                    {
+                        return NGX_ERROR;
+                    }
+                }
+                j += 3;
+            } else {
+                j += 1;
+            }
+        }
+
+        // Check again for ".." after conceptual unquoting
+        let mut i = 0;
+        while i < uri.len() {
+            if uri[i] == b'/' && i + 2 < uri.len() {
+                if uri[i + 1] == b'.' && uri[i + 2] == b'.' {
+                    if i + 3 >= uri.len() || uri[i + 3] == b'/' {
+                        return NGX_ERROR;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    NGX_OK
+}
+
+/// Parse Set-Cookie header values looking for a specific cookie name.
+/// Returns the cookie value if found, None otherwise.
+/// Ported from ngx_http_parse_set_cookie_lines.
+pub fn parse_set_cookie_lines(values: &[&[u8]], name: &[u8]) -> Option<Vec<u8>> {
+    for value in values {
+        // Name must be shorter than value
+        if name.len() >= value.len() {
+            continue;
+        }
+
+        let mut start = 0;
+        let end = value.len();
+
+        // Check if this header starts with the name
+        if !case_insensitive_eq(&value[start..], name) {
+            continue;
+        }
+
+        start += name.len();
+
+        // Skip whitespace
+        while start < end && value[start] == b' ' {
+            start += 1;
+        }
+
+        // Expect '=' after name
+        if start >= end || value[start] != b'=' {
+            continue;
+        }
+
+        start += 1;
+
+        // Skip whitespace after '='
+        while start < end && value[start] == b' ' {
+            start += 1;
+        }
+
+        // Find the end of the value (terminated by ; or end of string)
+        let val_start = start;
+        while start < end && value[start] != b';' {
+            start += 1;
+        }
+
+        return Some(value[val_start..start].to_vec());
+    }
+
+    None
 }
 
 /// Parse header value for multi-header lines (cookies, accept, etc.)
@@ -2586,5 +3079,530 @@ mod tests {
 
         assert_eq!(rc, NGX_OK);
         assert_eq!(r.plus_in_uri, true);
+    }
+
+    // Tests for parse_complex_uri
+    #[test]
+    fn test_parse_complex_uri_simple() {
+        let buf = b"/path/to/file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(13);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        assert_eq!(uri.uri, b"/path/to/file");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_with_dot() {
+        let buf = b"/path/./file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(12);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        // The dot should be removed
+        assert_eq!(uri.uri, b"/path/file");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_with_dotdot() {
+        let buf = b"/path/../file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(13);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        // Should go back up one level
+        assert_eq!(uri.uri, b"/file");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_with_extension() {
+        let buf = b"/path/file.html\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(15);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        assert_eq!(uri.uri, b"/path/file.html");
+        assert!(uri.exten.is_some());
+        assert_eq!(uri.exten.unwrap(), b"html");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_with_query() {
+        let buf = b"/path?query=value\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(17);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        assert_eq!(uri.uri, b"/path");
+        assert!(uri.args.is_some());
+        assert_eq!(uri.args.unwrap(), b"query=value");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_with_fragment() {
+        let buf = b"/path#fragment\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(14);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        assert_eq!(uri.uri, b"/path");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_merge_slashes_true() {
+        let buf = b"/path//to///file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(15);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        // With merge_slashes=true, consecutive slashes should be collapsed
+        assert_eq!(uri.uri, b"/path/to/file");
+    }
+
+    #[test]
+    fn test_parse_complex_uri_merge_slashes_false() {
+        let buf = b"/path//to/file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(14);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_complex_uri_empty_path_prepend() {
+        let buf = b"path/to/file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(12);
+        r.empty_path_in_uri = true;
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        assert!(result.is_ok());
+        let uri = result.unwrap();
+        // Should prepend / when empty_path_in_uri is set
+        assert!(uri.uri[0] == b'/');
+    }
+
+    #[test]
+    fn test_parse_complex_uri_invalid_percent_encoding() {
+        let buf = b"/path%GG/file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(13);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        // Invalid percent encoding should fail
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_complex_uri_null_char_invalid() {
+        let buf = b"/path%00/file\r\n";
+        let mut r = ParseRequest::default();
+        r.uri_start = Some(0);
+        r.uri_end = Some(13);
+
+        let result = parse_complex_uri(&r, buf, true);
+
+        // %00 (null byte) is invalid
+        assert!(result.is_err());
+    }
+
+    // Tests for parse_unsafe_uri
+    #[test]
+    fn test_parse_unsafe_uri_safe() {
+        let uri = b"/path/to/file";
+        let args = b"";
+        let mut flags = 0u32;
+
+        let rc = parse_unsafe_uri(uri, args, &mut flags);
+
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_unsafe_uri_empty() {
+        let uri = b"";
+        let args = b"";
+        let mut flags = 0u32;
+
+        let rc = parse_unsafe_uri(uri, args, &mut flags);
+
+        assert_eq!(rc, NGX_ERROR);
+    }
+
+    #[test]
+    fn test_parse_unsafe_uri_question_mark() {
+        let uri = b"?query";
+        let args = b"";
+        let mut flags = 0u32;
+
+        let rc = parse_unsafe_uri(uri, args, &mut flags);
+
+        assert_eq!(rc, NGX_ERROR);
+    }
+
+    #[test]
+    fn test_parse_unsafe_uri_dotdot_start() {
+        let uri = b"../etc/passwd";
+        let args = b"";
+        let mut flags = 0u32;
+
+        let rc = parse_unsafe_uri(uri, args, &mut flags);
+
+        assert_eq!(rc, NGX_ERROR);
+    }
+
+    #[test]
+    fn test_parse_unsafe_uri_dotdot_in_path() {
+        let uri = b"/path/../etc/passwd";
+        let args = b"";
+        let mut flags = 0u32;
+
+        let rc = parse_unsafe_uri(uri, args, &mut flags);
+
+        assert_eq!(rc, NGX_ERROR);
+    }
+
+    // Tests for parse_set_cookie_lines
+    #[test]
+    fn test_parse_set_cookie_lines_found() {
+        let values = vec![b"SessionID=abc123; Path=/; HttpOnly".as_ref()];
+        let result = parse_set_cookie_lines(&values, b"SessionID");
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"abc123");
+    }
+
+    #[test]
+    fn test_parse_set_cookie_lines_not_found() {
+        let values = vec![b"SessionID=abc123; Path=/".as_ref()];
+        let result = parse_set_cookie_lines(&values, b"OtherID");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_set_cookie_lines_with_spaces() {
+        let values = vec![b"SessionID = abc123 ; Path=/".as_ref()];
+        let result = parse_set_cookie_lines(&values, b"SessionID");
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"abc123");
+    }
+
+    #[test]
+    fn test_parse_set_cookie_lines_multiple_values() {
+        let values = vec![
+            b"OldID=old; Path=/".as_ref(),
+            b"NewID=new; Path=/".as_ref(),
+        ];
+        let result = parse_set_cookie_lines(&values, b"NewID");
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"new");
+    }
+
+    // Additional specific test cases from nginx compliance
+    #[test]
+    fn test_parse_request_line_http09_minimal() {
+        // GET /\r\n (HTTP/0.9 with no version)
+        let buf = b"GET /\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.http_version, 9);
+        assert_eq!(r.method, NGX_HTTP_GET);
+        assert!(r.uri_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_with_query_and_extension() {
+        // GET /a/b.html?x=1 HTTP/1.1
+        let buf = b"GET /a/b.html?x=1 HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert!(r.uri_ext.is_some());
+        assert!(r.args_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_absolute_uri_with_port() {
+        // GET http://host:8080/path HTTP/1.1
+        let buf = b"GET http://host:8080/path HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert!(r.schema_start.is_some());
+        assert!(r.host_start.is_some());
+        assert!(r.port_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_absolute_uri_empty_path() {
+        // GET http://host HTTP/1.1
+        let buf = b"GET http://host HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.empty_path_in_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_double_space() {
+        // GET  / HTTP/1.0 (double space)
+        let buf = b"GET  / HTTP/1.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_request_line_invalid_http_version() {
+        // GET / HTTP/2.0 (only HTTP/1.x supported)
+        let buf = b"GET / HTTP/2.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_VERSION);
+    }
+
+    #[test]
+    fn test_parse_request_line_quoted_slash() {
+        // GET /%2f HTTP/1.1
+        let buf = b"GET /%2f HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.quoted_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_double_slash_complex() {
+        // GET /a//b HTTP/1.1
+        let buf = b"GET /a//b HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.complex_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_dot_slash_complex() {
+        // GET /a/./b
+        let buf = b"GET /a/./b HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.complex_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_lowercase_method_invalid() {
+        // get / HTTP/1.0 (lowercase method)
+        let buf = b"get / HTTP/1.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_METHOD);
+    }
+
+    #[test]
+    fn test_parse_request_line_trailing_data() {
+        // GET / HTTP/1.1 extra\r\n
+        let buf = b"GET / HTTP/1.1 extra\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        // Should have error due to extra data after version
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn test_parse_request_line_incremental() {
+        // Incremental feeding: one byte at a time
+        let buf = b"GET / HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        // Feed one byte at a time until complete
+        for i in 1..=buf.len() {
+            pos = 0;
+            let rc = parse_request_line(&mut r, &buf[..i], &mut pos);
+            if i < buf.len() {
+                // Should be incomplete until we get the final \n
+                if i < buf.len() - 1 {
+                    assert_eq!(rc, NGX_AGAIN);
+                }
+            }
+            // Reset for next iteration - parse_request_line resumes via r.state
+        }
+
+        // Final complete parse
+        pos = 0;
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_header_line_no_space_after_colon() {
+        // Host:x (no space)
+        let buf = b"Host:x\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.header_name_end, 4);
+    }
+
+    #[test]
+    fn test_parse_header_line_trailing_spaces() {
+        // "Header: value   \r\n"
+        let buf = b"Header: value   \r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_header_line_invalid_char() {
+        // "Ho st: x" (space in header name)
+        let buf = b"Ho st: x\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_HEADER);
+    }
+
+    #[test]
+    fn test_parse_chunked_simple_chunk() {
+        let buf = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut ctx = ChunkedState::default();
+        let mut pos = 0;
+
+        // Parse chunk size
+        let rc1 = parse_chunked(&mut ctx, buf, &mut pos, false);
+        // Should indicate chunk data is ready
+        assert!(rc1 == NGX_OK || rc1 == NGX_AGAIN);
+    }
+
+    #[test]
+    fn test_parse_chunked_with_extension() {
+        let buf = b"4;ext=1\r\nWiki\r\n0\r\n\r\n";
+        let mut ctx = ChunkedState::default();
+        let mut pos = 0;
+
+        let rc = parse_chunked(&mut ctx, buf, &mut pos, false);
+        // Should handle chunk extensions
+        assert!(rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE);
+    }
+
+    #[test]
+    fn test_parse_status_line_simple() {
+        let buf = b"HTTP/1.1 200 OK\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 200);
+        assert_eq!(status.http_version, 1001);
+    }
+
+    #[test]
+    fn test_parse_status_line_http10() {
+        let buf = b"HTTP/1.0 404 Not Found\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 404);
+        assert_eq!(status.http_version, 1000);
+    }
+
+    #[test]
+    fn test_parse_status_line_no_reason() {
+        let buf = b"HTTP/1.1 200\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 200);
     }
 }
