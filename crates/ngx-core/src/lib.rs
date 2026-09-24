@@ -45,3 +45,4 @@ pub mod regex;
 pub mod rc;
 pub mod proxy_protocol;
 pub mod crypt;
+pub mod resolver;
