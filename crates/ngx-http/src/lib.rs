@@ -57,6 +57,9 @@ pub mod split_clients;
 pub mod referer;
 pub mod browser;
 pub mod http_ssl;
+pub mod gzip_filter;
+pub mod gzip_static;
+pub mod gunzip_filter;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -545,6 +548,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(realip::realip_module());
     v.push(static_module::static_module());
     v.push(dav::dav_module());
+    v.push(gzip_static::gzip_static_module());
+    v.extend(stubs::handler_modules_a());
     v.push(autoindex::autoindex_module());
     v.push(index::index_module());
     v.extend(stubs::handler_modules_a());
@@ -568,12 +573,14 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(header_filter::header_filter_module());
     v.push(chunked_filter::chunked_filter_module());
     v.extend(stubs::filter_modules_a());
+    v.push(gzip_filter::gzip_filter_module());
     v.push(range_filter::range_header_filter_module());
     v.extend(stubs::filter_modules_b());
     v.push(postpone_filter::postpone_filter_module());
     v.extend(stubs::filter_modules_c());
     v.push(headers_filter::headers_filter_module());
     v.push(copy_filter::copy_filter_module());
+    v.push(gunzip_filter::gunzip_filter_module());
     v.push(range_filter::range_body_filter_module());
     v.push(not_modified_filter::not_modified_filter_module());
     v.extend(stubs::filter_modules_d());
