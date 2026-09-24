@@ -115,7 +115,8 @@ async fn index_handler(r: R) -> i64 {
                 continue;
             }
             if name[0] == b'/' {
-                return internal_redirect(&r, &name, Some(&r.args.borrow().clone())).await;
+                let args = r.args.borrow().clone();
+                return internal_redirect(&r, &name, Some(&args)).await;
             }
             match map_uri_to_path(&r, name.len() + 1) {
                 Some((p, rl)) => {
@@ -156,7 +157,8 @@ async fn index_handler(r: R) -> i64 {
                 uri.extend_from_slice(&name);
                 let _ = dir_len;
                 let _ = root_len;
-                return internal_redirect(&r, &uri, Some(&r.args.borrow().clone())).await;
+                let args = r.args.borrow().clone();
+                return internal_redirect(&r, &uri, Some(&args)).await;
             }
             Err(()) => {
                 http_debug!(r, "{} \"{}\" failed ({}: {})", of.failed, B(&full), of.err, ngx_core::log::strerror(of.err));
