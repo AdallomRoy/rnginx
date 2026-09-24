@@ -2,6 +2,7 @@
 
 pub mod conf;
 pub mod cycle;
+pub mod hash;
 pub mod log;
 pub mod module;
 pub mod os;
