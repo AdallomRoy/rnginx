@@ -21,6 +21,7 @@ pub mod request_headers;
 pub mod parse;
 pub mod variables;
 pub mod script;
+pub mod upstream;
 pub mod header_filter;
 pub mod write_filter;
 pub mod special_response;
@@ -537,7 +538,7 @@ pub fn http_module() -> ModuleDef {
 
 /// All http modules in nginx order (ngx_modules.c).
 pub fn modules() -> Vec<ModuleDef> {
-    let mut v = vec![http_module(), core::core_module(), log::log_module()];
+    let mut v = vec![http_module(), core::core_module(), log::log_module(), upstream::upstream_module()];
     v.extend(stubs::early_modules());
     v.push(realip::realip_module());
     v.push(static_module::static_module());
