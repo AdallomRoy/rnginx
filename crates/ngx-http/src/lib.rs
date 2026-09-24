@@ -38,6 +38,9 @@ pub mod copy_filter;
 pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
+pub mod access;
+pub mod auth_basic;
+pub mod auth_request;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -528,6 +531,9 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(index::index_module());
     v.extend(stubs::handler_modules_b());
     v.push(try_files::try_files_module());
+    v.push(auth_request::auth_request_module());
+    v.push(auth_basic::auth_basic_module());
+    v.push(access::access_module());
     v.extend(stubs::handler_modules_c());
     v.push(rewrite::rewrite_module());
     v.extend(stubs::handler_modules_d());
