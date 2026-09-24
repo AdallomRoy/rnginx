@@ -115,48 +115,48 @@ fn merge_srv_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
 
 fn set_certificate(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing certificate path"));
     }
     let cell = conf_rc::<HttpSslSrvConf>(conf.as_ref().unwrap());
     let mut c = cell.borrow_mut();
     let mut certs = c.certificates.0.clone().unwrap_or_default();
-    certs.push(args[0].clone());
+    certs.push(args[1].clone());
     c.certificates.0 = Some(certs);
     Ok(())
 }
 
 fn set_certificate_key(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing certificate key path"));
     }
     let cell = conf_rc::<HttpSslSrvConf>(conf.as_ref().unwrap());
     let mut c = cell.borrow_mut();
     let mut keys = c.certificate_keys.0.clone().unwrap_or_default();
-    keys.push(args[0].clone());
+    keys.push(args[1].clone());
     c.certificate_keys.0 = Some(keys);
     Ok(())
 }
 
 fn set_ciphers(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing ciphers"));
     }
     let cell = conf_rc::<HttpSslSrvConf>(conf.as_ref().unwrap());
-    cell.borrow_mut().ciphers.0 = Some(args[0].clone());
+    cell.borrow_mut().ciphers.0 = Some(args[1].clone());
     Ok(())
 }
 
 fn set_protocols(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing protocol"));
     }
     let mut mask = 0u32;
-    for arg in &args {
-        let s = String::from_utf8_lossy(arg);
+    for i in 1..args.len() {
+        let s = String::from_utf8_lossy(&args[i]);
         match s.as_ref() {
             "SSLv2" => mask |= 0x02,
             "SSLv3" => mask |= 0x04,
@@ -177,10 +177,10 @@ fn set_protocols(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
 
 fn set_verify_client(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing verify_client mode"));
     }
-    let s = String::from_utf8_lossy(&args[0]);
+    let s = String::from_utf8_lossy(&args[1]);
     let mode = match s.as_ref() {
         "off" => 0,
         "on" => 1,
@@ -195,10 +195,10 @@ fn set_verify_client(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
 
 fn set_buffer_size(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing buffer_size"));
     }
-    let s = String::from_utf8_lossy(&args[0]);
+    let s = String::from_utf8_lossy(&args[1]);
     match s.parse::<usize>() {
         Ok(size) => {
             let cell = conf_rc::<HttpSslSrvConf>(conf.as_ref().unwrap());
@@ -211,10 +211,10 @@ fn set_buffer_size(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> 
 
 fn set_session_timeout(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing session_timeout"));
     }
-    let s = String::from_utf8_lossy(&args[0]);
+    let s = String::from_utf8_lossy(&args[1]);
     match s.parse::<u64>() {
         Ok(timeout) => {
             let cell = conf_rc::<HttpSslSrvConf>(conf.as_ref().unwrap());
@@ -227,10 +227,9 @@ fn set_session_timeout(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
 
 fn set_session_cache(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if args.is_empty() {
+    if args.len() < 2 {
         return Err(msg("missing session_cache mode"));
     }
-    let _s = String::from_utf8_lossy(&args[0]);
     Ok(())
 }
 
@@ -240,105 +239,105 @@ fn accept_directive(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
 
 fn set_verify_depth(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let depth = args.get(0).and_then(|v| String::from_utf8_lossy(v).parse::<u32>().ok()).unwrap_or(1);
+    let depth = args.get(1).and_then(|v| String::from_utf8_lossy(v).parse::<u32>().ok()).unwrap_or(1);
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().verify_depth.0 = Some(depth);
     Ok(())
 }
 
 fn set_client_certificate(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().client_certificate.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().client_certificate.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_trusted_certificate(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().trusted_certificate.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().trusted_certificate.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_crl(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().crl.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().crl.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_session_tickets(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().session_tickets.0 = Some(enabled);
     Ok(())
 }
 
 fn set_dhparam(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().dhparam.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().dhparam.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_ecdh_curve(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().ecdh_curve.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().ecdh_curve.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_prefer_server_ciphers(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().prefer_server_ciphers.0 = Some(enabled);
     Ok(())
 }
 
 fn set_early_data(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().early_data.0 = Some(enabled);
     Ok(())
 }
 
 fn set_reject_handshake(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().reject_handshake.0 = Some(enabled);
     Ok(())
 }
 
 fn set_stapling_file(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().stapling_file.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().stapling_file.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_stapling_responder(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    if !args.is_empty() {
-        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().stapling_responder.0 = Some(args[0].clone());
+    if args.len() >= 2 {
+        conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().stapling_responder.0 = Some(args[1].clone());
     }
     Ok(())
 }
 
 fn set_stapling_verify(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().stapling_verify.0 = Some(enabled);
     Ok(())
 }
 
 fn set_certificate_compression(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
-    let enabled = !args.is_empty() && (args[0] == b"on" || args[0] == b"true");
+    let enabled = args.len() >= 2 && (args[1] == b"on" || args[1] == b"true");
     conf_cell::<HttpSslSrvConf>(conf.as_ref().unwrap()).borrow_mut().certificate_compression.0 = Some(enabled);
     Ok(())
 }
