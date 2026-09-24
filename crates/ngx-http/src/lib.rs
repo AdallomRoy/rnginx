@@ -49,6 +49,7 @@ pub mod empty_gif;
 pub mod stub_status;
 pub mod mirror;
 pub mod userid;
+pub mod realip;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -533,6 +534,7 @@ pub fn http_module() -> ModuleDef {
 pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module()];
     v.extend(stubs::early_modules());
+    v.push(realip::realip_module());
     v.push(static_module::static_module());
     v.push(dav::dav_module());
     v.push(autoindex::autoindex_module());
