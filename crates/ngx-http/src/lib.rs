@@ -38,6 +38,7 @@ pub mod copy_filter;
 pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
+pub mod realip;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -522,6 +523,7 @@ pub fn http_module() -> ModuleDef {
 pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module()];
     v.extend(stubs::early_modules());
+    v.push(realip::realip_module());
     v.push(static_module::static_module());
     v.extend(stubs::handler_modules_a());
     v.push(autoindex::autoindex_module());
