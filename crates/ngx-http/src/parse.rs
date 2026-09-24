@@ -3335,4 +3335,274 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), b"new");
     }
+
+    // Additional specific test cases from nginx compliance
+    #[test]
+    fn test_parse_request_line_http09_minimal() {
+        // GET /\r\n (HTTP/0.9 with no version)
+        let buf = b"GET /\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.http_version, 9);
+        assert_eq!(r.method, NGX_HTTP_GET);
+        assert!(r.uri_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_with_query_and_extension() {
+        // GET /a/b.html?x=1 HTTP/1.1
+        let buf = b"GET /a/b.html?x=1 HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert!(r.uri_ext.is_some());
+        assert!(r.args_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_absolute_uri_with_port() {
+        // GET http://host:8080/path HTTP/1.1
+        let buf = b"GET http://host:8080/path HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert!(r.schema_start.is_some());
+        assert!(r.host_start.is_some());
+        assert!(r.port_start.is_some());
+    }
+
+    #[test]
+    fn test_parse_request_line_absolute_uri_empty_path() {
+        // GET http://host HTTP/1.1
+        let buf = b"GET http://host HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.empty_path_in_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_double_space() {
+        // GET  / HTTP/1.0 (double space)
+        let buf = b"GET  / HTTP/1.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_request_line_invalid_http_version() {
+        // GET / HTTP/2.0 (only HTTP/1.x supported)
+        let buf = b"GET / HTTP/2.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_VERSION);
+    }
+
+    #[test]
+    fn test_parse_request_line_quoted_slash() {
+        // GET /%2f HTTP/1.1
+        let buf = b"GET /%2f HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.quoted_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_double_slash_complex() {
+        // GET /a//b HTTP/1.1
+        let buf = b"GET /a//b HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.complex_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_dot_slash_complex() {
+        // GET /a/./b
+        let buf = b"GET /a/./b HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.complex_uri, true);
+    }
+
+    #[test]
+    fn test_parse_request_line_lowercase_method_invalid() {
+        // get / HTTP/1.0 (lowercase method)
+        let buf = b"get / HTTP/1.0\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_METHOD);
+    }
+
+    #[test]
+    fn test_parse_request_line_trailing_data() {
+        // GET / HTTP/1.1 extra\r\n
+        let buf = b"GET / HTTP/1.1 extra\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+
+        // Should have error due to extra data after version
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn test_parse_request_line_incremental() {
+        // Incremental feeding: one byte at a time
+        let buf = b"GET / HTTP/1.1\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        // Feed one byte at a time until complete
+        for i in 1..=buf.len() {
+            pos = 0;
+            let rc = parse_request_line(&mut r, &buf[..i], &mut pos);
+            if i < buf.len() {
+                // Should be incomplete until we get the final \n
+                if i < buf.len() - 1 {
+                    assert_eq!(rc, NGX_AGAIN);
+                }
+            }
+            // Reset for next iteration - parse_request_line resumes via r.state
+        }
+
+        // Final complete parse
+        pos = 0;
+        let rc = parse_request_line(&mut r, buf, &mut pos);
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_header_line_no_space_after_colon() {
+        // Host:x (no space)
+        let buf = b"Host:x\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(r.header_name_end, 4);
+    }
+
+    #[test]
+    fn test_parse_header_line_trailing_spaces() {
+        // "Header: value   \r\n"
+        let buf = b"Header: value   \r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_OK);
+    }
+
+    #[test]
+    fn test_parse_header_line_invalid_char() {
+        // "Ho st: x" (space in header name)
+        let buf = b"Ho st: x\r\n";
+        let mut r = ParseRequest::default();
+        let mut pos = 0;
+
+        let rc = parse_header_line(&mut r, buf, &mut pos, false);
+
+        assert_eq!(rc, NGX_HTTP_PARSE_INVALID_HEADER);
+    }
+
+    #[test]
+    fn test_parse_chunked_simple_chunk() {
+        let buf = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut ctx = ChunkedState::default();
+        let mut pos = 0;
+
+        // Parse chunk size
+        let rc1 = parse_chunked(&mut ctx, buf, &mut pos, false);
+        // Should indicate chunk data is ready
+        assert!(rc1 == NGX_OK || rc1 == NGX_AGAIN);
+    }
+
+    #[test]
+    fn test_parse_chunked_with_extension() {
+        let buf = b"4;ext=1\r\nWiki\r\n0\r\n\r\n";
+        let mut ctx = ChunkedState::default();
+        let mut pos = 0;
+
+        let rc = parse_chunked(&mut ctx, buf, &mut pos, false);
+        // Should handle chunk extensions
+        assert!(rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE);
+    }
+
+    #[test]
+    fn test_parse_status_line_simple() {
+        let buf = b"HTTP/1.1 200 OK\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 200);
+        assert_eq!(status.http_version, 1001);
+    }
+
+    #[test]
+    fn test_parse_status_line_http10() {
+        let buf = b"HTTP/1.0 404 Not Found\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 404);
+        assert_eq!(status.http_version, 1000);
+    }
+
+    #[test]
+    fn test_parse_status_line_no_reason() {
+        let buf = b"HTTP/1.1 200\r\n";
+        let mut status = Status::default();
+        let mut pos = 0;
+
+        let rc = parse_status_line(buf, &mut pos, &mut status);
+
+        assert_eq!(rc, NGX_OK);
+        assert_eq!(status.code, 200);
+    }
 }
