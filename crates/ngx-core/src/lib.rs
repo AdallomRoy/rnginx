@@ -39,3 +39,5 @@ pub mod event;
 pub mod ssl;
 pub mod regex;
 pub mod rc;
+pub mod proxy_protocol;
+pub mod crypt;
