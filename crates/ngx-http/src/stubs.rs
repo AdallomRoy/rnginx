@@ -36,7 +36,9 @@ fn simple_directive_module(name: &'static str, directive: &'static str, flags: u
 }
 
 pub fn early_modules() -> Vec<ModuleDef> {
-    vec![]
+    vec![
+        simple_directive_module("ngx_control_api_module", "control_api", NGX_HTTP_MAIN_CONF, NGX_CONF_FLAG),
+    ]
 }
 
 pub fn handler_modules_a() -> Vec<ModuleDef> {

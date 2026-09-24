@@ -6,7 +6,6 @@ use std::mem;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
-use ngx_core::hash::crc32_short;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
@@ -384,7 +383,7 @@ async fn limit_conn_handler(r: R) -> i64 {
 
         r.limit_conn_status.set(LIMIT_CONN_PASSED);
 
-        let hash = crc32_short(&key);
+        let hash = { fn h(b:&[u8])->u32{let mut c=crc32fast::Hasher::new();c.update(b);c.finalize()} h }(&key);
         let pool = unsafe { &*ctx.shpool };
 
         pool.lock();

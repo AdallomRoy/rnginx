@@ -55,6 +55,8 @@ pub mod geo;
 pub mod split_clients;
 pub mod referer;
 pub mod browser;
+pub mod limit_conn;
+pub mod limit_req;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -540,11 +542,6 @@ pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module()];
     v.extend(stubs::early_modules());
     v.push(realip::realip_module());
-    v.push(map::map_module());
-    v.push(geo::geo_module());
-    v.push(split_clients::split_clients_module());
-    v.push(referer::referer_module());
-    v.push(browser::browser_module());
     v.push(static_module::static_module());
     v.push(dav::dav_module());
     v.push(autoindex::autoindex_module());
@@ -553,6 +550,9 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(mirror::mirror_module());
     v.extend(stubs::handler_modules_b());
     v.push(try_files::try_files_module());
+    v.push(auth_request::auth_request_module());
+    v.push(auth_basic::auth_basic_module());
+    v.push(access::access_module());
     v.extend(stubs::handler_modules_c());
     v.extend(stubs::handler_modules_b());
     v.push(rewrite::rewrite_module());
@@ -563,6 +563,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.extend(stubs::handler_modules_d());
     v.push(empty_gif::empty_gif_module());
     v.push(stub_status::stub_status_module());
+    v.push(limit_conn::limit_conn_module());
+    v.push(limit_req::limit_req_module());
     v.push(write_filter::write_filter_module());
     v.push(header_filter::header_filter_module());
     v.push(chunked_filter::chunked_filter_module());
@@ -575,7 +577,6 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(copy_filter::copy_filter_module());
     v.push(range_filter::range_body_filter_module());
     v.push(not_modified_filter::not_modified_filter_module());
-    v.push(userid::userid_module());
     v.extend(stubs::filter_modules_d());
     v
 }

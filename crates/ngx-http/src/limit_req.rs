@@ -7,7 +7,6 @@ use std::ptr;
 use std::time::Duration;
 
 use ngx_core::conf::*;
-use ngx_core::hash::crc32_short;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::queue::Queue;
@@ -623,7 +622,7 @@ async fn limit_req_handler(r: R) -> i64 {
             continue;
         }
 
-        let hash = crc32_short(&key) as u32;
+        let hash = { fn h(b:&[u8])->u32{let mut c=crc32fast::Hasher::new();c.update(b);c.finalize()} h }(&key) as u32;
 
         // Lock and lookup
         let (lookup_rc, ex) = unsafe {
