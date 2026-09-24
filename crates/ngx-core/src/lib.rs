@@ -1,0 +1,41 @@
+//! ngx-core: core runtime of the Rust nginx port.
+
+pub mod conf;
+pub mod cycle;
+pub mod log;
+pub mod module;
+pub mod os;
+pub mod parse;
+pub mod string;
+pub mod times;
+
+pub const NGINX_VERSION: &str = "1.31.7";
+pub const NGINX_VER: &str = "nginx/1.31.7";
+pub const NGINX_VER_BUILD: &str = "nginx/1.31.7";
+pub const NGX_PREFIX: &str = "/usr/local/nginx/";
+pub const NGX_CONF_PATH: &str = "conf/nginx.conf";
+pub const NGX_PID_PATH: &str = "logs/nginx.pid";
+pub const NGX_LOCK_PATH: &str = "logs/nginx.lock";
+pub const NGX_ERROR_LOG_PATH: &str = "logs/error.log";
+pub const NGX_HTTP_LOG_PATH: &str = "logs/access.log";
+pub const NGX_HTTP_CLIENT_TEMP_PATH: &str = "client_body_temp";
+pub const NGX_HTTP_PROXY_TEMP_PATH: &str = "proxy_temp";
+pub const NGX_HTTP_FASTCGI_TEMP_PATH: &str = "fastcgi_temp";
+pub const NGX_HTTP_UWSGI_TEMP_PATH: &str = "uwsgi_temp";
+pub const NGX_HTTP_SCGI_TEMP_PATH: &str = "scgi_temp";
+
+pub use conf::{Conf, ConfError, ConfResult, Val};
+pub use log::Log;
+pub use cycle::Cycle;
+pub mod shm;
+pub mod slab;
+pub mod listening;
+pub mod inet;
+pub mod core_module;
+pub mod syslog;
+pub mod connection;
+pub mod process;
+pub mod event;
+pub mod ssl;
+pub mod regex;
+pub mod rc;

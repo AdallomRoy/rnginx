@@ -1,0 +1,19 @@
+[package]
+name = "nginx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nginx"
+path = "src/main.rs"
+
+[dependencies]
+ngx-core.workspace = true
+ngx-http.workspace = true
+ngx-stream.workspace = true
+ngx-mail.workspace = true
+libc.workspace = true
+nix.workspace = true
+tokio.workspace = true
+memchr.workspace = true

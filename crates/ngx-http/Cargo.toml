@@ -1,0 +1,18 @@
+[package]
+name = "ngx-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ngx-core.workspace = true
+libc.workspace = true
+nix.workspace = true
+tokio.workspace = true
+openssl.workspace = true
+openssl-sys.workspace = true
+flate2.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+crc32fast.workspace = true
+memchr.workspace = true

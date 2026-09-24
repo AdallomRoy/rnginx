@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ngx-core",
+    "crates/ngx-http",
+    "crates/ngx-stream",
+    "crates/ngx-mail",
+    "crates/nginx",
+]
+
+[workspace.package]
+version = "1.31.7"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[workspace.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "process", "signal", "socket", "uio", "mman", "user", "sched", "resource", "poll", "net", "time", "term"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros", "signal"] }
+openssl = "0.10"
+openssl-sys = "0.9"
+foreign-types = "0.3"
+pcre2 = "0.2"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+md-5 = "0.10"
+sha1 = "0.10"
+crc32fast = "1"
+memchr = "2"
+bytes = "1"
+ngx-core = { path = "crates/ngx-core" }
+ngx-http = { path = "crates/ngx-http" }
+ngx-stream = { path = "crates/ngx-stream" }
+ngx-mail = { path = "crates/ngx-mail" }
+
+[profile.dev]
+opt-level = 1
+debug = 1
+
+[profile.release]
+opt-level = 3
+debug = 1

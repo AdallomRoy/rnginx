@@ -1,0 +1,12 @@
+[package]
+name = "ngx-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ngx-core.workspace = true
+libc.workspace = true
+nix.workspace = true
+tokio.workspace = true
+openssl.workspace = true
