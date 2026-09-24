@@ -38,6 +38,7 @@ pub mod copy_filter;
 pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
+pub mod http_ssl;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -520,7 +521,7 @@ pub fn http_module() -> ModuleDef {
 
 /// All http modules in nginx order (ngx_modules.c).
 pub fn modules() -> Vec<ModuleDef> {
-    let mut v = vec![http_module(), core::core_module(), log::log_module()];
+    let mut v = vec![http_module(), core::core_module(), http_ssl::ssl_module(), log::log_module()];
     v.extend(stubs::early_modules());
     v.push(static_module::static_module());
     v.extend(stubs::handler_modules_a());
