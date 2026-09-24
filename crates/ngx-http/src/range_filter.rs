@@ -1,4 +1,4 @@
-//! ngx_http_range_header_filter_module / ngx_http_range_body_filter_module (placeholder: pass-through)
+//! ngx_http_range_header_filter_module / ngx_http_range_body_filter_module
 
 use ngx_core::conf::{Conf, ConfResult};
 use ngx_core::module::ModuleDef;
@@ -17,10 +17,13 @@ pub fn range_body_filter_module() -> ModuleDef {
 
 fn init_header(_cf: &mut Conf) -> ConfResult {
     install_header_filter(|r, next| async move {
-        // minimal: advertise Accept-Ranges when allowed
-        if r.allow_ranges.get() && r.headers_out.borrow().status == NGX_HTTP_OK && r.headers_in.borrow().range.is_empty() {
-            let h = r.headers_out.borrow_mut().add(b"Accept-Ranges", b"bytes");
-            r.headers_out.borrow_mut().accept_ranges = Some(h);
+        // Advertise Accept-Ranges when no Range header
+        if r.allow_ranges.get() && r.headers_out.borrow().status == NGX_HTTP_OK && r.is_main() {
+            let hi = r.headers_in.borrow();
+            if hi.range.is_empty() {
+                let h = r.headers_out.borrow_mut().add(b"Accept-Ranges", b"bytes");
+                r.headers_out.borrow_mut().accept_ranges = Some(h);
+            }
         }
         next(r).await
     });

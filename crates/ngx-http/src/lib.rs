@@ -25,17 +25,18 @@ pub mod header_filter;
 pub mod write_filter;
 pub mod special_response;
 pub mod static_module;
-pub mod autoindex;
 pub mod index;
 pub mod log;
 pub mod request_body;
 pub mod output;
 pub mod chunked_filter;
 pub mod not_modified_filter;
-pub mod headers_filter;
 pub mod range_filter;
+pub mod slice_filter;
+pub mod headers_filter;
 pub mod postpone_filter;
 pub mod copy_filter;
+pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
 pub mod stubs;
@@ -542,6 +543,7 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(headers_filter::headers_filter_module());
     v.push(copy_filter::copy_filter_module());
     v.push(range_filter::range_body_filter_module());
+    v.push(slice_filter::slice_filter_module());
     v.push(not_modified_filter::not_modified_filter_module());
     v.extend(stubs::filter_modules_d());
     v
