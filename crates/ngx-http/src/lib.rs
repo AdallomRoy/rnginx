@@ -38,6 +38,8 @@ pub mod copy_filter;
 pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
+pub mod limit_conn;
+pub mod limit_req;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -530,6 +532,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(try_files::try_files_module());
     v.extend(stubs::handler_modules_c());
     v.push(rewrite::rewrite_module());
+    v.push(limit_conn::limit_conn_module());
+    v.push(limit_req::limit_req_module());
     v.extend(stubs::handler_modules_d());
     v.push(write_filter::write_filter_module());
     v.push(header_filter::header_filter_module());
