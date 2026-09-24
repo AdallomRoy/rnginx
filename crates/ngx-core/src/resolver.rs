@@ -500,10 +500,25 @@ impl Resolver {
         Err(NGX_RESOLVE_TIMEDOUT)
     }
 
-    async fn send_query(&self, _query: &[u8], _server: &SocketAddr) -> Result<Vec<u8>, i64> {
-        // TODO: Implement actual UDP socket sending
-        // For now, return error
-        Err(NGX_RESOLVE_TIMEDOUT)
+    async fn send_query(&self, query: &[u8], server: &SocketAddr) -> Result<Vec<u8>, i64> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        socket.connect(server)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        socket.send(query)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        let mut buf = [0u8; 4096];
+        let n = socket.recv(&mut buf)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        Ok(buf[..n].to_vec())
     }
 
     async fn query_srv(
@@ -747,6 +762,7 @@ fn remaining_time_ms(deadline: &Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn test_strerror() {
@@ -800,5 +816,148 @@ mod tests {
     async fn test_empty_resolver() {
         let resolver = Resolver::empty();
         assert!(!resolver.has_servers());
+    }
+
+    /// Simple in-process fake DNS server for testing
+    #[allow(dead_code)]
+    async fn fake_dns_server(port: u16, _queries: &[(&[u8], Vec<u8>)]) -> tokio::task::JoinHandle<()> {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .expect("bind failed");
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, addr)) => {
+                        // Simple mock: if it's asking for a.example.com, respond with 127.0.0.1
+                        let query = &buf[..n];
+                        let mut response = vec![0u8; 512];
+
+                        // Copy header (change response bit)
+                        if n >= 12 {
+                            response[0..2].copy_from_slice(&query[0..2]); // ID
+                            response[2] = 0x84; // QR=1, AA=0, TC=0, RD=1, RA=1
+                            response[3] = 0x00; // Z, RCODE=0
+                            response[4..6].copy_from_slice(&query[4..6]); // QDCOUNT
+                            response[6] = 0x00;
+                            response[7] = 0x01; // ANCOUNT=1
+                            response[8..12].copy_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
+
+                            // Copy question
+                            let mut offset = 12;
+                            while offset < n && offset < 100 {
+                                let len = query[offset] as usize;
+                                if len == 0 {
+                                    offset += 1;
+                                    break;
+                                }
+                                response[offset] = query[offset];
+                                offset += 1;
+                                if offset + len > n {
+                                    break;
+                                }
+                                response[offset..offset + len].copy_from_slice(&query[offset..offset + len]);
+                                offset += len;
+                            }
+
+                            // Copy QTYPE and QCLASS
+                            if offset + 4 <= n {
+                                response[offset..offset + 4].copy_from_slice(&query[offset..offset + 4]);
+                                offset += 4;
+                            }
+
+                            // Add answer: A record for 127.0.0.1
+                            response[offset] = 0xc0; // Pointer to name
+                            response[offset + 1] = 0x0c; // offset 12
+                            response[offset + 2] = 0x00;
+                            response[offset + 3] = 0x01; // TYPE A
+                            response[offset + 4] = 0x00;
+                            response[offset + 5] = 0x01; // CLASS IN
+                            response[offset + 6..offset + 10].copy_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL 60
+                            response[offset + 10] = 0x00;
+                            response[offset + 11] = 0x04; // RDLEN 4
+                            response[offset + 12..offset + 16].copy_from_slice(&[127, 0, 0, 1]); // IP
+                            offset += 16;
+
+                            let _ = socket.send_to(&response[..offset], addr).await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ip_literal() {
+        // Test IP literal resolution (doesn't need actual resolver)
+        let resolver = Resolver::empty();
+
+        let log = Log::stderr(crate::log::NGX_LOG_ERR);
+        let result = resolver.resolve_name(b"127.0.0.1", 1000, &log).await;
+        assert!(result.is_ok());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].name, b"127.0.0.1");
+
+        // Test IPv6 literal
+        let result = resolver.resolve_name(b"::1", 1000, &log).await;
+        assert!(result.is_ok());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dns_query_creation() {
+        let query = create_dns_query(b"example.com", NGX_RESOLVE_A).unwrap();
+        assert!(query.len() > 12); // At least header + encoded name + QTYPE + QCLASS
+
+        // Verify header
+        let header = DnsHeader::from_bytes(&query).unwrap();
+        assert_eq!(header.qdcount, 1);
+        assert_eq!(header.ancount, 0);
+    }
+
+    #[test]
+    fn test_dns_response_parsing() {
+        // Create a minimal DNS response with A record
+        let mut response = vec![0u8; 50];
+        response[0] = 0x12;
+        response[1] = 0x34; // ID
+        response[2] = 0x84; // QR=1, RD=1, RA=1
+        response[3] = 0x00; // RCODE=0
+        response[4] = 0x00;
+        response[5] = 0x01; // QDCOUNT
+        response[6] = 0x00;
+        response[7] = 0x01; // ANCOUNT
+        response[8] = 0x00;
+        response[9] = 0x00; // NSCOUNT
+        response[10] = 0x00;
+        response[11] = 0x00; // ARCOUNT
+
+        // Question: example.com A IN
+        response[12] = 0x07;
+        response[13..20].copy_from_slice(b"example");
+        response[20] = 0x03;
+        response[21..24].copy_from_slice(b"com");
+        response[24] = 0x00;
+        response[25..27].copy_from_slice(&(NGX_RESOLVE_A as u16).to_be_bytes());
+        response[27..29].copy_from_slice(&1u16.to_be_bytes()); // IN class
+
+        // Answer: pointer to name, A record, 127.0.0.1
+        response[29] = 0xc0;
+        response[30] = 0x0c; // Pointer to offset 12
+        response[31..33].copy_from_slice(&(NGX_RESOLVE_A as u16).to_be_bytes());
+        response[33..35].copy_from_slice(&1u16.to_be_bytes()); // IN class
+        response[35..39].copy_from_slice(&0u32.to_be_bytes()); // TTL
+        response[39] = 0x00;
+        response[40] = 0x04; // RDLEN=4
+        response[41..45].copy_from_slice(&[127, 0, 0, 1]); // IP
+
+        let result = parse_dns_response(&response[..45], b"example.com", 0x1234, NGX_RESOLVE_A);
+        assert!(result.is_ok());
+        let addrs = result.unwrap();
+        assert_eq!(addrs.len(), 1);
     }
 }
