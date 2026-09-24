@@ -287,64 +287,64 @@ fn parse_if_condition(cf: &mut Conf, cell: &Rc<RefCell<RewriteConf>>) -> ConfRes
         return Err(cf.emerg(format_args!("if requires a condition")));
     }
 
-    let mut cond_str = args[1].clone();
+    // Arguments are already tokenized by conf parser
+    // Format: if ( <expr> ) { ... }
+    // args[0] = "if", args[1] = first_expr_token, args[2] = second_expr_token, ...
 
-    // Parse condition format: ( condition_expr )
-    if cond_str.is_empty() || cond_str[0] != b'(' {
-        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&cond_str))));
+    let mut cur = 1;
+    let mut last = args.len() - 1;
+
+    // Handle opening paren
+    let mut first_token = args[1].clone();
+    if first_token == b"(" {
+        cur = 2;
+    } else if first_token.starts_with(b"(") {
+        first_token = first_token[1..].to_vec();
+    } else {
+        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&args[1]))));
     }
 
-    // Remove leading ( and trailing )
-    cond_str.remove(0);
-    if cond_str.is_empty() || cond_str[cond_str.len() - 1] != b')' {
-        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&cond_str))));
+    // Handle closing paren
+    let mut last_token = args[last].clone();
+    if last_token == b")" {
+        last -= 1;
+    } else if last_token.ends_with(b")") {
+        last_token.truncate(last_token.len() - 1);
+    } else {
+        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&args[last]))));
     }
-    cond_str.pop();
 
-    let cond_str = cond_str;
     let mut codes = cell.borrow_mut();
 
-    // Parse simple conditions
-    // $variable - test truthiness
-    if cond_str.len() > 1 && cond_str[0] == b'$' {
-        // Extract variable name
-        let mut end = 1;
-        while end < cond_str.len() && (cond_str[end].is_ascii_alphanumeric() || cond_str[end] == b'_') {
-            end += 1;
-        }
+    // Now parse the condition based on number and types of tokens
+    if cur > last {
+        return Err(cf.emerg(format_args!("empty condition")));
+    }
 
-        if end == 1 {
-            return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&cond_str))));
-        }
+    let first = if cur == 1 { &first_token } else { &args[cur] };
 
-        let var_name = &cond_str[1..end];
+    // Check if first token is a variable
+    if first.len() > 1 && first[0] == b'$' {
+        // Variable condition: $var [ operator value ]
+        let var_name = &first[1..];
         let index = get_variable_index(cf, var_name)?;
         codes.push(ScriptCode::Var { index });
 
-        // Check for operators
-        if end < cond_str.len() {
-            let rest = &cond_str[end..];
-            let rest = rest.iter().skip_while(|&&c| c == b' ').cloned().collect::<Vec<_>>();
+        if cur == last {
+            // Just test variable truthiness
+        } else if cur + 2 == last {
+            // Variable with operator and value
+            let op = &args[cur + 1];
+            let val = if cur + 1 == last { &last_token } else { &args[last] };
 
-            if rest.starts_with(b"= ") {
-                // = comparison
-                let val_start = rest.iter().position(|&c| c != b' ' && c != b'=').unwrap_or(rest.len());
-                let val = rest[val_start..].to_vec();
-                codes.push(ScriptCode::Value { data: val });
+            if op == b"=" {
+                codes.push(ScriptCode::Value { data: val.clone() });
                 codes.push(ScriptCode::Equal);
-            } else if rest.starts_with(b"!= ") || rest.starts_with(b"!= ") {
-                // != comparison
-                let val_start = rest.iter().position(|&c| c != b' ' && c != b'!').unwrap_or(rest.len());
-                let val_start = rest[val_start..].iter().position(|&c| c != b' ' && c != b'=').unwrap_or(rest.len() - val_start) + val_start;
-                let val = rest[val_start..].to_vec();
-                codes.push(ScriptCode::Value { data: val });
+            } else if op == b"!=" {
+                codes.push(ScriptCode::Value { data: val.clone() });
                 codes.push(ScriptCode::NotEqual);
-            } else if rest.starts_with(b"~ ") || rest.starts_with(b"~* ") {
-                // Regex match - compile and push regex code
-                let caseless = rest.starts_with(b"~* ");
-                let val_start = if caseless { 3 } else { 2 };
-                let pattern = rest[val_start..].to_vec();
-                let regex = regex_compile(cf, &pattern, if caseless { NGX_REGEX_CASELESS } else { 0 })?;
+            } else if op == b"~" {
+                let regex = regex_compile(cf, val, 0)?;
                 codes.push(ScriptCode::RegexStart {
                     regex,
                     add_args: false,
@@ -352,12 +352,8 @@ fn parse_if_condition(cf: &mut Conf, cell: &Rc<RefCell<RewriteConf>>) -> ConfRes
                     redirect_status: 0,
                     break_cycle: false,
                 });
-            } else if rest.starts_with(b"!~ ") || rest.starts_with(b"!~* ") {
-                // Negative regex match
-                let caseless = rest.starts_with(b"!~* ");
-                let val_start = if caseless { 4 } else { 3 };
-                let pattern = rest[val_start..].to_vec();
-                let regex = regex_compile(cf, &pattern, if caseless { NGX_REGEX_CASELESS } else { 0 })?;
+            } else if op == b"~*" {
+                let regex = regex_compile(cf, val, NGX_REGEX_CASELESS)?;
                 codes.push(ScriptCode::RegexStart {
                     regex,
                     add_args: false,
@@ -365,49 +361,72 @@ fn parse_if_condition(cf: &mut Conf, cell: &Rc<RefCell<RewriteConf>>) -> ConfRes
                     redirect_status: 0,
                     break_cycle: false,
                 });
+            } else if op == b"!~" {
+                let regex = regex_compile(cf, val, 0)?;
+                codes.push(ScriptCode::RegexStart {
+                    regex,
+                    add_args: false,
+                    redirect: false,
+                    redirect_status: 0,
+                    break_cycle: false,
+                });
+            } else if op == b"!~*" {
+                let regex = regex_compile(cf, val, NGX_REGEX_CASELESS)?;
+                codes.push(ScriptCode::RegexStart {
+                    regex,
+                    add_args: false,
+                    redirect: false,
+                    redirect_status: 0,
+                    break_cycle: false,
+                });
+            } else {
+                return Err(cf.emerg(format_args!("unexpected \"{}\" in condition", B(op))));
             }
+        } else {
+            return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(first))));
         }
-    } else if cond_str.starts_with(b"-f ") {
-        // File test
-        let path = cond_str[3..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"-f" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_PLAIN });
-    } else if cond_str.starts_with(b"!-f ") {
-        let path = cond_str[4..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"!-f" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_NOT_PLAIN });
-    } else if cond_str.starts_with(b"-d ") {
-        let path = cond_str[3..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"-d" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_DIR });
-    } else if cond_str.starts_with(b"!-d ") {
-        let path = cond_str[4..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"!-d" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_NOT_DIR });
-    } else if cond_str.starts_with(b"-e ") {
-        let path = cond_str[3..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"-e" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_EXISTS });
-    } else if cond_str.starts_with(b"!-e ") {
-        let path = cond_str[4..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"!-e" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_NOT_EXISTS });
-    } else if cond_str.starts_with(b"-x ") {
-        let path = cond_str[3..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"-x" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_EXEC });
-    } else if cond_str.starts_with(b"!-x ") {
-        let path = cond_str[4..].to_vec();
-        let cv = compile_complex_value(cf, &path, 0)?;
+    } else if first == b"!-x" && cur + 1 == last {
+        let path = if cur == last { &last_token } else { &args[last] };
+        let cv = compile_complex_value(cf, path, 0)?;
         codes.push(ScriptCode::ComplexValue { value: cv });
         codes.push(ScriptCode::File { op: FILE_NOT_EXEC });
+    } else {
+        return Err(cf.emerg(format_args!("invalid condition")));
     }
 
     // Add the If code which will test the condition result
