@@ -55,8 +55,6 @@ pub mod geo;
 pub mod split_clients;
 pub mod referer;
 pub mod browser;
-pub mod limit_conn;
-pub mod limit_req;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -563,8 +561,6 @@ pub fn modules() -> Vec<ModuleDef> {
     v.extend(stubs::handler_modules_d());
     v.push(empty_gif::empty_gif_module());
     v.push(stub_status::stub_status_module());
-    v.push(limit_conn::limit_conn_module());
-    v.push(limit_req::limit_req_module());
     v.push(write_filter::write_filter_module());
     v.push(header_filter::header_filter_module());
     v.push(chunked_filter::chunked_filter_module());
