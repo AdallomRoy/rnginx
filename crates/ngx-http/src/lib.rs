@@ -38,6 +38,11 @@ pub mod copy_filter;
 pub mod autoindex;
 pub mod try_files;
 pub mod rewrite;
+pub mod map;
+pub mod geo;
+pub mod split_clients;
+pub mod referer;
+pub mod browser;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -521,6 +526,11 @@ pub fn http_module() -> ModuleDef {
 /// All http modules in nginx order (ngx_modules.c).
 pub fn modules() -> Vec<ModuleDef> {
     let mut v = vec![http_module(), core::core_module(), log::log_module()];
+    v.push(map::map_module());
+    v.push(geo::geo_module());
+    v.push(split_clients::split_clients_module());
+    v.push(referer::referer_module());
+    v.push(browser::browser_module());
     v.extend(stubs::early_modules());
     v.push(static_module::static_module());
     v.extend(stubs::handler_modules_a());
