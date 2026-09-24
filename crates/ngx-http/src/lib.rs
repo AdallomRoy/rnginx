@@ -60,6 +60,8 @@ pub mod http_ssl;
 pub mod gzip_filter;
 pub mod gzip_static;
 pub mod gunzip_filter;
+pub mod limit_conn;
+pub mod limit_req;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -566,6 +568,8 @@ pub fn modules() -> Vec<ModuleDef> {
     v.push(ssi_filter::ssi_filter_module());
     v.push(flv_module::flv_module());
     v.push(mp4_module::mp4_module());
+    v.push(limit_conn::limit_conn_module());
+    v.push(limit_req::limit_req_module());
     v.extend(stubs::handler_modules_d());
     v.push(empty_gif::empty_gif_module());
     v.push(stub_status::stub_status_module());
