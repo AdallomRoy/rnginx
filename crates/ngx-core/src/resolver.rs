@@ -526,24 +526,17 @@ impl Resolver {
         name: &[u8],
         deadline: Instant,
     ) -> Result<Vec<ResolverAddr>, i64> {
-        // Try A record if ipv4 enabled
-        let a_fut = if self.ipv4 {
-            Box::pin(self.query_type_with_cname(name, NGX_RESOLVE_A, deadline, 0))
-        } else {
-            Box::pin(async { Err(NGX_RESOLVE_NXDOMAIN) })
-        };
+        // Run A and AAAA queries in parallel
+        let a_fut = self.query_type_with_cname(name, NGX_RESOLVE_A, deadline, 0);
+        let aaaa_fut = self.query_type_with_cname(name, NGX_RESOLVE_AAAA, deadline, 0);
 
-        // Try AAAA record if ipv6 enabled
-        let aaaa_fut = if self.ipv6 {
-            Box::pin(self.query_type_with_cname(name, NGX_RESOLVE_AAAA, deadline, 0))
-        } else {
-            Box::pin(async { Err(NGX_RESOLVE_NXDOMAIN) })
-        };
-
-        // Run both in parallel
         let (a_result, aaaa_result) = tokio::join!(a_fut, aaaa_fut);
 
         // Merge results like C does (ngx_resolver_process_a)
+        // Apply ipv4/ipv6 flags: only run query if enabled
+        let a_result = if !self.ipv4 { Err(NGX_RESOLVE_NXDOMAIN) } else { a_result };
+        let aaaa_result = if !self.ipv6 { Err(NGX_RESOLVE_NXDOMAIN) } else { aaaa_result };
+
         match (a_result, aaaa_result) {
             // Both succeeded: merge
             (Ok(mut a_addrs), Ok(aaaa_addrs)) => {
@@ -551,25 +544,11 @@ impl Resolver {
                 Ok(a_addrs)
             }
             // Only A succeeded
-            (Ok(a_addrs), Err(_)) => {
-                if self.ipv6 && !a_addrs.is_empty() {
-                    Ok(a_addrs)
-                } else {
-                    Ok(a_addrs)
-                }
-            }
+            (Ok(a_addrs), Err(_)) => Ok(a_addrs),
             // Only AAAA succeeded
-            (Err(_), Ok(aaaa_addrs)) => {
-                if self.ipv4 && !aaaa_addrs.is_empty() {
-                    Ok(aaaa_addrs)
-                } else {
-                    Ok(aaaa_addrs)
-                }
-            }
+            (Err(_), Ok(aaaa_addrs)) => Ok(aaaa_addrs),
             // Both failed
-            (Err(a_err), Err(_aaaa_err)) => {
-                Err(a_err)
-            }
+            (Err(a_err), Err(_aaaa_err)) => Err(a_err),
         }
     }
 
@@ -608,12 +587,15 @@ impl Resolver {
         let query = create_dns_query(name, qtype)?;
         let ident = (query[0] as u16) << 8 | query[1] as u16;
 
-        // Try each server with resend logic
-        let mut last_conn = self.last_connection.borrow_mut();
+        // Get initial server index, drop borrow before await
+        let start_idx = {
+            let last_conn = self.last_connection.borrow();
+            *last_conn
+        };
 
         // Try all servers
         for attempt in 0..self.servers.len() {
-            let server_idx = (*last_conn + attempt) % self.servers.len();
+            let server_idx = (start_idx + attempt) % self.servers.len();
             let server = &self.servers[server_idx];
 
             // Try UDP first
@@ -636,7 +618,7 @@ impl Resolver {
                             {
                                 if let Ok(tcp_resp) = tcp_response {
                                     if let Ok(result) = parse_dns_response(&tcp_resp, name, ident, qtype) {
-                                        *last_conn = (server_idx + 1) % self.servers.len();
+                                        *self.last_connection.borrow_mut() = (server_idx + 1) % self.servers.len();
                                         return Ok(result);
                                     }
                                 }
@@ -646,7 +628,7 @@ impl Resolver {
 
                     // Parse response
                     if let Ok(result) = parse_dns_response(&response, name, ident, qtype) {
-                        *last_conn = (server_idx + 1) % self.servers.len();
+                        *self.last_connection.borrow_mut() = (server_idx + 1) % self.servers.len();
                         return Ok(result);
                     }
                 }
@@ -774,17 +756,6 @@ impl Resolver {
     }
 }
 
-impl Clone for CacheNode {
-    fn clone(&self) -> Self {
-        CacheNode {
-            addrs: self.addrs.clone(),
-            error: self.error,
-            expire_at: self.expire_at,
-            valid_until: self.valid_until,
-            ttl: self.ttl,
-        }
-    }
-}
 
 // Helper functions
 
@@ -1256,17 +1227,12 @@ mod tests {
         let resolver = Resolver::empty();
         let log = Log::stderr(crate::log::NGX_LOG_ERR);
 
-        // Make two concurrent requests for same hostname
+        // Concurrent requests for same IP literal (doesn't need DNS)
         let r1 = resolver.clone();
         let r2 = resolver.clone();
 
-        let h1 = tokio::spawn(async move {
-            r1.resolve_name(b"127.0.0.1", 1000, &log).await
-        });
-
-        let h2 = tokio::spawn(async move {
-            r2.resolve_name(b"127.0.0.1", 1000, &log).await
-        });
+        let h1 = r1.resolve_name(b"127.0.0.1", 1000, &log);
+        let h2 = r2.resolve_name(b"127.0.0.1", 1000, &log);
 
         let (r1_result, r2_result) = tokio::join!(h1, h2);
         assert!(r1_result.is_ok());
