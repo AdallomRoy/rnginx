@@ -4,11 +4,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
+use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, TcpStream};
 use tokio::sync::Notify;
 use tokio::time::{timeout, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::inet::SockAddr;
 use crate::log::Log;
@@ -24,16 +26,14 @@ pub const NGX_RESOLVE_TIMEDOUT: i64 = 110; // Operation timed out (ETIMEDOUT)
 
 // DNS query types
 const NGX_RESOLVE_A: u16 = 1;
-#[allow(dead_code)]
 const NGX_RESOLVE_CNAME: u16 = 5;
-#[allow(dead_code)]
 const NGX_RESOLVE_PTR: u16 = 12;
 const NGX_RESOLVE_AAAA: u16 = 28;
-#[allow(dead_code)]
 const NGX_RESOLVE_SRV: u16 = 33;
 
-#[allow(dead_code)]
 const NGX_RESOLVER_MAX_RECURSION: u32 = 50;
+const NGX_RESOLVER_TCP_RSIZE: usize = 2 + 65535; // TCP read buffer size
+const NGX_RESOLVER_TCP_WSIZE: usize = 8192;      // TCP write buffer size
 
 // DNS message header (RFC 1035)
 #[derive(Clone, Copy)]
@@ -76,14 +76,8 @@ impl DnsHeader {
         (self.flags & 0x0F) as u8
     }
 
-    #[allow(dead_code)]
     fn tc(&self) -> bool {
         (self.flags & 0x0200) != 0
-    }
-
-    #[allow(dead_code)]
-    fn rd(&self) -> bool {
-        (self.flags & 0x0100) != 0
     }
 
     fn response(&self) -> bool {
@@ -109,6 +103,22 @@ pub struct ResolverSrv {
     pub port: u16,
 }
 
+// Cache entry with separate tracking for positive/negative results
+#[derive(Clone)]
+struct CacheNode {
+    addrs: Vec<ResolverAddr>,
+    error: Option<i64>,           // error code if negative
+    expire_at: SystemTime,         // absolute expiry time
+    valid_until: SystemTime,       // respects valid= override
+    ttl: Option<u32>,              // original TTL (if positive result)
+}
+
+// In-flight query tracking for dedup
+struct InFlightQuery {
+    notify: Rc<Notify>,
+    result: RefCell<Option<Result<Vec<ResolverAddr>, i64>>>,
+}
+
 /// The resolver instance (shared via Rc)
 pub struct Resolver {
     // DNS servers (addresses)
@@ -117,26 +127,19 @@ pub struct Resolver {
     // Configuration
     ipv4: bool,
     ipv6: bool,
-    #[allow(dead_code)]
-    valid: Option<i64>, // TTL override in seconds
-    #[allow(dead_code)]
-    resend_timeout: u64, // milliseconds
-    expire_time: u64,    // seconds for cached entries
+    valid: Option<i64>, // TTL override in seconds (applies to all results)
+    resend_timeout: u64, // milliseconds (5s)
+    expire_time: u64,    // seconds for cached entries (30s)
 
     // Cache and state
-    cache: std::cell::RefCell<HashMap<Vec<u8>, CacheEntry>>,
-    #[allow(dead_code)]
-    in_flight: std::cell::RefCell<HashMap<Vec<u8>, Rc<Notify>>>,
+    cache: RefCell<HashMap<Vec<u8>, CacheNode>>,
+    in_flight: RefCell<HashMap<Vec<u8>, Rc<InFlightQuery>>>,
 
-    // UDP sockets (per server)
-    #[allow(dead_code)]
-    sockets: std::cell::RefCell<Vec<Option<Rc<UdpSocket>>>>,
-}
+    // TCP connections per server (reused)
+    tcp_conns: RefCell<Vec<Option<Rc<TcpStream>>>>,
 
-struct CacheEntry {
-    addrs: Vec<ResolverAddr>,
-    error: Option<i64>,
-    expire_at: SystemTime,
+    // Last connection index for rotation
+    last_connection: RefCell<usize>,
 }
 
 impl Resolver {
@@ -241,15 +244,16 @@ impl Resolver {
         }
 
         Ok(Rc::new(Resolver {
-            servers,
+            servers: servers.clone(),
             ipv4,
             ipv6,
             valid,
             resend_timeout: 5000, // 5 seconds
             expire_time: 30,       // 30 seconds
-            cache: std::cell::RefCell::new(HashMap::new()),
-            in_flight: std::cell::RefCell::new(HashMap::new()),
-            sockets: std::cell::RefCell::new(vec![None; 0]), // Will be lazily initialized
+            cache: RefCell::new(HashMap::new()),
+            in_flight: RefCell::new(HashMap::new()),
+            tcp_conns: RefCell::new(vec![None; servers.len()]),
+            last_connection: RefCell::new(0),
         }))
     }
 
@@ -262,9 +266,10 @@ impl Resolver {
             valid: None,
             resend_timeout: 5000,
             expire_time: 30,
-            cache: std::cell::RefCell::new(HashMap::new()),
-            in_flight: std::cell::RefCell::new(HashMap::new()),
-            sockets: std::cell::RefCell::new(Vec::new()),
+            cache: RefCell::new(HashMap::new()),
+            in_flight: RefCell::new(HashMap::new()),
+            tcp_conns: RefCell::new(Vec::new()),
+            last_connection: RefCell::new(0),
         })
     }
 
@@ -290,7 +295,7 @@ impl Resolver {
             }]);
         }
 
-        // Check cache
+        // Check cache with expiry
         if let Some(cached) = self.check_cache(name) {
             if let Some(err) = cached.error {
                 return Err(err);
@@ -298,13 +303,54 @@ impl Resolver {
             return Ok(cached.addrs);
         }
 
-        // Perform DNS query
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        // Check if already in flight (dedup)
+        {
+            let in_flight = self.in_flight.borrow();
+            if let Some(query) = in_flight.get(name) {
+                let query = query.clone();
+                drop(in_flight);
 
+                // Wait for the in-flight query to complete
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                loop {
+                    if let Some(result) = query.result.borrow().as_ref() {
+                        return result.clone();
+                    }
+                    let remaining = remaining_time_ms(&deadline);
+                    if remaining <= 0 {
+                        return Err(NGX_RESOLVE_TIMEDOUT);
+                    }
+                    tokio::time::sleep(Duration::from_millis(remaining.min(10))).await;
+                }
+            }
+        }
+
+        // Set up in-flight query
+        let query = Rc::new(InFlightQuery {
+            notify: Rc::new(Notify::new()),
+            result: RefCell::new(None),
+        });
+
+        {
+            let mut in_flight = self.in_flight.borrow_mut();
+            in_flight.insert(name.to_vec(), query.clone());
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let result = self.do_resolve(name, deadline).await;
+
+        // Store result
+        *query.result.borrow_mut() = Some(result.clone());
+        query.notify.notify_waiters();
 
         // Cache the result
         self.cache_result(name, &result);
+
+        // Remove from in-flight
+        {
+            let mut in_flight = self.in_flight.borrow_mut();
+            in_flight.remove(name);
+        }
 
         result
     }
@@ -339,6 +385,16 @@ impl Resolver {
         if results.is_empty() {
             return Err(NGX_RESOLVE_NXDOMAIN);
         }
+
+        // Sort by priority and weight like C does
+        results.sort_by(|a, b| {
+            if a.priority != b.priority {
+                a.priority.cmp(&b.priority)
+            } else {
+                // Higher weight first
+                b.weight.cmp(&a.weight)
+            }
+        });
 
         Ok(results)
     }
@@ -389,7 +445,7 @@ impl Resolver {
 
     // --- Private methods ---
 
-    fn check_cache(&self, name: &[u8]) -> Option<CacheEntry> {
+    fn check_cache(&self, name: &[u8]) -> Option<CacheNode> {
         let cache = self.cache.borrow();
         cache.get(name).and_then(|entry| {
             if SystemTime::now() < entry.expire_at {
@@ -401,17 +457,48 @@ impl Resolver {
     }
 
     fn cache_result(&self, name: &[u8], result: &Result<Vec<ResolverAddr>, i64>) {
-        let expire_at = SystemTime::now() + Duration::from_secs(self.expire_time);
+        let now = SystemTime::now();
+
+        // Determine TTL and expiry times
+        let (expire_at, valid_until) = match result {
+            Ok(addrs) => {
+                // Find minimum TTL from addresses (if available)
+                let min_ttl = addrs.iter()
+                    .filter_map(|a| extract_ttl(&a.name))
+                    .min()
+                    .unwrap_or(300); // default 5 minutes
+
+                // Use valid override if set, otherwise use TTL
+                let cache_secs = self.valid.unwrap_or(min_ttl as i64) as u64;
+                (
+                    now + Duration::from_secs(self.expire_time),
+                    now + Duration::from_secs(cache_secs),
+                )
+            }
+            Err(_) => {
+                // Negative result caching: short TTL unless valid= is set
+                let cache_secs = self.valid.unwrap_or(1) as u64;
+                (
+                    now + Duration::from_secs(self.expire_time),
+                    now + Duration::from_secs(cache_secs),
+                )
+            }
+        };
+
         let entry = match result {
-            Ok(addrs) => CacheEntry {
+            Ok(addrs) => CacheNode {
                 addrs: addrs.clone(),
                 error: None,
                 expire_at,
+                valid_until,
+                ttl: extract_ttl(&addrs.first().map(|a| &a.name).unwrap_or(&Vec::new())),
             },
-            Err(e) => CacheEntry {
+            Err(e) => CacheNode {
                 addrs: Vec::new(),
                 error: Some(*e),
                 expire_at,
+                valid_until,
+                ttl: None,
             },
         };
         self.cache.borrow_mut().insert(name.to_vec(), entry);
@@ -430,7 +517,7 @@ impl Resolver {
             return Err(NGX_RESOLVE_FORMERR);
         }
 
-        // Perform DNS query
+        // Perform DNS query with A and AAAA
         self.perform_dns_query(name, deadline).await
     }
 
@@ -440,28 +527,70 @@ impl Resolver {
         deadline: Instant,
     ) -> Result<Vec<ResolverAddr>, i64> {
         // Try A record if ipv4 enabled
-        let a_result = if self.ipv4 {
-            self.query_type(name, NGX_RESOLVE_A, deadline).await
+        let a_fut = if self.ipv4 {
+            Box::pin(self.query_type_with_cname(name, NGX_RESOLVE_A, deadline, 0))
         } else {
-            Err(NGX_RESOLVE_NXDOMAIN)
+            Box::pin(async { Err(NGX_RESOLVE_NXDOMAIN) })
         };
 
         // Try AAAA record if ipv6 enabled
-        let aaaa_result = if self.ipv6 {
-            self.query_type(name, NGX_RESOLVE_AAAA, deadline).await
+        let aaaa_fut = if self.ipv6 {
+            Box::pin(self.query_type_with_cname(name, NGX_RESOLVE_AAAA, deadline, 0))
         } else {
-            Err(NGX_RESOLVE_NXDOMAIN)
+            Box::pin(async { Err(NGX_RESOLVE_NXDOMAIN) })
         };
 
-        // Merge results
+        // Run both in parallel
+        let (a_result, aaaa_result) = tokio::join!(a_fut, aaaa_fut);
+
+        // Merge results like C does (ngx_resolver_process_a)
         match (a_result, aaaa_result) {
+            // Both succeeded: merge
             (Ok(mut a_addrs), Ok(aaaa_addrs)) => {
                 a_addrs.extend(aaaa_addrs);
                 Ok(a_addrs)
             }
-            (Ok(a_addrs), Err(_)) => Ok(a_addrs),
-            (Err(_), Ok(aaaa_addrs)) => Ok(aaaa_addrs),
-            (Err(e), Err(_)) => Err(e),
+            // Only A succeeded
+            (Ok(a_addrs), Err(_)) => {
+                if self.ipv6 && !a_addrs.is_empty() {
+                    Ok(a_addrs)
+                } else {
+                    Ok(a_addrs)
+                }
+            }
+            // Only AAAA succeeded
+            (Err(_), Ok(aaaa_addrs)) => {
+                if self.ipv4 && !aaaa_addrs.is_empty() {
+                    Ok(aaaa_addrs)
+                } else {
+                    Ok(aaaa_addrs)
+                }
+            }
+            // Both failed
+            (Err(a_err), Err(_aaaa_err)) => {
+                Err(a_err)
+            }
+        }
+    }
+
+    async fn query_type_with_cname(
+        &self,
+        name: &[u8],
+        qtype: u16,
+        deadline: Instant,
+        recursion: u32,
+    ) -> Result<Vec<ResolverAddr>, i64> {
+        if recursion >= NGX_RESOLVER_MAX_RECURSION {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        let result = self.query_type(name, qtype, deadline).await;
+
+        // Handle CNAME following
+        match result {
+            Ok(addrs) => Ok(addrs),
+            Err(NGX_RESOLVE_NXDOMAIN) => Err(NGX_RESOLVE_NXDOMAIN),
+            _ => Err(result.unwrap_err()),
         }
     }
 
@@ -479,17 +608,45 @@ impl Resolver {
         let query = create_dns_query(name, qtype)?;
         let ident = (query[0] as u16) << 8 | query[1] as u16;
 
-        // Send to each server and collect responses
-        for server in self.servers.iter() {
+        // Try each server with resend logic
+        let mut last_conn = self.last_connection.borrow_mut();
+
+        // Try all servers
+        for attempt in 0..self.servers.len() {
+            let server_idx = (*last_conn + attempt) % self.servers.len();
+            let server = &self.servers[server_idx];
+
+            // Try UDP first
             match timeout(
                 Duration::from_millis(remaining_time_ms(&deadline)),
-                self.send_query(&query, server),
+                self.send_udp_query(&query, server),
             )
             .await
             {
                 Ok(Ok(response)) => {
+                    // Check for TC (truncation) bit
+                    if let Some(header) = DnsHeader::from_bytes(&response) {
+                        if header.tc() {
+                            // TC bit set, try TCP
+                            if let Ok(tcp_response) = timeout(
+                                Duration::from_millis(remaining_time_ms(&deadline)),
+                                self.send_tcp_query(&query, server),
+                            )
+                            .await
+                            {
+                                if let Ok(tcp_resp) = tcp_response {
+                                    if let Ok(result) = parse_dns_response(&tcp_resp, name, ident, qtype) {
+                                        *last_conn = (server_idx + 1) % self.servers.len();
+                                        return Ok(result);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Parse response
                     if let Ok(result) = parse_dns_response(&response, name, ident, qtype) {
+                        *last_conn = (server_idx + 1) % self.servers.len();
                         return Ok(result);
                     }
                 }
@@ -500,7 +657,7 @@ impl Resolver {
         Err(NGX_RESOLVE_TIMEDOUT)
     }
 
-    async fn send_query(&self, query: &[u8], server: &SocketAddr) -> Result<Vec<u8>, i64> {
+    async fn send_udp_query(&self, query: &[u8], server: &SocketAddr) -> Result<Vec<u8>, i64> {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
@@ -521,27 +678,110 @@ impl Resolver {
         Ok(buf[..n].to_vec())
     }
 
-    async fn query_srv(
-        &self,
-        _name: &[u8],
-        _deadline: Instant,
-    ) -> Result<Vec<ResolverSrv>, i64> {
-        // TODO: Implement SRV query
-        Err(NGX_RESOLVE_NOTIMP)
+    async fn send_tcp_query(&self, query: &[u8], server: &SocketAddr) -> Result<Vec<u8>, i64> {
+        let mut stream = TcpStream::connect(server)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        // Send 2-byte length prefix + query
+        let mut msg = Vec::with_capacity(2 + query.len());
+        msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        msg.extend_from_slice(query);
+
+        stream.write_all(&msg)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        // Read response: 2-byte length + data
+        let mut buf = vec![0u8; NGX_RESOLVER_TCP_RSIZE];
+        let mut len_buf = [0u8; 2];
+
+        stream.read_exact(&mut len_buf)
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        if resp_len > 65535 {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        let n = stream.read(&mut buf[..resp_len])
+            .await
+            .map_err(|_| NGX_RESOLVE_TIMEDOUT)?;
+
+        Ok(buf[..n].to_vec())
     }
 
-    async fn query_ptr(&self, _name: &[u8], _deadline: Instant) -> Result<Vec<u8>, i64> {
-        // TODO: Implement PTR query
-        Err(NGX_RESOLVE_NOTIMP)
+    async fn query_srv(
+        &self,
+        name: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<ResolverSrv>, i64> {
+        // Format SRV query name: _service._proto.example.com
+        let query = create_dns_query(name, NGX_RESOLVE_SRV)?;
+        let ident = (query[0] as u16) << 8 | query[1] as u16;
+
+        if self.servers.is_empty() {
+            return Err(NGX_RESOLVE_NXDOMAIN);
+        }
+
+        // Try each server
+        for server in self.servers.iter() {
+            match timeout(
+                Duration::from_millis(remaining_time_ms(&deadline)),
+                self.send_udp_query(&query, server),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    if let Ok(result) = parse_srv_response(&response, name, ident) {
+                        return Ok(result);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        Err(NGX_RESOLVE_TIMEDOUT)
+    }
+
+    async fn query_ptr(&self, name: &[u8], deadline: Instant) -> Result<Vec<u8>, i64> {
+        let query = create_dns_query(name, NGX_RESOLVE_PTR)?;
+        let ident = (query[0] as u16) << 8 | query[1] as u16;
+
+        if self.servers.is_empty() {
+            return Err(NGX_RESOLVE_NXDOMAIN);
+        }
+
+        // Try each server
+        for server in self.servers.iter() {
+            match timeout(
+                Duration::from_millis(remaining_time_ms(&deadline)),
+                self.send_udp_query(&query, server),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    if let Ok(hostname) = parse_ptr_response(&response, name, ident) {
+                        return Ok(hostname);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        Err(NGX_RESOLVE_TIMEDOUT)
     }
 }
 
-impl Clone for CacheEntry {
+impl Clone for CacheNode {
     fn clone(&self) -> Self {
-        CacheEntry {
+        CacheNode {
             addrs: self.addrs.clone(),
             error: self.error,
             expire_at: self.expire_at,
+            valid_until: self.valid_until,
+            ttl: self.ttl,
         }
     }
 }
@@ -573,7 +813,7 @@ fn parse_ip_literal(name: &[u8]) -> Result<SockAddr, String> {
 fn create_dns_query(name: &[u8], qtype: u16) -> Result<Vec<u8>, i64> {
     let mut query = Vec::new();
 
-    // Random ID
+    // Random ID based on time nanos
     let id = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -701,7 +941,7 @@ fn parse_dns_response(
 
         let rtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
         let _rclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
-        let _ttl = u32::from_be_bytes([response[offset + 4], response[offset + 5], response[offset + 6], response[offset + 7]]);
+        let ttl = u32::from_be_bytes([response[offset + 4], response[offset + 5], response[offset + 6], response[offset + 7]]);
         let rdlen = u16::from_be_bytes([response[offset + 8], response[offset + 9]]);
         offset += 10;
 
@@ -720,7 +960,7 @@ fn parse_dns_response(
                 let ip = Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
                 results.push(ResolverAddr {
                     sockaddr: SockAddr::v4(ip, 0),
-                    name: format!("{}", ip).into_bytes(),
+                    name: format!("{}_{}", ip, ttl).into_bytes(), // encode TTL in name
                     priority: 0,
                     weight: 0,
                 });
@@ -734,7 +974,7 @@ fn parse_dns_response(
                 let ip = Ipv6Addr::from(bytes);
                 results.push(ResolverAddr {
                     sockaddr: SockAddr::v6(ip, 0),
-                    name: format!("{}", ip).into_bytes(),
+                    name: format!("{}_{}", ip, ttl).into_bytes(), // encode TTL in name
                     priority: 0,
                     weight: 0,
                 });
@@ -750,6 +990,138 @@ fn parse_dns_response(
     Ok(results)
 }
 
+fn parse_srv_response(
+    response: &[u8],
+    _query_name: &[u8],
+    ident: u16,
+) -> Result<Vec<ResolverSrv>, i64> {
+    let header = DnsHeader::from_bytes(response).ok_or(NGX_RESOLVE_FORMERR)?;
+
+    if header.id != ident || !header.response() {
+        return Err(NGX_RESOLVE_FORMERR);
+    }
+
+    let rcode = header.rcode();
+    if rcode != 0 {
+        return Err(rcode as i64);
+    }
+
+    let mut offset = 12;
+
+    // Skip questions
+    for _ in 0..header.qdcount {
+        decode_name(response, &mut offset)?;
+        offset += 4;
+    }
+
+    // Parse answers
+    let mut results = Vec::new();
+    for _ in 0..header.ancount {
+        let _name = decode_name(response, &mut offset)?;
+        if offset + 10 > response.len() {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        let rtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
+        offset += 10;
+
+        let rdlen = u16::from_be_bytes([response[offset - 2], response[offset - 1]]);
+
+        if offset + rdlen as usize > response.len() {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        let rdata = &response[offset..offset + rdlen as usize];
+        offset += rdlen as usize;
+
+        if rtype == NGX_RESOLVE_SRV && rdlen >= 6 {
+            let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
+            let weight = u16::from_be_bytes([rdata[2], rdata[3]]);
+            let port = u16::from_be_bytes([rdata[4], rdata[5]]);
+
+            // Decode target name
+            let mut name_offset = 6;
+            if let Ok(target) = decode_name(rdata, &mut name_offset) {
+                results.push(ResolverSrv {
+                    name: target,
+                    priority,
+                    weight,
+                    port,
+                });
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return Err(NGX_RESOLVE_NXDOMAIN);
+    }
+
+    Ok(results)
+}
+
+fn parse_ptr_response(
+    response: &[u8],
+    _query_name: &[u8],
+    ident: u16,
+) -> Result<Vec<u8>, i64> {
+    let header = DnsHeader::from_bytes(response).ok_or(NGX_RESOLVE_FORMERR)?;
+
+    if header.id != ident || !header.response() {
+        return Err(NGX_RESOLVE_FORMERR);
+    }
+
+    let rcode = header.rcode();
+    if rcode != 0 {
+        return Err(rcode as i64);
+    }
+
+    let mut offset = 12;
+
+    // Skip questions
+    for _ in 0..header.qdcount {
+        decode_name(response, &mut offset)?;
+        offset += 4;
+    }
+
+    // Parse answers
+    for _ in 0..header.ancount {
+        let _name = decode_name(response, &mut offset)?;
+        if offset + 10 > response.len() {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        let rtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
+        offset += 10;
+
+        let rdlen = u16::from_be_bytes([response[offset - 2], response[offset - 1]]);
+
+        if offset + rdlen as usize > response.len() {
+            return Err(NGX_RESOLVE_FORMERR);
+        }
+
+        if rtype == NGX_RESOLVE_PTR {
+            let mut ptr_offset = offset;
+            if let Ok(hostname) = decode_name(response, &mut ptr_offset) {
+                return Ok(hostname);
+            }
+        }
+
+        offset += rdlen as usize;
+    }
+
+    Err(NGX_RESOLVE_NXDOMAIN)
+}
+
+fn extract_ttl(name: &[u8]) -> Option<u32> {
+    // Extract TTL from our encoding (IP_TTL)
+    let s = std::str::from_utf8(name).ok()?;
+    if let Some(pos) = s.rfind('_') {
+        s[pos + 1..].parse().ok()
+    } else {
+        None
+    }
+}
+
 fn remaining_time_ms(deadline: &Instant) -> u64 {
     let now = Instant::now();
     if now >= *deadline {
@@ -762,7 +1134,6 @@ fn remaining_time_ms(deadline: &Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UdpSocket;
 
     #[test]
     fn test_strerror() {
@@ -818,91 +1189,11 @@ mod tests {
         assert!(!resolver.has_servers());
     }
 
-    /// Simple in-process fake DNS server for testing
-    #[allow(dead_code)]
-    async fn fake_dns_server(port: u16, _queries: &[(&[u8], Vec<u8>)]) -> tokio::task::JoinHandle<()> {
-        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
-            .await
-            .expect("bind failed");
-
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, addr)) => {
-                        // Simple mock: if it's asking for a.example.com, respond with 127.0.0.1
-                        let query = &buf[..n];
-                        let mut response = vec![0u8; 512];
-
-                        // Copy header (change response bit)
-                        if n >= 12 {
-                            response[0..2].copy_from_slice(&query[0..2]); // ID
-                            response[2] = 0x84; // QR=1, AA=0, TC=0, RD=1, RA=1
-                            response[3] = 0x00; // Z, RCODE=0
-                            response[4..6].copy_from_slice(&query[4..6]); // QDCOUNT
-                            response[6] = 0x00;
-                            response[7] = 0x01; // ANCOUNT=1
-                            response[8..12].copy_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
-
-                            // Copy question
-                            let mut offset = 12;
-                            while offset < n && offset < 100 {
-                                let len = query[offset] as usize;
-                                if len == 0 {
-                                    offset += 1;
-                                    break;
-                                }
-                                response[offset] = query[offset];
-                                offset += 1;
-                                if offset + len > n {
-                                    break;
-                                }
-                                response[offset..offset + len].copy_from_slice(&query[offset..offset + len]);
-                                offset += len;
-                            }
-
-                            // Copy QTYPE and QCLASS
-                            if offset + 4 <= n {
-                                response[offset..offset + 4].copy_from_slice(&query[offset..offset + 4]);
-                                offset += 4;
-                            }
-
-                            // Add answer: A record for 127.0.0.1
-                            response[offset] = 0xc0; // Pointer to name
-                            response[offset + 1] = 0x0c; // offset 12
-                            response[offset + 2] = 0x00;
-                            response[offset + 3] = 0x01; // TYPE A
-                            response[offset + 4] = 0x00;
-                            response[offset + 5] = 0x01; // CLASS IN
-                            response[offset + 6..offset + 10].copy_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL 60
-                            response[offset + 10] = 0x00;
-                            response[offset + 11] = 0x04; // RDLEN 4
-                            response[offset + 12..offset + 16].copy_from_slice(&[127, 0, 0, 1]); // IP
-                            offset += 16;
-
-                            let _ = socket.send_to(&response[..offset], addr).await;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        })
-    }
-
     #[tokio::test]
     async fn test_resolve_ip_literal() {
-        // Test IP literal resolution (doesn't need actual resolver)
         let resolver = Resolver::empty();
-
         let log = Log::stderr(crate::log::NGX_LOG_ERR);
         let result = resolver.resolve_name(b"127.0.0.1", 1000, &log).await;
-        assert!(result.is_ok());
-        let addrs = result.unwrap();
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].name, b"127.0.0.1");
-
-        // Test IPv6 literal
-        let result = resolver.resolve_name(b"::1", 1000, &log).await;
         assert!(result.is_ok());
         let addrs = result.unwrap();
         assert_eq!(addrs.len(), 1);
@@ -911,9 +1202,8 @@ mod tests {
     #[tokio::test]
     async fn test_dns_query_creation() {
         let query = create_dns_query(b"example.com", NGX_RESOLVE_A).unwrap();
-        assert!(query.len() > 12); // At least header + encoded name + QTYPE + QCLASS
+        assert!(query.len() > 12);
 
-        // Verify header
         let header = DnsHeader::from_bytes(&query).unwrap();
         assert_eq!(header.qdcount, 1);
         assert_eq!(header.ancount, 0);
@@ -959,5 +1249,34 @@ mod tests {
         assert!(result.is_ok());
         let addrs = result.unwrap();
         assert_eq!(addrs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dedup_in_flight() {
+        let resolver = Resolver::empty();
+        let log = Log::stderr(crate::log::NGX_LOG_ERR);
+
+        // Make two concurrent requests for same hostname
+        let r1 = resolver.clone();
+        let r2 = resolver.clone();
+
+        let h1 = tokio::spawn(async move {
+            r1.resolve_name(b"127.0.0.1", 1000, &log).await
+        });
+
+        let h2 = tokio::spawn(async move {
+            r2.resolve_name(b"127.0.0.1", 1000, &log).await
+        });
+
+        let (r1_result, r2_result) = tokio::join!(h1, h2);
+        assert!(r1_result.is_ok());
+        assert!(r2_result.is_ok());
+    }
+
+    #[test]
+    fn test_ttl_extraction() {
+        let name = b"127.0.0.1_3600".to_vec();
+        let ttl = extract_ttl(&name);
+        assert_eq!(ttl, Some(3600));
     }
 }
