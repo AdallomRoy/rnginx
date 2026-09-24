@@ -1,4 +1,5 @@
 //! ngx_http_browser_module - Browser detection (placeholder)
+//! ngx_http_browser_module - Browser detection
 
 use std::any::Any;
 use std::rc::Rc;
@@ -36,6 +37,7 @@ fn add_variables(cf: &mut Conf) -> ConfResult {
 }
 
 fn accept(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn browser_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
     Ok(())
 }
 
@@ -51,6 +53,30 @@ pub fn browser_module() -> ModuleDef {
         ngx_core::cmd_fn!("ancient_browser", NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, accept),
         ngx_core::cmd_fn!("modern_browser_value", NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, accept),
         ngx_core::cmd_fn!("ancient_browser_value", NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, accept),
+        ngx_core::cmd_fn!(
+            "modern_browser",
+            NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12,
+            ConfLevel::Loc,
+            browser_handler
+        ),
+        ngx_core::cmd_fn!(
+            "ancient_browser",
+            NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE,
+            ConfLevel::Loc,
+            browser_handler
+        ),
+        ngx_core::cmd_fn!(
+            "modern_browser_value",
+            NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+            ConfLevel::Loc,
+            browser_handler
+        ),
+        ngx_core::cmd_fn!(
+            "ancient_browser_value",
+            NGX_HTTP_MAIN_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+            ConfLevel::Loc,
+            browser_handler
+        ),
     ];
     http_module_def("ngx_http_browser_module", def, commands)
 }
