@@ -268,6 +268,8 @@ pub struct HeaderBuf {
     pub last: usize,
     /// Capacity per large buffer / small buffer semantic bookkeeping.
     pub allocated: bool,
+    pub cap: usize,
+    pub nbusy: usize,
 }
 
 impl HeaderBuf {
@@ -590,7 +592,7 @@ impl Request {
 
     pub fn partial_request_line(&self) -> Option<Vec<u8>> {
         let p = self.parse.borrow();
-        if p.request_start_set {
+        if p.uri_start.is_some() || p.method_end != 0 {
             let hb = self.http_connection.buffer.borrow();
             let start = p.request_start.min(hb.last);
             let mut end = start;

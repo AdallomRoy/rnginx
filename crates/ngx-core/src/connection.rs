@@ -178,6 +178,10 @@ pub struct Connection {
 impl Connection {
     /// ngx_get_connection: allocate a connection object, enforcing worker_connections.
     pub fn get(fd: RawFd, log: &Log) -> Option<Rc<Connection>> {
+        Connection::create(fd, log, None, libc::SOCK_STREAM, SockAddr::v4(std::net::Ipv4Addr::UNSPECIFIED, 0))
+    }
+
+    fn create(fd: RawFd, log: &Log, listening: Option<Rc<Listening>>, ty: i32, sockaddr: SockAddr) -> Option<Rc<Connection>> {
         if active_connections() >= connection_n() {
             ngx_log_error!(NGX_LOG_ALERT, log, None, "{} worker_connections are not enough", connection_n());
             return None;
@@ -191,10 +195,10 @@ impl Connection {
             afd: RefCell::new(None),
             number,
             log: clog,
-            listening: None,
-            ty: libc::SOCK_STREAM,
-            sockaddr: RefCell::new(SockAddr::v4(std::net::Ipv4Addr::UNSPECIFIED, 0)),
-            addr_text: RefCell::new(Vec::new()),
+            listening,
+            ty,
+            addr_text: RefCell::new(sockaddr.addr_text()),
+            sockaddr: RefCell::new(sockaddr),
             local_sockaddr: RefCell::new(None),
             proxy_protocol: RefCell::new(None),
             ssl: RefCell::new(None),
@@ -233,15 +237,7 @@ impl Connection {
 
     /// Build a connection for an accepted socket.
     pub fn accepted(fd: RawFd, ls: &Rc<Listening>, sockaddr: SockAddr, log: &Log) -> Option<Rc<Connection>> {
-        let mut c = Connection::get(fd, log)?;
-        {
-            let cm = Rc::get_mut(&mut c).expect("fresh connection");
-            cm.listening = Some(ls.clone());
-            cm.ty = ls.ty;
-            cm.sockaddr = RefCell::new(sockaddr);
-        }
-        let text = c.sockaddr.borrow().addr_text();
-        *c.addr_text.borrow_mut() = text;
+        let c = Connection::create(fd, log, Some(ls.clone()), ls.ty, sockaddr)?;
         if !ls.wildcard.get() {
             *c.local_sockaddr.borrow_mut() = Some(ls.sockaddr.clone());
         }

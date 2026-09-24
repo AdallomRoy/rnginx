@@ -109,6 +109,7 @@ pub struct CoreMainConf {
     pub variables_keys: Option<HashKeysArrays<Rc<crate::variables::Variable>>>,
     pub ports: Vec<ConfPort>,
     pub phases: Vec<Phase>,
+    pub log_handlers: Vec<Rc<dyn Fn(&R) -> i64>>,
 }
 
 pub struct ServerName {
@@ -398,6 +399,7 @@ fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
         variables_keys: None,
         ports: Vec::new(),
         phases: vec![Phase::default(); NGX_HTTP_LOG_PHASE + 1],
+        log_handlers: Vec::new(),
     })
 }
 
@@ -1736,8 +1738,8 @@ pub fn core_module() -> ModuleDef {
         cmd!("server_names_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::Main, M, server_names_hash_max_size, set_num),
         cmd!("server_names_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::Main, M, server_names_hash_bucket_size, set_num),
         cmd_fn!("server", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_NOARGS, ConfLevel::None, server_block),
-        cmd!("connection_pool_size", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, connection_pool_size, set_pool_size),
-        cmd!("request_pool_size", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, request_pool_size, set_pool_size),
+        ngx_core::cmdp!("connection_pool_size", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, connection_pool_size, set_pool_size),
+        ngx_core::cmdp!("request_pool_size", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, request_pool_size, set_pool_size),
         cmd!("client_header_timeout", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, client_header_timeout, set_msec),
         cmd!("client_header_buffer_size", MS | NGX_CONF_TAKE1, ConfLevel::Srv, S, client_header_buffer_size, set_size),
         cmd!("large_client_header_buffers", MS | NGX_CONF_TAKE2, ConfLevel::Srv, S, large_client_header_buffers, set_bufs),
@@ -1785,7 +1787,7 @@ pub fn core_module() -> ModuleDef {
         cmd!("tcp_nopush", MSL | NGX_CONF_FLAG, ConfLevel::Loc, L, tcp_nopush, set_flag),
         cmd!("tcp_nodelay", MSL | NGX_CONF_FLAG, ConfLevel::Loc, L, tcp_nodelay, set_flag),
         cmd!("send_timeout", MSL | NGX_CONF_TAKE1, ConfLevel::Loc, L, send_timeout, set_msec),
-        cmd!("send_lowat", MSL | NGX_CONF_TAKE1, ConfLevel::Loc, L, send_lowat, set_lowat),
+        ngx_core::cmdp!("send_lowat", MSL | NGX_CONF_TAKE1, ConfLevel::Loc, L, send_lowat, set_lowat),
         cmd!("postpone_output", MSL | NGX_CONF_TAKE1, ConfLevel::Loc, L, postpone_output, set_size),
         cmd_fn!("limit_rate", MSL | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf, cmd, conf| {
             let clcf = clcf_of(&conf);
@@ -2094,6 +2096,12 @@ pub fn init_phases(_cf: &mut Conf, cmcf: &Rc<RefCell<CoreMainConf>>) -> ConfResu
 pub fn add_phase_handler(cf: &Conf, phase: usize, h: HandlerFn) {
     let cmcf = core_main_conf(cf);
     cmcf.borrow_mut().phases[phase].handlers.push(h);
+}
+
+/// Add a log phase handler (synchronous).
+pub fn add_log_handler(cf: &Conf, h: Rc<dyn Fn(&R) -> i64>) {
+    let cmcf = core_main_conf(cf);
+    cmcf.borrow_mut().log_handlers.push(h);
 }
 
 pub fn init_headers_in_hash(cf: &mut Conf, cmcf: &Rc<RefCell<CoreMainConf>>) -> ConfResult {

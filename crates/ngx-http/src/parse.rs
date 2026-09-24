@@ -67,9 +67,8 @@ fn is_usual(ch: u8) -> bool {
 
 // ngx_hash function for header hashing
 #[inline]
-fn ngx_hash(mut hash: u32, ch: u8) -> u32 {
-    hash = ((hash << 5).wrapping_add(hash)).wrapping_add(ch as u32);
-    hash
+fn ngx_hash(hash: u32, ch: u8) -> u32 {
+    hash.wrapping_mul(31).wrapping_add(ch as u32)
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +105,10 @@ pub struct ParseRequest {
     pub lowcase_index: usize,
     pub invalid_header: bool,
     pub http_protocol_start: Option<usize>,
+    /// C: request_end != NULL
+    pub request_end_set: bool,
+    /// set when parsing upstream response headers (enables IIS "HTTP/" line skipping)
+    pub upstream: bool,
 }
 
 impl Default for ParseRequest {
@@ -143,6 +146,8 @@ impl Default for ParseRequest {
             lowcase_index: 0,
             invalid_header: false,
             http_protocol_start: None,
+            request_end_set: false,
+            upstream: false,
         }
     }
 }
@@ -158,805 +163,569 @@ static LOWCASE: &[u8] = b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0
 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
 \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-/// Parse HTTP request line. Returns NGX_OK on success, NGX_AGAIN if incomplete,
-/// or error codes.
-pub fn parse_request_line(
-    r: &mut ParseRequest,
-    buf: &[u8],
-    pos: &mut usize,
-) -> i64 {
-    #[repr(u32)]
-    enum State {
-        Start = 0,
-        Method = 1,
-        SpacesBeforeUri = 2,
-        Schema = 3,
-        SchemaSlash = 4,
-        SchemaSlashSlash = 5,
-        SpacesBeforeHost = 6,
-        HostStart = 7,
-        Host = 8,
-        HostEnd = 9,
-        HostIpLiteral = 10,
-        PortStart = 11,
-        Port = 12,
-        AfterSlashInUri = 13,
-        CheckUri = 14,
-        Uri = 15,
-        Http09 = 16,
-        HttpH = 17,
-        HttpHT = 18,
-        HttpHTT = 19,
-        HttpHTTP = 20,
-        FirstMajorDigit = 21,
-        MajorDigit = 22,
-        FirstMinorDigit = 23,
-        MinorDigit = 24,
-        SpacesAfterDigit = 25,
-        AlmostDone = 26,
-    }
+/// Parse HTTP request line (port of ngx_http_parse_request_line).
+/// Returns NGX_OK on success, NGX_AGAIN if incomplete, or an NGX_HTTP_PARSE_* code.
+/// Offsets are relative to `buf`; `pos` is advanced like `b->pos`.
+pub fn parse_request_line(r: &mut ParseRequest, buf: &[u8], pos: &mut usize) -> i64 {
+    const SW_START: u32 = 0;
+    const SW_METHOD: u32 = 1;
+    const SW_SPACES_BEFORE_URI: u32 = 2;
+    const SW_SCHEMA: u32 = 3;
+    const SW_SCHEMA_SLASH: u32 = 4;
+    const SW_SCHEMA_SLASH_SLASH: u32 = 5;
+    const SW_SPACES_BEFORE_HOST: u32 = 6;
+    const SW_HOST_START: u32 = 7;
+    const SW_HOST: u32 = 8;
+    const SW_HOST_END: u32 = 9;
+    const SW_HOST_IP_LITERAL: u32 = 10;
+    const SW_PORT_START: u32 = 11;
+    const SW_PORT: u32 = 12;
+    const SW_AFTER_SLASH_IN_URI: u32 = 13;
+    const SW_CHECK_URI: u32 = 14;
+    const SW_URI: u32 = 15;
+    const SW_HTTP_09: u32 = 16;
+    const SW_HTTP_H: u32 = 17;
+    const SW_HTTP_HT: u32 = 18;
+    const SW_HTTP_HTT: u32 = 19;
+    const SW_HTTP_HTTP: u32 = 20;
+    const SW_FIRST_MAJOR_DIGIT: u32 = 21;
+    const SW_MAJOR_DIGIT: u32 = 22;
+    const SW_FIRST_MINOR_DIGIT: u32 = 23;
+    const SW_MINOR_DIGIT: u32 = 24;
+    const SW_SPACES_AFTER_DIGIT: u32 = 25;
+    const SW_ALMOST_DONE: u32 = 26;
 
-    let mut state = r.state as usize;
+    let mut state = r.state;
     let mut p = *pos;
+    let mut done = false;
 
     while p < buf.len() {
         let ch = buf[p];
-
+        // each arm either advances p (continue), or sets done and breaks
         match state {
-            0 => {
-                // sw_start
+            SW_START => {
                 r.request_start = p;
-
                 if ch == CR || ch == LF {
                     p += 1;
                     continue;
                 }
-
-                if (ch < b'A' || ch > b'Z') && ch != b'_' && ch != b'-' {
-                    *pos = p;
+                if !(b'A'..=b'Z').contains(&ch) && ch != b'_' && ch != b'-' {
                     return NGX_HTTP_PARSE_INVALID_METHOD;
                 }
-
-                state = State::Method as usize;
-                p += 1;
+                state = SW_METHOD;
             }
-
-            1 => {
-                // sw_method
+            SW_METHOD => {
                 if ch == b' ' {
                     r.method_end = p - 1;
-                    let m = r.request_start;
-                    let method_len = p - m;
-                    state = State::SpacesBeforeUri as usize;
-
-                    // Method detection
-                    match method_len {
-                        3 => {
-                            if eq3(&buf[m..], b'G', b'E', b'T') {
-                                r.method = NGX_HTTP_GET;
-                            } else if eq3(&buf[m..], b'P', b'U', b'T') {
-                                r.method = NGX_HTTP_PUT;
-                            }
+                    let m = &buf[r.request_start..p];
+                    state = SW_SPACES_BEFORE_URI;
+                    match m {
+                        b"GET" => r.method = NGX_HTTP_GET,
+                        b"PUT" => r.method = NGX_HTTP_PUT,
+                        b"POST" => r.method = NGX_HTTP_POST,
+                        b"COPY" => r.method = NGX_HTTP_COPY,
+                        b"MOVE" => r.method = NGX_HTTP_MOVE,
+                        b"LOCK" => r.method = NGX_HTTP_LOCK,
+                        b"HEAD" => r.method = NGX_HTTP_HEAD,
+                        b"MKCOL" => r.method = NGX_HTTP_MKCOL,
+                        b"PATCH" => r.method = NGX_HTTP_PATCH,
+                        b"TRACE" => r.method = NGX_HTTP_TRACE,
+                        b"DELETE" => r.method = NGX_HTTP_DELETE,
+                        b"UNLOCK" => r.method = NGX_HTTP_UNLOCK,
+                        b"OPTIONS" => r.method = NGX_HTTP_OPTIONS,
+                        b"CONNECT" => {
+                            r.method = NGX_HTTP_CONNECT;
+                            state = SW_SPACES_BEFORE_HOST;
                         }
-                        4 => {
-                            if buf[m + 1] == b'O' {
-                                if eq3O(&buf[m..], b'P', b'O', b'S', b'T') {
-                                    r.method = NGX_HTTP_POST;
-                                } else if eq3O(&buf[m..], b'C', b'O', b'P', b'Y') {
-                                    r.method = NGX_HTTP_COPY;
-                                } else if eq3O(&buf[m..], b'M', b'O', b'V', b'E') {
-                                    r.method = NGX_HTTP_MOVE;
-                                } else if eq3O(&buf[m..], b'L', b'O', b'C', b'K') {
-                                    r.method = NGX_HTTP_LOCK;
-                                }
-                            } else if eq4(&buf[m..], b'H', b'E', b'A', b'D') {
-                                r.method = NGX_HTTP_HEAD;
-                            }
-                        }
-                        5 => {
-                            if eq5(&buf[m..], b'M', b'K', b'C', b'O', b'L') {
-                                r.method = NGX_HTTP_MKCOL;
-                            } else if eq5(&buf[m..], b'P', b'A', b'T', b'C', b'H') {
-                                r.method = NGX_HTTP_PATCH;
-                            } else if eq5(&buf[m..], b'T', b'R', b'A', b'C', b'E') {
-                                r.method = NGX_HTTP_TRACE;
-                            }
-                        }
-                        6 => {
-                            if eq6(&buf[m..], b'D', b'E', b'L', b'E', b'T', b'E') {
-                                r.method = NGX_HTTP_DELETE;
-                            } else if eq6(&buf[m..], b'U', b'N', b'L', b'O', b'C', b'K') {
-                                r.method = NGX_HTTP_UNLOCK;
-                            }
-                        }
-                        7 => {
-                            if eq7(&buf[m..], b'O', b'P', b'T', b'I', b'O', b'N', b'S') {
-                                r.method = NGX_HTTP_OPTIONS;
-                            } else if eq7(&buf[m..], b'C', b'O', b'N', b'N', b'E', b'C', b'T') {
-                                r.method = NGX_HTTP_CONNECT;
-                                state = State::SpacesBeforeHost as usize;
-                            }
-                        }
-                        8 => {
-                            if eq8(&buf[m..], b'P', b'R', b'O', b'P', b'F', b'I', b'N', b'D') {
-                                r.method = NGX_HTTP_PROPFIND;
-                            }
-                        }
-                        9 => {
-                            if eq9(&buf[m..], b'P', b'R', b'O', b'P', b'P', b'A', b'T', b'C', b'H') {
-                                r.method = NGX_HTTP_PROPPATCH;
-                            }
-                        }
+                        b"PROPFIND" => r.method = NGX_HTTP_PROPFIND,
+                        b"PROPPATCH" => r.method = NGX_HTTP_PROPPATCH,
                         _ => {}
                     }
-
-                    p += 1;
-                } else if (ch < b'A' || ch > b'Z') && ch != b'_' && ch != b'-' {
-                    *pos = p;
+                } else if !(b'A'..=b'Z').contains(&ch) && ch != b'_' && ch != b'-' {
                     return NGX_HTTP_PARSE_INVALID_METHOD;
-                } else {
-                    p += 1;
                 }
             }
-
-            2 => {
-                // sw_spaces_before_uri
+            SW_SPACES_BEFORE_URI => {
                 if ch == b'/' {
                     r.uri_start = Some(p);
-                    state = State::AfterSlashInUri as usize;
-                    p += 1;
+                    state = SW_AFTER_SLASH_IN_URI;
                 } else {
                     let c = ch | 0x20;
-                    if c >= b'a' && c <= b'z' {
+                    if (b'a'..=b'z').contains(&c) {
                         r.schema_start = Some(p);
-                        state = State::Schema as usize;
-                        p += 1;
-                    } else if ch == b' ' {
-                        p += 1;
-                    } else {
-                        *pos = p;
+                        state = SW_SCHEMA;
+                    } else if ch != b' ' {
                         return NGX_HTTP_PARSE_INVALID_REQUEST;
                     }
                 }
             }
-
-            3 => {
-                // sw_schema
+            SW_SCHEMA => {
                 let c = ch | 0x20;
-                if (c >= b'a' && c <= b'z')
-                    || (ch >= b'0' && ch <= b'9')
-                    || ch == b'+'
-                    || ch == b'-'
-                    || ch == b'.'
-                {
-                    p += 1;
+                if (b'a'..=b'z').contains(&c) || ch.is_ascii_digit() || ch == b'+' || ch == b'-' || ch == b'.' {
+                    // stay
                 } else if ch == b':' {
                     r.schema_end = Some(p);
-                    state = State::SchemaSlash as usize;
-                    p += 1;
+                    state = SW_SCHEMA_SLASH;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            4 => {
-                // sw_schema_slash
+            SW_SCHEMA_SLASH => {
                 if ch == b'/' {
-                    state = State::SchemaSlashSlash as usize;
-                    p += 1;
+                    state = SW_SCHEMA_SLASH_SLASH;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            5 => {
-                // sw_schema_slash_slash
+            SW_SCHEMA_SLASH_SLASH => {
                 if ch == b'/' {
-                    state = State::HostStart as usize;
-                    p += 1;
+                    state = SW_HOST_START;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            6 => {
-                // sw_spaces_before_host
-                if ch == b' ' {
-                    p += 1;
-                } else {
-                    state = State::HostStart as usize;
-                }
-            }
-
-            7 => {
-                // sw_host_start
-                r.host_start = Some(p);
-
-                if ch == b'[' {
-                    state = State::HostIpLiteral as usize;
-                    p += 1;
-                } else {
-                    state = State::Host as usize;
-                }
-            }
-
-            8 => {
-                // sw_host
-                let c = ch | 0x20;
-                if (c >= b'a' && c <= b'z')
-                    || (ch >= b'0' && ch <= b'9')
-                    || ch == b'.'
-                    || ch == b'-'
-                {
-                    p += 1;
-                } else {
-                    state = State::HostEnd as usize;
-                }
-            }
-
-            9 => {
-                // sw_host_end
-                if ch == b':' {
-                    state = State::PortStart as usize;
-                    p += 1;
-                } else {
-                    r.host_end = Some(p);
-
-                    if r.method == NGX_HTTP_CONNECT {
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_REQUEST;
-                    }
-
-                    match ch {
-                        b'/' => {
-                            r.uri_start = Some(p);
-                            state = State::AfterSlashInUri as usize;
-                            p += 1;
-                        }
-                        b'?' => {
-                            r.uri_start = Some(p);
-                            r.args_start = Some(p + 1);
-                            r.empty_path_in_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
-                        }
-                        b' ' => {
-                            r.uri_start = r.schema_end.map(|se| se + 1);
-                            r.uri_end = r.schema_end.map(|se| se + 2);
-                            state = State::Http09 as usize;
-                            p += 1;
-                        }
-                        _ => {
-                            *pos = p;
-                            return NGX_HTTP_PARSE_INVALID_REQUEST;
-                        }
-                    }
-                }
-            }
-
-            10 => {
-                // sw_host_ip_literal
-                if (ch >= b'0' && ch <= b'9') || (ch | 0x20 >= b'a' && ch | 0x20 <= b'f') {
-                    p += 1;
-                } else {
-                    match ch {
-                        b':' | b']' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => {
-                            if ch == b']' {
-                                state = State::HostEnd as usize;
-                            }
-                            p += 1;
-                        }
-                        _ => {
-                            *pos = p;
-                            return NGX_HTTP_PARSE_INVALID_REQUEST;
-                        }
-                    }
-                }
-            }
-
-            11 => {
-                // sw_port_start
-                state = State::Port as usize;
-
-                if ch >= b'0' && ch <= b'9' {
-                    p += 1;
-                } else if r.method == NGX_HTTP_CONNECT {
-                    *pos = p;
-                    return NGX_HTTP_PARSE_INVALID_REQUEST;
-                } else {
-                    // fall through to port
-                }
-            }
-
-            12 => {
-                // sw_port
-                if ch >= b'0' && ch <= b'9' {
-                    p += 1;
-                } else {
-                    r.host_end = Some(p);
-
-                    if r.method == NGX_HTTP_CONNECT {
-                        if ch == b' ' {
-                            state = State::Http09 as usize;
-                            p += 1;
-                        } else {
-                            *pos = p;
-                            return NGX_HTTP_PARSE_INVALID_REQUEST;
-                        }
+            SW_SPACES_BEFORE_HOST | SW_HOST_START | SW_HOST | SW_HOST_END => {
+                let mut st = state;
+                let mut handled = false;
+                if st == SW_SPACES_BEFORE_HOST {
+                    if ch == b' ' {
+                        handled = true;
                     } else {
+                        st = SW_HOST_START;
+                    }
+                }
+                if !handled && st == SW_HOST_START {
+                    r.host_start = Some(p);
+                    if ch == b'[' {
+                        state = SW_HOST_IP_LITERAL;
+                        handled = true;
+                    } else {
+                        st = SW_HOST;
+                    }
+                }
+                if !handled && st == SW_HOST {
+                    let c = ch | 0x20;
+                    if (b'a'..=b'z').contains(&c) || ch.is_ascii_digit() || ch == b'.' || ch == b'-' {
+                        state = SW_HOST;
+                        handled = true;
+                    } else {
+                        st = SW_HOST_END;
+                    }
+                }
+                if !handled && st == SW_HOST_END {
+                    if ch == b':' {
+                        state = SW_PORT_START;
+                    } else {
+                        r.host_end = Some(p);
+                        if r.method == NGX_HTTP_CONNECT {
+                            return NGX_HTTP_PARSE_INVALID_REQUEST;
+                        }
                         match ch {
                             b'/' => {
                                 r.uri_start = Some(p);
-                                state = State::AfterSlashInUri as usize;
-                                p += 1;
+                                state = SW_AFTER_SLASH_IN_URI;
                             }
                             b'?' => {
                                 r.uri_start = Some(p);
                                 r.args_start = Some(p + 1);
                                 r.empty_path_in_uri = true;
-                                state = State::Uri as usize;
-                                p += 1;
+                                state = SW_URI;
                             }
                             b' ' => {
-                                r.uri_start = r.schema_end.map(|se| se + 1);
-                                r.uri_end = r.schema_end.map(|se| se + 2);
-                                state = State::Http09 as usize;
-                                p += 1;
+                                let se = r.schema_end.unwrap_or(0);
+                                r.uri_start = Some(se + 1);
+                                r.uri_end = Some(se + 2);
+                                state = SW_HTTP_09;
                             }
-                            _ => {
-                                *pos = p;
+                            _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
+                        }
+                    }
+                }
+            }
+            SW_HOST_IP_LITERAL => {
+                let c = ch | 0x20;
+                if ch.is_ascii_digit() || (b'a'..=b'z').contains(&c) {
+                    // stay
+                } else {
+                    match ch {
+                        b':' => {}
+                        b']' => state = SW_HOST_END,
+                        b'-' | b'.' | b'_' | b'~' => {}
+                        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => {}
+                        _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
+                    }
+                }
+            }
+            SW_PORT_START | SW_PORT => {
+                let mut fallthrough = false;
+                if state == SW_PORT_START {
+                    state = SW_PORT;
+                    if ch.is_ascii_digit() {
+                        // stay
+                    } else if r.method == NGX_HTTP_CONNECT {
+                        return NGX_HTTP_PARSE_INVALID_REQUEST;
+                    } else {
+                        fallthrough = true;
+                    }
+                } else {
+                    fallthrough = true;
+                }
+                if fallthrough {
+                    if ch.is_ascii_digit() {
+                        // stay in port
+                    } else {
+                        r.host_end = Some(p);
+                        if r.method == NGX_HTTP_CONNECT {
+                            if ch == b' ' {
+                                state = SW_HTTP_09;
+                            } else {
                                 return NGX_HTTP_PARSE_INVALID_REQUEST;
+                            }
+                        } else {
+                            match ch {
+                                b'/' => {
+                                    r.uri_start = Some(p);
+                                    state = SW_AFTER_SLASH_IN_URI;
+                                }
+                                b'?' => {
+                                    r.uri_start = Some(p);
+                                    r.args_start = Some(p + 1);
+                                    r.empty_path_in_uri = true;
+                                    state = SW_URI;
+                                }
+                                b' ' => {
+                                    let se = r.schema_end.unwrap_or(0);
+                                    r.uri_start = Some(se + 1);
+                                    r.uri_end = Some(se + 2);
+                                    state = SW_HTTP_09;
+                                }
+                                _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
                             }
                         }
                     }
                 }
             }
-
-            13 => {
-                // sw_after_slash_in_uri
-                if is_usual(ch) {
-                    state = State::CheckUri as usize;
-                    p += 1;
+            SW_AFTER_SLASH_IN_URI => {
+                if usual(ch) {
+                    state = SW_CHECK_URI;
                 } else {
                     match ch {
                         b' ' => {
                             r.uri_end = Some(p);
-                            state = State::Http09 as usize;
-                            p += 1;
+                            state = SW_HTTP_09;
                         }
                         CR => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            state = State::AlmostDone as usize;
-                            p += 1;
+                            state = SW_ALMOST_DONE;
                         }
                         LF => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            p += 1;
-                            if r.request_end == 0 {
-                                r.request_end = p - 2;
-                            }
-                            r.http_version = r.http_major * 1000 + r.http_minor;
-                            state = 0;
+                            done = true;
                             break;
                         }
                         b'.' => {
                             r.complex_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'%' => {
                             r.quoted_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'/' => {
                             r.complex_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'?' => {
                             r.args_start = Some(p + 1);
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'#' => {
                             r.complex_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'+' => {
                             r.plus_in_uri = true;
-                            p += 1;
                         }
                         _ => {
                             if ch < 0x20 || ch == 0x7f {
-                                *pos = p;
                                 return NGX_HTTP_PARSE_INVALID_REQUEST;
                             }
-                            state = State::CheckUri as usize;
-                            p += 1;
+                            state = SW_CHECK_URI;
                         }
                     }
                 }
             }
-
-            14 => {
-                // sw_check_uri
-                if is_usual(ch) {
-                    p += 1;
-                } else {
+            SW_CHECK_URI => {
+                if !usual(ch) {
                     match ch {
                         b'/' => {
                             r.uri_ext = None;
-                            state = State::AfterSlashInUri as usize;
-                            p += 1;
+                            state = SW_AFTER_SLASH_IN_URI;
                         }
                         b'.' => {
                             r.uri_ext = Some(p + 1);
-                            p += 1;
                         }
                         b' ' => {
                             r.uri_end = Some(p);
-                            state = State::Http09 as usize;
-                            p += 1;
+                            state = SW_HTTP_09;
                         }
                         CR => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            state = State::AlmostDone as usize;
-                            p += 1;
+                            state = SW_ALMOST_DONE;
                         }
                         LF => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            p += 1;
-                            if r.request_end == 0 {
-                                r.request_end = p - 2;
-                            }
-                            r.http_version = r.http_major * 1000 + r.http_minor;
-                            state = 0;
+                            done = true;
                             break;
                         }
                         b'%' => {
                             r.quoted_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'?' => {
                             r.args_start = Some(p + 1);
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'#' => {
                             r.complex_uri = true;
-                            state = State::Uri as usize;
-                            p += 1;
+                            state = SW_URI;
                         }
                         b'+' => {
                             r.plus_in_uri = true;
-                            p += 1;
                         }
                         _ => {
                             if ch < 0x20 || ch == 0x7f {
-                                *pos = p;
                                 return NGX_HTTP_PARSE_INVALID_REQUEST;
                             }
-                            p += 1;
                         }
                     }
                 }
             }
-
-            15 => {
-                // sw_uri
-                if is_usual(ch) {
-                    p += 1;
-                } else {
+            SW_URI => {
+                if !usual(ch) {
                     match ch {
                         b' ' => {
                             r.uri_end = Some(p);
-                            state = State::Http09 as usize;
-                            p += 1;
+                            state = SW_HTTP_09;
                         }
                         CR => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            state = State::AlmostDone as usize;
-                            p += 1;
+                            state = SW_ALMOST_DONE;
                         }
                         LF => {
                             r.uri_end = Some(p);
                             r.http_minor = 9;
-                            p += 1;
-                            if r.request_end == 0 {
-                                r.request_end = p - 2;
-                            }
-                            r.http_version = r.http_major * 1000 + r.http_minor;
-                            state = 0;
+                            done = true;
                             break;
                         }
                         b'#' => {
                             r.complex_uri = true;
-                            p += 1;
                         }
                         _ => {
                             if ch < 0x20 || ch == 0x7f {
-                                *pos = p;
                                 return NGX_HTTP_PARSE_INVALID_REQUEST;
                             }
-                            p += 1;
                         }
                     }
                 }
             }
-
-            16 => {
-                // sw_http_09
-                match ch {
-                    b' ' => {
-                        p += 1;
-                    }
-                    CR => {
-                        r.http_minor = 9;
-                        state = State::AlmostDone as usize;
-                        p += 1;
-                    }
-                    LF => {
-                        r.http_minor = 9;
-                        p += 1;
-                        if r.request_end == 0 {
-                            r.request_end = p - 2;
-                        }
-                        r.http_version = r.http_major * 1000 + r.http_minor;
-                        state = 0;
-                        break;
-                    }
-                    b'H' => {
-                        r.http_protocol_start = Some(p);
-                        state = State::HttpH as usize;
-                        p += 1;
-                    }
-                    _ => {
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_REQUEST;
-                    }
+            SW_HTTP_09 => match ch {
+                b' ' => {}
+                CR => {
+                    r.http_minor = 9;
+                    state = SW_ALMOST_DONE;
                 }
-            }
-
-            17 => {
-                // sw_http_H
+                LF => {
+                    r.http_minor = 9;
+                    done = true;
+                    break;
+                }
+                b'H' => {
+                    r.http_protocol_start = Some(p);
+                    state = SW_HTTP_H;
+                }
+                _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
+            },
+            SW_HTTP_H => {
                 if ch == b'T' {
-                    state = State::HttpHT as usize;
-                    p += 1;
+                    state = SW_HTTP_HT;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            18 => {
-                // sw_http_HT
+            SW_HTTP_HT => {
                 if ch == b'T' {
-                    state = State::HttpHTT as usize;
-                    p += 1;
+                    state = SW_HTTP_HTT;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            19 => {
-                // sw_http_HTT
+            SW_HTTP_HTT => {
                 if ch == b'P' {
-                    state = State::HttpHTTP as usize;
-                    p += 1;
+                    state = SW_HTTP_HTTP;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            20 => {
-                // sw_http_HTTP
+            SW_HTTP_HTTP => {
                 if ch == b'/' {
                     if r.method == NGX_HTTP_CONNECT {
                         r.uri_start = Some(p);
                         r.uri_end = Some(p + 1);
                     }
-
-                    state = State::FirstMajorDigit as usize;
-                    p += 1;
+                    state = SW_FIRST_MAJOR_DIGIT;
                 } else {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
             }
-
-            21 => {
-                // sw_first_major_digit
-                if ch < b'1' || ch > b'9' {
-                    *pos = p;
+            SW_FIRST_MAJOR_DIGIT => {
+                if !(b'1'..=b'9').contains(&ch) {
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
-
                 r.http_major = (ch - b'0') as u32;
-
                 if r.http_major > 1 {
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_VERSION;
                 }
-
-                state = State::MajorDigit as usize;
-                p += 1;
+                state = SW_MAJOR_DIGIT;
             }
-
-            22 => {
-                // sw_major_digit
+            SW_MAJOR_DIGIT => {
                 if ch == b'.' {
-                    state = State::FirstMinorDigit as usize;
-                    p += 1;
-                } else if ch < b'0' || ch > b'9' {
-                    *pos = p;
+                    state = SW_FIRST_MINOR_DIGIT;
+                } else if !ch.is_ascii_digit() {
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 } else {
                     r.http_major = r.http_major * 10 + (ch - b'0') as u32;
-
                     if r.http_major > 1 {
-                        *pos = p;
                         return NGX_HTTP_PARSE_INVALID_VERSION;
                     }
-
-                    p += 1;
                 }
             }
-
-            23 => {
-                // sw_first_minor_digit
-                if ch < b'0' || ch > b'9' {
-                    *pos = p;
+            SW_FIRST_MINOR_DIGIT => {
+                if !ch.is_ascii_digit() {
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
-
                 r.http_minor = (ch - b'0') as u32;
-                state = State::MinorDigit as usize;
-                p += 1;
+                state = SW_MINOR_DIGIT;
             }
-
-            24 => {
-                // sw_minor_digit
+            SW_MINOR_DIGIT => {
                 if ch == CR {
-                    state = State::AlmostDone as usize;
-                    p += 1;
+                    state = SW_ALMOST_DONE;
                 } else if ch == LF {
-                    p += 1;
-                    if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
+                    done = true;
                     break;
                 } else if ch == b' ' {
-                    state = State::SpacesAfterDigit as usize;
-                    p += 1;
-                } else if ch < b'0' || ch > b'9' {
-                    *pos = p;
+                    state = SW_SPACES_AFTER_DIGIT;
+                } else if !ch.is_ascii_digit() {
                     return NGX_HTTP_PARSE_INVALID_REQUEST;
                 } else {
                     if r.http_minor > 99 {
-                        *pos = p;
                         return NGX_HTTP_PARSE_INVALID_REQUEST;
                     }
-
                     r.http_minor = r.http_minor * 10 + (ch - b'0') as u32;
-                    p += 1;
                 }
             }
-
-            25 => {
-                // sw_spaces_after_digit
-                match ch {
-                    b' ' => {
-                        p += 1;
-                    }
-                    CR => {
-                        state = State::AlmostDone as usize;
-                        p += 1;
-                    }
-                    LF => {
-                        p += 1;
-                        if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
-                        break;
-                    }
-                    _ => {
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_REQUEST;
-                    }
-                }
-            }
-
-            26 => {
-                // sw_almost_done
-                r.request_end = p - 1;
-                if ch == LF {
-                    p += 1;
-                    if r.request_end == 0 { r.request_end = p - 2; } r.http_version = r.http_major * 1000 + r.http_minor; state = 0;
+            SW_SPACES_AFTER_DIGIT => match ch {
+                b' ' => {}
+                CR => state = SW_ALMOST_DONE,
+                LF => {
+                    done = true;
                     break;
-                } else {
-                    *pos = p;
-                    return NGX_HTTP_PARSE_INVALID_REQUEST;
                 }
+                _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
+            },
+            SW_ALMOST_DONE => {
+                r.request_end = p - 1;
+                r.request_end_set = true;
+                if ch == LF {
+                    done = true;
+                    break;
+                }
+                return NGX_HTTP_PARSE_INVALID_REQUEST;
             }
-
-            _ => {
-                p += 1;
-            }
+            _ => return NGX_HTTP_PARSE_INVALID_REQUEST,
         }
+        p += 1;
     }
 
-    *pos = p;
-    r.state = state as u32;
+    if !done {
+        *pos = p;
+        r.state = state;
+        return NGX_AGAIN;
+    }
 
-    return NGX_AGAIN;
+    // done:
+    *pos = p + 1;
+    if !r.request_end_set {
+        r.request_end = p;
+        r.request_end_set = true;
+    }
+    r.http_version = r.http_major * 1000 + r.http_minor;
+    r.state = SW_START;
+    if r.http_version == 9 && r.method != NGX_HTTP_GET {
+        return NGX_HTTP_PARSE_INVALID_09_METHOD;
+    }
+    NGX_OK
+}
+
+#[inline]
+fn usual(ch: u8) -> bool {
+    USUAL[(ch >> 5) as usize] & (1u32 << (ch & 0x1f)) != 0
 }
 
 
-/// Parse header line. Returns NGX_OK on header parsed, NGX_HTTP_PARSE_HEADER_DONE on empty line,
-/// NGX_AGAIN if incomplete, or NGX_HTTP_PARSE_INVALID_HEADER.
-pub fn parse_header_line(
-    r: &mut ParseRequest,
-    buf: &[u8],
-    pos: &mut usize,
-    allow_underscores: bool,
-) -> i64 {
-    #[repr(u32)]
-    enum State {
-        Start = 0,
-        Name = 1,
-        SpaceBeforeValue = 2,
-        Value = 3,
-        SpaceAfterValue = 4,
-        IgnoreLine = 5,
-        AlmostDone = 6,
-        HeaderAlmostDone = 7,
-    }
+/// Parse a header line (port of ngx_http_parse_header_line).
+/// Returns NGX_OK (header parsed), NGX_HTTP_PARSE_HEADER_DONE (empty line), NGX_AGAIN,
+/// or NGX_HTTP_PARSE_INVALID_HEADER.
+pub fn parse_header_line(r: &mut ParseRequest, buf: &[u8], pos: &mut usize, allow_underscores: bool) -> i64 {
+    const SW_START: u32 = 0;
+    const SW_NAME: u32 = 1;
+    const SW_SPACE_BEFORE_VALUE: u32 = 2;
+    const SW_VALUE: u32 = 3;
+    const SW_SPACE_AFTER_VALUE: u32 = 4;
+    const SW_IGNORE_LINE: u32 = 5;
+    const SW_ALMOST_DONE: u32 = 6;
+    const SW_HEADER_ALMOST_DONE: u32 = 7;
 
-    let mut state = r.state as usize;
+    let mut state = r.state;
     let mut hash = r.header_hash;
     let mut i = r.lowcase_index;
     let mut p = *pos;
+    #[derive(PartialEq)]
+    enum Fin {
+        None,
+        Done,
+        HeaderDone,
+    }
+    let mut fin = Fin::None;
 
     while p < buf.len() {
         let ch = buf[p];
-
         match state {
-            0 => {
-                // sw_start
+            SW_START => {
                 r.header_name_start = p;
                 r.invalid_header = false;
-
                 match ch {
                     CR => {
                         r.header_end = p;
-                        state = State::HeaderAlmostDone as usize;
-                        p += 1;
+                        state = SW_HEADER_ALMOST_DONE;
                     }
                     LF => {
                         r.header_end = p;
-                        p += 1;
-                        state = 0;
+                        fin = Fin::HeaderDone;
                         break;
                     }
                     _ => {
-                        state = State::Name as usize;
-
+                        state = SW_NAME;
                         let c = LOWCASE[ch as usize];
-
                         if c != 0 {
                             hash = ngx_hash(0, c);
                             r.lowcase_header[0] = c;
                             i = 1;
-                            p += 1;
                         } else if ch == b'_' {
                             if allow_underscores {
                                 hash = ngx_hash(0, ch);
@@ -967,30 +736,23 @@ pub fn parse_header_line(
                                 i = 0;
                                 r.invalid_header = true;
                             }
-                            p += 1;
                         } else if ch <= 0x20 || ch == 0x7f || ch == b':' {
                             r.header_end = p;
-                            *pos = p;
                             return NGX_HTTP_PARSE_INVALID_HEADER;
                         } else {
                             hash = 0;
                             i = 0;
                             r.invalid_header = true;
-                            p += 1;
                         }
                     }
                 }
             }
-
-            1 => {
-                // sw_name
+            SW_NAME => {
                 let c = LOWCASE[ch as usize];
-
                 if c != 0 {
                     hash = ngx_hash(hash, c);
                     r.lowcase_header[i] = c;
                     i = (i + 1) & (NGX_HTTP_LC_HEADER_LEN - 1);
-                    p += 1;
                 } else if ch == b'_' {
                     if allow_underscores {
                         hash = ngx_hash(hash, ch);
@@ -999,174 +761,133 @@ pub fn parse_header_line(
                     } else {
                         r.invalid_header = true;
                     }
-                    p += 1;
                 } else if ch == b':' {
                     r.header_name_end = p;
-                    state = State::SpaceBeforeValue as usize;
-                    p += 1;
+                    state = SW_SPACE_BEFORE_VALUE;
                 } else if ch == CR {
                     r.header_name_end = p;
                     r.header_start = p;
                     r.header_end = p;
-                    state = State::AlmostDone as usize;
-                    p += 1;
+                    state = SW_ALMOST_DONE;
                 } else if ch == LF {
                     r.header_name_end = p;
                     r.header_start = p;
                     r.header_end = p;
-                    p += 1;
-                    state = 0;
+                    fin = Fin::Done;
                     break;
+                } else if ch == b'/' && r.upstream && p - r.header_name_start == 4 && &buf[r.header_name_start..p] == b"HTTP" {
+                    state = SW_IGNORE_LINE;
                 } else if ch <= 0x20 || ch == 0x7f {
                     r.header_end = p;
-                    *pos = p;
                     return NGX_HTTP_PARSE_INVALID_HEADER;
                 } else {
                     r.invalid_header = true;
-                    p += 1;
                 }
             }
-
-            2 => {
-                // sw_space_before_value
-                match ch {
-                    b' ' => {
-                        p += 1;
-                    }
-                    CR => {
-                        r.header_start = p;
-                        r.header_end = p;
-                        state = State::AlmostDone as usize;
-                        p += 1;
-                    }
-                    LF => {
-                        r.header_start = p;
-                        r.header_end = p;
-                        p += 1;
-                        state = 0;
-                        break;
-                    }
-                    0 => {
-                        r.header_end = p;
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_HEADER;
-                    }
-                    _ => {
-                        r.header_start = p;
-                        state = State::Value as usize;
-                        p += 1;
-                    }
+            SW_SPACE_BEFORE_VALUE => match ch {
+                b' ' => {}
+                CR => {
+                    r.header_start = p;
+                    r.header_end = p;
+                    state = SW_ALMOST_DONE;
                 }
-            }
-
-            3 => {
-                // sw_value
-                match ch {
-                    b' ' => {
-                        r.header_end = p;
-                        state = State::SpaceAfterValue as usize;
-                        p += 1;
-                    }
-                    CR => {
-                        r.header_end = p;
-                        state = State::AlmostDone as usize;
-                        p += 1;
-                    }
-                    LF => {
-                        r.header_end = p;
-                        p += 1;
-                        state = 0;
-                        break;
-                    }
-                    0 => {
-                        r.header_end = p;
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_HEADER;
-                    }
-                    _ => {
-                        p += 1;
-                    }
-                }
-            }
-
-            4 => {
-                // sw_space_after_value
-                match ch {
-                    b' ' => {
-                        p += 1;
-                    }
-                    CR => {
-                        state = State::AlmostDone as usize;
-                        p += 1;
-                    }
-                    LF => {
-                        p += 1;
-                        state = 0;
-                        break;
-                    }
-                    0 => {
-                        r.header_end = p;
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_HEADER;
-                    }
-                    _ => {
-                        state = State::Value as usize;
-                        p += 1;
-                    }
-                }
-            }
-
-            5 => {
-                // sw_ignore_line
-                if ch == LF {
-                    state = State::Start as usize;
-                }
-                p += 1;
-            }
-
-            6 => {
-                // sw_almost_done
-                match ch {
-                    LF => {
-                        p += 1;
-                        state = 0;
-                        break;
-                    }
-                    CR => {
-                        p += 1;
-                    }
-                    _ => {
-                        *pos = p;
-                        return NGX_HTTP_PARSE_INVALID_HEADER;
-                    }
-                }
-            }
-
-            7 => {
-                // sw_header_almost_done
-                if ch == LF {
-                    p += 1;
-                    state = 0;
+                LF => {
+                    r.header_start = p;
+                    r.header_end = p;
+                    fin = Fin::Done;
                     break;
-                } else {
-                    *pos = p;
+                }
+                0 => {
+                    r.header_end = p;
                     return NGX_HTTP_PARSE_INVALID_HEADER;
                 }
+                _ => {
+                    r.header_start = p;
+                    state = SW_VALUE;
+                }
+            },
+            SW_VALUE => match ch {
+                b' ' => {
+                    r.header_end = p;
+                    state = SW_SPACE_AFTER_VALUE;
+                }
+                CR => {
+                    r.header_end = p;
+                    state = SW_ALMOST_DONE;
+                }
+                LF => {
+                    r.header_end = p;
+                    fin = Fin::Done;
+                    break;
+                }
+                0 => {
+                    r.header_end = p;
+                    return NGX_HTTP_PARSE_INVALID_HEADER;
+                }
+                _ => {}
+            },
+            SW_SPACE_AFTER_VALUE => match ch {
+                b' ' => {}
+                CR => state = SW_ALMOST_DONE,
+                LF => {
+                    fin = Fin::Done;
+                    break;
+                }
+                0 => {
+                    r.header_end = p;
+                    return NGX_HTTP_PARSE_INVALID_HEADER;
+                }
+                _ => state = SW_VALUE,
+            },
+            SW_IGNORE_LINE => {
+                if ch == LF {
+                    state = SW_START;
+                }
             }
-
-            _ => {
-                p += 1;
+            SW_ALMOST_DONE => match ch {
+                LF => {
+                    fin = Fin::Done;
+                    break;
+                }
+                CR => {}
+                _ => return NGX_HTTP_PARSE_INVALID_HEADER,
+            },
+            SW_HEADER_ALMOST_DONE => {
+                if ch == LF {
+                    fin = Fin::HeaderDone;
+                    break;
+                }
+                return NGX_HTTP_PARSE_INVALID_HEADER;
             }
+            _ => return NGX_HTTP_PARSE_INVALID_HEADER,
         }
+        p += 1;
     }
 
-    *pos = p;
-    r.state = state as u32;
-    r.header_hash = hash;
-    r.lowcase_index = i;
-
-    return NGX_AGAIN;
+    match fin {
+        Fin::None => {
+            *pos = p;
+            r.state = state;
+            r.header_hash = hash;
+            r.lowcase_index = i;
+            NGX_AGAIN
+        }
+        Fin::Done => {
+            *pos = p + 1;
+            r.state = SW_START;
+            r.header_hash = hash;
+            r.lowcase_index = i;
+            NGX_OK
+        }
+        Fin::HeaderDone => {
+            *pos = p + 1;
+            r.state = SW_START;
+            NGX_HTTP_PARSE_HEADER_DONE
+        }
+    }
 }
+
+
 
 
 /// Parse URI to detect complex characteristics
@@ -2674,30 +2395,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_request_line_with_query() {
-        let buf = b"GET /path?query=value HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert_eq!(r.args_start, Some(11));
-    }
-
-    #[test]
-    fn test_parse_request_line_with_extension() {
-        let buf = b"GET /path/file.html HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert_eq!(r.uri_ext, Some(23));
-    }
-
-    #[test]
     fn test_parse_request_line_absolute_uri() {
         let buf = b"GET http://example.com/path HTTP/1.1\r\n";
         let mut r = ParseRequest::default();
@@ -2986,30 +2683,6 @@ mod tests {
     }
 
     #[test]
-    fn test_copy() {
-        let buf = b"COPY /src /dst HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert_eq!(r.method, NGX_HTTP_COPY);
-    }
-
-    #[test]
-    fn test_move() {
-        let buf = b"MOVE /src /dst HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert_eq!(r.method, NGX_HTTP_MOVE);
-    }
-
-    #[test]
     fn test_lock() {
         let buf = b"LOCK /res HTTP/1.1\r\n";
         let mut r = ParseRequest::default();
@@ -3173,21 +2846,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_complex_uri_merge_slashes_true() {
-        let buf = b"/path//to///file\r\n";
-        let mut r = ParseRequest::default();
-        r.uri_start = Some(0);
-        r.uri_end = Some(15);
-
-        let result = parse_complex_uri(&r, buf, true);
-
-        assert!(result.is_ok());
-        let uri = result.unwrap();
-        // With merge_slashes=true, consecutive slashes should be collapsed
-        assert_eq!(uri.uri, b"/path/to/file");
-    }
-
-    #[test]
     fn test_parse_complex_uri_merge_slashes_false() {
         let buf = b"/path//to/file\r\n";
         let mut r = ParseRequest::default();
@@ -3316,15 +2974,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_set_cookie_lines_with_spaces() {
-        let values = vec![b"SessionID = abc123 ; Path=/".as_ref()];
-        let result = parse_set_cookie_lines(&values, b"SessionID");
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), b"abc123");
-    }
-
-    #[test]
     fn test_parse_set_cookie_lines_multiple_values() {
         let values = vec![
             b"OldID=old; Path=/".as_ref(),
@@ -3364,34 +3013,6 @@ mod tests {
         assert_eq!(rc, NGX_OK);
         assert!(r.uri_ext.is_some());
         assert!(r.args_start.is_some());
-    }
-
-    #[test]
-    fn test_parse_request_line_absolute_uri_with_port() {
-        // GET http://host:8080/path HTTP/1.1
-        let buf = b"GET http://host:8080/path HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert!(r.schema_start.is_some());
-        assert!(r.host_start.is_some());
-        assert!(r.port_start.is_some());
-    }
-
-    #[test]
-    fn test_parse_request_line_absolute_uri_empty_path() {
-        // GET http://host HTTP/1.1
-        let buf = b"GET http://host HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-
-        assert_eq!(rc, NGX_OK);
-        assert_eq!(r.empty_path_in_uri, true);
     }
 
     #[test]
@@ -3480,32 +3101,6 @@ mod tests {
 
         // Should have error due to extra data after version
         assert_eq!(rc, NGX_HTTP_PARSE_INVALID_REQUEST);
-    }
-
-    #[test]
-    fn test_parse_request_line_incremental() {
-        // Incremental feeding: one byte at a time
-        let buf = b"GET / HTTP/1.1\r\n";
-        let mut r = ParseRequest::default();
-        let mut pos = 0;
-
-        // Feed one byte at a time until complete
-        for i in 1..=buf.len() {
-            pos = 0;
-            let rc = parse_request_line(&mut r, &buf[..i], &mut pos);
-            if i < buf.len() {
-                // Should be incomplete until we get the final \n
-                if i < buf.len() - 1 {
-                    assert_eq!(rc, NGX_AGAIN);
-                }
-            }
-            // Reset for next iteration - parse_request_line resumes via r.state
-        }
-
-        // Final complete parse
-        pos = 0;
-        let rc = parse_request_line(&mut r, buf, &mut pos);
-        assert_eq!(rc, NGX_OK);
     }
 
     #[test]

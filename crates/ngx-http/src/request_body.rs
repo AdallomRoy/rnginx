@@ -1,0 +1,587 @@
+//! Client request body reading and discarding (ngx_http_request_body.c).
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use ngx_core::buf::{Buf, BufData, BufFile, Chain};
+use ngx_core::log::*;
+use ngx_core::rc::*;
+use ngx_core::ngx_log_error;
+
+use crate::parse::{self, ChunkedState};
+use crate::request::*;
+use crate::*;
+
+fn new_body() -> RequestBody {
+    RequestBody { temp_file: None, bufs: Chain::new(), buf: None, rest: -1, received: 0, chunked: None, filter_need_buffering: false, last_sent: false, last_saved: false, in_memory: Vec::new() }
+}
+
+/// ngx_http_test_expect: send "100 Continue" if requested.
+pub async fn test_expect(r: &R) -> i64 {
+    if r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() {
+        return NGX_OK;
+    }
+    let expect = match &r.headers_in.borrow().expect {
+        Some(e) => e.value.borrow().clone(),
+        None => return NGX_OK,
+    };
+    r.expect_tested.set(true);
+    if !ngx_core::string::eq_ignore_case(&expect, b"100-continue") {
+        return NGX_OK;
+    }
+    http_debug!(r, "send 100 Continue");
+    match r.connection.send_all(b"HTTP/1.1 100 Continue\r\n\r\n").await {
+        Ok(()) => NGX_OK,
+        Err(_) => {
+            r.connection.error.set(true);
+            NGX_ERROR
+        }
+    }
+}
+
+/// ngx_http_read_early_body (client_body_early_read)
+pub async fn read_early_body(r: &R) -> i64 {
+    let cscf = r.cscf();
+    let preds = cscf.borrow().client_body_early_read.get().clone();
+    if preds.is_none() {
+        return NGX_OK;
+    }
+    {
+        let hin = r.headers_in.borrow();
+        if hin.content_length_n <= 0 && !hin.chunked {
+            return NGX_OK;
+        }
+    }
+    if crate::script::test_predicates(r, &preds) != NGX_OK {
+        return NGX_OK;
+    }
+    let rc = read_client_request_body(r).await;
+    if rc >= NGX_HTTP_SPECIAL_RESPONSE {
+        crate::request_rt::finalize_request(r, rc).await;
+        return rc;
+    }
+    NGX_OK
+}
+
+/// ngx_http_read_client_request_body: read the whole body (buffered).
+pub async fn read_client_request_body(r: &R) -> i64 {
+    if !r.is_main() || r.request_body.borrow().is_some() || r.discard_body.get() {
+        r.request_body_no_buffering.set(false);
+        return NGX_OK;
+    }
+    if test_expect(r).await != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    let rb = Rc::new(RefCell::new(new_body()));
+    *r.request_body.borrow_mut() = Some(rb.clone());
+    {
+        let hin = r.headers_in.borrow();
+        if hin.content_length_n < 0 && !hin.chunked {
+            r.request_body_no_buffering.set(false);
+            return NGX_OK;
+        }
+    }
+    let hc = r.http_connection.clone();
+    // preread bytes already in the header buffer
+    let preread: Vec<u8> = {
+        let b = hc.buffer.borrow();
+        b.unread().to_vec()
+    };
+    if !preread.is_empty() {
+        http_debug!(r, "http client request body preread {}", preread.len());
+        let mut chain = Chain::new();
+        chain.push_back(Buf::from_vec(preread.clone()));
+        let (rc, consumed) = request_body_filter(r, &rb, chain).await;
+        {
+            let mut b = hc.buffer.borrow_mut();
+            b.pos += consumed;
+        }
+        r.request_length.set(r.request_length.get() + consumed as i64);
+        if rc != NGX_OK {
+            return rc;
+        }
+    } else {
+        let (rc, _) = request_body_filter(r, &rb, Chain::new()).await;
+        if rc != NGX_OK {
+            return rc;
+        }
+    }
+    {
+        let b = rb.borrow();
+        if b.rest == 0 && b.last_saved {
+            drop(b);
+            r.request_body_no_buffering.set(false);
+            return finish_body(r, &rb);
+        }
+        if b.rest < 0 {
+            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "negative request body rest");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+    let rc = do_read_client_request_body(r, &rb).await;
+    if rc != NGX_OK {
+        return rc;
+    }
+    r.request_body_no_buffering.set(false);
+    finish_body(r, &rb)
+}
+
+fn finish_body(_r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
+    let mut b = rb.borrow_mut();
+    if b.temp_file.is_none() {
+        let mut data = Vec::new();
+        for buf in b.bufs.iter() {
+            if let BufData::Memory(v) = &buf.data {
+                data.extend_from_slice(&v[buf.pos..buf.last]);
+            }
+        }
+        b.in_memory = data;
+    }
+    NGX_OK
+}
+
+async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
+    let c = r.connection.clone();
+    http_debug!(r, "http read client request body");
+    let clcf = r.clcf();
+    let (buf_size, timeout) = {
+        let cl = clcf.borrow();
+        (*cl.client_body_buffer_size, *cl.client_body_timeout)
+    };
+    loop {
+        let rest = rb.borrow().rest;
+        if rest == 0 {
+            break;
+        }
+        let chunked = r.headers_in.borrow().chunked;
+        let mut size = buf_size;
+        if !chunked && rest < size as i64 {
+            size = rest as usize;
+        }
+        if size == 0 {
+            size = 1;
+        }
+        let mut buf = vec![0u8; size];
+        let n = match tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)).await {
+            Err(_) => {
+                c.timedout.set(true);
+                return NGX_HTTP_REQUEST_TIME_OUT;
+            }
+            Ok(Ok(0)) => {
+                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+                c.error.set(true);
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            Ok(Err(_)) => {
+                c.error.set(true);
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            Ok(Ok(n)) => n,
+        };
+        http_debug!(r, "http client request body recv {}", n);
+        buf.truncate(n);
+        r.request_length.set(r.request_length.get() + n as i64);
+        let mut chain = Chain::new();
+        chain.push_back(Buf::from_vec(buf));
+        let (rc, consumed) = request_body_filter(r, rb, chain).await;
+        if rc != NGX_OK {
+            return rc;
+        }
+        let _ = consumed;
+        http_debug!(r, "http client request body rest {}", rb.borrow().rest);
+    }
+    let b = rb.borrow();
+    if b.rest == 0 && b.last_saved {
+        return NGX_OK;
+    }
+    drop(b);
+    // flush filter
+    let (rc, _) = request_body_filter(r, rb, Chain::new()).await;
+    rc
+}
+
+/// ngx_http_request_body_filter: returns (rc, bytes consumed from input).
+/// Leftover bytes (pipelined requests) are appended back to the connection buffer.
+async fn request_body_filter(r: &R, rb: &Rc<RefCell<RequestBody>>, input: Chain) -> (i64, usize) {
+    let chunked = r.headers_in.borrow().chunked;
+    let data: Vec<u8> = input.iter().filter_map(|b| if let BufData::Memory(v) = &b.data { Some(&v[b.pos..b.last]) } else { None }).flatten().copied().collect();
+    let total = data.len();
+    let mut out = Chain::new();
+    let mut consumed = 0usize;
+    if !chunked {
+        let mut b = rb.borrow_mut();
+        if b.rest == -1 {
+            http_debug!(r, "http request body content length filter");
+            b.rest = r.headers_in.borrow().content_length_n;
+            if b.rest == 0 {
+                let mut lb = Buf::special();
+                lb.last_buf = true;
+                out.push_back(lb);
+            }
+        }
+        if b.rest > 0 && total > 0 {
+            let take = (b.rest as usize).min(total);
+            let mut nb = Buf::from_vec(data[..take].to_vec());
+            nb.temporary = true;
+            nb.flush = r.request_body_no_buffering.get();
+            b.rest -= take as i64;
+            consumed = take;
+            if b.rest == 0 {
+                nb.last_buf = true;
+            }
+            out.push_back(nb);
+        }
+    } else {
+        let mut b = rb.borrow_mut();
+        if b.rest == -1 {
+            http_debug!(r, "http request body chunked filter");
+            b.chunked = Some(ChunkedState { state: 0, size: 0, length: 0 });
+            r.headers_in.borrow_mut().content_length_n = 0;
+            let cscf = r.cscf();
+            b.rest = cscf.borrow().large_client_header_buffers.size as i64;
+        }
+        let mut pos = 0usize;
+        let mut cur: Option<Vec<u8>> = None;
+        loop {
+            let mut st = b.chunked.take().unwrap();
+            let rc = parse::parse_chunked(&mut st, &data, &mut pos, false);
+            if rc == NGX_OK {
+                let clcf = r.clcf();
+                let max = *clcf.borrow().client_max_body_size;
+                let cl = r.headers_in.borrow().content_length_n;
+                if max != 0 && max - cl < st.size {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "client intended to send too large chunked body: {}+{} bytes", cl, st.size);
+                    r.lingering_close.set(true);
+                    b.chunked = Some(st);
+                    return (NGX_HTTP_REQUEST_ENTITY_TOO_LARGE, pos);
+                }
+                let avail = total - pos;
+                let take = (st.size as usize).min(avail);
+                let piece = &data[pos..pos + take];
+                cur.get_or_insert_with(Vec::new).extend_from_slice(piece);
+                pos += take;
+                st.size -= take as i64;
+                r.headers_in.borrow_mut().content_length_n += take as i64;
+                b.chunked = Some(st);
+                continue;
+            }
+            if rc == NGX_DONE {
+                b.rest = 0;
+                b.chunked = Some(st);
+                if let Some(v) = cur.take() {
+                    let mut nb = Buf::from_vec(v);
+                    nb.temporary = true;
+                    nb.flush = r.request_body_no_buffering.get();
+                    out.push_back(nb);
+                }
+                let mut lb = Buf::special();
+                lb.last_buf = true;
+                out.push_back(lb);
+                break;
+            }
+            if rc == NGX_AGAIN {
+                let cscf = r.cscf();
+                b.rest = st.length.max(cscf.borrow().large_client_header_buffers.size as i64);
+                b.chunked = Some(st);
+                if let Some(v) = cur.take() {
+                    let mut nb = Buf::from_vec(v);
+                    nb.temporary = true;
+                    nb.flush = r.request_body_no_buffering.get();
+                    out.push_back(nb);
+                }
+                break;
+            }
+            b.chunked = Some(st);
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "client sent invalid chunked body");
+            return (NGX_HTTP_BAD_REQUEST, pos);
+        }
+        consumed = pos;
+    }
+    // leftover (pipelined) bytes go back to the header buffer
+    if consumed < total {
+        let hc = r.http_connection.clone();
+        let mut hb = hc.buffer.borrow_mut();
+        let extra = &data[consumed..];
+        // The input was taken from the buffer already; only append when it came from the socket
+        if hb.pos == hb.last {
+            hb.pos = 0;
+            hb.last = 0;
+            if hb.data.len() < extra.len() {
+                hb.data.resize(extra.len(), 0);
+            }
+            hb.data[..extra.len()].copy_from_slice(extra);
+            hb.last = extra.len();
+        }
+    }
+    let f = top_request_body_filter();
+    let rc = f(r.clone(), out).await;
+    (rc, consumed)
+}
+
+/// ngx_http_request_body_save_filter
+pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
+    let rb = match r.request_body.borrow().clone() {
+        Some(rb) => rb,
+        None => return NGX_OK,
+    };
+    let mut b = rb.borrow_mut();
+    for buf in input.into_iter() {
+        if buf.last_buf {
+            if b.last_saved {
+                ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "duplicate last buf in save filter");
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            b.last_saved = true;
+        }
+        b.bufs.push_back(buf);
+    }
+    if r.request_body_no_buffering.get() {
+        return NGX_OK;
+    }
+    let clcf = r.clcf();
+    let buffer_size = *clcf.borrow().client_body_buffer_size;
+    let in_mem: usize = b.bufs.iter().map(|x| x.buf_size() as usize).sum();
+    if b.rest > 0 {
+        if (in_mem >= buffer_size && !b.bufs.is_empty()) || r.request_body_in_file_only.get() {
+            if write_request_body(&r, &mut b) != NGX_OK {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+        }
+        return NGX_OK;
+    }
+    if !b.last_saved {
+        return NGX_OK;
+    }
+    if b.temp_file.is_some() || r.request_body_in_file_only.get() {
+        if write_request_body(&r, &mut b) != NGX_OK {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        let tf = b.temp_file.as_ref().unwrap();
+        if tf.offset != 0 {
+            let file = Rc::new(BufFile { fd: tf.fd, name: tf.name.clone(), directio: false });
+            let mut fb = Buf::file(file, 0, tf.offset);
+            fb.in_file = true;
+            b.bufs.clear();
+            b.bufs.push_back(fb);
+        }
+    }
+    NGX_OK
+}
+
+fn write_request_body(r: &R, b: &mut RequestBody) -> i64 {
+    http_debug!(r, "http write client request body, bufs {}", b.bufs.len());
+    if b.temp_file.is_none() {
+        let clcf = r.clcf();
+        let path = clcf.borrow().client_body_temp_path.get().clone();
+        let access = if r.request_body_file_group_access.get() { 0o660 } else { 0 };
+        match ngx_core::buf::create_temp_file(&path, r.request_body_in_persistent_file.get(), r.request_body_in_clean_file.get(), access, &r.connection.log) {
+            Ok(tf) => {
+                let level = r.request_body_file_log_level.get();
+                if level != 0 {
+                    ngx_log_error!(level, r.connection.log, None, "a client request body is buffered to a temporary file {}", ngx_core::string::B(&tf.name));
+                }
+                b.temp_file = Some(tf);
+            }
+            Err(_) => return NGX_ERROR,
+        }
+    }
+    let mem: Chain = b.bufs.drain(..).filter(|x| x.in_memory()).collect();
+    if mem.is_empty() {
+        return NGX_OK;
+    }
+    let tf = b.temp_file.as_mut().unwrap();
+    match ngx_core::buf::write_chain_to_temp_file(tf, &mem, &r.connection.log) {
+        Ok(_) => NGX_OK,
+        Err(_) => NGX_ERROR,
+    }
+}
+
+/// ngx_http_discard_request_body: start discarding; may complete later.
+pub async fn discard_request_body(r: &R) -> i64 {
+    if !r.is_main() || r.discard_body.get() || r.request_body.borrow().is_some() {
+        return NGX_OK;
+    }
+    if r.stream.borrow().is_some() {
+        return NGX_OK;
+    }
+    if test_expect(r).await != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    http_debug!(r, "http set discard body");
+    {
+        let hin = r.headers_in.borrow();
+        if hin.content_length_n <= 0 && !hin.chunked {
+            return NGX_OK;
+        }
+    }
+    let hc = r.http_connection.clone();
+    let preread: Vec<u8> = hc.buffer.borrow().unread().to_vec();
+    if !preread.is_empty() || r.headers_in.borrow().chunked {
+        let (rc, consumed) = discard_request_body_filter(r, &preread);
+        hc.buffer.borrow_mut().pos += consumed;
+        if rc != NGX_OK {
+            return rc;
+        }
+        if r.headers_in.borrow().content_length_n == 0 {
+            return NGX_OK;
+        }
+    }
+    let rc = read_discarded_request_body(r, false).await;
+    if rc == NGX_OK {
+        r.lingering_close.set(false);
+        return NGX_OK;
+    }
+    if rc >= NGX_HTTP_SPECIAL_RESPONSE {
+        return rc;
+    }
+    r.discard_body.set(true);
+    NGX_OK
+}
+
+/// Reads and discards; `wait` = block for data (with lingering limits) or only drain what is ready.
+async fn read_discarded_request_body(r: &R, wait: bool) -> i64 {
+    http_debug!(r, "http read discarded body");
+    let c = r.connection.clone();
+    let mut buffer = vec![0u8; NGX_HTTP_DISCARD_BUFFER_SIZE];
+    loop {
+        let cl = r.headers_in.borrow().content_length_n;
+        if cl == 0 {
+            break;
+        }
+        let size = (cl as usize).min(NGX_HTTP_DISCARD_BUFFER_SIZE);
+        let n = if wait {
+            let clcf = r.clcf();
+            let ltimeout = *clcf.borrow().lingering_timeout;
+            let mut t = ltimeout;
+            if r.lingering_time.get() != 0 {
+                let rem = r.lingering_time.get() - ngx_core::times::time();
+                if rem <= 0 {
+                    r.discard_body.set(false);
+                    r.lingering_close.set(false);
+                    return NGX_ERROR;
+                }
+                t = t.min(rem as u64 * 1000);
+            }
+            match tokio::time::timeout(Duration::from_millis(t), c.recv(&mut buffer[..size])).await {
+                Err(_) => {
+                    c.timedout.set(true);
+                    c.error.set(true);
+                    return NGX_ERROR;
+                }
+                Ok(Err(_)) => {
+                    c.error.set(true);
+                    return NGX_OK;
+                }
+                Ok(Ok(0)) => return NGX_OK,
+                Ok(Ok(n)) => n,
+            }
+        } else {
+            match c.try_recv_raw(&mut buffer[..size]) {
+                Ok(0) => return NGX_OK,
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        return NGX_AGAIN;
+                    }
+                    c.error.set(true);
+                    return NGX_OK;
+                }
+            }
+        };
+        let (rc, consumed) = discard_request_body_filter(r, &buffer[..n]);
+        if rc != NGX_OK {
+            return rc;
+        }
+        if consumed < n {
+            // pipelined data after the body
+            let hc = r.http_connection.clone();
+            let mut hb = hc.buffer.borrow_mut();
+            hb.pos = 0;
+            hb.last = 0;
+            let extra = &buffer[consumed..n];
+            if hb.data.len() < extra.len() {
+                hb.data.resize(extra.len(), 0);
+            }
+            hb.data[..extra.len()].copy_from_slice(extra);
+            hb.last = extra.len();
+        }
+    }
+    NGX_OK
+}
+
+/// Finish discarding the body before keepalive (ngx_http_discarded_request_body_handler).
+pub async fn discard_remaining_body(r: &R) -> Result<(), ()> {
+    let clcf = r.clcf();
+    let ltime = *clcf.borrow().lingering_time;
+    if r.lingering_time.get() == 0 {
+        r.lingering_time.set(ngx_core::times::time() + (ltime / 1000) as i64);
+    }
+    let rc = read_discarded_request_body(r, true).await;
+    if rc == NGX_OK {
+        r.discard_body.set(false);
+        r.discard_body_done.set(true);
+        r.lingering_close.set(false);
+        r.lingering_time.set(0);
+        return Ok(());
+    }
+    r.connection.error.set(true);
+    Err(())
+}
+
+/// ngx_http_discard_request_body_filter: returns (rc, consumed)
+fn discard_request_body_filter(r: &R, data: &[u8]) -> (i64, usize) {
+    if r.headers_in.borrow().chunked {
+        let rb = {
+            let mut slot = r.request_body.borrow_mut();
+            if slot.is_none() {
+                let mut b = new_body();
+                b.chunked = Some(ChunkedState { state: 0, size: 0, length: 0 });
+                *slot = Some(Rc::new(RefCell::new(b)));
+            }
+            slot.clone().unwrap()
+        };
+        let mut b = rb.borrow_mut();
+        let mut pos = 0usize;
+        loop {
+            let mut st = b.chunked.take().unwrap_or(ChunkedState { state: 0, size: 0, length: 0 });
+            let rc = parse::parse_chunked(&mut st, data, &mut pos, false);
+            if rc == NGX_OK {
+                let avail = data.len() - pos;
+                if avail as i64 > st.size {
+                    pos += st.size as usize;
+                    st.size = 0;
+                } else {
+                    st.size -= avail as i64;
+                    pos = data.len();
+                }
+                b.chunked = Some(st);
+                continue;
+            }
+            if rc == NGX_DONE {
+                r.headers_in.borrow_mut().content_length_n = 0;
+                b.chunked = Some(st);
+                return (NGX_OK, pos);
+            }
+            if rc == NGX_AGAIN {
+                let cscf = r.cscf();
+                r.headers_in.borrow_mut().content_length_n = st.length.max(cscf.borrow().large_client_header_buffers.size as i64);
+                b.chunked = Some(st);
+                return (NGX_OK, pos);
+            }
+            b.chunked = Some(st);
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "client sent invalid chunked body");
+            return (NGX_HTTP_BAD_REQUEST, pos);
+        }
+    }
+    let mut hin = r.headers_in.borrow_mut();
+    let size = data.len() as i64;
+    if size > hin.content_length_n {
+        let consumed = hin.content_length_n as usize;
+        hin.content_length_n = 0;
+        (NGX_OK, consumed)
+    } else {
+        hin.content_length_n -= size;
+        (NGX_OK, data.len())
+    }
+}

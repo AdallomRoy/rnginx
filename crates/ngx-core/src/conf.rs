@@ -1049,6 +1049,19 @@ macro_rules! cmd {
     };
 }
 
+/// Like `cmd!` but the setter is an arbitrary path/expression (fn(&Conf, &Command, &mut T) -> ConfResult).
+#[macro_export]
+macro_rules! cmdp {
+    ($name:expr, $ty:expr, $level:expr, $conf:ty, $field:ident, $setter:expr) => {
+        $crate::conf::Command::new($name, $ty, $level, |cf, cmd, conf| {
+            let conf = conf.expect("conf");
+            let cell = $crate::conf::conf_cell::<$conf>(&conf);
+            let mut c = cell.borrow_mut();
+            ($setter)(cf, cmd, &mut c.$field)
+        })
+    };
+}
+
 /// Macro for a custom handler command.
 #[macro_export]
 macro_rules! cmd_fn {

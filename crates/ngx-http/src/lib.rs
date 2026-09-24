@@ -14,7 +14,10 @@ use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_error};
 
 pub mod core;
+pub mod core_rt;
 pub mod request;
+pub mod request_rt;
+pub mod request_headers;
 pub mod parse;
 pub mod variables;
 pub mod script;
@@ -478,8 +481,9 @@ fn merge_servers(cf: &mut Conf, cmcf: &Rc<RefCell<core::CoreMainConf>>, d: &Http
                 break;
             }
             let clcf = core::loc_conf_from_ctx(&sctx);
-            let locations = clcf.borrow().locations.clone();
+            let locations = std::mem::take(&mut clcf.borrow_mut().locations);
             rv = merge_locations(cf, &locations, sctx.loc.as_ref().unwrap(), f, mi);
+            clcf.borrow_mut().locations = locations;
             if rv.is_err() {
                 break;
             }
@@ -498,8 +502,10 @@ fn merge_locations(cf: &mut Conf, locations: &[core::LocationQueue], loc_conf: &
         let prev = loc_conf.borrow()[mi].clone().expect("loc conf");
         let conf = lctx.borrow()[mi].clone().expect("loc conf");
         f(cf, &prev, &conf)?;
-        let sub = clcf.borrow().locations.clone();
-        merge_locations(cf, &sub, &lctx, f, mi)?;
+        let sub = std::mem::take(&mut clcf.borrow_mut().locations);
+        let r = merge_locations(cf, &sub, &lctx, f, mi);
+        clcf.borrow_mut().locations = sub;
+        r?;
     }
     cf.ctx = saved;
     Ok(())
