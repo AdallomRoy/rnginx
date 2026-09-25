@@ -38,6 +38,10 @@ pub struct NgxHttpProxyLocConf {
     pub pass_request_body: Val<bool>,
     /// proxy_set_body: overrides the request body sent upstream (complex value).
     pub set_body: Option<crate::script::ComplexValue>,
+    /// proxy_set_header entries: (name, complex value). Empty value drops the
+    /// header. Overrides same-name client headers. Matches C's list-of-entries
+    /// semantic though we keep it simple (no upstream defaults inheritance).
+    pub set_headers: Vec<(Vec<u8>, crate::script::ComplexValue)>,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -49,6 +53,7 @@ impl Default for NgxHttpProxyLocConf {
             pass_request_headers: Val::unset(),
             pass_request_body: Val::unset(),
             set_body: None,
+            set_headers: Vec::new(),
         }
     }
 }
@@ -71,6 +76,9 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.pass_request_body.merge(&p.pass_request_body, true);
     if c.set_body.is_none() {
         c.set_body = p.set_body.clone();
+    }
+    if c.set_headers.is_empty() {
+        c.set_headers = p.set_headers.clone();
     }
     Ok(())
 }
@@ -161,10 +169,15 @@ fn proxy_read_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dy
     Ok(())
 }
 
-fn proxy_set_header_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn proxy_set_header_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     if cf.args.len() < 3 {
-        return Err(msg("invalid number of arguments"));
+        return Err(cf.emerg(format_args!("invalid number of arguments")));
     }
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    let name = args[1].clone();
+    let cv = crate::script::compile_complex_value(cf, &args[2], 0)?;
+    cell.borrow_mut().set_headers.push((name, cv));
     Ok(())
 }
 
@@ -314,16 +327,23 @@ async fn proxy_handler(r: R) -> i64 {
         uri_path
     };
 
-    // Read pass_request_headers/body and set_body configs.
-    let (pass_headers_flag, pass_body_flag, set_body_cv) = {
+    // Read pass_request_headers/body, set_body, and set_headers configs.
+    let (pass_headers_flag, pass_body_flag, set_body_cv, set_headers_list) = {
         let lcf3 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
         let b = lcf3.borrow();
         (
             b.pass_request_headers.get_or(true),
             b.pass_request_body.get_or(true),
             b.set_body.clone(),
+            b.set_headers.clone(),
         )
     };
+    // Names that proxy_set_header overrides (case-insensitive). Also used to
+    // suppress the corresponding client header from the pass-through loop.
+    let overridden_names: Vec<Vec<u8>> = set_headers_list
+        .iter()
+        .map(|(n, _)| n.to_ascii_lowercase())
+        .collect();
 
     // Collect request body (if any) into a Vec. proxy_set_body wins over the
     // client body when configured; otherwise honour proxy_pass_request_body.
@@ -375,7 +395,7 @@ async fn proxy_handler(r: R) -> i64 {
     // is a subset: pass everything except headers that would conflict with the
     // synthesized request line, hop-by-hop headers, and things upstream shouldn't
     // trust from the client.
-    let forward_headers: String = if !pass_headers_flag { String::new() } else {
+    let mut forward_headers: String = if !pass_headers_flag { String::new() } else {
         let hin = r.headers_in.borrow();
         let mut s = String::new();
         for h in hin.headers.iter() {
@@ -389,6 +409,9 @@ async fn proxy_handler(r: R) -> i64 {
             {
                 continue;
             }
+            if overridden_names.iter().any(|n| n.as_slice() == lc.as_slice()) {
+                continue; // proxy_set_header will emit (or drop) this one
+            }
             let key = match std::str::from_utf8(&h.key) { Ok(s) => s, Err(_) => continue };
             let val = h.value.borrow();
             let val = match std::str::from_utf8(&val) { Ok(s) => s, Err(_) => continue };
@@ -399,6 +422,19 @@ async fn proxy_handler(r: R) -> i64 {
         }
         s
     };
+    // Append proxy_set_header emissions (skip empty-valued ones to drop them).
+    for (name, cv) in &set_headers_list {
+        let val = crate::script::complex_value(&r, cv).unwrap_or_default();
+        if val.is_empty() {
+            continue;
+        }
+        if let (Ok(k), Ok(v)) = (std::str::from_utf8(name), std::str::from_utf8(&val)) {
+            forward_headers.push_str(k);
+            forward_headers.push_str(": ");
+            forward_headers.push_str(v);
+            forward_headers.push_str("\r\n");
+        }
+    }
 
     let request = format!(
         "{} {} HTTP/1.0\r\n\
@@ -534,6 +570,11 @@ async fn proxy_handler(r: R) -> i64 {
     // addition_filter / sub_filter / gzip clear ho.content_length_n during
     // their header pass.
     let upstream_content_length = r.headers_out.borrow().content_length_n;
+
+    // Proxied responses (uncacheable) must skip the not_modified filter —
+    // the backend is responsible for handling If-Modified-Since / If-None-Match.
+    // C sets this to `!u->cacheable` in ngx_http_upstream_send_response.
+    r.disable_not_modified.set(true);
 
     // proxy_intercept_errors: hand off to error_page instead of forwarding the
     // upstream body — but only if the location actually has an error_page
@@ -718,7 +759,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_connect_timeout_handler),
         cmd_fn!("proxy_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_send_timeout_handler),
         cmd_fn!("proxy_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_read_timeout_handler),
-        cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, proxy_set_header_handler),
+        cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_set_header_handler),
         // Additional proxy directives that tests need
         cmd_fn!("proxy_temp_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
