@@ -54,7 +54,11 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     Ok(())
 }
 
-fn mp4_directive(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn mp4_directive(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // Match C: install as the location's content handler only when 'mp4;' is set.
+    use crate::core::CoreLocConf;
+    let loc_conf = crate::get_loc_conf::<CoreLocConf>(cf, crate::core::ctx_index());
+    loc_conf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(mp4_handler(r))));
     Ok(())
 }
 
@@ -119,8 +123,9 @@ fn mp4_start_key_frame_cmd(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn An
     Ok(())
 }
 
-fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(mp4_handler(r))));
+fn init(_cf: &mut Conf) -> ConfResult {
+    // mp4 handler is only installed by the `mp4;` directive (see mp4_directive above),
+    // matching nginx C behaviour. Do not register a global content-phase handler here.
     Ok(())
 }
 

@@ -27,12 +27,15 @@ pub fn flv_module() -> ModuleDef {
     http_module_def("ngx_http_flv_module", def, commands)
 }
 
-fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(flv_handler(r))));
+fn init(_cf: &mut Conf) -> ConfResult {
+    // Handler is installed by the `flv;` directive, not globally, per C.
     Ok(())
 }
 
-fn flv_directive(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn std::any::Any>>) -> ConfResult {
+fn flv_directive(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn std::any::Any>>) -> ConfResult {
+    use crate::core::CoreLocConf;
+    let loc_conf = crate::get_loc_conf::<CoreLocConf>(cf, crate::core::ctx_index());
+    loc_conf.borrow_mut().handler = Some(std::rc::Rc::new(|r| Box::pin(flv_handler(r))));
     Ok(())
 }
 
