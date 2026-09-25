@@ -38,6 +38,30 @@ The temp dir is `/tmp/nginx-test-XXXX`; `error.log` there has the debug log
 You can also run the binary manually: write a small nginx.conf, then
 `target/debug/nginx -p /tmp/x -c nginx.conf -g 'daemon off; master_process off;'`.
 
+
+## Stubs and how to replace one
+`crates/ngx-http/src/stubs.rs` is GENERATED (`python3 scripts/gen_stubs.py`, from the C command
+tables) and contains a parse-only stub for every http module that is not ported yet, in
+nginx module order. `crate::modules()` in `lib.rs` lists all modules in C order and picks either
+the real module or `stubs::<name>_module()`. To port module X:
+1. create `crates/ngx-http/src/x.rs` exposing `pub fn x_module() -> ModuleDef` (see templates);
+2. add `pub mod x;` to lib.rs and change the single line in `modules()` from
+   `stubs::x_module()` to `x::x_module()`;
+3. do not delete the stub function from stubs.rs (keeps merges conflict-free); if the stub file
+   also carries a hook the core calls (`upstream_log_info`, `ssl_*`), redirect the hook body to
+   your module with a minimal edit.
+Keep the module ORDER in `modules()` exactly as in `nginx-c/objs/ngx_modules.c` — filter order
+and phase handler order depend on it.
+
+## Salvageable earlier work (reverted because it did not compile against master)
+`git show 20274cd^:crates/ngx-http/src/<file>` has older ports of rewrite.rs (1430 lines),
+range_filter.rs, slice_filter.rs, gzip_filter.rs, gunzip_filter.rs, gzip_static.rs, userid.rs,
+mirror.rs, http_ssl.rs, headers_filter.rs. Branches with unmerged work: `git log master..<branch>`
+for worktree-agent-a89ccda4fa66d5d56 (sub/addition/charset), a0a909a3af9385c9c (mail skeleton),
+ab45da8217a19c939 (stream skeleton), abffe8c0e9f1b41a4 (ssl skeleton), a2e6d701dff99d8ec
+(upstream/proxy conf parsing), 93ff569 (map/geo/split_clients/referer/browser). Use them as
+reference material only if they help; correctness against the C source and the tests is what counts.
+
 ## Where things are
 - Directive tables: `Command::new(..)` / `cmd_fn!`. Handlers get `Option<Rc<dyn Any>>` = the
   module's conf slot at the directive's ConfLevel; use `conf_rc::<T>(conf.as_ref().unwrap())`.

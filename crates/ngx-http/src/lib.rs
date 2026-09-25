@@ -31,19 +31,15 @@ pub mod request_body;
 pub mod output;
 pub mod chunked_filter;
 pub mod not_modified_filter;
-pub mod range_filter;
-pub mod slice_filter;
 pub mod headers_filter;
 pub mod postpone_filter;
 pub mod copy_filter;
-pub mod autoindex;
-pub mod try_files;
 pub mod rewrite;
-pub mod map;
-pub mod geo;
-pub mod split_clients;
-pub mod referer;
-pub mod browser;
+pub mod access;
+pub mod auth_basic;
+pub mod auth_request;
+pub mod realip;
+pub mod stub_status;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -524,39 +520,83 @@ pub fn http_module() -> ModuleDef {
     m
 }
 
-/// All http modules in nginx order (ngx_modules.c).
+/// All http modules in nginx order (nginx-c/objs/ngx_modules.c).
 pub fn modules() -> Vec<ModuleDef> {
-    let mut v = vec![http_module(), core::core_module(), log::log_module()];
-    v.push(map::map_module());
-    v.push(geo::geo_module());
-    v.push(split_clients::split_clients_module());
-    v.push(referer::referer_module());
-    v.push(browser::browser_module());
-    v.extend(stubs::early_modules());
-    v.push(static_module::static_module());
-    v.extend(stubs::handler_modules_a());
-    v.push(autoindex::autoindex_module());
-    v.push(index::index_module());
-    v.extend(stubs::handler_modules_b());
-    v.push(try_files::try_files_module());
-    v.extend(stubs::handler_modules_c());
-    v.push(rewrite::rewrite_module());
-    v.extend(stubs::handler_modules_d());
-    v.push(write_filter::write_filter_module());
-    v.push(header_filter::header_filter_module());
-    v.push(chunked_filter::chunked_filter_module());
-    v.extend(stubs::filter_modules_a());
-    v.push(range_filter::range_header_filter_module());
-    v.extend(stubs::filter_modules_b());
-    v.push(postpone_filter::postpone_filter_module());
-    v.extend(stubs::filter_modules_c());
-    v.push(headers_filter::headers_filter_module());
-    v.push(copy_filter::copy_filter_module());
-    v.push(range_filter::range_body_filter_module());
-    v.push(slice_filter::slice_filter_module());
-    v.push(not_modified_filter::not_modified_filter_module());
-    v.extend(stubs::filter_modules_d());
-    v
+    vec![
+        http_module(),
+        core::core_module(),
+        log::log_module(),
+        stubs::upstream_module(),
+        stubs::v2_module(),
+        stubs::v3_module(),
+        static_module::static_module(),
+        stubs::gzip_static_module(),
+        stubs::dav_module(),
+        stubs::autoindex_module(),
+        index::index_module(),
+        stubs::random_index_module(),
+        stubs::mirror_module(),
+        stubs::try_files_module(),
+        auth_request::auth_request_module(),
+        auth_basic::auth_basic_module(),
+        access::access_module(),
+        stubs::limit_conn_module(),
+        stubs::limit_req_module(),
+        realip::realip_module(),
+        stubs::json_module(),
+        stubs::geo_module(),
+        stubs::geoip_module(),
+        stubs::map_module(),
+        stubs::split_clients_module(),
+        stubs::referer_module(),
+        rewrite::rewrite_module(),
+        stubs::ssl_module(),
+        stubs::proxy_module(),
+        stubs::fastcgi_module(),
+        stubs::uwsgi_module(),
+        stubs::scgi_module(),
+        stubs::grpc_module(),
+        stubs::proxy_v2_module(),
+        stubs::tunnel_module(),
+        stubs::perl_module(),
+        stubs::memcached_module(),
+        stubs::empty_gif_module(),
+        stubs::browser_module(),
+        stubs::secure_link_module(),
+        stubs::degradation_module(),
+        stubs::flv_module(),
+        stubs::mp4_module(),
+        stubs::upstream_hash_module(),
+        stubs::upstream_ip_hash_module(),
+        stubs::upstream_least_conn_module(),
+        stubs::upstream_least_time_module(),
+        stubs::upstream_random_module(),
+        stubs::upstream_keepalive_module(),
+        stubs::upstream_zone_module(),
+        stubs::upstream_sticky_module(),
+        stub_status::stub_status_module(),
+        write_filter::write_filter_module(),
+        header_filter::header_filter_module(),
+        chunked_filter::chunked_filter_module(),
+        stubs::v2_filter_module(),
+        stubs::v3_filter_module(),
+        stubs::range_header_filter_module(),
+        stubs::gzip_filter_module(),
+        postpone_filter::postpone_filter_module(),
+        stubs::ssi_filter_module(),
+        stubs::charset_filter_module(),
+        stubs::xslt_filter_module(),
+        stubs::image_filter_module(),
+        stubs::sub_filter_module(),
+        stubs::addition_filter_module(),
+        stubs::gunzip_filter_module(),
+        stubs::userid_filter_module(),
+        headers_filter::headers_filter_module(),
+        copy_filter::copy_filter_module(),
+        stubs::range_body_filter_module(),
+        not_modified_filter::not_modified_filter_module(),
+        stubs::slice_filter_module(),
+    ]
 }
 
 /// Log an http-level configuration error helper.

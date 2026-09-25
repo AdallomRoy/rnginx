@@ -42,6 +42,7 @@ pub mod connection;
 pub mod process;
 pub mod event;
 pub mod ssl;
+pub mod stubs;
 pub mod regex;
 pub mod rc;
 pub mod proxy_protocol;

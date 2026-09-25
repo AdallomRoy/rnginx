@@ -176,7 +176,20 @@ fn process_options(cycle: &mut Cycle, o: &Options) -> Result<(), ()> {
 }
 
 fn modules() -> Vec<ModuleDef> {
-    let mut v = vec![core_module(), errlog_module(), conf_module(), ngx_core::ssl::openssl_module(), ngx_core::regex::regex_module(), ngx_core::event::events_module(), ngx_core::event::event_core_module()];
+    let mut v = vec![
+        core_module(),
+        errlog_module(),
+        conf_module(),
+        ngx_core::ssl::openssl_module(),
+        ngx_core::stubs::openssl_cache_module(),
+        ngx_core::stubs::quic_module(),
+        ngx_core::stubs::quic_bpf_module(),
+        ngx_core::regex::regex_module(),
+        ngx_core::event::events_module(),
+        ngx_core::event::event_core_module(),
+        ngx_core::stubs::epoll_module(),
+        ngx_core::stubs::thread_pool_module(),
+    ];
     v.extend(ngx_http::modules());
     v.extend(ngx_mail::modules());
     v.extend(ngx_stream::modules());
