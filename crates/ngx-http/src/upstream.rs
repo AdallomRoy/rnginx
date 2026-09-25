@@ -13,9 +13,11 @@ use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 use ngx_core::string::B;
 use ngx_core::cmd_fn;
+use ngx_core::conf::{NGX_CONF_BLOCK, NGX_CONF_TAKE1, NGX_CONF_1MORE};
 
 use crate::core::*;
 use crate::request::*;
+use crate::variables::{GetHandler, SetHandler, VarDef};
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_UPS_CONF, HttpModuleDef, http_module_def};
 
 // ============================================================================
@@ -306,54 +308,171 @@ fn init_main_conf(_cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult {
 // DIRECTIVE HANDLERS
 // ============================================================================
 
-fn upstream_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: Parse upstream { ... } block and register in main conf
-    // cf.args[0] = "upstream"
-    // cf.args[1] = upstream name
-    Ok(())
+fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // upstream name { ... } block handler
+    if cf.args.len() < 2 {
+        return Err(msg("no upstream name specified"));
+    }
+
+    let name = cf.args[1].clone();
+
+    // Parse the upstream { ... } block
+    // Set command type to UPS_CONF so directives inside the block know we're in upstream context
+    let saved_ct = cf.cmd_type;
+    cf.cmd_type = NGX_HTTP_UPS_CONF;
+
+    let rv = cf.parse_block();
+
+    cf.cmd_type = saved_ct;
+
+    // TODO: Register the upstream in main conf
+    // For now, just accept any upstream block
+
+    rv
 }
 
-fn server_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // server address [parameters]
+    if cf.args.len() < 2 {
+        return Err(msg("no server address specified"));
+    }
+
     // TODO: Parse server directive parameters
     // address, weight=, max_conns=, max_fails=, fail_timeout=, backup, down, resolve, service=, slow_start=
+    // cf.args[1] = address (host:port or unix socket path)
+    // cf.args[2+] = parameters like "weight=5" "backup" "down" etc
+
     Ok(())
 }
 
-fn keepalive_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: Parse keepalive count
+fn resolver_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    if cf.args.len() < 2 {
+        return Err(msg("no resolver address specified"));
+    }
+    // TODO: Parse resolver directive
     Ok(())
 }
 
-fn keepalive_timeout_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn resolver_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    if cf.args.len() < 2 {
+        return Err(msg("no timeout value specified"));
+    }
     // TODO: Parse timeout
     Ok(())
 }
 
-fn keepalive_time_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: Parse timeout
-    Ok(())
+// ============================================================================
+// VARIABLE GETTERS
+// ============================================================================
+
+fn upstream_addr_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // TODO: Return upstream server addresses
+    // Format: comma-separated list of addrs
+    v.not_found = true; NGX_OK
 }
 
-fn keepalive_requests_handler(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: Parse count
-    Ok(())
+fn upstream_status_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // TODO: Return upstream response status codes
+    // Format: comma-separated list of HTTP status codes (one per try)
+    v.not_found = true; NGX_OK
+}
+
+fn upstream_connect_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // TODO: Return upstream connection time in milliseconds (first try)
+    v.not_found = true; NGX_OK
+}
+
+fn upstream_header_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // TODO: Return time to receive upstream response headers
+    v.not_found = true; NGX_OK
+}
+
+fn upstream_response_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // TODO: Return total upstream response time
+    v.not_found = true; NGX_OK
 }
 
 // ============================================================================
 // MODULE REGISTRATION
 // ============================================================================
 
+fn preconfiguration(cf: &mut Conf) -> ConfResult {
+    // Register upstream variables
+    let vars = vec![
+        VarDef {
+            name: "upstream_addr",
+            get: Some(upstream_addr_variable),
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_status",
+            get: Some(upstream_status_variable),
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_connect_time",
+            get: Some(upstream_connect_time_variable),
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_header_time",
+            get: Some(upstream_header_time_variable),
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_response_time",
+            get: Some(upstream_response_time_variable),
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_response_length",
+            get: None,
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_bytes_received",
+            get: None,
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+        VarDef {
+            name: "upstream_bytes_sent",
+            get: None,
+            set: None,
+            data: 0,
+            flags: 0,
+        },
+    ];
+
+    crate::variables::add_variables(cf, &vars)?;
+
+    // TODO: Add upstream_http_* and upstream_trailer_* variables with getters
+    Ok(())
+}
+
 pub fn upstream_module() -> ModuleDef {
     let commands = vec![
-        cmd_fn!("upstream", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK, ConfLevel::Main, upstream_handler),
-        cmd_fn!("server", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1, ConfLevel::None, server_handler),
-        cmd_fn!("keepalive", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1, ConfLevel::None, keepalive_handler),
-        cmd_fn!("keepalive_timeout", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE12, ConfLevel::None, keepalive_timeout_handler),
-        cmd_fn!("keepalive_time", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1, ConfLevel::None, keepalive_time_handler),
-        cmd_fn!("keepalive_requests", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1, ConfLevel::None, keepalive_requests_handler),
+        cmd_fn!("upstream", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE1, ConfLevel::Main, upstream_handler),
+        cmd_fn!("server", NGX_HTTP_UPS_CONF | NGX_CONF_1MORE, ConfLevel::None, server_handler),
+        cmd_fn!("resolver", NGX_HTTP_UPS_CONF | NGX_CONF_1MORE, ConfLevel::None, resolver_handler),
+        cmd_fn!("resolver_timeout", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE1, ConfLevel::None, resolver_timeout_handler),
     ];
 
     let def = HttpModuleDef {
+        preconfiguration: Some(preconfiguration),
         create_main_conf: Some(create_main_conf),
         init_main_conf: Some(init_main_conf),
         ..Default::default()

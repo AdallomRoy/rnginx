@@ -50,6 +50,11 @@ pub mod browser;
 pub mod ssi_filter;
 pub mod geo;
 pub mod range_filter;
+pub mod proxy;
+pub mod upstream;
+pub mod upstream_keepalive;
+pub mod upstream_round_robin;
+pub mod event_pipe;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -545,7 +550,7 @@ pub fn modules() -> Vec<ModuleDef> {
         http_module(),
         core::core_module(),
         log::log_module(),
-        stubs::upstream_module(),
+        upstream::upstream_module(),
         stubs::v2_module(),
         stubs::v3_module(),
         static_module::static_module(),
@@ -570,7 +575,7 @@ pub fn modules() -> Vec<ModuleDef> {
         referer::referer_module(),
         rewrite::rewrite_module(),
         stubs::ssl_module(),
-        stubs::proxy_module(),
+        proxy::proxy_module(),
         stubs::fastcgi_module(),
         stubs::uwsgi_module(),
         stubs::scgi_module(),
@@ -590,7 +595,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::upstream_least_conn_module(),
         stubs::upstream_least_time_module(),
         stubs::upstream_random_module(),
-        stubs::upstream_keepalive_module(),
+        upstream_keepalive::upstream_keepalive_module(),
         stubs::upstream_zone_module(),
         stubs::upstream_sticky_module(),
         stub_status::stub_status_module(),
