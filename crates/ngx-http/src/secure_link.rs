@@ -103,57 +103,59 @@ fn var_secure_link(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
 
     // Check for legacy secure_link_secret mode
     if !conf.secret.get().is_empty() {
-        // Legacy mode: parse /md5/url format
-        let unparsed_uri = &r.unparsed_uri.borrow();
-
-        // Find first / after the first character
-        let mut parts = Vec::new();
-        let mut current = 0;
-        for i in 1..unparsed_uri.len() {
-            if unparsed_uri[i] == b'/' {
-                parts.push((current, i));
-                current = i + 1;
+        // Match C ngx_http_secure_link_old_variable: URI /PREFIX/HASH/URL,
+        // hash = md5(URL + secret) hex-encoded.
+        let unparsed_uri = r.unparsed_uri.borrow();
+        // First byte is '/' — find the next '/' (end of prefix segment,
+        // start of hash) then the one after (end of hash, start of URL).
+        let after_first = match unparsed_uri.iter().skip(1).position(|&b| b == b'/') {
+            Some(p) => p + 1 + 1, // skip past prefix's trailing '/'
+            None => {
+                v.not_found = true;
+                return NGX_OK;
             }
+        };
+        let hash_start = after_first;
+        let after_hash = match unparsed_uri[hash_start..].iter().position(|&b| b == b'/') {
+            Some(p) => hash_start + p,
+            None => {
+                v.not_found = true;
+                return NGX_OK;
+            }
+        };
+        let hash_end = after_hash;
+        let url_start = after_hash + 1;
+        if hash_end - hash_start != 32 || url_start >= unparsed_uri.len() {
+            v.not_found = true;
+            return NGX_OK;
         }
+        let hash_part = &unparsed_uri[hash_start..hash_end];
+        let url_part = &unparsed_uri[url_start..];
 
-        if parts.len() >= 2 {
-            let md5_start = parts[0].1 + 1;
-            let md5_end = parts[1].0;
-            let url_start = parts[1].1;
+        use md5::Md5;
+        let mut hasher = Md5::new();
+        hasher.update(url_part);
+        hasher.update(conf.secret.get());
+        let digest = hasher.finalize();
 
-            if md5_end - md5_start == 32 && url_start < unparsed_uri.len() {
-                let md5_part = &unparsed_uri[md5_start..md5_end];
-                let url_part = &unparsed_uri[url_start..];
-
-                // Compute MD5
-                use md5::Md5;
-                let mut hasher = Md5::new();
-                hasher.update(url_part);
-                hasher.update(conf.secret.get());
-                let digest = hasher.finalize();
-
-                // Compare
-                let mut match_result = true;
-                for (i, byte) in digest.iter().enumerate() {
-                    let hex_str = format!("{:02x}", byte);
-                    if i * 2 + 1 < md5_part.len() {
-                        let hex_bytes = hex_str.as_bytes();
-                        if hex_bytes[0] != md5_part[i * 2] || hex_bytes[1] != md5_part[i * 2 + 1] {
-                            match_result = false;
-                            break;
-                        }
-                    }
-                }
-
-                if match_result {
-                    v.data = url_part.to_vec();
-                    v.valid = true;
+        // Constant-time compare with hex-encoded hash.
+        let mut mismatch = 0u8;
+        for (i, byte) in digest.iter().enumerate() {
+            let n = match hex_pair(&hash_part[i * 2..i * 2 + 2]) {
+                Some(v) => v,
+                None => {
+                    v.not_found = true;
                     return NGX_OK;
                 }
-            }
+            };
+            mismatch |= n ^ byte;
         }
-
-        v.not_found = true;
+        if mismatch != 0 {
+            v.not_found = true;
+            return NGX_OK;
+        }
+        v.data = url_part.to_vec();
+        v.valid = true;
         return NGX_OK;
     }
 
@@ -344,6 +346,18 @@ fn base64url_decode(input: &[u8]) -> Option<Vec<u8>> {
     }
 
     Some(result)
+}
+
+fn hex_pair(pair: &[u8]) -> Option<u8> {
+    fn one(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    Some((one(pair[0])? << 4) | one(pair[1])?)
 }
 
 #[cfg(test)]
