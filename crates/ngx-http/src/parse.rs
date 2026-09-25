@@ -1071,6 +1071,7 @@ pub fn parse_complex_uri(
     let mut args_buf: Vec<u8> = Vec::new();
     let mut uri_ext: Option<usize> = None;
     let mut args_set = false;
+    let mut reprocess_ch = false;
 
     // Handle empty_path_in_uri: prepend /
     if r.empty_path_in_uri {
@@ -1108,7 +1109,6 @@ pub fn parse_complex_uri(
                             while p < uri_end {
                                 // Scan for # to mark end of args
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1157,7 +1157,6 @@ pub fn parse_complex_uri(
                             args_set = true;
                             while p < uri_end {
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1201,13 +1200,9 @@ pub fn parse_complex_uri(
                             state = SW_QUOTED;
                         }
                         b'?' => {
-                            if u.len() > 0 {
-                                u.pop(); // Remove the dot
-                            }
                             args_set = true;
                             while p < uri_end {
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1216,9 +1211,6 @@ pub fn parse_complex_uri(
                             break;
                         }
                         b'#' => {
-                            if u.len() > 0 {
-                                u.pop(); // Remove the dot
-                            }
                             break;
                         }
                         b'+' => {
@@ -1257,17 +1249,14 @@ pub fn parse_complex_uri(
                                 args_set = true;
                                 while p < uri_end {
                                     if buf[p] == b'#' {
-                                        args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                         break;
                                     }
                                     args_buf.push(buf[p]);
                                     p += 1;
                                 }
-                                break;
-                            } else if ch == b'#' {
-                                break;
                             }
-                            state = SW_SLASH;
+                            state = SW_USUAL;  // Set state so trailing handler doesn't apply
+                            break;  // Exit while loop
                         }
                         b'%' => {
                             quoted_state = state;
@@ -1330,19 +1319,27 @@ pub fn parse_complex_uri(
                 } else if decodedch == b'+' {
                     // Track plus_in_uri (caller will use this if needed)
                     state = quoted_state;
+                    ch = decodedch;
+                    reprocess_ch = true;
                 } else {
                     state = quoted_state;
+                    ch = decodedch;
+                    reprocess_ch = true;
                 }
             }
 
             _ => {}
         }
 
-        if p >= buf.len() {
-            break;
+        if !reprocess_ch {
+            if p >= buf.len() {
+                break;
+            }
+            ch = buf[p];
+            p += 1;
+        } else {
+            reprocess_ch = false;
         }
-        ch = buf[p];
-        p += 1;
     }
 
     // Handle trailing incomplete states
