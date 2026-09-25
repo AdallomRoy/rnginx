@@ -200,11 +200,12 @@ async fn limit_req_handler(r: R) -> i64 {
         let decay = elapsed_ms * zone.rate_num / zone.rate_per;
         let excess = node.excess.saturating_sub(decay);
 
-        // Check if would be rejected BEFORE counting this request
-        // Capacity = (burst + rate_num) requests in excess units (where 1 request = 1000)
-        // Reject if excess + 1000 (this request) would exceed capacity
-        let capacity = (limit.burst + zone.rate_num) * 1000;
-        if excess + 1000 > capacity {
+        // Nginx C: compute new excess including this request, reject if > burst.
+        //   excess = lr->excess - ctx->rate * |ms| / 1000 + 1000;
+        //   if (excess > limit->burst) return NGX_BUSY;
+        let new_excess = excess + 1000;
+        // burst is in requests; compare against thousandths.
+        if new_excess > limit.burst * 1000 {
             // Reject - DON'T update state
             drop(map); // Release borrow before logging
 
@@ -212,7 +213,7 @@ async fn limit_req_handler(r: R) -> i64 {
             ngx_log_error!(*conf.limit_log_level.get() as u32, r.connection.log, None,
                 "limiting requests{}, excess: {:.3} by zone \"{}\"",
                 dry_run_str,
-                excess as f64 / 1000.0,
+                new_excess as f64 / 1000.0,
                 B(&limit.zone_name)
             );
 
@@ -226,7 +227,6 @@ async fn limit_req_handler(r: R) -> i64 {
         }
 
         // Check if delay would be needed (after counting this request)
-        let new_excess = excess + 1000;
         if new_excess > rate_per_second && !limit.delay {
             // nodelay=true but this request would need delay - reject without updating state
             drop(map);
