@@ -14,21 +14,21 @@ Read CONVENTIONS.md first. This file explains how work is organised.
    - If you need a change in core (`ngx-core`, `core.rs`, `request*.rs`, `variables.rs`,
      filters), keep it small and additive (new fields/functions), never rename or remove
      existing APIs. Describe every core change in your final report.
-3. `cargo build --release` must succeed with no errors before you commit. Warnings are
+3. `cargo build` must succeed with no errors before you commit. Warnings are
    tolerated but do not add new `#[allow]` blanket attributes.
 4. Run the relevant nginx-tests and report the exact pass/fail numbers. Never claim a test
    passes without running it.
 5. Commit your work on your branch with a descriptive message (git add the specific files).
 
-## Build and test
+## Build and test (nginx-tests and nginx-c are NOT in git: always use /home/ubuntu/rnginx/nginx-tests and /home/ubuntu/rnginx/nginx-c)
 ```
 cd <your worktree>
-cargo build --release 2>&1 | tail -20
-cd nginx-tests
-TEST_NGINX_BINARY=<your worktree>/target/release/nginx prove -v foo.t          # one test, verbose
-TEST_NGINX_BINARY=<your worktree>/target/release/nginx prove foo.t bar.t       # several
-TEST_NGINX_BINARY=<your worktree>/target/release/nginx TEST_NGINX_LEAVE=1 prove foo.t   # keep temp dir
-TEST_NGINX_BINARY=<your worktree>/target/release/nginx TEST_NGINX_CATLOG=1 prove -v foo.t  # dump error.log
+cargo build 2>&1 | tail -20            # debug profile (opt-level 1) is fastest for iteration; release only for final runs
+cd /home/ubuntu/rnginx/nginx-tests
+TEST_NGINX_BINARY=<your worktree>/target/debug/nginx prove -v foo.t          # one test, verbose
+TEST_NGINX_BINARY=<your worktree>/target/debug/nginx prove foo.t bar.t       # several
+TEST_NGINX_BINARY=<your worktree>/target/debug/nginx TEST_NGINX_LEAVE=1 prove foo.t   # keep temp dir
+TEST_NGINX_BINARY=<your worktree>/target/debug/nginx TEST_NGINX_CATLOG=1 prove -v foo.t  # dump error.log
 ```
 Expected behaviour: run the same test against the C reference binary
 `TEST_NGINX_BINARY=/home/ubuntu/rnginx/nginx-c/objs/nginx prove -v foo.t` and diff.
@@ -36,7 +36,7 @@ The temp dir is `/tmp/nginx-test-XXXX`; `error.log` there has the debug log
 (tests run nginx with `error_log ... debug`).
 
 You can also run the binary manually: write a small nginx.conf, then
-`target/release/nginx -p /tmp/x -c nginx.conf -g 'daemon off; master_process off;'`.
+`target/debug/nginx -p /tmp/x -c nginx.conf -g 'daemon off; master_process off;'`.
 
 ## Where things are
 - Directive tables: `Command::new(..)` / `cmd_fn!`. Handlers get `Option<Rc<dyn Any>>` = the
