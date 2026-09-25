@@ -13,7 +13,7 @@ use ngx_core::radix_tree::RadixTree;
 use ngx_core::rc::*;
 use ngx_core::string::B;
 
-use crate::variables::{add_variable, NGX_HTTP_VAR_CHANGEABLE};
+use crate::variables::{add_variable, get_variable_index, NGX_HTTP_VAR_CHANGEABLE};
 use crate::{request::*, *};
 
 crate::http_module_index!("ngx_http_geo_module");
@@ -33,6 +33,7 @@ pub struct GeoCtx {
     pub ranges: Vec<GeoRange>,
     pub proxies: Vec<u32>, // Trusted proxy addresses
     pub proxy_recursive: bool,
+    pub source_var_index: Option<usize>, // Index of the source variable (if specified)
 }
 
 pub struct GeoLocConf {
@@ -64,7 +65,22 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     v.data.clear();
 
     // Get the IP address to look up
-    let ip_u32 = if !ctx.proxies.is_empty() {
+    let ip_u32 = if let Some(src_var_idx) = ctx.source_var_index {
+        // Use the value from the source variable (as an IP string)
+        let vars = r.variables.borrow();
+        if let Some(var_val) = vars.get(src_var_idx) {
+            let ip_str = match std::str::from_utf8(&var_val.data) {
+                Ok(s) => s,
+                Err(_) => return NGX_OK,
+            };
+            match parse_ipv4_to_u32(ip_str.as_bytes()) {
+                Some(ip) => ip,
+                None => return NGX_OK,
+            }
+        } else {
+            return NGX_OK;
+        }
+    } else if !ctx.proxies.is_empty() {
         // Get the IP from X-Forwarded-For header if trusted proxy
         get_forwarded_for_ip(r, ctx)
     } else {
@@ -221,7 +237,21 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         return Err(msg("requires at least 1 argument"));
     }
 
-    let var_arg = &args[args.len() - 1];
+    // Parse arguments:
+    // geo $var_to_set { ... }    - uses remote address
+    // geo $source $var_to_set { ... } - uses source variable
+    let (source_var_index, var_arg) = if args.len() == 3 {
+        // Two arguments: geo $source $var_to_set { ... }
+        if args[1].is_empty() || args[1][0] != b'$' {
+            return Err(msg("invalid source variable name"));
+        }
+        let src_idx = get_variable_index(cf, &args[1][1..])?;
+        (Some(src_idx), &args[2])
+    } else {
+        // One argument: geo $var_to_set { ... } - use remote address
+        (None, &args[1])
+    };
+
     if var_arg.is_empty() || var_arg[0] != b'$' {
         return Err(msg("invalid variable name"));
     }
@@ -236,6 +266,7 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         ranges: Vec::new(),
         proxies: Vec::new(),
         proxy_recursive: false,
+        source_var_index,
     }));
 
     var.get_handler.set(Some(geo_variable));
@@ -293,7 +324,12 @@ fn geo_include_file(cf: &mut Conf, filename: &[u8], ctx: &mut GeoCtx) -> ConfRes
         }
 
         let ip_part = parts[0];
-        let value_part = parts[1];
+        let mut value_part = parts[1];
+
+        // Strip trailing semicolon from value if present
+        if value_part.ends_with(';') {
+            value_part = &value_part[..value_part.len()-1];
+        }
 
         let ip_bytes = ip_part.as_bytes();
         let value_bytes = value_part.as_bytes();

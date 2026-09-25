@@ -8,12 +8,13 @@ use ngx_core::conf::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 
+use crate::script::ComplexValue;
 use crate::*;
 
 crate::http_module_index!("ngx_http_charset_filter_module");
 
 pub struct CharsetLocConf {
-    pub charset: Val<Vec<u8>>,
+    pub charset: Val<ComplexValue>,
     pub source_charset: Val<Vec<u8>>,
     pub override_charset: Val<bool>,
 }
@@ -29,9 +30,14 @@ fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let p = conf_cell::<CharsetLocConf>(prev).borrow();
     let mut c = conf_cell::<CharsetLocConf>(conf).borrow_mut();
-    c.charset.merge(&p.charset, b"utf-8".to_vec());
+
+    // charset default is handled in header filter
+    if !c.charset.is_set() && p.charset.is_set() {
+        c.charset = Val::set(p.charset.get().clone());
+    }
+
     c.source_charset.merge(&p.source_charset, Vec::new());
-    c.override_charset.merge(&p.override_charset, true);
+    c.override_charset.merge(&p.override_charset, false);
     Ok(())
 }
 
@@ -43,13 +49,22 @@ pub fn charset_filter_module() -> ModuleDef {
         ..Default::default()
     };
     let commands = vec![
-        ngx_core::cmd!("charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, CharsetLocConf, charset, set_str),
+        ngx_core::cmd_fn!("charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, set_charset),
         ngx_core::cmd!("source_charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, CharsetLocConf, source_charset, set_str),
         ngx_core::cmd!("override_charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG, ConfLevel::Loc, CharsetLocConf, override_charset, set_flag),
         ngx_core::cmd_fn!("charset_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, stub_types),
         ngx_core::cmd_fn!("charset_map", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE2, ConfLevel::Main, stub_charset_map),
     ];
     http_module_def("ngx_http_charset_filter_module", def, commands)
+}
+
+fn set_charset(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<CharsetLocConf>(conf.as_ref().unwrap());
+    let arg = cf.args[1].clone();
+
+    let charset_val = crate::script::compile_complex_value(cf, &arg, 0)?;
+    cell.borrow_mut().charset = Val::set(charset_val);
+    Ok(())
 }
 
 fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
@@ -77,20 +92,43 @@ async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
     let conf = r.loc_conf::<CharsetLocConf>(ctx_index());
     let conf_ref = conf.borrow();
 
-    // If charset is specified, add it to Content-Type
-    if !conf_ref.charset.get().is_empty() {
-        let charset = conf_ref.charset.get().clone();
+    // Only set charset if explicitly configured
+    if let Some(charset_val) = conf_ref.charset.as_option() {
+        let charset_bytes = match crate::script::complex_value(&r, charset_val) {
+            Ok(b) => {
+                if b.is_empty() {
+                    drop(conf_ref);
+                    return next(r).await;
+                }
+                b
+            }
+            Err(_) => {
+                drop(conf_ref);
+                return next(r).await;
+            }
+        };
+
         drop(conf_ref);
 
-        // Note: Full charset parameter addition requires deeper integration
-        // with Content-Type header management, which is complex
-        r.clear_content_length();
+        // Set the charset in headers_out
+        // This will be used when headers are serialized
+        {
+            let mut headers_out = r.headers_out.borrow_mut();
+            if headers_out.charset.is_empty() {
+                // Set the charset
+                headers_out.charset = charset_bytes;
+            }
+        }
+    } else {
+        drop(conf_ref);
     }
+
+    r.clear_content_length();
 
     next(r).await
 }
 
-async fn charset_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
+async fn charset_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     if input.is_empty() {
         return next(r, input).await;
     }
@@ -99,55 +137,12 @@ async fn charset_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     let conf_ref = conf.borrow();
 
     // If source_charset is specified, try to convert
-    if !conf_ref.source_charset.get().is_empty() && !conf_ref.charset.get().is_empty() {
-        let source = conf_ref.source_charset.get().clone();
-        let target = conf_ref.charset.get().clone();
-        drop(conf_ref);
-
-        // For now, just pass through (full charset conversion is complex)
-        // In a real implementation, we'd use encoding libraries
-        return next(r, input).await;
+    if !conf_ref.source_charset.get().is_empty() {
+        // TODO: implement charset recoding
+        // For now, just pass through
     }
 
+    drop(conf_ref);
     next(r, input).await
 }
 
-// Helper trait for checking if slice contains a pattern (case-insensitive)
-trait CaseInsensitiveContains {
-    fn windows_1251_contains(&self, pattern: &[u8]) -> bool;
-}
-
-impl CaseInsensitiveContains for [u8] {
-    fn windows_1251_contains(&self, pattern: &[u8]) -> bool {
-        if pattern.is_empty() || self.len() < pattern.len() {
-            return false;
-        }
-
-        for i in 0..=self.len() - pattern.len() {
-            let mut match_found = true;
-            for j in 0..pattern.len() {
-                if self[i + j].to_ascii_lowercase() != pattern[j].to_ascii_lowercase() {
-                    match_found = false;
-                    break;
-                }
-            }
-            if match_found {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_case_insensitive_contains() {
-        let haystack = b"Content-Type: text/html; charset=utf-8";
-        assert!(haystack.windows_1251_contains(b"charset"));
-        assert!(haystack.windows_1251_contains(b"CHARSET"));
-        assert!(!haystack.windows_1251_contains(b"foobar"));
-    }
-}

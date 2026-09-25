@@ -44,7 +44,7 @@ pub enum Code {
     Rewrite(RewriteRule),
     Set { var_idx: usize, value: ComplexValue },
     Return { status: i64, text: Option<ComplexValue> },
-    Break,
+    Break { is_break_cycle: bool }, // true = break, false = last
     If { condition: IfCondition, codes: Vec<Code> },
 }
 
@@ -420,7 +420,7 @@ fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
 
     // If "last" flag, add terminator code
     if flags.last {
-        cell.borrow_mut().codes.push(Code::Break);
+        cell.borrow_mut().codes.push(Code::Break { is_break_cycle: flags.break_cycle });
     }
 
     Ok(())
@@ -499,7 +499,7 @@ fn set_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
 /// ngx_http_rewrite_break directive handler
 fn break_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<RewriteConf>(conf.as_ref().unwrap());
-    cell.borrow_mut().codes.push(Code::Break);
+    cell.borrow_mut().codes.push(Code::Break { is_break_cycle: true });
     Ok(())
 }
 
@@ -642,6 +642,7 @@ async fn rewrite_handler(r: R) -> i64 {
             Code::Rewrite(rule) => {
                 // Test regex against current URI
                 let uri = r.uri.borrow().clone();
+                let old_uri = uri.clone();
 
                 // Try to match the regex
                 let captures = match rule.regex.exec(&uri) {
@@ -807,6 +808,7 @@ async fn rewrite_handler(r: R) -> i64 {
                 *r.uri.borrow_mut() = rewritten_uri.clone();
                 set_exten(&r);
                 *r.args.borrow_mut() = rewritten_args;
+                r.uri_changed.set(true);
 
                 // Check for "last" or "break" flags
                 if rule.flags.break_cycle {
@@ -862,8 +864,10 @@ async fn rewrite_handler(r: R) -> i64 {
                 return rc;
             }
 
-            Code::Break => {
+            Code::Break { is_break_cycle } => {
                 // Stop processing rules
+                // Both break and last stop rule processing
+                // Location re-evaluation is handled by uri_changed flag in post_rewrite
                 break;
             }
 
@@ -975,6 +979,7 @@ async fn rewrite_handler(r: R) -> i64 {
                                 *r.uri.borrow_mut() = rewritten_uri.clone();
                                 set_exten(&r);
                                 *r.args.borrow_mut() = rewritten_args;
+                                r.uri_changed.set(true);
 
                                 if rule.flags.break_cycle {
                                     break;
@@ -1012,7 +1017,7 @@ async fn rewrite_handler(r: R) -> i64 {
                                 }
                                 return rc;
                             }
-                            Code::Break => break,
+                            Code::Break { .. } => break,
                             Code::If { .. } => {
                                 // Nested if not fully implemented
                             }

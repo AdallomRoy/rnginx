@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
@@ -209,6 +210,82 @@ fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     }
 }
 
+fn map_include_file(cf: &mut Conf, filename: &[u8], ctx: &MapCtx) -> ConfResult {
+    // Read the file
+    let full_path = cf.full_name(filename, true);
+
+    let data = match std::fs::read(std::ffi::OsStr::from_bytes(&full_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(0);
+            return Err(cf.emerg(format_args!("open() \"{}\" failed", B(&full_path))));
+        }
+    };
+
+    let content = match std::str::from_utf8(&data) {
+        Ok(s) => s,
+        Err(_) => return Err(cf.emerg(format_args!("invalid UTF-8 in \"{}\"", B(&full_path)))),
+    };
+
+    // Parse each line as "key value"
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Split on whitespace (first split is key, rest is value)
+        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let key = parts[0].as_bytes();
+        let mut value_str = parts[1].trim();
+
+        // Strip trailing semicolon if present
+        if value_str.ends_with(';') {
+            value_str = &value_str[..value_str.len()-1].trim_end();
+        }
+
+        let value_bytes = value_str.as_bytes();
+
+        // Parse the value (can be a variable or static string)
+        let value = if value_bytes.first() == Some(&b'$') {
+            MapEntry::Complex(crate::script::compile_complex_value(cf, value_bytes, 0)?)
+        } else {
+            MapEntry::Static(value_bytes.to_vec())
+        };
+
+        // Add entry to map
+        if !key.is_empty() && key[0] == b'~' {
+            // Regex pattern
+            let is_case_sensitive = key.len() < 2 || key[1] != b'*';
+            let pattern_start = if is_case_sensitive { 1 } else { 2 };
+            let pattern = &key[pattern_start..];
+
+            let flags = if is_case_sensitive { 0 } else { ngx_core::regex::NGX_REGEX_CASELESS };
+            match Regex::compile(pattern, flags) {
+                Ok(regex) => {
+                    ctx.regexes.borrow_mut().push(MapRegex {
+                        regex,
+                        case_sensitive: is_case_sensitive,
+                        value,
+                    });
+                }
+                Err(e) => return Err(cf.emerg(format_args!("regex error: {}", e))),
+            }
+        } else {
+            // Regular entry
+            ctx.entries.borrow_mut().push((key.to_vec(), value));
+        }
+    }
+
+    Ok(())
+}
+
 fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
     let args = cf.args.clone();
 
@@ -231,10 +308,15 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
 
     let value_str = &args[1];
 
-    // Handle "include" directive (without escaping)
+    // Handle "include" directive - but only if the file exists
+    // If key is "include" and the file doesn't exist, treat it as a literal key instead
     if key == b"include" && !args.is_empty() && args.len() >= 2 {
-        // TODO: Actually read the include file
-        return Ok(());
+        let full_path = cf.full_name(value_str, true);
+        // Check if the file exists
+        if std::fs::metadata(std::ffi::OsStr::from_bytes(&full_path)).is_ok() {
+            return map_include_file(cf, value_str, ctx);
+        }
+        // If file doesn't exist, fall through to treat as literal key
     }
 
     let value = if value_str.first() == Some(&b'$') {
@@ -287,18 +369,25 @@ fn map_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         return Err(msg("invalid variable name"));
     }
 
-    let var = add_variable(cf, &var_name[1..], NGX_HTTP_VAR_CHANGEABLE)?;
-
     // Parse flags from map directive arguments (volatile, hostnames, etc.)
     let mut volatile = false;
     let mut hostnames = false;
-    for (i, arg) in args.iter().enumerate().skip(3) {
+    for arg in args.iter().skip(3) {
         if arg == b"volatile" {
             volatile = true;
         } else if arg == b"hostnames" {
             hostnames = true;
         }
     }
+
+    // If volatile, add NOCACHEABLE flag to prevent caching
+    let var_flags = if volatile {
+        NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE
+    } else {
+        NGX_HTTP_VAR_CHANGEABLE
+    };
+
+    let var = add_variable(cf, &var_name[1..], var_flags)?;
 
     let ctx = Box::leak(Box::new(MapCtx {
         cv,
