@@ -392,6 +392,17 @@ fn upstream_response_time_variable(_r: &R, v: &mut crate::request::VariableValue
     v.not_found = true; NGX_OK
 }
 
+fn upstream_zero_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // Placeholder for upstream_response_length / upstream_bytes_received /
+    // upstream_bytes_sent until we track them properly. Report 0 rather than
+    // not_found so log lines don't emit "cycle while evaluating variable" alerts.
+    v.data = b"0".to_vec();
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+    NGX_OK
+}
+
 // ============================================================================
 // MODULE REGISTRATION
 // ============================================================================
@@ -436,21 +447,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
         },
         VarDef {
             name: "upstream_response_length",
-            get: None,
+            get: Some(upstream_zero_variable),
             set: None,
             data: 0,
             flags: 0,
         },
         VarDef {
             name: "upstream_bytes_received",
-            get: None,
+            get: Some(upstream_zero_variable),
             set: None,
             data: 0,
             flags: 0,
         },
         VarDef {
             name: "upstream_bytes_sent",
-            get: None,
+            get: Some(upstream_zero_variable),
             set: None,
             data: 0,
             flags: 0,
