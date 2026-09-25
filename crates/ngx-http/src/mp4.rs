@@ -335,6 +335,53 @@ fn parse_float_ms(value: &[u8]) -> Option<i64> {
     Some(whole * 1000 + frac)
 }
 
+// ============================================================================
+// MP4 Atom Parsing Infrastructure
+// ============================================================================
+
+/// MP4 atom header: 4 bytes size + 4 bytes name
+#[derive(Debug, Clone, Copy)]
+struct AtomHeader {
+    size: u32,
+    name: [u8; 4],
+}
+
+impl AtomHeader {
+    /// Parse atom header from bytes
+    fn from_bytes(data: &[u8]) -> Option<(Self, u64)> {
+        if data.len() < 8 {
+            return None;
+        }
+        let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let name = [data[4], data[5], data[6], data[7]];
+
+        let actual_size = if size == 1 {
+            // Extended size: next 8 bytes contain the real size
+            if data.len() < 16 {
+                return None;
+            }
+            u64::from_be_bytes([
+                data[8], data[9], data[10], data[11],
+                data[12], data[13], data[14], data[15],
+            ])
+        } else if size == 0 {
+            // Atom extends to end of file (only for last atom)
+            0u64
+        } else {
+            size as u64
+        };
+
+        Some((AtomHeader { size, name }, actual_size))
+    }
+
+    fn name_str(&self) -> &str {
+        match std::str::from_utf8(&self.name) {
+            Ok(s) => s,
+            Err(_) => "????",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +394,15 @@ mod tests {
         assert_eq!(parse_float_ms(b"100"), Some(100000));
         assert_eq!(parse_float_ms(b"0.1"), Some(100));
         assert_eq!(parse_float_ms(b"0.001"), Some(1));
+    }
+
+    #[test]
+    fn test_atom_header_parse() {
+        // Standard 4-byte size header
+        let data = b"\x00\x00\x00\x20ftyp";
+        let (hdr, size) = AtomHeader::from_bytes(data).unwrap();
+        assert_eq!(hdr.size, 0x20);
+        assert_eq!(hdr.name, *b"ftyp");
+        assert_eq!(size, 0x20 as u64);
     }
 }
