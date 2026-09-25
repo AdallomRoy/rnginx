@@ -278,6 +278,11 @@ extern "C" {
 /// Fallback to libc crypt_r
 #[cfg(target_os = "linux")]
 fn crypt_libc(key: &[u8], salt: &[u8]) -> Result<Vec<u8>, i32> {
+    // crypt_r wants null-terminated C strings.
+    let mut key_c = key.to_vec();
+    key_c.push(0);
+    let mut salt_c = salt.to_vec();
+    salt_c.push(0);
     let mut crypt_data = CryptData {
         initialized: [0u8; 1],
         buf: [0u8; 32768],
@@ -285,8 +290,8 @@ fn crypt_libc(key: &[u8], salt: &[u8]) -> Result<Vec<u8>, i32> {
 
     let result = unsafe {
         crypt_r(
-            key.as_ptr(),
-            salt.as_ptr(),
+            key_c.as_ptr(),
+            salt_c.as_ptr(),
             &mut crypt_data,
         )
     };
