@@ -82,10 +82,11 @@ fn set_auth_request_set(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>
     // Compile the complex value
     let cv = compile_complex_value(cf, &args[2], 0)?;
 
-    // Get variable index
-    let var_index = match add_variable(cf, var_name) {
-        Some(idx) => idx,
-        None => return Err(cf.emerg(format_args!("cannot add variable \"{}\"", B(var_name)))),
+    // Get variable index (strip $ prefix)
+    let var_name_bare = &var_name[1..];
+    let var_index = match crate::variables::get_variable_index(cf, var_name_bare) {
+        Ok(idx) => idx,
+        Err(_) => return Err(cf.emerg(format_args!("cannot add variable \"{}\"", B(var_name)))),
     };
 
     cell.borrow_mut().vars.push(AuthRequestVariable {
@@ -222,8 +223,7 @@ fn set_variables(r: &R, conf: &AuthRequestLocConf, ctx: &AuthRequestCtx) -> Resu
         for var in &conf.vars {
             match complex_value(sr, &var.value) {
                 Ok(v) => {
-                    // Set the variable value - this is a placeholder
-                    // Proper variable setting would need to be integrated with variables.rs
+                    crate::variables::set_indexed_variable(r, var.var_index, v);
                 }
                 Err(_) => return Err(NGX_ERROR),
             }
