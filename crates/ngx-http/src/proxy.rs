@@ -170,16 +170,13 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
 }
 
 async fn proxy_handler(r: R) -> i64 {
-    eprintln!("DEBUG proxy_handler: CALLED");
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let conf_borrowed = lcf.borrow();
-    eprintln!("DEBUG proxy_handler: upstream_uri = {:?}", conf_borrowed.upstream_uri);
 
     // Check if this location has proxy_pass configured
     let upstream_uri = match &conf_borrowed.upstream_uri {
         Some(uri) => uri.clone(),
         None => {
-            eprintln!("DEBUG proxy_handler: no upstream_uri, declining");
             return NGX_DECLINED;
         }
     };
@@ -188,32 +185,26 @@ async fn proxy_handler(r: R) -> i64 {
     let upstream_uri_str = match std::str::from_utf8(&upstream_uri) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("DEBUG proxy_handler: invalid UTF-8 in URI");
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
 
     let (host, port, _path) = match parse_upstream_uri(upstream_uri_str) {
         Some(p) => {
-            eprintln!("DEBUG: parsed URI successfully");
             p
         }
         None => {
-            eprintln!("DEBUG: failed to parse URI: {}", upstream_uri_str);
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
 
     // Try to connect to upstream
     let addr = format!("{}:{}", host, port);
-    eprintln!("DEBUG: connecting to {}", addr);
     let mut upstream = match TcpStream::connect(&addr).await {
         Ok(s) => {
-            eprintln!("DEBUG: connected");
             s
         }
         Err(e) => {
-            eprintln!("DEBUG: connection failed: {}", e);
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
@@ -245,11 +236,8 @@ async fn proxy_handler(r: R) -> i64 {
     }
 
     if response.is_empty() {
-        eprintln!("DEBUG: empty response from upstream");
         return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
     }
-
-    eprintln!("DEBUG: upstream response ({} bytes): {:?}", response.len(), String::from_utf8_lossy(&response[..response.len().min(200)]));
 
     // Parse status line
     let status_line_end = match response.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -257,7 +245,6 @@ async fn proxy_handler(r: R) -> i64 {
         None => match response.windows(2).position(|w| w == b"\n\n") {
             Some(pos) => pos,
             None => {
-                eprintln!("DEBUG: could not find response header terminator");
                 return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
             }
         }
@@ -274,14 +261,12 @@ async fn proxy_handler(r: R) -> i64 {
     let status_line_end_nl = match headers_section.iter().position(|&b| b == b'\n') {
         Some(pos) => pos,
         None => {
-            eprintln!("DEBUG: could not find newline in status line");
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
 
     let status_line = &headers_section[..status_line_end_nl];
     let status_line_str = std::str::from_utf8(status_line).unwrap_or("HTTP/1.0 500 Internal Server Error");
-    eprintln!("DEBUG: status_line_str = {}", status_line_str);
 
     // Parse "HTTP/1.x NNN Reason"
     let parts: Vec<&str> = status_line_str.split_whitespace().collect();
@@ -290,21 +275,65 @@ async fn proxy_handler(r: R) -> i64 {
     } else {
         502
     };
-    eprintln!("DEBUG: parsed status = {}", status);
 
-    // Set status in response headers
+    // Set status in response headers and copy upstream headers
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = status;
-        eprintln!("DEBUG: set ho.status = {}", ho.status);
+        // Parse and copy headers from headers_section
+        let mut pos = status_line_end_nl + 1;
+        while pos < headers_section.len() {
+            let line_end = headers_section[pos..].iter().position(|&b| b == b'\n').map(|i| pos + i).unwrap_or(headers_section.len());
+            let line = &headers_section[pos..line_end];
+            let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
+            if line.is_empty() { break; }
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = &line[..colon];
+                let mut vstart = colon + 1;
+                while vstart < line.len() && (line[vstart] == b' ' || line[vstart] == b'\t') { vstart += 1; }
+                let value = &line[vstart..];
+                let lc = name.to_ascii_lowercase();
+                // Handle a few well-known headers specially so header_filter renders them.
+                match lc.as_slice() {
+                    b"content-length" => {
+                        if let Ok(s) = std::str::from_utf8(value) {
+                            if let Ok(n) = s.trim().parse::<i64>() { ho.content_length_n = n; }
+                        }
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.content_length = Some(h);
+                    }
+                    b"content-type" => {
+                        ho.content_type = value.to_vec();
+                        ho.content_type_len = value.len();
+                    }
+                    b"connection" | b"keep-alive" | b"transfer-encoding" | b"server" | b"date" => {
+                        // suppress: our header_filter emits its own
+                    }
+                    b"location" => {
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.location = Some(h);
+                    }
+                    b"last-modified" => {
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.last_modified = Some(h);
+                        // best-effort time parse skipped; header_filter emits from .last_modified
+                    }
+                    b"etag" => {
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.etag = Some(h);
+                    }
+                    _ => {
+                        ho.add(name, value);
+                    }
+                }
+            }
+            pos = line_end + 1;
+        }
     }
 
     // Send status and headers to client
-    eprintln!("DEBUG: before send_header: err_status={}, post_action={}, header_sent={}", r.err_status.get(), r.post_action.get(), r.header_sent.get());
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
-    eprintln!("DEBUG: send_header returned {}", send_hdr_rc);
     if send_hdr_rc != NGX_OK {
-        eprintln!("DEBUG: send_header failed");
         return NGX_ERROR;
     }
 
