@@ -184,7 +184,7 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
                 ctx.ranges.len(),
                 if !ctx.ranges.is_empty() { ctx.ranges[0].start } else { 0 },
                 if !ctx.ranges.is_empty() { ctx.ranges[0].end } else { 0 });
-            r.set_ctx(ctx_index(), Some(ctx));
+            r.set_ctx(ctx_index(), ctx);
             next(r).await
         }
         Err(NGX_HTTP_RANGE_NOT_SATISFIABLE) => {

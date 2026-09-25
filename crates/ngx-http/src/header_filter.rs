@@ -237,6 +237,6 @@ pub async fn header_filter(r: R) -> i64 {
     b.flush = r.header_only.get();
     let mut chain = Chain::new();
     chain.push_back(b);
-    let f = top_body_filter();
-    f(r.clone(), chain).await
+    // Header bytes go directly to the write filter (they bypass body filters like range/gzip/sub).
+    crate::write_filter::write_filter(r.clone(), chain).await
 }
