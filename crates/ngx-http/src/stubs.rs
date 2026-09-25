@@ -789,8 +789,8 @@ pub fn upstream_log_info(_r: &Request) -> Option<Vec<u8>> {
     None
 }
 
-pub async fn ssl_handshake(_c: &Rc<Connection>, _hc: &Rc<HttpConnection>) -> bool {
-    false
+pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool {
+    crate::ssl_module::ssl_handshake(c, hc).await
 }
 
 pub fn ssl_verify_enabled(_cscf: &Rc<std::cell::RefCell<CoreSrvConf>>) -> bool {
@@ -801,4 +801,4 @@ pub fn ssl_process_request_checks(_r: &R) -> Option<i64> {
     None
 }
 
-pub async fn ssl_shutdown(_c: &Rc<Connection>) {}
+pub async fn ssl_shutdown(c: &Rc<Connection>) { crate::ssl_module::ssl_shutdown(c).await }

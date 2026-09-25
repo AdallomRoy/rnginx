@@ -1,42 +1,135 @@
-//! OpenSSL integration (ngx_event_openssl.c). Connection-level pieces; contexts come later.
+//! OpenSSL integration (ngx_event_openssl.c). Connection-level I/O via openssl-sys FFI.
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::io;
+use std::os::raw::c_void;
 use std::rc::Rc;
+
+use foreign_types::ForeignType;
+use openssl::ssl::Ssl;
 
 use crate::conf::*;
 use crate::connection::Connection;
 use crate::log::Log;
 use crate::module::*;
-use crate::{cmd_fn};
+use crate::cmd_fn;
 
-/// Per-connection SSL state (filled in by the ssl module port).
+/// Per-connection SSL state.
 pub struct SslConnection {
-    pub inner: std::cell::RefCell<Option<openssl::ssl::Ssl>>,
-    pub handshaked: std::cell::Cell<bool>,
-    pub no_wait_shutdown: std::cell::Cell<bool>,
-    pub no_send_shutdown: std::cell::Cell<bool>,
-    pub shutdown_without_free: std::cell::Cell<bool>,
-    pub buffer_size: std::cell::Cell<usize>,
-    pub data: std::cell::RefCell<Option<Rc<dyn Any>>>,
+    pub inner: RefCell<Option<Ssl>>,
+    pub handshaked: Cell<bool>,
+    pub no_wait_shutdown: Cell<bool>,
+    pub no_send_shutdown: Cell<bool>,
+    pub shutdown_without_free: Cell<bool>,
+    pub buffer_size: Cell<usize>,
+    pub data: RefCell<Option<Rc<dyn Any>>>,
 }
 
 impl SslConnection {
+    pub fn new() -> Self {
+        SslConnection {
+            inner: RefCell::new(None),
+            handshaked: Cell::new(false),
+            no_wait_shutdown: Cell::new(false),
+            no_send_shutdown: Cell::new(false),
+            shutdown_without_free: Cell::new(false),
+            buffer_size: Cell::new(16384),
+            data: RefCell::new(None),
+        }
+    }
+
+    /// Get the raw SSL* pointer. Panics if handshake hasn't started.
+    fn ssl_ptr(&self) -> *mut openssl_sys::SSL {
+        let b = self.inner.borrow();
+        b.as_ref().expect("SSL not initialized").as_ptr()
+    }
+
     pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
-        let _ = (c, buf);
-        Err(io::Error::new(io::ErrorKind::Other, "ssl not implemented"))
+        loop {
+            let rc = unsafe {
+                openssl_sys::SSL_read(self.ssl_ptr(), buf.as_mut_ptr() as *mut c_void, buf.len() as i32)
+            };
+            if rc > 0 {
+                return Ok(rc as usize);
+            }
+            let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
+            match err {
+                openssl_sys::SSL_ERROR_WANT_READ => c.readable().await?,
+                openssl_sys::SSL_ERROR_WANT_WRITE => c.writable().await?,
+                openssl_sys::SSL_ERROR_ZERO_RETURN => {
+                    c.read_eof.set(true);
+                    return Ok(0);
+                }
+                openssl_sys::SSL_ERROR_SYSCALL => {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() == Some(0) {
+                        c.read_eof.set(true);
+                        return Ok(0);
+                    }
+                    return Err(e);
+                }
+                _ => {
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", ssl_error_string())));
+                }
+            }
+        }
     }
 
     pub async fn send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
-        let _ = (c, buf);
-        Err(io::Error::new(io::ErrorKind::Other, "ssl not implemented"))
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let rc = unsafe {
+                openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32)
+            };
+            if rc > 0 {
+                c.sent.set(c.sent.get() + rc as u64);
+                return Ok(rc as usize);
+            }
+            let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
+            match err {
+                openssl_sys::SSL_ERROR_WANT_READ => c.readable().await?,
+                openssl_sys::SSL_ERROR_WANT_WRITE => c.writable().await?,
+                openssl_sys::SSL_ERROR_SYSCALL => {
+                    let e = io::Error::last_os_error();
+                    return Err(e);
+                }
+                _ => {
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string())));
+                }
+            }
+        }
     }
 
-    pub fn free_on_close(&self, _c: &Connection) {}
+    pub fn free_on_close(&self, _c: &Connection) {
+        // Ssl is dropped when SslConnection is dropped.
+    }
+}
+
+/// Read the top of the OpenSSL error queue into a string.
+pub fn ssl_error_string() -> String {
+    unsafe {
+        let mut msg = String::new();
+        loop {
+            let e = openssl_sys::ERR_get_error();
+            if e == 0 {
+                break;
+            }
+            let cptr = openssl_sys::ERR_reason_error_string(e);
+            if cptr.is_null() { continue; }
+            let s = std::ffi::CStr::from_ptr(cptr).to_string_lossy();
+            if !msg.is_empty() {
+                msg.push_str("; ");
+            }
+            msg.push_str(&s);
+        }
+        if msg.is_empty() { "unknown".to_string() } else { msg }
+    }
 }
 
 pub fn openssl_version_text() -> String {
-    // OPENSSL_VERSION_TEXT of the linked library, e.g. "OpenSSL 3.0.2 15 Mar 2022"
     openssl::version::version().to_string()
 }
 

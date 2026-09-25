@@ -55,6 +55,7 @@ pub mod upstream;
 pub mod upstream_keepalive;
 pub mod upstream_round_robin;
 pub mod event_pipe;
+pub mod ssl_module;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -574,7 +575,7 @@ pub fn modules() -> Vec<ModuleDef> {
         split_clients::split_clients_module(),
         referer::referer_module(),
         rewrite::rewrite_module(),
-        stubs::ssl_module(),
+        ssl_module::ssl_module(),
         proxy::proxy_module(),
         stubs::fastcgi_module(),
         stubs::uwsgi_module(),
