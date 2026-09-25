@@ -36,6 +36,8 @@ pub struct NgxHttpProxyLocConf {
     pub pass_request_headers: Val<bool>,
     /// proxy_pass_request_body: forward client body to upstream (default on).
     pub pass_request_body: Val<bool>,
+    /// proxy_set_body: overrides the request body sent upstream (complex value).
+    pub set_body: Option<crate::script::ComplexValue>,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -46,6 +48,7 @@ impl Default for NgxHttpProxyLocConf {
             intercept_errors: Val::unset(),
             pass_request_headers: Val::unset(),
             pass_request_body: Val::unset(),
+            set_body: None,
         }
     }
 }
@@ -66,6 +69,17 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.intercept_errors.merge(&p.intercept_errors, false);
     c.pass_request_headers.merge(&p.pass_request_headers, true);
     c.pass_request_body.merge(&p.pass_request_body, true);
+    if c.set_body.is_none() {
+        c.set_body = p.set_body.clone();
+    }
+    Ok(())
+}
+
+fn proxy_set_body_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+    cell.borrow_mut().set_body = Some(cv);
     Ok(())
 }
 
@@ -300,15 +314,22 @@ async fn proxy_handler(r: R) -> i64 {
         uri_path
     };
 
-    // Read pass_request_headers/body configs (defaults on).
-    let (pass_headers_flag, pass_body_flag) = {
+    // Read pass_request_headers/body and set_body configs.
+    let (pass_headers_flag, pass_body_flag, set_body_cv) = {
         let lcf3 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
         let b = lcf3.borrow();
-        (b.pass_request_headers.get_or(true), b.pass_request_body.get_or(true))
+        (
+            b.pass_request_headers.get_or(true),
+            b.pass_request_body.get_or(true),
+            b.set_body.clone(),
+        )
     };
 
-    // Collect request body (if any) into a Vec.
-    let body_bytes: Vec<u8> = if !pass_body_flag { Vec::new() } else {
+    // Collect request body (if any) into a Vec. proxy_set_body wins over the
+    // client body when configured; otherwise honour proxy_pass_request_body.
+    let body_bytes: Vec<u8> = if let Some(cv) = set_body_cv {
+        crate::script::complex_value(&r, &cv).unwrap_or_default()
+    } else if !pass_body_flag { Vec::new() } else {
         let rb = r.request_body.borrow();
         let mut out = Vec::new();
         if let Some(body) = rb.as_ref() {
@@ -715,7 +736,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_flags", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_set_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_set_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_set_body_handler),
         cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_hide_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
