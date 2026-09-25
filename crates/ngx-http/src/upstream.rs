@@ -17,7 +17,7 @@ use ngx_core::conf::{NGX_CONF_BLOCK, NGX_CONF_TAKE1, NGX_CONF_1MORE};
 
 use crate::core::*;
 use crate::request::*;
-use crate::variables::{GetHandler, SetHandler, VarDef};
+use crate::variables::{GetHandler, SetHandler, VarDef, NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_NOCACHEABLE, prefix_var_name};
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_UPS_CONF, HttpModuleDef, http_module_def};
 
 // ============================================================================
@@ -459,8 +459,94 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
 
     crate::variables::add_variables(cf, &vars)?;
 
-    // TODO: Add upstream_http_* and upstream_trailer_* variables with getters
+    // Prefix variables: $upstream_http_<name> reads from upstream response headers.
+    // Registered separately because they use NGX_HTTP_VAR_PREFIX.
+    let prefix_vars = vec![
+        VarDef {
+            name: "upstream_http_",
+            get: Some(upstream_http_variable),
+            set: None,
+            data: 0,
+            flags: NGX_HTTP_VAR_PREFIX,
+        },
+        VarDef {
+            name: "upstream_trailer_",
+            get: Some(upstream_trailer_variable),
+            set: None,
+            data: 0,
+            flags: NGX_HTTP_VAR_PREFIX,
+        },
+        VarDef {
+            name: "upstream_cookie_",
+            get: Some(upstream_cookie_variable),
+            set: None,
+            data: 0,
+            flags: NGX_HTTP_VAR_PREFIX,
+        },
+    ];
+    crate::variables::add_variables(cf, &prefix_vars)?;
+
     Ok(())
+}
+
+fn upstream_http_variable(r: &R, v: &mut crate::request::VariableValue, d: usize) -> i64 {
+    let name = prefix_var_name(r, d);
+    let want = &name["upstream_http_".len()..];
+    let headers = r.upstream_headers_in.borrow();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for h in headers.iter() {
+        if h.lowcase_key.len() != want.len() {
+            continue;
+        }
+        let same = h.lowcase_key.iter().zip(want.iter()).all(|(a, b)| *a == *b || (*a == b'-' && *b == b'_'));
+        if same {
+            parts.push(h.value.borrow().clone());
+        }
+    }
+    if parts.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let joined = parts.join(&b", "[..]);
+    v.data = joined;
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+    NGX_OK
+}
+
+fn upstream_trailer_variable(_r: &R, v: &mut crate::request::VariableValue, _d: usize) -> i64 {
+    // Trailers not currently captured; report not_found rather than error.
+    v.not_found = true;
+    NGX_OK
+}
+
+fn upstream_cookie_variable(r: &R, v: &mut crate::request::VariableValue, d: usize) -> i64 {
+    // Look for Set-Cookie header whose cookie name matches the requested key.
+    let name = prefix_var_name(r, d);
+    let want = &name["upstream_cookie_".len()..];
+    let headers = r.upstream_headers_in.borrow();
+    for h in headers.iter() {
+        if h.lowcase_key.as_slice() != b"set-cookie" {
+            continue;
+        }
+        let val = h.value.borrow();
+        // Cookie is "name=value; ..."
+        if val.len() > want.len() + 1
+            && val[..want.len()].eq_ignore_ascii_case(want)
+            && val[want.len()] == b'='
+        {
+            let after = &val[want.len() + 1..];
+            let end = after.iter().position(|&b| b == b';').unwrap_or(after.len());
+            v.data = after[..end].to_vec();
+            v.valid = true;
+            v.no_cacheable = false;
+            v.not_found = false;
+            return NGX_OK;
+        }
+    }
+    v.not_found = true;
+    NGX_OK
 }
 
 pub fn upstream_module() -> ModuleDef {

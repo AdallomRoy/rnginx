@@ -23,6 +23,9 @@ crate::http_module_index!("ngx_http_auth_request_module");
 pub struct AuthRequestVariable {
     pub var_index: usize,
     pub value: ComplexValue,
+    /// Cached set_handler (from the variable's original registration). Called after
+    /// storing the value so side-effecting variables like $args update r->args.
+    pub set_handler: Option<crate::variables::SetHandler>,
 }
 
 pub struct AuthRequestLocConf {
@@ -82,19 +85,41 @@ fn set_auth_request_set(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>
     // Compile the complex value
     let cv = compile_complex_value(cf, &args[2], 0)?;
 
-    // Get variable index (strip $ prefix)
+    // Match C ngx_http_auth_request_set: register the variable, set its fallback
+    // get_handler if not already installed, then get its index.
     let var_name_bare = &var_name[1..];
+    let v = crate::variables::add_variable(cf, var_name_bare, crate::variables::NGX_HTTP_VAR_CHANGEABLE)?;
+
     let var_index = match crate::variables::get_variable_index(cf, var_name_bare) {
         Ok(idx) => idx,
         Err(_) => return Err(cf.emerg(format_args!("cannot add variable \"{}\"", B(var_name)))),
     };
 
+    if v.get_handler.get().is_none() {
+        // Fallback handler: returns "not_found" when the auth subrequest never ran
+        // for this location (e.g. the variable is read outside an auth_request-guarded
+        // location). auth_request_handler will overwrite via set_indexed_variable when
+        // it does run.
+        v.get_handler.set(Some(auth_request_variable));
+        v.data.set(var_index);
+    }
+
+    // Capture the variable's set_handler so we can re-invoke it at set time (e.g.
+    // $args updates r.args). C stores this in av->set_handler.
+    let set_handler = v.set_handler.get();
+
     cell.borrow_mut().vars.push(AuthRequestVariable {
         var_index,
         value: cv,
+        set_handler,
     });
 
     Ok(())
+}
+
+fn auth_request_variable(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    v.not_found = true;
+    NGX_OK
 }
 
 fn add_variable(cf: &Conf, name: &[u8]) -> Option<usize> {
@@ -223,7 +248,19 @@ fn set_variables(r: &R, conf: &AuthRequestLocConf, ctx: &AuthRequestCtx) -> Resu
         for var in &conf.vars {
             match complex_value(sr, &var.value) {
                 Ok(v) => {
-                    crate::variables::set_indexed_variable(r, var.var_index, v);
+                    crate::variables::set_indexed_variable(r, var.var_index, v.clone());
+                    // C also calls av->set_handler if the variable had one (e.g. $args
+                    // side-effects r->args). Mirror that.
+                    if let Some(handler) = var.set_handler {
+                        let mut vv = VariableValue {
+                            data: v,
+                            valid: true,
+                            not_found: false,
+                            no_cacheable: false,
+                            escape: false,
+                        };
+                        handler(r, &mut vv, var.var_index);
+                    }
                 }
                 Err(_) => return Err(NGX_ERROR),
             }

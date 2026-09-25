@@ -386,6 +386,8 @@ async fn proxy_handler(r: R) -> i64 {
                 let mut vstart = colon + 1;
                 while vstart < line.len() && (line[vstart] == b' ' || line[vstart] == b'\t') { vstart += 1; }
                 let value = &line[vstart..];
+                // Stash into upstream_headers_in so $upstream_http_* can read them.
+                r.upstream_headers_in.borrow_mut().push(crate::request::TableElt::new(name, value));
                 let lc = name.to_ascii_lowercase();
                 // Handle a few well-known headers specially so header_filter renders them.
                 match lc.as_slice() {

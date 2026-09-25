@@ -383,6 +383,8 @@ pub struct Request {
     pub loc_conf: RefCell<Rc<ConfSlots>>,
 
     pub upstream: RefCell<Option<Rc<dyn Any>>>,
+    /// Upstream response headers, populated by proxy/fastcgi/etc. Read by $upstream_http_* variables.
+    pub upstream_headers_in: RefCell<Vec<Header>>,
     pub upstream_states: RefCell<Vec<UpstreamState>>,
     pub cache: RefCell<Option<Rc<dyn Any>>>,
 
@@ -679,6 +681,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         srv_conf: RefCell::new(ctx.srv.clone().unwrap()),
         loc_conf: RefCell::new(ctx.loc.clone().unwrap()),
         upstream: RefCell::new(None),
+        upstream_headers_in: RefCell::new(Vec::new()),
         upstream_states: RefCell::new(Vec::new()),
         cache: RefCell::new(None),
         headers_in: RefCell::new(HeadersIn::new()),

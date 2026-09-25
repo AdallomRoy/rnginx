@@ -10,7 +10,7 @@ shift $((OPTIND-1))
 OUT=${OUT:-/tmp/rnginx-tests.txt}
 cd $ROOT/nginx-tests
 if [ $# -eq 0 ]; then set -- .; fi
-TEST_NGINX_BINARY=$BIN timeout 3000 prove -j $JOBS --timer --exec "timeout 240 perl" "$@" > $OUT 2>&1
+TEST_NGINX_BINARY=$BIN timeout 1200 prove -j $JOBS --timer --exec "timeout 60 perl" "$@" > $OUT 2>&1
 grep -E "\.t \.+ ok" $OUT | sed -E 's/^\[[^]]*\] \.\///; s/ \.+ ok.*//' | sort > /tmp/rnginx-pass.txt
 echo "pass: $(wc -l < /tmp/rnginx-pass.txt)   C-pass: $(wc -l < $ROOT/docs/c-pass.txt)"
 if [ "$1" = "." ]; then
