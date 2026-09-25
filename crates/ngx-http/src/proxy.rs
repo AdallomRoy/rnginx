@@ -173,6 +173,22 @@ async fn proxy_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let conf_borrowed = lcf.borrow();
 
+    // Read the client request body first (or discard if none) — nginx does this before
+    // opening the upstream connection so we can either forward it or drop it cleanly.
+    drop(conf_borrowed);
+    let has_body = r.headers_in.borrow().content_length_n > 0 || r.headers_in.borrow().chunked;
+    if has_body {
+        let rc = crate::request_body::read_client_request_body(&r).await;
+        if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+            return rc;
+        }
+    } else {
+        let rc = crate::request_body::discard_request_body(&r).await;
+        if rc != NGX_OK { return rc; }
+    }
+    let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let conf_borrowed = lcf.borrow();
+
     // Check if this location has proxy_pass configured
     let upstream_uri = match &conf_borrowed.upstream_uri {
         Some(uri) => uri.clone(),
@@ -244,17 +260,63 @@ async fn proxy_handler(r: R) -> i64 {
         uri_path
     };
 
+    // Collect request body (if any) into a Vec.
+    let body_bytes: Vec<u8> = {
+        let rb = r.request_body.borrow();
+        let mut out = Vec::new();
+        if let Some(body) = rb.as_ref() {
+            let bod = body.borrow();
+            for b in bod.bufs.iter() {
+                if let ngx_core::buf::BufData::Memory(m) = &b.data {
+                    let end = b.last.min(m.len());
+                    if b.pos < end { out.extend_from_slice(&m[b.pos..end]); }
+                }
+                if b.in_file {
+                    if let ngx_core::buf::BufData::File(f) = &b.data {
+                        let sz = (b.file_last - b.file_pos) as usize;
+                        let mut buf = vec![0u8; sz];
+                        let mut off = 0usize;
+                        while off < sz {
+                            let n = unsafe { libc::pread(f.fd, buf[off..].as_mut_ptr() as *mut _, sz - off, b.file_pos + off as i64) };
+                            if n <= 0 { break; }
+                            off += n as usize;
+                        }
+                        out.extend_from_slice(&buf[..off]);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let content_length_hdr = if !body_bytes.is_empty() {
+        format!("Content-Length: {}\r\n", body_bytes.len())
+    } else if r.headers_in.borrow().content_length_n > 0 || r.headers_in.borrow().chunked {
+        format!("Content-Length: 0\r\n")
+    } else {
+        String::new()
+    };
+    let content_type_hdr = {
+        let hin = r.headers_in.borrow();
+        if let Some(ct) = hin.content_type.first() {
+            format!("Content-Type: {}\r\n", std::str::from_utf8(&ct.value.borrow()).unwrap_or(""))
+        } else { String::new() }
+    };
     let request = format!(
         "{} {} HTTP/1.0\r\n\
          Host: {}\r\n\
          Connection: close\r\n\
-         \r\n",
-        method, uri_with_args, host
+         {}{}\r\n",
+        method, uri_with_args, host, content_length_hdr, content_type_hdr
     );
 
     // Send request to upstream
     if let Err(_) = upstream.write_all(request.as_bytes()).await {
         return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+    }
+    if !body_bytes.is_empty() {
+        if let Err(_) = upstream.write_all(&body_bytes).await {
+            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+        }
     }
 
     // Read entire response
