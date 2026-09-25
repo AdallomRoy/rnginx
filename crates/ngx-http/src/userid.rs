@@ -166,6 +166,13 @@ fn add_variables(cf: &mut Conf) -> ConfResult {
             data: 0,
             flags: 0,
         },
+        VarDef {
+            name: "uid_reset",
+            set: None,
+            get: Some(var_uid_reset),
+            data: 0,
+            flags: variables::NGX_HTTP_VAR_CHANGEABLE,
+        },
     ];
     variables::add_variables(cf, &vars)
 }
@@ -215,6 +222,14 @@ fn var_uid_set(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     }
 
     v.not_found = true;
+    NGX_OK
+}
+
+fn var_uid_reset(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    // uid_reset is a changeable variable that's not modified by this module
+    // It just returns an empty value to allow configuration to set it
+    v.data = Vec::new();
+    v.valid = true;
     NGX_OK
 }
 

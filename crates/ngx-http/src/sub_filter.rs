@@ -82,7 +82,11 @@ fn add_sub_filter(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> C
     };
 
     let mut c = cell.borrow_mut();
-    let mut pairs = c.pairs.as_option().cloned().unwrap_or_default();
+    let mut pairs = if let Some(p) = c.pairs.as_option() {
+        p.clone()
+    } else {
+        Vec::new()
+    };
     pairs.push(pair);
     c.pairs = Val::set(pairs);
 
@@ -98,22 +102,29 @@ fn init(_cf: &mut Conf) -> ConfResult {
 async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
     let status = r.headers_out.borrow().status;
     let conf = r.loc_conf::<SubLocConf>(ctx_index());
-    let conf = conf.borrow();
+    let conf_cell = conf.borrow();
 
-    if status != NGX_HTTP_OK || !r.is_main() || conf.pairs.is_empty() {
-        drop(conf);
+    // Check if pairs exist
+    let has_pairs = conf_cell.pairs.as_option().map_or(false, |p| !p.is_empty());
+
+    if status != NGX_HTTP_OK || !r.is_main() || !has_pairs {
+        drop(conf_cell);
         return next(r).await;
     }
 
-    drop(conf);
+    drop(conf_cell);
 
     // Set up context
-    let ctx = SubCtx { applied: 0, once: *r.loc_conf::<SubLocConf>(ctx_index()).borrow().once.get() };
+    let once = r.loc_conf::<SubLocConf>(ctx_index()).borrow().once.get_or(false);
+
+    let ctx = SubCtx { applied: 0, once };
     r.set_ctx(ctx_index(), ctx);
 
     r.clear_content_length();
 
-    if !*r.loc_conf::<SubLocConf>(ctx_index()).borrow().last_modified.get() {
+    let clear_modified = !r.loc_conf::<SubLocConf>(ctx_index()).borrow().last_modified.get_or(true);
+
+    if clear_modified {
         r.clear_last_modified();
         r.clear_etag();
     } else {
@@ -134,11 +145,16 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     }
 
     let conf = r.loc_conf::<SubLocConf>(ctx_index());
-    let conf = conf.borrow();
-    if conf.pairs.is_empty() {
-        drop(conf);
+    let conf_ref = conf.borrow();
+
+    // Check if pairs exist
+    let pairs_opt = conf_ref.pairs.as_option();
+    if pairs_opt.is_none() || pairs_opt.unwrap().is_empty() {
+        drop(conf_ref);
         return next(r, input).await;
     }
+    let pairs = pairs_opt.unwrap().clone();
+    drop(conf_ref);
 
     let mut output = Chain::new();
 
@@ -154,7 +170,7 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
 
         let mut content = content_data[buf.pos..buf.last].to_vec();
 
-        for pair in conf.pairs.iter() {
+        for pair in pairs.iter() {
             // Evaluate match pattern
             let match_bytes = match crate::script::complex_value(&r, &pair.match_val) {
                 Ok(b) => b,
@@ -179,8 +195,6 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         new_buf.last_buf = buf.last_buf;
         output.push_back(new_buf);
     }
-
-    drop(conf);
 
     if output.is_empty() {
         return NGX_OK;
