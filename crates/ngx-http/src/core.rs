@@ -954,6 +954,13 @@ fn server_name(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Conf
     let cscf = cscf_of(&conf);
     let args = cf.args.clone();
     for v in &args[1..] {
+        if v.is_empty() {
+            // Empty server name is valid - just add it
+            let me = cscf.borrow().me.upgrade().unwrap();
+            let sn = ServerName { regex: None, server: me, name: v.clone() };
+            cscf.borrow_mut().server_names.push(sn);
+            continue;
+        }
         let ch = v[0];
         if (ch == b'*' && (v.len() < 3 || v[1] != b'.')) || (ch == b'.' && v.len() < 2) {
             return Err(cf.emerg(format_args!("server name \"{}\" is invalid", B(v))));
