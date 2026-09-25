@@ -58,9 +58,13 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
         conf.borrow_mut().upstream_uri = Some(cf.args[1].clone());
     }
 
-    // Set the location handler to our proxy_handler
+    // Set the location handler to our proxy_handler and mark auto_redirect for `/xxx/` locs.
     let loc_conf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
-    loc_conf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
+    let mut lc = loc_conf.borrow_mut();
+    lc.handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
+    if lc.name.last() == Some(&b'/') {
+        lc.auto_redirect = true;
+    }
 
     Ok(())
 }
