@@ -796,19 +796,39 @@ fn var_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_host_header_or_not(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    // generic single header accessor by field selector
+    // Selector 0 is Host (unique). Others are multi-value: join with ", " to match
+    // C ngx_http_variable_headers_internal.
     let hin = r.headers_in.borrow();
-    let h: Option<Header> = match d {
-        0 => hin.host.clone(),
-        1 => hin.user_agent.first().cloned(),
-        2 => hin.referer.first().cloned(),
-        3 => hin.via.first().cloned(),
-        _ => None,
-    };
-    match h {
-        Some(h) => set_str(v, &h.value.borrow()),
-        None => v.not_found = true,
+    if d == 0 {
+        match &hin.host {
+            Some(h) => set_str(v, &h.value.borrow()),
+            None => v.not_found = true,
+        }
+        return NGX_OK;
     }
+    let list: &[Header] = match d {
+        1 => &hin.user_agent,
+        2 => &hin.referer,
+        3 => &hin.via,
+        _ => &[],
+    };
+    if list.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let parts: Vec<Vec<u8>> = list.iter().map(|h| h.value.borrow().clone()).collect();
+    set_str(v, &parts.join(&b", "[..]));
+    NGX_OK
+}
+
+fn var_content_type(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    let hin = r.headers_in.borrow();
+    if hin.content_type.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let parts: Vec<Vec<u8>> = hin.content_type.iter().map(|h| h.value.borrow().clone()).collect();
+    set_str(v, &parts.join(&b", "[..]));
     NGX_OK
 }
 
@@ -1017,6 +1037,7 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "http_referer", set: None, get: Some(var_host_header_or_not), data: 2, flags: 0 },
     VarDef { name: "http_via", set: None, get: Some(var_host_header_or_not), data: 3, flags: 0 },
     VarDef { name: "content_length", set: None, get: Some(var_content_length), data: 0, flags: 0 },
+    VarDef { name: "content_type", set: None, get: Some(var_content_type), data: 0, flags: 0 },
     VarDef { name: "host", set: None, get: Some(var_host), data: 0, flags: 0 },
     VarDef { name: "binary_remote_addr", set: None, get: Some(var_binary_remote_addr), data: 0, flags: 0 },
     VarDef { name: "remote_addr", set: None, get: Some(var_remote_addr), data: 0, flags: 0 },
