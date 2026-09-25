@@ -398,11 +398,8 @@ fn parse_ranges(range_str: &[u8], content_len: i64, max_ranges: i64, ranges: &mu
     let s = String::from_utf8_lossy(range_str);
     let parts: Vec<&str> = s.split(',').collect();
 
-    if parts.len() as i64 > max_ranges {
-        return Err(NGX_DECLINED);
-    }
-
     let mut total_size = 0i64;
+    let mut remaining = max_ranges;
 
     for part in parts {
         let part = part.trim();
@@ -445,6 +442,12 @@ fn parse_ranges(range_str: &[u8], content_len: i64, max_ranges: i64, ranges: &mu
         if total_size > content_len {
             return Err(NGX_DECLINED);
         }
+
+        if remaining <= 0 {
+            // Exceeded max_ranges — matches C: return NGX_DECLINED (serve full body).
+            return Err(NGX_DECLINED);
+        }
+        remaining -= 1;
 
         let content_range = format!("bytes {}-{}/{}\r\n\r\n", start, end - 1, content_len);
         ranges.push(Range { start, end, content_range: content_range.into_bytes() });
