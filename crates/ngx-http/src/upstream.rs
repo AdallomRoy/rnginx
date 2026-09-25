@@ -533,7 +533,9 @@ fn upstream_trailer_variable(_r: &R, v: &mut crate::request::VariableValue, _d: 
 }
 
 fn upstream_cookie_variable(r: &R, v: &mut crate::request::VariableValue, d: usize) -> i64 {
-    // Look for Set-Cookie header whose cookie name matches the requested key.
+    // Port of ngx_http_parse_set_cookie_lines: for each Set-Cookie header,
+    // require case-insensitive prefix `name`, skip spaces before/after '=',
+    // then take up to the next ';'.
     let name = prefix_var_name(r, d);
     let want = &name["upstream_cookie_".len()..];
     let headers = r.upstream_headers_in.borrow();
@@ -542,19 +544,26 @@ fn upstream_cookie_variable(r: &R, v: &mut crate::request::VariableValue, d: usi
             continue;
         }
         let val = h.value.borrow();
-        // Cookie is "name=value; ..."
-        if val.len() > want.len() + 1
-            && val[..want.len()].eq_ignore_ascii_case(want)
-            && val[want.len()] == b'='
-        {
-            let after = &val[want.len() + 1..];
-            let end = after.iter().position(|&b| b == b';').unwrap_or(after.len());
-            v.data = after[..end].to_vec();
-            v.valid = true;
-            v.no_cacheable = false;
-            v.not_found = false;
-            return NGX_OK;
+        if want.len() >= val.len() {
+            continue;
         }
+        if !val[..want.len()].eq_ignore_ascii_case(want) {
+            continue;
+        }
+        let mut i = want.len();
+        while i < val.len() && val[i] == b' ' { i += 1; }
+        if i == val.len() || val[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < val.len() && val[i] == b' ' { i += 1; }
+        let mut j = i;
+        while j < val.len() && val[j] != b';' { j += 1; }
+        v.data = val[i..j].to_vec();
+        v.valid = true;
+        v.no_cacheable = false;
+        v.not_found = false;
+        return NGX_OK;
     }
     v.not_found = true;
     NGX_OK
