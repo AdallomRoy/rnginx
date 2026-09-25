@@ -47,6 +47,7 @@ pub mod mp4;
 pub mod split_clients;
 pub mod referer;
 pub mod browser;
+pub mod ssi_filter;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -599,7 +600,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::range_header_filter_module(),
         stubs::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),
-        stubs::ssi_filter_module(),
+        ssi_filter::ssi_filter_module(),
         charset_filter::charset_filter_module(),
         stubs::xslt_filter_module(),
         stubs::image_filter_module(),
