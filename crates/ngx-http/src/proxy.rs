@@ -189,14 +189,36 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
 
-    let (host, port, _path) = match parse_upstream_uri(upstream_uri_str) {
-        Some(p) => {
-            p
-        }
+    let (host, port, upstream_path) = match parse_upstream_uri(upstream_uri_str) {
+        Some(p) => p,
         None => {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
+    // If proxy_pass URL includes a URI (e.g. "http://backend/local/"), rewrite:
+    //   forwarded = upstream_path + (request_uri - location_prefix)
+    // Else forward the request URI as-is.
+    let clcf = r.clcf();
+    let loc_name = clcf.borrow().name.clone();
+    let request_uri = r.uri.borrow().clone();
+    let forwarded_uri: Vec<u8> = if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[7..].contains('/') {
+        let mut u = upstream_path.as_bytes().to_vec();
+        // Strip trailing slash if adding suffix that starts with /
+        let tail = if request_uri.starts_with(loc_name.as_slice()) {
+            &request_uri[loc_name.len()..]
+        } else {
+            &request_uri[..]
+        };
+        if u.last() == Some(&b'/') && tail.first() == Some(&b'/') {
+            u.pop();
+        }
+        u.extend_from_slice(tail);
+        u
+    } else {
+        request_uri.clone()
+    };
+    // For byte-preservation in the request line below.
+    let request_uri_bytes = forwarded_uri;
 
     // Try to connect to upstream
     let addr = format!("{}:{}", host, port);
@@ -213,15 +235,21 @@ async fn proxy_handler(r: R) -> i64 {
     let method_name = r.method_name.borrow();
     let method = std::str::from_utf8(&method_name).unwrap_or("GET");
 
-    let uri = r.uri.borrow();
-    let uri_path = std::str::from_utf8(&uri).unwrap_or("/");
+    let uri_path = std::str::from_utf8(&request_uri_bytes).unwrap_or("/").to_string();
+    // Include query string if present
+    let args = r.args.borrow();
+    let uri_with_args = if !args.is_empty() {
+        format!("{}?{}", uri_path, std::str::from_utf8(&args).unwrap_or(""))
+    } else {
+        uri_path
+    };
 
     let request = format!(
         "{} {} HTTP/1.0\r\n\
          Host: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        method, uri_path, host
+        method, uri_with_args, host
     );
 
     // Send request to upstream
