@@ -135,7 +135,8 @@ fn init_event_conf(cf: &mut Conf, conf: &Rc<dyn Any>) -> ConfResult {
     ecf.multi_accept.init(false);
     ecf.accept_mutex.init(false);
     ecf.accept_mutex_delay.init(500);
-    let _ = cf;
+    // Propagate to the cycle so the process init sets the per-worker connection cap.
+    cf.cycle.connection_n = *ecf.connections as usize;
     Ok(())
 }
 
