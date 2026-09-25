@@ -2,11 +2,12 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
 use ngx_core::inet::SockAddr;
-use ngx_core::log::*;
+use ngx_core::log::{NGX_LOG_WARN, *};
 use ngx_core::module::ModuleDef;
 use ngx_core::radix_tree::RadixTree;
 use ngx_core::rc::*;
@@ -30,6 +31,8 @@ pub struct GeoCtx {
     pub values: Vec<Vec<u8>>,
     pub ranges_mode: bool,
     pub ranges: Vec<GeoRange>,
+    pub proxies: Vec<u32>, // Trusted proxy addresses
+    pub proxy_recursive: bool,
 }
 
 pub struct GeoLocConf {
@@ -60,8 +63,14 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     v.escape = false;
     v.data.clear();
 
-    // Get remote address
-    let ip_u32 = get_remote_addr_u32(r);
+    // Get the IP address to look up
+    let ip_u32 = if !ctx.proxies.is_empty() {
+        // Get the IP from X-Forwarded-For header if trusted proxy
+        get_forwarded_for_ip(r, ctx)
+    } else {
+        // Use remote address
+        get_remote_addr_u32(r)
+    };
 
     if ctx.ranges_mode {
         // Binary search in ranges array
@@ -93,6 +102,47 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     }
 
     NGX_OK
+}
+
+fn get_forwarded_for_ip(r: &R, ctx: &GeoCtx) -> u32 {
+    // Try to get X-Forwarded-For header
+    let headers_in = r.headers_in.borrow();
+    if let Some(xff_header) = headers_in.find(b"x-forwarded-for") {
+        let xff_value = xff_header.value.borrow();
+        let xff_str = match std::str::from_utf8(&xff_value) {
+            Ok(s) => s,
+            Err(_) => return get_remote_addr_u32(r),
+        };
+
+        // Parse X-Forwarded-For header - it contains comma-separated IPs
+        let ips: Vec<&str> = xff_str.split(',').map(|s| s.trim()).collect();
+
+        if ctx.proxy_recursive {
+            // proxy_recursive: walk from right to left, skip trusted proxies
+            for ip_str in ips.iter().rev() {
+                if let Some(ip) = parse_ipv4_to_u32(ip_str.as_bytes()) {
+                    // Check if this IP is a trusted proxy
+                    if !ctx.proxies.contains(&ip) {
+                        return ip;
+                    }
+                }
+            }
+        } else {
+            // default: use rightmost IP if it's trusted, otherwise use remote_addr
+            let remote_addr = get_remote_addr_u32(r);
+            if let Some(last_ip_str) = ips.last() {
+                if let Some(last_ip) = parse_ipv4_to_u32(last_ip_str.as_bytes()) {
+                    if ctx.proxies.contains(&remote_addr) {
+                        // Remote addr is a trusted proxy, use the rightmost X-Forwarded-For IP
+                        return last_ip;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to remote address
+    get_remote_addr_u32(r)
 }
 
 fn parse_ipv4_to_u32(s: &[u8]) -> Option<u32> {
@@ -184,6 +234,8 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         values: Vec::new(),
         ranges_mode: false,
         ranges: Vec::new(),
+        proxies: Vec::new(),
+        proxy_recursive: false,
     }));
 
     var.get_handler.set(Some(geo_variable));
@@ -203,6 +255,68 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
     // Sort ranges if in ranges mode
     if ctx.ranges_mode {
         ctx.ranges.sort_by_key(|r| r.start);
+    }
+
+    Ok(())
+}
+
+fn geo_include_file(cf: &mut Conf, filename: &[u8], ctx: &mut GeoCtx) -> ConfResult {
+    // Read the file
+    let full_path = cf.full_name(filename, true);
+
+    let data = match std::fs::read(std::ffi::OsStr::from_bytes(&full_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            let en = e.raw_os_error().unwrap_or(0);
+            return Err(cf.emerg(format_args!("open() \"{}\" failed", B(&full_path))));
+        }
+    };
+
+    let content = match std::str::from_utf8(&data) {
+        Ok(s) => s,
+        Err(_) => return Err(cf.emerg(format_args!("invalid UTF-8 in \"{}\"", B(&full_path)))),
+    };
+
+    // Parse each line
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Split on whitespace
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let ip_part = parts[0];
+        let value_part = parts[1];
+
+        let ip_bytes = ip_part.as_bytes();
+        let value_bytes = value_part.as_bytes();
+        let value_idx = ctx.values.len();
+        ctx.values.push(value_bytes.to_vec());
+
+        if ctx.ranges_mode {
+            // Parse as IP range (127.0.0.0-127.0.0.1)
+            if let Some((start, end)) = parse_ip_range(ip_bytes) {
+                ctx.ranges.push(GeoRange { start, end, value_idx });
+            } else {
+                return Err(cf.emerg(format_args!("invalid range in \"{}\"", ip_part)));
+            }
+        } else {
+            // Parse as CIDR (192.0.2.0/24 or 192.0.2.0)
+            if let Some((ip, mask)) = parse_cidr(ip_bytes) {
+                if let Some(ref tree) = ctx.tree {
+                    tree.insert32(ip, mask, (value_idx + 1) as usize);
+                }
+            } else {
+                return Err(cf.emerg(format_args!("invalid network in \"{}\"", ip_part)));
+            }
+        }
     }
 
     Ok(())
@@ -231,18 +345,50 @@ fn geo_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
         }
         b"include" => {
             if args.len() >= 2 {
-                // TODO: implement include file reading
+                geo_include_file(cf, &args[1], ctx)
+            } else {
+                Ok(())
             }
-            Ok(())
         }
         b"delete" => {
             if args.len() >= 2 {
-                // TODO: implement delete
+                let ip_bytes = &args[1];
+                if ctx.ranges_mode {
+                    // Parse as IP range and remove from ranges
+                    if let Some((start, end)) = parse_ip_range(ip_bytes) {
+                        ctx.ranges.retain(|r| !(r.start == start && r.end == end));
+                    } else {
+                        return Err(cf.emerg(format_args!("invalid range in \"{}\"", B(ip_bytes))));
+                    }
+                } else {
+                    // Parse as CIDR and remove from tree
+                    if let Some((ip, mask)) = parse_cidr(ip_bytes) {
+                        if let Some(ref tree) = ctx.tree {
+                            let rc = tree.delete32(ip, mask);
+                            if rc != 0 {
+                                // Log a warning but don't error - nginx logs this as warning, not error
+                                cf.log_error(NGX_LOG_WARN, None, format_args!("no network \"{}\" to delete", B(ip_bytes)));
+                            }
+                        }
+                    } else {
+                        return Err(cf.emerg(format_args!("invalid network in \"{}\"", B(ip_bytes))));
+                    }
+                }
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+        b"proxy" => {
+            if args.len() >= 2 {
+                if let Some(ip) = parse_ipv4_to_u32(&args[1]) {
+                    ctx.proxies.push(ip);
+                }
             }
             Ok(())
         }
-        b"proxy" | b"proxy_recursive" => {
-            // Proxy directives - for now just accept
+        b"proxy_recursive" => {
+            ctx.proxy_recursive = true;
             Ok(())
         }
         _ => {

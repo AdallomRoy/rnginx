@@ -50,6 +50,8 @@ pub mod browser;
 pub mod ssi_filter;
 pub mod geo;
 pub mod range_filter;
+pub mod limit_req;
+pub mod limit_conn;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -559,8 +561,8 @@ pub fn modules() -> Vec<ModuleDef> {
         auth_request::auth_request_module(),
         auth_basic::auth_basic_module(),
         access::access_module(),
-        stubs::limit_conn_module(),
-        stubs::limit_req_module(),
+        limit_conn::limit_conn_module(),
+        limit_req::limit_req_module(),
         realip::realip_module(),
         stubs::json_module(),
         geo::geo_module(),
