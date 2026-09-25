@@ -38,20 +38,20 @@ async fn not_modified_header_filter(r: R, next: HeaderFilter) -> i64 {
         }
     }
     if ims.is_some() || inm.is_some() {
+        // Match C ngx_http_not_modified_header_filter: if If-Modified-Since says
+        // "modified" OR If-None-Match doesn't match, serve the response;
+        // otherwise fall through to 304.
         if let Some(h) = &ims {
-            if !test_if_modified(&r, &h.value.borrow()) {
-                return not_modified(&r, next).await;
+            if test_if_modified(&r, &h.value.borrow()) {
+                return next(r).await;
             }
         }
         if let Some(h) = &inm {
             if !test_if_match(&r, &h.value.borrow(), true) {
-                return not_modified(&r, next).await;
+                return next(r).await;
             }
         }
-        // both present: if-none-match matched? then continue only if both say modified
-        if let (Some(_ims), Some(inm)) = (&ims, &inm) {
-            let _ = inm;
-        }
+        return not_modified(&r, next).await;
     }
     next(r).await
 }
@@ -112,45 +112,55 @@ fn test_if_match(r: &R, list: &[u8], weak: bool) -> bool {
     if list.len() == 1 && list[0] == b'*' {
         return true;
     }
-    let etag = match &r.headers_out.borrow().etag {
+    let etag_owned = match &r.headers_out.borrow().etag {
         Some(e) => e.value.borrow().clone(),
         None => return false,
     };
-    let mut etag: &[u8] = &etag;
+    let mut etag: &[u8] = &etag_owned;
     if weak && etag.len() > 2 && etag[0] == b'W' && etag[1] == b'/' {
         etag = &etag[2..];
     }
-    let mut start = 0;
+    // Port of ngx_http_test_if_match: walk the list token by token, skipping
+    // leading spaces/tabs, an optional weak marker (when weak=true), then
+    // require the etag literal followed by end/comma (with optional trailing
+    // whitespace).
     let end = list.len();
-    let mut i = 0;
-    loop {
-        // skip spaces
-        while start < end && list[start] == b' ' {
+    let mut start = 0;
+    while start < end {
+        while start < end && (list[start] == b' ' || list[start] == b'\t') {
             start += 1;
         }
-        let mut s = start;
-        if weak && s + 2 <= end && list[s] == b'W' && list[s + 1] == b'/' {
-            s += 2;
+        if weak && end - start > 2 && list[start] == b'W' && list[start + 1] == b'/' {
+            start += 2;
         }
-        let mut t = s;
-        while t < end && list[t] != b',' {
-            t += 1;
+        if etag.len() > end - start {
+            return false;
         }
-        let mut tok_end = t;
-        while tok_end > s && list[tok_end - 1] == b' ' {
-            tok_end -= 1;
+        if &list[start..start + etag.len()] != etag {
+            // Skip to next comma
+            while start < end && list[start] != b',' {
+                start += 1;
+            }
+            if start < end {
+                start += 1;
+            }
+            continue;
         }
-        if &list[s..tok_end] == etag {
+        let mut p = start + etag.len();
+        while p < end && (list[p] == b' ' || list[p] == b'\t') {
+            p += 1;
+        }
+        if p == end || list[p] == b',' {
             return true;
         }
-        if t >= end {
-            break;
+        // Otherwise, skip to next comma and keep looking
+        while p < end && list[p] != b',' {
+            p += 1;
         }
-        start = t + 1;
-        i += 1;
-        if i > 1000 {
-            break;
+        if p < end {
+            p += 1;
         }
+        start = p;
     }
     false
 }
