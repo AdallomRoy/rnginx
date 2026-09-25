@@ -365,22 +365,21 @@ async fn proxy_handler(r: R) -> i64 {
     }
 
     // Parse status line
-    let status_line_end = match response.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(pos) => pos,
-        None => match response.windows(2).position(|w| w == b"\n\n") {
-            Some(pos) => pos,
-            None => {
-                return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-            }
-        }
+    // Pick the earliest header/body separator. \r\n\r\n and \n\n can both occur;
+    // if the upstream uses \n line endings but the body is chunked, a stray
+    // "0\r\n\r\n" later in the response fools a pure \r\n\r\n search into
+    // treating the trailer as the header terminator.
+    let sep_crlf = response.windows(4).position(|w| w == b"\r\n\r\n");
+    let sep_lf = response.windows(2).position(|w| w == b"\n\n");
+    let (status_line_end, body_start) = match (sep_crlf, sep_lf) {
+        (Some(a), Some(b)) if a <= b => (a, a + 4),
+        (Some(_), Some(b)) => (b, b + 2),
+        (Some(a), None) => (a, a + 4),
+        (None, Some(b)) => (b, b + 2),
+        (None, None) => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
     };
 
     let headers_section = &response[..status_line_end];
-    let body_start = if response[status_line_end..].starts_with(b"\r\n\r\n") {
-        status_line_end + 4
-    } else {
-        status_line_end + 2
-    };
 
     // Parse status line
     let status_line_end_nl = match headers_section.iter().position(|&b| b == b'\n') {
@@ -402,6 +401,7 @@ async fn proxy_handler(r: R) -> i64 {
     };
 
     // Set status in response headers and copy upstream headers
+    let mut upstream_chunked = false;
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = status;
@@ -433,7 +433,14 @@ async fn proxy_handler(r: R) -> i64 {
                         ho.content_type = value.to_vec();
                         ho.content_type_len = value.len();
                     }
-                    b"connection" | b"keep-alive" | b"transfer-encoding" | b"server" | b"date" => {
+                    b"transfer-encoding" => {
+                        // Track chunked so we can decode the body; header itself
+                        // is not forwarded (we handle framing ourselves).
+                        if value.eq_ignore_ascii_case(b"chunked") {
+                            upstream_chunked = true;
+                        }
+                    }
+                    b"connection" | b"keep-alive" | b"server" | b"date" => {
                         // suppress: our header_filter emits its own
                     }
                     b"location" => {
@@ -480,12 +487,18 @@ async fn proxy_handler(r: R) -> i64 {
         return NGX_OK;
     }
     if body_start < response.len() {
-        let end = if upstream_content_length >= 0 {
-            (body_start + upstream_content_length as usize).min(response.len())
+        let body_owned: Vec<u8>;
+        let body: &[u8] = if upstream_chunked {
+            body_owned = decode_chunked(&response[body_start..]);
+            &body_owned
         } else {
-            response.len()
+            let end = if upstream_content_length >= 0 {
+                (body_start + upstream_content_length as usize).min(response.len())
+            } else {
+                response.len()
+            };
+            &response[body_start..end]
         };
-        let body = &response[body_start..end];
 
         // Create a buffer chain for the body
         use ngx_core::buf::{Buf, BufData, Chain};
@@ -536,6 +549,54 @@ async fn return_error(r: &R, status: i64) -> i64 {
 }
 
 /// Parse upstream URL of form "http://host:port/path" or "http://host/path" (assumes port 80)
+/// Decode HTTP/1.1 chunked transfer encoding. Malformed input truncates the
+/// output at the first bad chunk rather than erroring — mirrors what a
+/// buffering proxy tends to do when the upstream is misbehaving.
+fn decode_chunked(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        // Find end of chunk size line
+        let line_end = match input[i..].iter().position(|&b| b == b'\n') {
+            Some(p) => i + p,
+            None => break,
+        };
+        let mut size_end = line_end;
+        // Strip trailing \r
+        if size_end > i && input[size_end - 1] == b'\r' {
+            size_end -= 1;
+        }
+        // Chunk size stops at ';' (chunk extension) or whitespace
+        let hex_end = input[i..size_end]
+            .iter()
+            .position(|&b| b == b';' || b == b' ' || b == b'\t')
+            .map(|p| i + p)
+            .unwrap_or(size_end);
+        let hex_str = match std::str::from_utf8(&input[i..hex_end]) {
+            Ok(s) => s.trim(),
+            Err(_) => break,
+        };
+        let size = match usize::from_str_radix(hex_str, 16) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        i = line_end + 1; // move past \n
+        if size == 0 {
+            break;
+        }
+        if i + size > input.len() {
+            out.extend_from_slice(&input[i..]);
+            break;
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size;
+        // Skip trailing \r\n after chunk data
+        if i < input.len() && input[i] == b'\r' { i += 1; }
+        if i < input.len() && input[i] == b'\n' { i += 1; }
+    }
+    out
+}
+
 fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
     if !uri.starts_with("http://") {
         return None;
