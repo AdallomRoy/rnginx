@@ -25,12 +25,17 @@ crate::http_module_index!("ngx_http_proxy_module");
 /// Proxy location configuration
 pub struct NgxHttpProxyLocConf {
     pub upstream_uri: Option<Vec<u8>>,  // proxy_pass URL
+    /// proxy_method: overrides the request method sent to upstream. Supports
+    /// variable interpolation via ComplexValue. Defaults to forwarding the
+    /// client's method.
+    pub method: Option<crate::script::ComplexValue>,
 }
 
 impl Default for NgxHttpProxyLocConf {
     fn default() -> Self {
         NgxHttpProxyLocConf {
             upstream_uri: None,
+            method: None,
         }
     }
 }
@@ -45,6 +50,17 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.upstream_uri.is_none() {
         c.upstream_uri = p.upstream_uri.clone();
     }
+    if c.method.is_none() {
+        c.method = p.method.clone();
+    }
+    Ok(())
+}
+
+fn proxy_method_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+    cell.borrow_mut().method = Some(cv);
     Ok(())
 }
 
@@ -251,9 +267,16 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
 
-    // Build request line
-    let method_name = r.method_name.borrow();
-    let method = std::str::from_utf8(&method_name).unwrap_or("GET");
+    // Build request line. proxy_method overrides the client method if set.
+    let method_owned: Vec<u8> = if let Some(mcv) = conf_borrowed.method.clone() {
+        drop(conf_borrowed);
+        let m = crate::script::complex_value(&r, &mcv).unwrap_or_default();
+        m
+    } else {
+        drop(conf_borrowed);
+        r.method_name.borrow().clone()
+    };
+    let method = std::str::from_utf8(&method_owned).unwrap_or("GET");
 
     let uri_path = std::str::from_utf8(&request_uri_bytes).unwrap_or("/").to_string();
     // Include query string if present
@@ -645,7 +668,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_next_upstream_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
         cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
