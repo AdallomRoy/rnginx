@@ -57,9 +57,9 @@ fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> Con
     Ok(())
 }
 
-fn stub_charset_map(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: implement charset_map block
-    Ok(())
+fn stub_charset_map(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // TODO: implement charset_map block (parse-only for now)
+    crate::stubs::skip_block(cf, cmd, conf)
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {

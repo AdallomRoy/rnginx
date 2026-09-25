@@ -102,6 +102,8 @@ fn set_expires(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Conf
 
     let expires = if value == b"max" {
         2145916555i64
+    } else if value == b"off" {
+        0i64
     } else {
         ngx_core::parse::parse_time(value, true).ok_or(msg("invalid value"))?
     };

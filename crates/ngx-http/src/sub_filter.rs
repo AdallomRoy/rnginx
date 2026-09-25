@@ -82,7 +82,7 @@ fn add_sub_filter(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> C
     };
 
     let mut c = cell.borrow_mut();
-    let mut pairs = c.pairs.get().clone();
+    let mut pairs = c.pairs.as_option().cloned().unwrap_or_default();
     pairs.push(pair);
     c.pairs = Val::set(pairs);
 
