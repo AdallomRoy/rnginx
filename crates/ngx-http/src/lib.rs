@@ -47,6 +47,9 @@ pub mod userid;
 pub mod addition_filter;
 pub mod random_index;
 pub mod degradation;
+pub mod sub_filter;
+pub mod charset_filter;
+pub mod secure_link;
 
 pub use request::{Request, R};
 
@@ -568,7 +571,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::memcached_module(),
         empty_gif::empty_gif_module(),
         stubs::browser_module(),
-        stubs::secure_link_module(),
+        secure_link::secure_link_module(),
         degradation::degradation_module(),
         stubs::flv_module(),
         stubs::mp4_module(),
@@ -590,10 +593,10 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),
         stubs::ssi_filter_module(),
-        stubs::charset_filter_module(),
+        charset_filter::charset_filter_module(),
         stubs::xslt_filter_module(),
         stubs::image_filter_module(),
-        stubs::sub_filter_module(),
+        sub_filter::sub_filter_module(),
         addition_filter::addition_filter_module(),
         stubs::gunzip_filter_module(),
         userid::userid_module(),
