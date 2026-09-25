@@ -119,7 +119,7 @@ pub async fn header_filter(r: R) -> i64 {
         } else if let Some(l) = status_line(status) {
             out.extend_from_slice(l.as_bytes());
         } else {
-            out.extend_from_slice(format!("{}", status).as_bytes());
+            out.extend_from_slice(format!("{} ", status).as_bytes());
         }
         out.extend_from_slice(b"\r\n");
     }

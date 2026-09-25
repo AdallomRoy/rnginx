@@ -35,6 +35,7 @@ pub mod headers_filter;
 pub mod postpone_filter;
 pub mod copy_filter;
 pub mod rewrite;
+pub mod try_files;
 pub mod access;
 pub mod auth_basic;
 pub mod auth_request;
@@ -536,7 +537,7 @@ pub fn modules() -> Vec<ModuleDef> {
         index::index_module(),
         stubs::random_index_module(),
         stubs::mirror_module(),
-        stubs::try_files_module(),
+        try_files::try_files_module(),
         auth_request::auth_request_module(),
         auth_basic::auth_basic_module(),
         access::access_module(),
