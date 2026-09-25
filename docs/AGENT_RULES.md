@@ -3,6 +3,18 @@
 You are one of several agents porting nginx 1.31.7 from C to Rust, working in parallel, each
 in its own git worktree and branch. Also read CONVENTIONS.md and PORTING.md in the repo root.
 
+
+## Working style (important — previous agents failed here)
+- You have a very large token budget (millions of tokens) and no time limit. Do NOT stop early.
+  Do NOT write summary documents, implementation guides, TODO lists, "phase 2" plans or
+  "skeletons for the next agent" — those are worthless; only working, tested code counts.
+  Expect to write 1,000–5,000 lines of Rust and to iterate for hours.
+- Whenever you feel like wrapping up, instead pick the next failing subtest, read the
+  corresponding C, port it, rebuild, rerun. You are finished only when the assigned tests pass,
+  or when a specific remaining failure is documented with the exact reason.
+- Port whole C functions one at a time (same names, same order of checks, same messages) rather
+  than designing new abstractions. Directive parsing alone is not a port; the runtime behaviour is.
+
 Locations (nginx-c and nginx-tests are NOT in git; always use these absolute paths):
 - C source: /home/ubuntu/rnginx/nginx-c/src ; reference C binary: /home/ubuntu/rnginx/nginx-c/objs/nginx
 - Tests: /home/ubuntu/rnginx/nginx-tests (Perl, Test::Nginx). docs/c-pass.txt lists the 478 files that pass with the C binary.
