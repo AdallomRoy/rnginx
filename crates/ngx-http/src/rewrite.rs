@@ -744,6 +744,23 @@ async fn rewrite_handler(r: R) -> i64 {
                             replacement.push(b'$');
                             i += 2;
                             continue;
+                        } else if repl[i + 1].is_ascii_alphabetic() || repl[i + 1] == b'_' {
+                            // Variable reference: $name or ${name}
+                            let start = i + 1;
+                            let mut end = start;
+                            while end < repl.len()
+                                && (repl[end].is_ascii_alphanumeric() || repl[end] == b'_')
+                            {
+                                end += 1;
+                            }
+                            let name = &repl[start..end];
+                            if let Some(vv) = crate::variables::get_variable(&r, name) {
+                                if !vv.not_found {
+                                    replacement.extend_from_slice(&vv.data);
+                                }
+                            }
+                            i = end;
+                            continue;
                         }
                     }
                     replacement.push(repl[i]);
@@ -762,6 +779,19 @@ async fn rewrite_handler(r: R) -> i64 {
                     if suppress_args {
                         response_url.pop(); // Remove the trailing '?'
                     }
+
+                    // Unescape the URL per C ngx_http_script_regex_end_code:
+                    // percent-encoded bytes in variable/capture expansions get
+                    // decoded up to the first '?', then the query string is
+                    // copied verbatim.
+                    let (mut decoded, consumed) = ngx_core::string::unescape_uri(
+                        &response_url,
+                        ngx_core::string::NGX_UNESCAPE_REDIRECT,
+                    );
+                    if consumed < response_url.len() {
+                        decoded.extend_from_slice(&response_url[consumed..]);
+                    }
+                    response_url = decoded;
 
                     let orig_args = r.args.borrow();
                     if !suppress_args && !orig_args.is_empty() {
