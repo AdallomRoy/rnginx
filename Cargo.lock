@@ -260,6 +260,7 @@ version = "1.31.7"
 dependencies = [
  "crc32fast",
  "flate2",
+ "foreign-types",
  "libc",
  "md-5",
  "memchr",
