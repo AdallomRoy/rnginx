@@ -29,6 +29,9 @@ pub struct NgxHttpProxyLocConf {
     /// variable interpolation via ComplexValue. Defaults to forwarding the
     /// client's method.
     pub method: Option<crate::script::ComplexValue>,
+    /// proxy_intercept_errors: if on, upstream >= 400 responses are handled by
+    /// the local error_page instead of being forwarded to the client.
+    pub intercept_errors: Val<bool>,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -36,6 +39,7 @@ impl Default for NgxHttpProxyLocConf {
         NgxHttpProxyLocConf {
             upstream_uri: None,
             method: None,
+            intercept_errors: Val::unset(),
         }
     }
 }
@@ -53,6 +57,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.method.is_none() {
         c.method = p.method.clone();
     }
+    c.intercept_errors.merge(&p.intercept_errors, false);
     Ok(())
 }
 
@@ -493,6 +498,26 @@ async fn proxy_handler(r: R) -> i64 {
     // their header pass.
     let upstream_content_length = r.headers_out.borrow().content_length_n;
 
+    // proxy_intercept_errors: hand off to error_page instead of forwarding the
+    // upstream body — but only if the location actually has an error_page
+    // configured for this status. Matches ngx_http_upstream_intercept_errors.
+    {
+        let lcf2 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let intercept = lcf2.borrow().intercept_errors.get_or(false);
+        if intercept && status >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+            let clcf = r.clcf();
+            let has_page = clcf
+                .borrow()
+                .error_pages
+                .as_ref()
+                .map(|pages| pages.iter().any(|p| p.status == status))
+                .unwrap_or(false);
+            if has_page {
+                return status;
+            }
+        }
+    }
+
     // Send status and headers to client
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
     if send_hdr_rc != NGX_OK {
@@ -678,7 +703,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_hide_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_store_access", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
