@@ -1232,17 +1232,22 @@ pub fn parse_complex_uri(
                 } else {
                     match ch {
                         b'/' | b'?' | b'#' => {
-                            // Remove ".." (3 chars: dot dot plus preceding slash)
-                            if u.len() >= 3 {
-                                u.truncate(u.len() - 3);
+                            // Port of C ngx_http_parse_complex_uri sw_dot_dot with '/':
+                            // remove "..", the '/' before them, and the trailing char of
+                            // the previous segment; then walk back to the prior '/'.
+                            if u.len() < 2 {
+                                return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
                             }
-
-                            // Find the previous slash and position after it
-                            while !u.is_empty() {
-                                if u[u.len() - 1] == b'/' {
-                                    break;
-                                }
+                            u.truncate(u.len() - 2); // drop ".."
+                            if u.last() == Some(&b'/') {
+                                u.pop(); // drop '/' between prev segment and ".."
+                            }
+                            while !u.is_empty() && *u.last().unwrap() != b'/' {
                                 u.pop();
+                            }
+                            if u.is_empty() {
+                                // ".." attempted to escape root
+                                return Err(NGX_HTTP_PARSE_INVALID_REQUEST);
                             }
 
                             if ch == b'?' {
@@ -1254,9 +1259,14 @@ pub fn parse_complex_uri(
                                     args_buf.push(buf[p]);
                                     p += 1;
                                 }
+                                state = SW_USUAL;
+                                break;
                             }
-                            state = SW_USUAL;  // Set state so trailing handler doesn't apply
-                            break;  // Exit while loop
+                            if ch == b'#' {
+                                state = SW_USUAL;
+                                break;
+                            }
+                            state = SW_SLASH;
                         }
                         b'%' => {
                             quoted_state = state;
