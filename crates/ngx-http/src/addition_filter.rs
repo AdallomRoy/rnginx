@@ -51,8 +51,14 @@ pub fn addition_filter_module() -> ModuleDef {
     let commands = vec![
         ngx_core::cmd!("add_before_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, AdditionLocConf, before_body, set_str),
         ngx_core::cmd!("add_after_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, AdditionLocConf, after_body, set_str),
+        ngx_core::cmd_fn!("addition_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, stub_types),
     ];
     http_module_def("ngx_http_addition_filter_module", def, commands)
+}
+
+fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // TODO: implement types filtering
+    Ok(())
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {

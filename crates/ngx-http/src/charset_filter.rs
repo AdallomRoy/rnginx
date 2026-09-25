@@ -46,8 +46,20 @@ pub fn charset_filter_module() -> ModuleDef {
         ngx_core::cmd!("charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, CharsetLocConf, charset, set_str),
         ngx_core::cmd!("source_charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, CharsetLocConf, source_charset, set_str),
         ngx_core::cmd!("override_charset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG, ConfLevel::Loc, CharsetLocConf, override_charset, set_flag),
+        ngx_core::cmd_fn!("charset_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, stub_types),
+        ngx_core::cmd_fn!("charset_map", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE2, ConfLevel::Main, stub_charset_map),
     ];
     http_module_def("ngx_http_charset_filter_module", def, commands)
+}
+
+fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // TODO: implement types filtering
+    Ok(())
+}
+
+fn stub_charset_map(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // TODO: implement charset_map block
+    Ok(())
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {

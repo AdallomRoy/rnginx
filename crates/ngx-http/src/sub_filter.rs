@@ -57,10 +57,16 @@ pub fn sub_filter_module() -> ModuleDef {
     };
     let commands = vec![
         ngx_core::cmd_fn!("sub_filter", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, add_sub_filter),
+        ngx_core::cmd_fn!("sub_filter_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, stub_types),
         ngx_core::cmd!("sub_filter_once", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, SubLocConf, once, set_flag),
         ngx_core::cmd!("sub_filter_last_modified", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, SubLocConf, last_modified, set_flag),
     ];
     http_module_def("ngx_http_sub_filter_module", def, commands)
+}
+
+fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    // TODO: implement types filtering
+    Ok(())
 }
 
 fn add_sub_filter(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
