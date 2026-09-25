@@ -34,7 +34,7 @@ pub const NGX_CONF_2MORE: u32 = 0x00001000;
 
 pub const NGX_DIRECT_CONF: u32 = 0x00010000;
 pub const NGX_MAIN_CONF: u32 = 0x01000000;
-pub const NGX_ANY_CONF: u32 = 0x1F000000;
+pub const NGX_ANY_CONF: u32 = 0xFF000000;
 
 pub const NGX_CONF_BUFFER: usize = 4096;
 
