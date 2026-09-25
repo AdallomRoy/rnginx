@@ -216,7 +216,7 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
             }
         };
 
-        let processed = process_ssi(&data, &mut ctx_rc.borrow_mut());
+        let processed = process_ssi(&data, &mut ctx_rc.borrow_mut(), &r);
         if !processed.is_empty() {
             output.push_back(Buf::from_vec(processed));
         }
@@ -225,7 +225,7 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     next(r, output).await
 }
 
-fn process_ssi(data: &[u8], ctx: &mut SsiCtx) -> Vec<u8> {
+fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut tag_start = 0;
@@ -322,7 +322,7 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx) -> Vec<u8> {
                     if i + 2 < data.len() && &data[i..i+3] == b"-->" {
                         let cmd = ctx.command.clone();
                         let params = ctx.params.clone();
-                        let result = execute_directive(&cmd, &params, ctx);
+                        let result = execute_directive(&cmd, &params, ctx, r);
                         out.extend_from_slice(&result);
                         ctx.state = SsiState::Start;
                         i += 3;
@@ -389,7 +389,7 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx) -> Vec<u8> {
                     if i + 2 < data.len() && &data[i..i+3] == b"-->" {
                         let cmd = ctx.command.clone();
                         let params = ctx.params.clone();
-                        let result = execute_directive(&cmd, &params, ctx);
+                        let result = execute_directive(&cmd, &params, ctx, r);
                         out.extend_from_slice(&result);
                         ctx.state = SsiState::Start;
                         i += 3;
@@ -405,12 +405,63 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx) -> Vec<u8> {
     out
 }
 
-fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut SsiCtx) -> Vec<u8> {
+fn ssi_get_variable(var_name: &[u8], ctx: &SsiCtx, r: &R) -> Option<Vec<u8>> {
+    // Check stored variables first
+    if let Some(val) = ctx.variables.get(var_name) {
+        return Some(val.clone());
+    }
+
+    // Try to get from nginx variable system (handles arg_*, etc.)
+    if let Some(vv) = get_variable(r, var_name) {
+        if !vv.not_found {
+            return Some(vv.data);
+        }
+    }
+
+    None
+}
+
+fn ssi_encode(value: &[u8], encoding: Option<&[u8]>) -> Vec<u8> {
+    match encoding {
+        Some(b"url") => {
+            let mut result = Vec::new();
+            for &byte in value {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        result.push(byte);
+                    }
+                    _ => {
+                        result.extend_from_slice(format!("%{:02X}", byte).as_bytes());
+                    }
+                }
+            }
+            result
+        }
+        Some(b"entity") => {
+            let mut result = Vec::new();
+            for &byte in value {
+                match byte {
+                    b'&' => result.extend_from_slice(b"&amp;"),
+                    b'<' => result.extend_from_slice(b"&lt;"),
+                    b'>' => result.extend_from_slice(b"&gt;"),
+                    b'"' => result.extend_from_slice(b"&quot;"),
+                    b'\'' => result.extend_from_slice(b"&#39;"),
+                    _ => result.push(byte),
+                }
+            }
+            result
+        }
+        _ => value.to_vec(), // "none" or default
+    }
+}
+
+fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
     match cmd {
         b"echo" => {
             if let Some(var_name) = params.get(&b"var".to_vec()) {
-                if let Some(val) = ctx.variables.get(var_name) {
-                    return val.clone();
+                if let Some(val) = ssi_get_variable(var_name, ctx, r) {
+                    let encoding = params.get(&b"encoding".to_vec()).map(|v| v.as_slice());
+                    return ssi_encode(&val, encoding);
                 }
                 if let Some(def) = params.get(&b"default".to_vec()) {
                     return def.clone();
