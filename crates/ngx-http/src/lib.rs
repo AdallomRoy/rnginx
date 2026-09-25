@@ -41,6 +41,8 @@ pub mod auth_basic;
 pub mod auth_request;
 pub mod realip;
 pub mod stub_status;
+pub mod flv;
+pub mod mp4;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -565,8 +567,8 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::browser_module(),
         stubs::secure_link_module(),
         stubs::degradation_module(),
-        stubs::flv_module(),
-        stubs::mp4_module(),
+        flv::flv_module(),
+        mp4::mp4_module(),
         stubs::upstream_hash_module(),
         stubs::upstream_ip_hash_module(),
         stubs::upstream_least_conn_module(),
