@@ -37,7 +37,9 @@ struct LimitReqNode {
 
 /// A zone for limit_req
 pub struct LimitReqZone {
-    rate_ms: u64,    // thousandths of req/sec
+    rate_num: u64,   // N requests
+    rate_per: u64,   // per N seconds (1 or 60)
+    key_expr: Vec<u8>,  // The key expression (e.g., $binary_remote_addr)
     map: RefCell<HashMap<Vec<u8>, LimitReqNode>>,
 }
 
@@ -176,27 +178,36 @@ async fn limit_req_handler(r: R) -> i64 {
             continue;
         };
 
-        // Evaluate the complex key (simplified: use remote addr)
-        let key = match &*r.connection.sockaddr.borrow() {
-            ngx_core::inet::SockAddr::V4(sa) => sa.ip().octets().to_vec(),
-            ngx_core::inet::SockAddr::V6(sa) => sa.ip().octets().to_vec(),
-            ngx_core::inet::SockAddr::Unix(_) => b"unix".to_vec(),
-        };
+        // Evaluate the key expression
+        let key = evaluate_key_expression(&r, &zone.key_expr);
+        if key.is_empty() {
+            // Empty key means variable not set - skip this limit
+            continue;
+        }
 
         let mut map = zone.map.borrow_mut();
         let node = map.entry(key).or_default();
 
+        // Compute rate in excess units per second
+        let rate_per_second = zone.rate_num * 1000 / zone.rate_per;
+
         // Leaky bucket algorithm
+        // Decay is: elapsed_ms * rate_num / rate_per thousandths
+        // (rate_num requests / rate_per seconds = rate_num / rate_per requests per second)
+        // = (rate_num / rate_per / 1000) requests per millisecond
+        // = (rate_num / rate_per) thousandths per millisecond
         let elapsed_ms = now.saturating_sub(node.last_ms);
-        let excess = node.excess.saturating_sub(elapsed_ms * zone.rate_ms / 1000) + zone.rate_ms;
-        node.last_ms = now;
-        node.excess = excess;
+        let decay = elapsed_ms * zone.rate_num / zone.rate_per;
+        let excess = node.excess.saturating_sub(decay);
 
-        drop(map); // Release borrow before potential sleep/log
+        // Check if would be rejected BEFORE counting this request
+        // Capacity = (burst + rate_num) requests in excess units (where 1 request = 1000)
+        // Reject if excess + 1000 (this request) would exceed capacity
+        let capacity = (limit.burst + zone.rate_num) * 1000;
+        if excess + 1000 > capacity {
+            // Reject - DON'T update state
+            drop(map); // Release borrow before logging
 
-        // Check limits
-        if excess > limit.burst * zone.rate_ms + zone.rate_ms {
-            // Reject
             let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
             ngx_log_error!(*conf.limit_log_level.get() as u32, r.connection.log, None,
                 "limiting requests{}, excess: {:.3} by zone \"{}\"",
@@ -214,9 +225,40 @@ async fn limit_req_handler(r: R) -> i64 {
             return *conf.status_code.get() as i64;
         }
 
+        // Check if delay would be needed (after counting this request)
+        let new_excess = excess + 1000;
+        if new_excess > rate_per_second && !limit.delay {
+            // nodelay=true but this request would need delay - reject without updating state
+            drop(map);
+
+            let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
+            ngx_log_error!(*conf.limit_log_level.get() as u32, r.connection.log, None,
+                "limiting requests{}, excess: {:.3} by zone \"{}\"",
+                dry_run_str,
+                new_excess as f64 / 1000.0,
+                B(&limit.zone_name)
+            );
+
+            if *conf.dry_run.get() {
+                r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_REJECTED_DRY_RUN);
+                return NGX_DECLINED;
+            }
+
+            r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_REJECTED);
+            return *conf.status_code.get() as i64;
+        }
+
+        // Not rejected, so count this request
+        let excess = new_excess;
+        node.last_ms = now;
+        node.excess = excess;
+
+        drop(map); // Release borrow before potential sleep/log
+
         // Check if delay needed
-        if excess > zone.rate_ms {
-            let delay_ms = (excess - zone.rate_ms) * 1000 / zone.rate_ms;
+        if excess > rate_per_second {
+            // Delay needed to drain excess at rate zone.rate_num requests per (zone.rate_per * 1000) ms
+            let delay_ms = ((excess - rate_per_second) * zone.rate_per) / zone.rate_num;
 
             let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
             ngx_log_error!(*conf.delay_log_level.get() as u32, r.connection.log, None,
@@ -231,11 +273,9 @@ async fn limit_req_handler(r: R) -> i64 {
                 return NGX_DECLINED;
             }
 
-            if limit.delay {
-                r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_DELAYED);
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                return NGX_DECLINED;
-            }
+            r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_DELAYED);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            return NGX_DECLINED;
         }
     }
 
@@ -250,8 +290,10 @@ fn limit_req_zone(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
     }
 
     // Parse: limit_req_zone $variable zone=name:size rate=X[r/m]
+    let key_expr = args[1].clone();  // The variable expression
     let mut zone_name: Option<Vec<u8>> = None;
-    let mut rate_ms: u64 = 0;
+    let mut rate_num: u64 = 0;
+    let mut rate_per: u64 = 0;
 
     for arg in &args[2..] {
         let arg_str = String::from_utf8_lossy(arg);
@@ -262,17 +304,21 @@ fn limit_req_zone(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
                 zone_name = Some(parts[0].as_bytes().to_vec());
             }
         } else if arg_str.starts_with("rate=") {
-            rate_ms = parse_zone_rate(&arg_str[5..])?;
+            let (num, per) = parse_zone_rate(&arg_str[5..])?;
+            rate_num = num;
+            rate_per = per;
         }
     }
 
-    if zone_name.is_none() || rate_ms == 0 {
+    if zone_name.is_none() || rate_num == 0 {
         return Err(msg("zone and rate required"));
     }
 
     let zone_name = zone_name.unwrap();
     let zone = Rc::new(LimitReqZone {
-        rate_ms,
+        rate_num,
+        rate_per,
+        key_expr,
         map: RefCell::new(HashMap::new()),
     });
 
@@ -367,7 +413,23 @@ fn limit_req_dry_run(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
     Ok(())
 }
 
-fn parse_zone_rate(s: &str) -> Result<u64, ConfError> {
+fn evaluate_key_expression(r: &R, expr: &[u8]) -> Vec<u8> {
+    let expr_str = String::from_utf8_lossy(expr);
+
+    if expr_str == "$binary_remote_addr" {
+        match &*r.connection.sockaddr.borrow() {
+            ngx_core::inet::SockAddr::V4(sa) => sa.ip().octets().to_vec(),
+            ngx_core::inet::SockAddr::V6(sa) => sa.ip().octets().to_vec(),
+            ngx_core::inet::SockAddr::Unix(_) => b"unix".to_vec(),
+        }
+    } else {
+        // For other expressions like $arg_*, return empty (not supported yet)
+        // TODO: implement other key expressions
+        Vec::new()
+    }
+}
+
+fn parse_zone_rate(s: &str) -> Result<(u64, u64), ConfError> {
     let s = s.trim();
     let (num_str, per) = if s.ends_with("r/s") || s.ends_with("r/S") {
         (&s[..s.len()-3], 1u64)
@@ -380,6 +442,6 @@ fn parse_zone_rate(s: &str) -> Result<u64, ConfError> {
     let num: u64 = num_str.parse()
         .map_err(|_| msg("invalid rate"))?;
 
-    // Convert to thousandths per millisecond
-    Ok(num * 1000 / per)
+    // Return (numerator, denominator in seconds)
+    Ok((num, per))
 }

@@ -67,6 +67,7 @@ pub struct SsiCtx {
     pub variables: HashMap<Vec<u8>, Vec<u8>>,
     pub timefmt: Vec<u8>,
     pub errmsg: Vec<u8>,
+    pub pending_include: Option<Vec<u8>>, // URI for pending include
 }
 
 impl Default for SsiCtx {
@@ -82,6 +83,7 @@ impl Default for SsiCtx {
             variables: HashMap::new(),
             timefmt: b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec(),
             errmsg: SSI_ERROR_MSG.to_vec(),
+            pending_include: None,
         }
     }
 }
@@ -207,6 +209,8 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     };
 
     let mut output = Chain::new();
+    let mut pending_includes = Vec::new();
+
     while let Some(buf) = input.pop_front() {
         let data = match &buf.data {
             BufData::Memory(v) => v.clone(),
@@ -220,6 +224,35 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         if !processed.is_empty() {
             output.push_back(Buf::from_vec(processed));
         }
+
+        // Collect pending includes
+        if let Some(uri) = ctx_rc.borrow_mut().pending_include.take() {
+            pending_includes.push(uri);
+        }
+    }
+
+    // Handle pending includes before calling next
+    for uri in pending_includes {
+        // Emit buffered output before the include
+        if !output.is_empty() {
+            let result = next(r.clone(), output).await;
+            if result != NGX_OK {
+                return result;
+            }
+            output = Chain::new();
+        }
+
+        // Split URI and query string if needed
+        let (path, args) = if let Some(q_pos) = uri.iter().position(|&b| b == b'?') {
+            let (p, a) = uri.split_at(q_pos);
+            (p.to_vec(), Some(a[1..].to_vec())) // Skip the '?'
+        } else {
+            (uri.clone(), None)
+        };
+
+        // Make the subrequest - its output goes to downstream
+        let args_ref = args.as_ref().map(|a| a.as_slice());
+        let _ = crate::request_rt::subrequest(&r, &path, args_ref, 0, None).await;
     }
 
     next(r, output).await
@@ -486,8 +519,62 @@ fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut S
             }
             Vec::new()
         }
+        b"include" => {
+            // Store the include directive for async handling
+            if let Some(virt) = params.get(&b"virtual".to_vec()) {
+                // Evaluate variables in the virtual URI
+                let uri = ssi_eval_string(virt, ctx, r);
+                // Store it for the body filter to handle
+                ctx.pending_include = Some(uri);
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
+}
+
+fn ssi_eval_string(s: &[u8], ctx: &SsiCtx, r: &R) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let bytes = s;
+
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                // ${var} format
+                let mut j = i + 2;
+                while j < bytes.len() && bytes[j] != b'}' {
+                    j += 1;
+                }
+                if j < bytes.len() {
+                    let var_name = &bytes[i + 2..j];
+                    if let Some(val) = ssi_get_variable(var_name, ctx, r) {
+                        result.extend_from_slice(&val);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            } else {
+                // $var format
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    let var_name = &bytes[i + 1..j];
+                    if let Some(val) = ssi_get_variable(var_name, ctx, r) {
+                        result.extend_from_slice(&val);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    result
 }
 
 #[cfg(test)]
