@@ -57,6 +57,7 @@ pub mod upstream_round_robin;
 pub mod event_pipe;
 pub mod ssl_module;
 pub mod gzip_filter;
+pub mod gzip_static;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -556,7 +557,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::v2_module(),
         stubs::v3_module(),
         static_module::static_module(),
-        stubs::gzip_static_module(),
+        gzip_static::gzip_static_module(),
         stubs::dav_module(),
         stubs::autoindex_module(),
         index::index_module(),
