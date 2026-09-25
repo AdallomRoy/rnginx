@@ -164,10 +164,25 @@ pub async fn header_filter(r: R) -> i64 {
                 ce.hash.set(0);
             }
         }
-        if ho.last_modified.is_none() && ho.last_modified_time != -1 {
+        if let Some(lm) = &ho.last_modified {
+            if lm.hash.get() != 0 {
+                out.extend_from_slice(b"Last-Modified: ");
+                out.extend_from_slice(&lm.value.borrow());
+                out.extend_from_slice(b"\r\n");
+                lm.hash.set(0);
+            }
+        } else if ho.last_modified_time != -1 {
             out.extend_from_slice(b"Last-Modified: ");
             out.extend_from_slice(ngx_core::times::http_time(ho.last_modified_time).as_bytes());
             out.extend_from_slice(b"\r\n");
+        }
+        if let Some(et) = &ho.etag {
+            if et.hash.get() != 0 {
+                out.extend_from_slice(b"ETag: ");
+                out.extend_from_slice(&et.value.borrow());
+                out.extend_from_slice(b"\r\n");
+                et.hash.set(0);
+            }
         }
     }
     // Location: make absolute for relative redirects
