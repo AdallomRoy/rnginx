@@ -18,7 +18,7 @@ use crate::request::*;
 use crate::upstream::*;
 use crate::variables::VarDef;
 use crate::get_loc_conf;
-use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, NGX_HTTP_BAD_GATEWAY, NGX_HTTP_OK, HttpModuleDef, http_module_def};
+use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, NGX_HTTP_BAD_GATEWAY, NGX_HTTP_OK, NGX_HTTP_HEAD, HttpModuleDef, http_module_def};
 
 crate::http_module_index!("ngx_http_proxy_module");
 
@@ -458,15 +458,34 @@ async fn proxy_handler(r: R) -> i64 {
         }
     }
 
+    // Snapshot upstream Content-Length before send_header runs — filters like
+    // addition_filter / sub_filter / gzip clear ho.content_length_n during
+    // their header pass.
+    let upstream_content_length = r.headers_out.borrow().content_length_n;
+
     // Send status and headers to client
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
     if send_hdr_rc != NGX_OK {
         return NGX_ERROR;
     }
 
-    // Forward response body
+    // Forward response body. Respect HEAD (no body) and Content-Length (truncate
+    // any extra bytes upstream sent past the declared length — matches C which
+    // reads exactly content_length_n bytes and logs "upstream sent more data
+    // than specified in Content-Length"). We captured upstream_content_length
+    // above BEFORE send_header, because some filters (e.g. addition_filter,
+    // sub_filter, gzip) clear r.headers_out.content_length_n.
+    let head_only = r.method.get() == NGX_HTTP_HEAD || r.header_only.get();
+    if head_only {
+        return NGX_OK;
+    }
     if body_start < response.len() {
-        let body = &response[body_start..];
+        let end = if upstream_content_length >= 0 {
+            (body_start + upstream_content_length as usize).min(response.len())
+        } else {
+            response.len()
+        };
+        let body = &response[body_start..end];
 
         // Create a buffer chain for the body
         use ngx_core::buf::{Buf, BufData, Chain};
