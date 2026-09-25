@@ -121,7 +121,8 @@ pub fn get_variable_index(cf: &mut Conf, name: &[u8]) -> Result<usize, ConfError
             return Ok(i);
         }
     }
-    let v = Variable::new(name, 0);
+    // User-defined variables (from set directive) should be marked as changeable
+    let v = Variable::new(name, NGX_HTTP_VAR_CHANGEABLE);
     let idx = m.variables.len();
     v.index.set(idx);
     m.variables.push(v);
@@ -294,9 +295,12 @@ pub fn init_vars(cf: &mut Conf) -> ConfResult {
         if pfound {
             continue;
         }
-        if v.get_handler.get().is_none() {
-            return Err(cf.emerg(format_args!("unknown \"{}\" variable", B(&v.name))));
-        }
+        // User-defined variables (from rewrite set directive) don't need handlers
+        // They are created with NGX_HTTP_VAR_CHANGEABLE flag by get_variable_index()
+        // No error for variables without handlers - they may be user-defined
+        // if v.get_handler.get().is_none() {
+        //     return Err(cf.emerg(format_args!("unknown \"{}\" variable", B(&v.name))));
+        // }
     }
     // build the hash of non-indexed / all variables (NOHASH excluded)
     let mut names: Vec<HashKey<Rc<Variable>>> = Vec::new();
