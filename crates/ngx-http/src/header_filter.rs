@@ -150,6 +150,12 @@ pub async fn header_filter(r: R) -> i64 {
         if ho.content_length.is_none() && ho.content_length_n >= 0 {
             out.extend_from_slice(format!("Content-Length: {}\r\n", ho.content_length_n).as_bytes());
         }
+        if let Some(cr) = &ho.content_range {
+            out.extend_from_slice(b"Content-Range: ");
+            out.extend_from_slice(&cr.value.borrow());
+            out.extend_from_slice(b"\r\n");
+            cr.hash.set(0);
+        }
         if ho.last_modified.is_none() && ho.last_modified_time != -1 {
             out.extend_from_slice(b"Last-Modified: ");
             out.extend_from_slice(ngx_core::times::http_time(ho.last_modified_time).as_bytes());
