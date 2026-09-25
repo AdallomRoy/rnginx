@@ -43,6 +43,12 @@ pub struct RewriteFlags {
 pub enum Code {
     Rewrite(RewriteRule),
     Set { var_idx: usize, value: ComplexValue },
+    /// Evaluate `value`, then feed the result into the variable's set_handler.
+    /// Matches C's ngx_http_script_var_set_handler_code emitted by rewrite_set
+    /// when v->set_handler is non-NULL (e.g. $args, $limit_rate); the handler
+    /// updates the underlying request field (r.args, r.limit_rate) and the
+    /// value is NOT cached in r.variables[index].
+    SetHandler { var_idx: usize, value: ComplexValue, handler: crate::variables::SetHandler },
     Return { status: i64, text: Option<ComplexValue> },
     Break { is_break_cycle: bool }, // true = break, false = last
     If { condition: IfCondition, codes: Vec<Code> },
@@ -479,21 +485,50 @@ fn set_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
         return Err(cf.emerg(format_args!("invalid number of arguments")));
     }
 
-    let var_name = &args[1];
+    let raw = &args[1];
+    if raw.is_empty() || raw[0] != b'$' {
+        return Err(cf.emerg(format_args!("invalid variable name \"{}\"", B(raw))));
+    }
+    let var_name = &raw[1..];
 
-    // Create or get variable index - set makes variables changeable
-    let _var = crate::variables::add_variable(cf, var_name, crate::variables::NGX_HTTP_VAR_CHANGEABLE)?;
+    // Register the variable and get its index. Matches C ngx_http_rewrite_set.
+    let v = crate::variables::add_variable(
+        cf,
+        var_name,
+        crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_WEAK,
+    )?;
     let var_idx = get_variable_index(cf, var_name)?;
+
+    // Install a null-value fallback if the variable has no handler yet, so
+    // reads before the set fires return not_found instead of "cycle" errors.
+    if v.get_handler.get().is_none() {
+        v.get_handler.set(Some(rewrite_var_fallback));
+        v.data.set(var_idx);
+    }
 
     // Compile the value as a ComplexValue
     let value_bytes = &args[2];
     let value = crate::script::compile_complex_value(cf, value_bytes, 0)?;
 
-    cell.borrow_mut()
-        .codes
-        .push(Code::Set { var_idx, value });
+    // If the variable has a set_handler (e.g. $args, $limit_rate), emit the
+    // handler code instead of caching the value in r.variables — the handler
+    // owns the underlying storage.
+    if let Some(handler) = v.set_handler.get() {
+        cell.borrow_mut()
+            .codes
+            .push(Code::SetHandler { var_idx, value, handler });
+    } else {
+        cell.borrow_mut()
+            .codes
+            .push(Code::Set { var_idx, value });
+    }
 
     Ok(())
+}
+
+fn rewrite_var_fallback(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    v.not_found = true;
+    NGX_OK
 }
 
 /// ngx_http_rewrite_break directive handler
@@ -866,6 +901,19 @@ async fn rewrite_handler(r: R) -> i64 {
                 }
             }
 
+            Code::SetHandler { var_idx, value, handler } => {
+                if let Ok(val) = crate::script::complex_value(&r, value) {
+                    let mut vv = crate::request::VariableValue {
+                        data: val,
+                        valid: true,
+                        not_found: false,
+                        no_cacheable: false,
+                        escape: false,
+                    };
+                    handler(&r, &mut vv, *var_idx);
+                }
+            }
+
             Code::Return { status, text } => {
                 let status = *status;
 
@@ -1021,6 +1069,18 @@ async fn rewrite_handler(r: R) -> i64 {
                                         set_indexed_variable(&r, *var_idx, val);
                                     }
                                     Err(_) => {}
+                                }
+                            }
+                            Code::SetHandler { var_idx, value, handler } => {
+                                if let Ok(val) = crate::script::complex_value(&r, value) {
+                                    let mut vv = crate::request::VariableValue {
+                                        data: val,
+                                        valid: true,
+                                        not_found: false,
+                                        no_cacheable: false,
+                                        escape: false,
+                                    };
+                                    handler(&r, &mut vv, *var_idx);
                                 }
                             }
                             Code::Return { status, text } => {
