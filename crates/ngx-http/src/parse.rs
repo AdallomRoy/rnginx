@@ -1109,7 +1109,6 @@ pub fn parse_complex_uri(
                             while p < uri_end {
                                 // Scan for # to mark end of args
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1158,7 +1157,6 @@ pub fn parse_complex_uri(
                             args_set = true;
                             while p < uri_end {
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1202,13 +1200,9 @@ pub fn parse_complex_uri(
                             state = SW_QUOTED;
                         }
                         b'?' => {
-                            if u.len() > 0 {
-                                u.pop(); // Remove the dot
-                            }
                             args_set = true;
                             while p < uri_end {
                                 if buf[p] == b'#' {
-                                    args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                     break;
                                 }
                                 args_buf.push(buf[p]);
@@ -1217,9 +1211,6 @@ pub fn parse_complex_uri(
                             break;
                         }
                         b'#' => {
-                            if u.len() > 0 {
-                                u.pop(); // Remove the dot
-                            }
                             break;
                         }
                         b'+' => {
@@ -1258,17 +1249,14 @@ pub fn parse_complex_uri(
                                 args_set = true;
                                 while p < uri_end {
                                     if buf[p] == b'#' {
-                                        args_buf.extend_from_slice(&buf[p + 1..uri_end]);
                                         break;
                                     }
                                     args_buf.push(buf[p]);
                                     p += 1;
                                 }
-                                break;
-                            } else if ch == b'#' {
-                                break;
                             }
-                            state = SW_SLASH;
+                            state = SW_USUAL;  // Set state so trailing handler doesn't apply
+                            break;  // Exit while loop
                         }
                         b'%' => {
                             quoted_state = state;
