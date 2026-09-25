@@ -41,6 +41,12 @@ pub mod auth_request;
 pub mod realip;
 pub mod stub_status;
 pub mod stubs;
+pub mod empty_gif;
+pub mod mirror;
+pub mod userid;
+pub mod addition_filter;
+pub mod random_index;
+pub mod degradation;
 
 pub use request::{Request, R};
 
@@ -534,8 +540,8 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::dav_module(),
         stubs::autoindex_module(),
         index::index_module(),
-        stubs::random_index_module(),
-        stubs::mirror_module(),
+        random_index::random_index_module(),
+        mirror::mirror_module(),
         stubs::try_files_module(),
         auth_request::auth_request_module(),
         auth_basic::auth_basic_module(),
@@ -560,10 +566,10 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::tunnel_module(),
         stubs::perl_module(),
         stubs::memcached_module(),
-        stubs::empty_gif_module(),
+        empty_gif::empty_gif_module(),
         stubs::browser_module(),
         stubs::secure_link_module(),
-        stubs::degradation_module(),
+        degradation::degradation_module(),
         stubs::flv_module(),
         stubs::mp4_module(),
         stubs::upstream_hash_module(),
@@ -588,9 +594,9 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::xslt_filter_module(),
         stubs::image_filter_module(),
         stubs::sub_filter_module(),
-        stubs::addition_filter_module(),
+        addition_filter::addition_filter_module(),
         stubs::gunzip_filter_module(),
-        stubs::userid_filter_module(),
+        userid::userid_module(),
         headers_filter::headers_filter_module(),
         copy_filter::copy_filter_module(),
         stubs::range_body_filter_module(),
