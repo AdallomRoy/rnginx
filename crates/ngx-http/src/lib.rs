@@ -27,6 +27,7 @@ pub mod special_response;
 pub mod static_module;
 pub mod index;
 pub mod log;
+pub mod map;
 pub mod request_body;
 pub mod output;
 pub mod chunked_filter;
@@ -547,7 +548,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::json_module(),
         stubs::geo_module(),
         stubs::geoip_module(),
-        stubs::map_module(),
+        map::map_module(),
         split_clients::split_clients_module(),
         stubs::referer_module(),
         rewrite::rewrite_module(),
