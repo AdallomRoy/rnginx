@@ -42,6 +42,8 @@ pub mod auth_request;
 pub mod realip;
 pub mod stub_status;
 pub mod split_clients;
+pub mod referer;
+pub mod browser;
 pub mod stubs;
 
 pub use request::{Request, R};
@@ -550,7 +552,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::geoip_module(),
         map::map_module(),
         split_clients::split_clients_module(),
-        stubs::referer_module(),
+        referer::referer_module(),
         rewrite::rewrite_module(),
         stubs::ssl_module(),
         stubs::proxy_module(),
@@ -563,7 +565,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::perl_module(),
         stubs::memcached_module(),
         stubs::empty_gif_module(),
-        stubs::browser_module(),
+        browser::browser_module(),
         stubs::secure_link_module(),
         stubs::degradation_module(),
         stubs::flv_module(),
