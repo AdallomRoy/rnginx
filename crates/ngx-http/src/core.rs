@@ -607,7 +607,7 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
         c.alias = p.alias;
         c.root = p.root.clone();
         c.root_script = p.root_script.clone();
-        if !p.root_set {
+        if c.root.is_empty() {
             c.root = cf.cycle.full_name(b"html", false);
         }
     }
