@@ -463,18 +463,24 @@ async fn rewrite_handler(r: R) -> i64 {
                 }
 
                 // For internal rewrites, parse replacement to separate URI and args
-                let (rewritten_uri, rewritten_args) = if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
-                    // Split on '?'
-                    let uri_part = replacement[..qpos].to_vec();
-                    let args_part = replacement[qpos + 1..].to_vec();
-                    (uri_part, args_part)
-                } else if replacement.ends_with(b"?") {
+                let orig_args = r.args.borrow().clone();
+
+                let (rewritten_uri, rewritten_args) = if replacement.ends_with(b"?") {
                     // "?" at end means drop query string
                     let uri_part = replacement[..replacement.len() - 1].to_vec();
                     (uri_part, Vec::new())
+                } else if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
+                    // '?' in the middle: replacement has explicit args, append original args
+                    let uri_part = replacement[..qpos].to_vec();
+                    let mut args_part = replacement[qpos + 1..].to_vec();
+                    if !orig_args.is_empty() {
+                        args_part.push(b'&');
+                        args_part.extend_from_slice(&orig_args);
+                    }
+                    (uri_part, args_part)
                 } else {
                     // No '?' - preserve original args
-                    (replacement.clone(), r.args.borrow().clone())
+                    (replacement.clone(), orig_args)
                 };
 
                 // Update request URI and args for internal rewrites
