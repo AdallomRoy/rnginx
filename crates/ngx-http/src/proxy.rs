@@ -305,12 +305,43 @@ async fn proxy_handler(r: R) -> i64 {
             format!("Content-Type: {}\r\n", std::str::from_utf8(&ct.value.borrow()).unwrap_or(""))
         } else { String::new() }
     };
+    // Forward client request headers that aren't the ones we synthesize ourselves.
+    // C proxies most client headers by default; the exact list is governed by
+    // proxy_set_header, hide_headers, etc.  We don't implement those yet, so this
+    // is a subset: pass everything except headers that would conflict with the
+    // synthesized request line, hop-by-hop headers, and things upstream shouldn't
+    // trust from the client.
+    let forward_headers: String = {
+        let hin = r.headers_in.borrow();
+        let mut s = String::new();
+        for h in hin.headers.iter() {
+            if h.hash.get() == 0 { continue; }
+            let lc = &h.lowcase_key;
+            if matches!(lc.as_slice(),
+                b"host" | b"connection" | b"keep-alive" |
+                b"transfer-encoding" | b"te" | b"upgrade" |
+                b"content-length" | b"content-type" |
+                b"expect" | b"proxy-connection")
+            {
+                continue;
+            }
+            let key = match std::str::from_utf8(&h.key) { Ok(s) => s, Err(_) => continue };
+            let val = h.value.borrow();
+            let val = match std::str::from_utf8(&val) { Ok(s) => s, Err(_) => continue };
+            s.push_str(key);
+            s.push_str(": ");
+            s.push_str(val);
+            s.push_str("\r\n");
+        }
+        s
+    };
+
     let request = format!(
         "{} {} HTTP/1.0\r\n\
          Host: {}\r\n\
          Connection: close\r\n\
-         {}{}\r\n",
-        method, uri_with_args, host, content_length_hdr, content_type_hdr
+         {}{}{}\r\n",
+        method, uri_with_args, host, content_length_hdr, content_type_hdr, forward_headers
     );
 
     // Send request to upstream
