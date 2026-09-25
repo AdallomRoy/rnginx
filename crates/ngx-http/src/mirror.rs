@@ -56,13 +56,15 @@ fn mirror_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) ->
     }
 
     let mut c = cell.borrow_mut();
-    let mirrors = if c.mirror.is_set() {
-        c.mirror.get().clone()
-    } else {
-        vec![]
-    };
-    let mut new_mirrors = mirrors;
+
+    // Get existing mirrors or start with empty
+    let current_mirrors = c.mirror.as_option().map(|m| m.clone()).unwrap_or_default();
+
+    // Add the new URI to the list
+    let mut new_mirrors = current_mirrors;
     new_mirrors.push(uri);
+
+    // Set the updated list
     c.mirror = Val::set(new_mirrors);
     Ok(())
 }
@@ -90,12 +92,24 @@ async fn mirror_handler(r: R) -> i64 {
     let mirrors = conf.mirror.get().clone();
     drop(conf);
 
-    for uri in mirrors {
-        let args = r.args.borrow().clone();
-        let args_ref = if args.is_empty() { None } else { Some(args.as_slice()) };
+    let args = r.args.borrow().clone();
+    let args_ref = if args.is_empty() { None } else { Some(args.as_slice()) };
+    let method = r.method.get();
+    let method_name = r.method_name.borrow().clone();
 
+    for uri in mirrors {
         // Create a subrequest for each mirror URI (background = no waiting)
-        let _ = subrequest(&r, &uri, args_ref, NGX_HTTP_SUBREQUEST_BACKGROUND, None).await;
+        match subrequest(&r, &uri, args_ref, NGX_HTTP_SUBREQUEST_BACKGROUND, None).await {
+            Ok((sr, _)) => {
+                // Follow C implementation: set header_only and copy method info
+                sr.header_only.set(true);
+                sr.method.set(method);
+                *sr.method_name.borrow_mut() = method_name.clone();
+            }
+            Err(_) => {
+                // Log error but continue with other mirrors
+            }
+        }
     }
 
     NGX_DECLINED

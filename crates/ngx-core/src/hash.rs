@@ -585,8 +585,14 @@ impl<V: Clone> HashWildcard<V> {
             if !next_batch.is_empty() {
                 let sub_hash = Self::init_recursive(hinit, next_batch)?;
                 curr_key.value = if first_label_len == key.len() {
+                    // Key has no trailing content after the first label
+                    WildcardValue::SubHashWithValue(std::rc::Rc::new(sub_hash), names[n].value.clone())
+                } else if key.len() == first_label_len + 1 {
+                    // Key is exactly first_label + one trailing dot
+                    // This is a complete match that should preserve its value
                     WildcardValue::SubHashWithValue(std::rc::Rc::new(sub_hash), names[n].value.clone())
                 } else {
+                    // Key has more content after first_label and a dot
                     WildcardValue::SubHashOnly(std::rc::Rc::new(sub_hash))
                 };
             }

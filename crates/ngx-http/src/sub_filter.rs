@@ -43,8 +43,8 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     let p = conf_cell::<SubLocConf>(prev).borrow();
     let mut c = conf_cell::<SubLocConf>(conf).borrow_mut();
     c.pairs.merge(&p.pairs, Vec::new());
-    c.once.merge(&p.once, false);
-    c.last_modified.merge(&p.last_modified, true);
+    c.once.merge(&p.once, true);  // default is true (replace only once)
+    c.last_modified.merge(&p.last_modified, false);  // default is false (remove Last-Modified)
     Ok(())
 }
 
@@ -122,12 +122,14 @@ async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
 
     r.clear_content_length();
 
-    let clear_modified = !r.loc_conf::<SubLocConf>(ctx_index()).borrow().last_modified.get_or(true);
+    let last_modified = r.loc_conf::<SubLocConf>(ctx_index()).borrow().last_modified.get_or(false);
 
-    if clear_modified {
+    if !last_modified {
+        // Default: clear Last-Modified and ETag
         r.clear_last_modified();
         r.clear_etag();
     } else {
+        // If last_modified is on: set weak ETag
         crate::core_rt::weak_etag(&r);
     }
 
@@ -154,45 +156,97 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         return next(r, input).await;
     }
     let pairs = pairs_opt.unwrap().clone();
+    let once = conf_ref.once.get_or(false);
     drop(conf_ref);
 
     let mut output = Chain::new();
+    let mut last_buf_flag = false;
+    let mut had_memory_buf = false;
 
-    // Simple substring replacement
-    for buf in input {
-        let content_data = match &buf.data {
-            ngx_core::buf::BufData::Memory(v) => v.clone(),
-            _ => {
-                output.push_back(buf);
-                continue;
+    // Collect all memory buffers and pass through non-memory buffers
+    let mut full_content = Vec::new();
+    for buf in input.iter() {
+        match &buf.data {
+            ngx_core::buf::BufData::Memory(v) => {
+                had_memory_buf = true;
+                full_content.extend_from_slice(&v[buf.pos..buf.last]);
+                if buf.last_buf {
+                    last_buf_flag = true;
+                }
             }
-        };
-
-        let mut content = content_data[buf.pos..buf.last].to_vec();
-
-        for pair in pairs.iter() {
-            // Evaluate match pattern
-            let match_bytes = match crate::script::complex_value(&r, &pair.match_val) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            // Evaluate replacement
-            let replacement = match crate::script::complex_value(&r, &pair.replacement_val) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            // Simple case-insensitive search-replace
-            content = simple_replace(&content, &match_bytes, &replacement);
-
-            if ctx_opt.as_ref().map_or(false, |c| c.borrow().once) && !content.is_empty() {
-                break;
+            _ => {
+                // Pass through non-memory buffers
+                output.push_back(buf.clone());
             }
         }
+    }
 
-        let mut new_buf = Buf::from_vec(content);
-        new_buf.last_buf = buf.last_buf;
+    // If no memory buffers, just pass through
+    if !had_memory_buf {
+        return next(r, output).await;
+    }
+
+    if full_content.is_empty() {
+        if !output.is_empty() {
+            return next(r, output).await;
+        }
+        return NGX_OK;
+    }
+
+    // Apply replacements
+    let mut processed = full_content;
+    let mut did_replace = false;
+
+    for pair in pairs.iter() {
+        if once && did_replace {
+            break;
+        }
+
+        // Evaluate match pattern
+        let match_bytes = match crate::script::complex_value(&r, &pair.match_val) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        // Evaluate replacement
+        let replacement = match crate::script::complex_value(&r, &pair.replacement_val) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        // Lowercase the match bytes (following C behavior)
+        let match_lower = match_bytes.to_ascii_lowercase();
+
+        // Replace: compare lowercase against lowercased match
+        let mut result = Vec::new();
+        let mut pos = 0;
+
+        while pos < processed.len() {
+            if pos + match_lower.len() <= processed.len() {
+                let slice_lower = processed[pos..pos + match_lower.len()].to_ascii_lowercase();
+                if slice_lower == match_lower {
+                    result.extend_from_slice(&replacement);
+                    pos += match_lower.len();
+                    did_replace = true;
+
+                    // If once, stop after first replacement
+                    if once {
+                        result.extend_from_slice(&processed[pos..]);
+                        break;
+                    }
+                    continue;
+                }
+            }
+            result.push(processed[pos]);
+            pos += 1;
+        }
+        processed = result;
+    }
+
+    // Create output buffer(s) from processed content
+    if !processed.is_empty() {
+        let mut new_buf = Buf::from_vec(processed);
+        new_buf.last_buf = last_buf_flag;
         output.push_back(new_buf);
     }
 
@@ -201,27 +255,6 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     }
 
     next(r, output).await
-}
-
-fn simple_replace(content: &[u8], search: &[u8], replace: &[u8]) -> Vec<u8> {
-    if search.is_empty() || content.len() < search.len() {
-        return content.to_vec();
-    }
-
-    let mut result = Vec::new();
-    let mut pos = 0;
-
-    while pos < content.len() {
-        if pos + search.len() <= content.len() && content[pos..pos + search.len()].eq_ignore_ascii_case(search) {
-            result.extend_from_slice(replace);
-            pos += search.len();
-        } else {
-            result.push(content[pos]);
-            pos += 1;
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]
