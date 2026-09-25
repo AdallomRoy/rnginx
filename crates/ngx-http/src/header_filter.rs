@@ -156,6 +156,14 @@ pub async fn header_filter(r: R) -> i64 {
             out.extend_from_slice(b"\r\n");
             cr.hash.set(0);
         }
+        if let Some(ce) = &ho.content_encoding {
+            if ce.hash.get() != 0 {
+                out.extend_from_slice(b"Content-Encoding: ");
+                out.extend_from_slice(&ce.value.borrow());
+                out.extend_from_slice(b"\r\n");
+                ce.hash.set(0);
+            }
+        }
         if ho.last_modified.is_none() && ho.last_modified_time != -1 {
             out.extend_from_slice(b"Last-Modified: ");
             out.extend_from_slice(ngx_core::times::http_time(ho.last_modified_time).as_bytes());

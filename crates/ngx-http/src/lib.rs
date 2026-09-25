@@ -56,6 +56,7 @@ pub mod upstream_keepalive;
 pub mod upstream_round_robin;
 pub mod event_pipe;
 pub mod ssl_module;
+pub mod gzip_filter;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -606,7 +607,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::v2_filter_module(),
         stubs::v3_filter_module(),
         range_filter::range_header_filter_module(),
-        stubs::gzip_filter_module(),
+        gzip_filter::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),
         ssi_filter::ssi_filter_module(),
         charset_filter::charset_filter_module(),
