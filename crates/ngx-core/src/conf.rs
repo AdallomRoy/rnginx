@@ -409,7 +409,9 @@ impl<'c> Conf<'c> {
 
             if let Some(h) = self.handler {
                 if rc == Token::BlockStart {
-                    return Err(self.emerg(format_args!("unexpected \"{{\"")));
+                    // Recurse into the nested block using the same handler.
+                    self.parse_block()?;
+                    continue;
                 }
                 let hc = self.handler_conf.clone().expect("handler conf");
                 match h(self, hc) {
