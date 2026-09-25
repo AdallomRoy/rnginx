@@ -114,10 +114,9 @@ where F: FnOnce(&mut HttpSslSrvConf) -> &mut Val<Vec<u8>>
     let arg = cf.args[1].clone();
     let mut c = conf.borrow_mut();
     let slot = get(&mut *c);
-    if slot.is_set() {
-        return Err(msg("is duplicate"));
+    if !slot.is_set() {
+        *slot = Val::set(arg);
     }
-    *slot = Val::set(arg);
     Ok(())
 }
 
