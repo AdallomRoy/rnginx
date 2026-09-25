@@ -121,8 +121,11 @@ async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
         }
     } else {
         drop(conf_ref);
+        // No charset configured: don't touch content_length
+        return next(r).await;
     }
 
+    // Charset was applied: content will be recoded, so length becomes unknown
     r.clear_content_length();
 
     next(r).await
