@@ -156,10 +156,39 @@ async fn auth_request_handler(r: R) -> i64 {
     // Create new context
     let uri_bytes = uri.clone();
 
-    // Issue subrequest
-    let flags = NGX_HTTP_SUBREQUEST_WAITED;
+    // Suppress subrequest body: C sets sr->header_only=1 before dispatching. We can't do
+    // that with our current inline-subrequest API, so use IN_MEMORY which collects body
+    // into a buffer instead of forwarding to the client.
+    let flags = NGX_HTTP_SUBREQUEST_WAITED | NGX_HTTP_SUBREQUEST_IN_MEMORY;
     match subrequest(&r, &uri_bytes, None, flags, None).await {
-        Ok((sr, status)) => {
+        Ok((sr, _rc)) => {
+            // Use the HTTP status the subrequest produced, not the subrequest rc.
+            let http_status = sr.headers_out.borrow().status;
+            let status = if http_status >= NGX_HTTP_OK && http_status < NGX_HTTP_SPECIAL_RESPONSE {
+                NGX_OK
+            } else if http_status == NGX_HTTP_FORBIDDEN || http_status == NGX_HTTP_UNAUTHORIZED {
+                // Propagate WWW-Authenticate headers to the parent response, matching C.
+                if http_status == NGX_HTTP_UNAUTHORIZED {
+                    let sr_ho = sr.headers_out.borrow();
+                    let mut wwws: Vec<Header> = Vec::new();
+                    for h in &sr_ho.www_authenticate {
+                        wwws.push(h.clone());
+                    }
+                    for h in sr_ho.headers.iter() {
+                        if h.key.eq_ignore_ascii_case(b"WWW-Authenticate") {
+                            wwws.push(h.clone());
+                        }
+                    }
+                    drop(sr_ho);
+                    let mut ho = r.headers_out.borrow_mut();
+                    for h in wwws {
+                        ho.headers.push(h);
+                    }
+                }
+                http_status
+            } else {
+                NGX_HTTP_INTERNAL_SERVER_ERROR
+            };
             let ctx_val = AuthRequestCtx {
                 done: true,
                 status,
