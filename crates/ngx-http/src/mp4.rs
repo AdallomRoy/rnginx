@@ -212,7 +212,31 @@ pub async fn mp4_handler(r: R) -> i64 {
 
     // If no seek params, serve the file normally
     let (output_chain, content_length) = if start_ms.is_some() || end_ms.is_some() {
-        // TODO: Implement mp4 processing
+        // TODO: Implement full mp4 processing
+        // This requires:
+        // 1. Atom parsing: Read atoms hierarchically from file
+        //    - Atom header: 4 bytes size (or size=1 for 64-bit), 4 bytes name
+        //    - Support ftyp, moov (with recursive children), mdat atoms
+        // 2. Track parsing: For each trak atom, extract timing/sample tables
+        //    - stts (time-to-sample): Array of (count:u32, duration:u32) entries
+        //    - stss (sync samples): Array of sample indices that are keyframes
+        //    - ctts (composition offset): Array of (count:u32, offset:i32) entries
+        //    - stsc (sample-to-chunk): Array of (chunk:u32, samples:u32, id:u32) entries
+        //    - stsz (sample sizes): Array of sample sizes (4 bytes each)
+        //    - stco (chunk offset): Array of chunk offsets (4 bytes each)
+        //    - co64 (chunk offset 64-bit): Array of chunk offsets (8 bytes each)
+        // 3. Seeking: Convert start_ms/end_ms to sample ranges
+        //    - Use stts table to find sample index from milliseconds
+        //    - Use stss to optionally snap to nearest keyframe if start_key_frame=true
+        //    - Compute prefix duration (partial samples) for cropped atoms
+        // 4. Atom rewriting: Update atom sizes and crop sample tables
+        //    - Recalculate stts, stss, ctts, stsc, stsz entries for [start_sample, end_sample]
+        //    - Adjust chunk offsets (stco/co64) by (ftyp_size + moov_size - original_mdat_offset)
+        //    - Update atom sizes (mvhd, mdhd, trak, moov) with new child sizes
+        // 5. Output chain: Build chain of atoms + file buffer slice
+        //    - Memory buffers for ftyp, moov atom header, rewritten child atoms
+        //    - File buffer for mdat data slice [start_offset, end_offset)
+        // 6. Error handling: Validate seek within bounds, atom sizes, buffer limits
         // For now, fallback to serving full file
         (None, of.size)
     } else {

@@ -118,11 +118,6 @@ pub async fn flv_handler(r: R) -> i64 {
         return NGX_HTTP_NOT_FOUND;
     }
 
-    let rc = crate::request_body::discard_request_body(&r).await;
-    if rc != NGX_OK {
-        return rc;
-    }
-
     log.set_action(Some("sending response to client"));
 
     // Parse the start offset from ?start=<offset> query string
