@@ -27,6 +27,7 @@ pub mod special_response;
 pub mod static_module;
 pub mod index;
 pub mod log;
+pub mod map;
 pub mod request_body;
 pub mod output;
 pub mod chunked_filter;
@@ -43,6 +44,9 @@ pub mod realip;
 pub mod stub_status;
 pub mod flv;
 pub mod mp4;
+pub mod split_clients;
+pub mod referer;
+pub mod browser;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -558,9 +562,9 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::json_module(),
         stubs::geo_module(),
         stubs::geoip_module(),
-        stubs::map_module(),
-        stubs::split_clients_module(),
-        stubs::referer_module(),
+        map::map_module(),
+        split_clients::split_clients_module(),
+        referer::referer_module(),
         rewrite::rewrite_module(),
         stubs::ssl_module(),
         stubs::proxy_module(),
@@ -573,7 +577,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::perl_module(),
         stubs::memcached_module(),
         empty_gif::empty_gif_module(),
-        stubs::browser_module(),
+        browser::browser_module(),
         secure_link::secure_link_module(),
         degradation::degradation_module(),
         flv::flv_module(),
