@@ -121,6 +121,9 @@ fn set_flags(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
             flags |= NGX_HTTP_USERID_COOKIE_SECURE;
         } else if arg == b"httponly" {
             flags |= NGX_HTTP_USERID_COOKIE_HTTPONLY;
+        } else if arg == b"off" {
+            // NGX_HTTP_USERID_COOKIE_OFF — clears the bitmask; we treat as "no flags".
+            flags = 0;
         } else if arg == b"samesite=strict" {
             flags |= NGX_HTTP_USERID_COOKIE_SAMESITE_STRICT;
         } else if arg == b"samesite=lax" {
