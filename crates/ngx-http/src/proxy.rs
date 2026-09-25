@@ -32,6 +32,10 @@ pub struct NgxHttpProxyLocConf {
     /// proxy_intercept_errors: if on, upstream >= 400 responses are handled by
     /// the local error_page instead of being forwarded to the client.
     pub intercept_errors: Val<bool>,
+    /// proxy_pass_request_headers: forward client headers to upstream (default on).
+    pub pass_request_headers: Val<bool>,
+    /// proxy_pass_request_body: forward client body to upstream (default on).
+    pub pass_request_body: Val<bool>,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -40,6 +44,8 @@ impl Default for NgxHttpProxyLocConf {
             upstream_uri: None,
             method: None,
             intercept_errors: Val::unset(),
+            pass_request_headers: Val::unset(),
+            pass_request_body: Val::unset(),
         }
     }
 }
@@ -58,6 +64,8 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
         c.method = p.method.clone();
     }
     c.intercept_errors.merge(&p.intercept_errors, false);
+    c.pass_request_headers.merge(&p.pass_request_headers, true);
+    c.pass_request_body.merge(&p.pass_request_body, true);
     Ok(())
 }
 
@@ -292,8 +300,15 @@ async fn proxy_handler(r: R) -> i64 {
         uri_path
     };
 
+    // Read pass_request_headers/body configs (defaults on).
+    let (pass_headers_flag, pass_body_flag) = {
+        let lcf3 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let b = lcf3.borrow();
+        (b.pass_request_headers.get_or(true), b.pass_request_body.get_or(true))
+    };
+
     // Collect request body (if any) into a Vec.
-    let body_bytes: Vec<u8> = {
+    let body_bytes: Vec<u8> = if !pass_body_flag { Vec::new() } else {
         let rb = r.request_body.borrow();
         let mut out = Vec::new();
         if let Some(body) = rb.as_ref() {
@@ -339,7 +354,7 @@ async fn proxy_handler(r: R) -> i64 {
     // is a subset: pass everything except headers that would conflict with the
     // synthesized request line, hop-by-hop headers, and things upstream shouldn't
     // trust from the client.
-    let forward_headers: String = {
+    let forward_headers: String = if !pass_headers_flag { String::new() } else {
         let hin = r.headers_in.borrow();
         let mut s = String::new();
         for h in hin.headers.iter() {
@@ -372,14 +387,15 @@ async fn proxy_handler(r: R) -> i64 {
         method, uri_with_args, host, content_length_hdr, content_type_hdr, forward_headers
     );
 
-    // Send request to upstream
-    if let Err(_) = upstream.write_all(request.as_bytes()).await {
-        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-    }
+    // Send request + body in one write so a fast upstream that reads once and
+    // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
+    let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
+    wire.extend_from_slice(request.as_bytes());
     if !body_bytes.is_empty() {
-        if let Err(_) = upstream.write_all(&body_bytes).await {
-            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-        }
+        wire.extend_from_slice(&body_bytes);
+    }
+    if let Err(_) = upstream.write_all(&wire).await {
+        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
     }
 
     // Read entire response
@@ -691,8 +707,8 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_next_upstream", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_next_upstream_tries", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_next_upstream_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_headers, set_flag),
+        ngx_core::cmd!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_body, set_flag),
         cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
         cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
