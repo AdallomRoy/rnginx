@@ -49,6 +49,7 @@ pub mod referer;
 pub mod browser;
 pub mod ssi_filter;
 pub mod geo;
+pub mod range_filter;
 pub mod stubs;
 pub mod empty_gif;
 pub mod mirror;
@@ -598,7 +599,7 @@ pub fn modules() -> Vec<ModuleDef> {
         chunked_filter::chunked_filter_module(),
         stubs::v2_filter_module(),
         stubs::v3_filter_module(),
-        stubs::range_header_filter_module(),
+        range_filter::range_header_filter_module(),
         stubs::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),
         ssi_filter::ssi_filter_module(),
@@ -611,7 +612,7 @@ pub fn modules() -> Vec<ModuleDef> {
         userid::userid_module(),
         headers_filter::headers_filter_module(),
         copy_filter::copy_filter_module(),
-        stubs::range_body_filter_module(),
+        range_filter::range_body_filter_module(),
         not_modified_filter::not_modified_filter_module(),
         stubs::slice_filter_module(),
     ]

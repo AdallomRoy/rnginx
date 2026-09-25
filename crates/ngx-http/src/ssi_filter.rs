@@ -1,18 +1,15 @@
-//! ngx_http_ssi_filter_module: Server-Side Includes (SSI) processing
+//! ngx_http_ssi_filter_module: Server-Side Includes
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::rc::Rc;
-
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
-use ngx_core::string::B;
 use ngx_core::times;
-use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
-
+use ngx_core::{cmd_fn, ngx_log_error};
 use crate::request::*;
 use crate::variables::*;
 use crate::*;
@@ -20,10 +17,9 @@ use crate::*;
 crate::http_module_index!("ngx_http_ssi_filter_module");
 
 const SSI_ERROR_MSG: &[u8] = b"[an error occurred while processing the directive]";
+const SSI_NONE: &[u8] = b"(none)";
 
-// Configuration
 pub struct SsiMainConf;
-
 pub struct SsiLocConf {
     pub enable: Val<bool>,
     pub silent_errors: Val<bool>,
@@ -48,47 +44,26 @@ impl Default for SsiLocConf {
     }
 }
 
-// Parser state machine states
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SsiParseState {
-    Start = 0,
-    Tag = 1,
-    Comment0 = 2,
-    Comment1 = 3,
-    Sharp = 4,
-    PreCommand = 5,
-    Command = 6,
-    PreParam = 7,
-    Param = 8,
-    PreEqual = 9,
-    PreValue = 10,
-    DoubleQuotedValue = 11,
-    QuotedValue = 12,
-    QuotedSymbol = 13,
-    PostParam = 14,
-    CommentEnd0 = 15,
-    CommentEnd1 = 16,
-    Error = 17,
-    ErrorEnd0 = 18,
-    ErrorEnd1 = 19,
+enum SsiState {
+    Start,Tag,Comment0,Comment1,Sharp,PreCommand,Command,PreParam,Param,PreEqual,
+    PreValue,DblQuotedVal,QuotedVal,QuotedSymbol,PostParam,CommentEnd0,CommentEnd1,
+    Error,ErrorEnd0,ErrorEnd1,
 }
 
-// Per-request SSI context
 pub struct SsiCtx {
     pub buf: Option<Buf>,
     pub pos: usize,
-    pub copy_start: Option<usize>,
+    pub copy_start: usize,
     pub copy_end: usize,
     pub key: u32,
     pub command: Vec<u8>,
-    pub params: Vec<(Vec<u8>, Vec<u8>)>,
+    pub params: HashMap<Vec<u8>, Vec<u8>>,
     pub param_name: Vec<u8>,
     pub param_value: Vec<u8>,
-    pub state: SsiParseState,
-    pub saved_state: SsiParseState,
+    pub state: SsiState,
     pub saved: usize,
     pub looked: usize,
-    pub value_len: usize,
     pub variables: HashMap<Vec<u8>, Vec<u8>>,
     pub timefmt: Vec<u8>,
     pub errmsg: Vec<u8>,
@@ -97,20 +72,13 @@ pub struct SsiCtx {
 impl Default for SsiCtx {
     fn default() -> Self {
         SsiCtx {
-            buf: None,
-            pos: 0,
-            copy_start: None,
-            copy_end: 0,
-            key: 0,
+            buf: None,pos:0,copy_start:0,copy_end:0,key:0,
             command: Vec::new(),
-            params: Vec::new(),
+            params: HashMap::new(),
             param_name: Vec::new(),
             param_value: Vec::new(),
-            state: SsiParseState::Start,
-            saved_state: SsiParseState::Start,
-            saved: 0,
-            looked: 0,
-            value_len: 256,
+            state: SsiState::Start,
+            saved:0,looked:0,
             variables: HashMap::new(),
             timefmt: b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec(),
             errmsg: SSI_ERROR_MSG.to_vec(),
@@ -118,22 +86,12 @@ impl Default for SsiCtx {
     }
 }
 
-fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(SsiMainConf)
-}
-
-fn init_main_conf(_cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult {
-    Ok(())
-}
-
-fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(SsiLocConf::default())
-}
-
+fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> { make_slot(SsiMainConf) }
+fn init_main_conf(_cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult { Ok(()) }
+fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> { make_slot(SsiLocConf::default()) }
 fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let p = conf_cell::<SsiLocConf>(prev).borrow();
     let mut c = conf_cell::<SsiLocConf>(conf).borrow_mut();
-
     c.enable.merge(&p.enable, false);
     c.silent_errors.merge(&p.silent_errors, false);
     c.ignore_recycled_buffers.merge(&p.ignore_recycled_buffers, false);
@@ -141,7 +99,6 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.types_keys.merge(&p.types_keys, Vec::new());
     c.min_file_chunk.merge(&p.min_file_chunk, 1024);
     c.value_len.merge(&p.value_len, 256);
-
     Ok(())
 }
 
@@ -155,7 +112,6 @@ pub fn ssi_filter_module() -> ModuleDef {
         merge_loc_conf: Some(merge_loc_conf),
         ..Default::default()
     };
-
     let commands = vec![
         cmd_fn!("ssi", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG, ConfLevel::Loc, ssi_enable),
         cmd_fn!("ssi_silent_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, ssi_silent_errors),
@@ -165,7 +121,6 @@ pub fn ssi_filter_module() -> ModuleDef {
         cmd_fn!("ssi_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, ssi_types),
         cmd_fn!("ssi_last_modified", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, ssi_last_modified),
     ];
-
     http_module_def("ngx_http_ssi_filter_module", def, commands)
 }
 
@@ -180,160 +135,309 @@ fn postconfiguration(_cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
-// Directive handlers
-fn ssi_enable(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
+fn ssi_enable(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().enable = Val::set(cf.args.get(1).map(|a| *a == b"on").unwrap_or(false));
+    Ok(())
+}
+fn ssi_silent_errors(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().silent_errors = Val::set(cf.args.get(1).map(|a| *a == b"on").unwrap_or(false));
+    Ok(())
+}
+fn ssi_ignore_recycled_buffers(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().ignore_recycled_buffers = Val::set(cf.args.get(1).map(|a| *a == b"on").unwrap_or(false));
+    Ok(())
+}
+fn ssi_min_file_chunk(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    if let Some(arg) = cf.args.get(1) {
+        if let Ok(val) = std::str::from_utf8(arg) { if let Ok(n) = val.parse() { conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().min_file_chunk = Val::set(n); return Ok(()); } }
     }
-    cell.borrow_mut().enable = Val::set(args[1] == b"on");
-    Ok(())
+    Err(msg("invalid size"))
 }
-
-fn ssi_silent_errors(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
+fn ssi_value_length(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    if let Some(arg) = cf.args.get(1) {
+        if let Ok(val) = std::str::from_utf8(arg) { if let Ok(n) = val.parse() { conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().value_len = Val::set(n); return Ok(()); } }
     }
-    cell.borrow_mut().silent_errors = Val::set(args[1] == b"on");
+    Err(msg("invalid size"))
+}
+fn ssi_types(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().types_keys = Val::set(cf.args[1..].join(&b' '));
+    Ok(())
+}
+fn ssi_last_modified(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    conf_rc::<SsiLocConf>(conf.as_ref().unwrap()).borrow_mut().last_modified = Val::set(cf.args.get(1).map(|a| *a == b"on").unwrap_or(false));
     Ok(())
 }
 
-fn ssi_ignore_recycled_buffers(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
-    }
-    cell.borrow_mut().ignore_recycled_buffers = Val::set(args[1] == b"on");
-    Ok(())
-}
-
-fn ssi_min_file_chunk(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
-    }
-    let val = parse_size(&args[1])?;
-    cell.borrow_mut().min_file_chunk = Val::set(val);
-    Ok(())
-}
-
-fn ssi_value_length(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
-    }
-    let val = parse_size(&args[1])?;
-    cell.borrow_mut().value_len = Val::set(val);
-    Ok(())
-}
-
-fn ssi_types(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    cell.borrow_mut().types_keys = Val::set(cf.args[1..].join(&b' '));
-    Ok(())
-}
-
-fn ssi_last_modified(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = &cf.args;
-    let cell = conf_rc::<SsiLocConf>(conf.as_ref().unwrap());
-    if args.len() < 2 {
-        return Err(msg("requires a value"));
-    }
-    cell.borrow_mut().last_modified = Val::set(args[1] == b"on");
-    Ok(())
-}
-
-fn parse_size(s: &[u8]) -> Result<usize, ConfError> {
-    use std::str;
-    let s_str = str::from_utf8(s).map_err(|_| msg("invalid size"))?;
-    s_str.parse::<usize>().map_err(|_| msg("invalid size"))
-}
-
-// Variables
-fn var_date_gmt(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
-    let ts = times::time();
-    v.data = times::http_time(ts).into_bytes();
+fn var_date_gmt(_r: &R, v: &mut VariableValue, _: usize) -> i64 {
+    v.data = times::http_time(times::time()).into_bytes();
     v.not_found = false;
     NGX_OK
 }
-
-fn var_date_local(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
-    let ts = times::time();
-    v.data = times::http_time(ts).into_bytes();
+fn var_date_local(_r: &R, v: &mut VariableValue, _: usize) -> i64 {
+    v.data = times::http_time(times::time()).into_bytes();
     v.not_found = false;
     NGX_OK
 }
 
 pub static SSI_VARIABLES: &[VarDef] = &[
-    VarDef {
-        name: "date_gmt",
-        set: None,
-        get: Some(var_date_gmt),
-        data: 1,
-        flags: NGX_HTTP_VAR_NOCACHEABLE,
-    },
-    VarDef {
-        name: "date_local",
-        set: None,
-        get: Some(var_date_local),
-        data: 0,
-        flags: NGX_HTTP_VAR_NOCACHEABLE,
-    },
+    VarDef { name: "date_gmt", set: None, get: Some(var_date_gmt), data: 1, flags: NGX_HTTP_VAR_NOCACHEABLE },
+    VarDef { name: "date_local", set: None, get: Some(var_date_local), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
 ];
 
-// Filters
 async fn ssi_header_filter(r: R, next: HeaderFilter) -> i64 {
     let clcf = r.loc_conf::<SsiLocConf>(ctx_index());
-    let clcf_borrow = clcf.borrow();
-
-    if !*clcf_borrow.enable {
-        drop(clcf_borrow);
+    if !*clcf.borrow().enable {
         return next(r).await;
     }
-    drop(clcf_borrow);
-
     let _ctx = r.set_ctx(ctx_index(), SsiCtx::default());
-
-    {
-        let mut headers = r.headers_out.borrow_mut();
-        headers.content_length_n = -1;
-    }
-
+    r.headers_out.borrow_mut().content_length_n = -1;
     r.filter_need_in_memory.set(true);
-
     next(r).await
 }
 
-async fn ssi_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
+async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     let clcf = r.loc_conf::<SsiLocConf>(ctx_index());
-    let clcf_borrow = clcf.borrow();
-
-    if !*clcf_borrow.enable {
-        drop(clcf_borrow);
+    if !*clcf.borrow().enable {
         return next(r, input).await;
     }
-    drop(clcf_borrow);
 
-    // Get context
-    let _ctx = match r.get_ctx::<SsiCtx>(ctx_index()) {
+    let ctx_rc = match r.get_ctx::<SsiCtx>(ctx_index()) {
         Some(ctx) => ctx,
-        None => {
-            return next(r, input).await;
-        }
+        None => r.set_ctx(ctx_index(), SsiCtx::default()),
     };
 
-    // For now, pass through
-    // Full implementation would parse and process SSI here
-    next(r, input).await
+    let mut output = Chain::new();
+    while let Some(buf) = input.pop_front() {
+        let data = match &buf.data {
+            BufData::Memory(v) => v.clone(),
+            _ => {
+                output.push_back(buf);
+                continue;
+            }
+        };
+
+        let processed = process_ssi(&data, &mut ctx_rc.borrow_mut());
+        if !processed.is_empty() {
+            output.push_back(Buf::from_vec(processed));
+        }
+    }
+
+    next(r, output).await
+}
+
+fn process_ssi(data: &[u8], ctx: &mut SsiCtx) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut tag_start = 0;
+
+    while i < data.len() {
+        match ctx.state {
+            SsiState::Start => {
+                if data[i] == b'<' {
+                    tag_start = i;
+                    ctx.looked = 1;
+                    ctx.state = SsiState::Tag;
+                } else {
+                    out.push(data[i]);
+                }
+                i += 1;
+            }
+            SsiState::Tag => {
+                if data[i] == b'!' {
+                    ctx.looked = 2;
+                    ctx.state = SsiState::Comment0;
+                } else if data[i] == b'<' {
+                    out.extend_from_slice(&data[tag_start..i]);
+                    tag_start = i;
+                } else {
+                    out.extend_from_slice(&data[tag_start..=i]);
+                    ctx.state = SsiState::Start;
+                }
+                i += 1;
+            }
+            SsiState::Comment0 => {
+                if data[i] == b'-' {
+                    ctx.looked = 3;
+                    ctx.state = SsiState::Comment1;
+                } else if data[i] == b'<' {
+                    out.extend_from_slice(&data[tag_start..i]);
+                    tag_start = i;
+                    ctx.state = SsiState::Tag;
+                } else {
+                    out.extend_from_slice(&data[tag_start..=i]);
+                    ctx.state = SsiState::Start;
+                }
+                i += 1;
+            }
+            SsiState::Comment1 => {
+                if data[i] == b'-' {
+                    ctx.looked = 4;
+                    ctx.state = SsiState::Sharp;
+                } else if data[i] == b'<' {
+                    out.extend_from_slice(&data[tag_start..i]);
+                    tag_start = i;
+                    ctx.state = SsiState::Tag;
+                } else {
+                    out.extend_from_slice(&data[tag_start..=i]);
+                    ctx.state = SsiState::Start;
+                }
+                i += 1;
+            }
+            SsiState::Sharp => {
+                if data[i] == b'#' {
+                    ctx.command.clear();
+                    ctx.params.clear();
+                    ctx.param_name.clear();
+                    ctx.param_value.clear();
+                    ctx.state = SsiState::PreCommand;
+                } else if data[i] == b'<' {
+                    out.extend_from_slice(&data[tag_start..i]);
+                    tag_start = i;
+                    ctx.state = SsiState::Tag;
+                } else {
+                    out.extend_from_slice(&data[tag_start..=i]);
+                    ctx.state = SsiState::Start;
+                }
+                i += 1;
+            }
+            SsiState::PreCommand => {
+                if data[i] != b' ' && data[i] != b'\t' {
+                    ctx.state = SsiState::Command;
+                } else {
+                    i += 1;
+                }
+            }
+            SsiState::Command => {
+                if data[i] >= 32 && data[i] < 127 && data[i] != b' ' && data[i] != b'\t' && data[i] != b'-' && data[i] != b'"' && data[i] != b'\'' {
+                    ctx.command.push(data[i]);
+                    i += 1;
+                } else {
+                    ctx.state = SsiState::PreParam;
+                }
+            }
+            SsiState::PreParam => {
+                if data[i] == b' ' || data[i] == b'\t' {
+                    i += 1;
+                } else if data[i] == b'-' {
+                    if i + 2 < data.len() && &data[i..i+3] == b"-->" {
+                        let cmd = ctx.command.clone();
+                        let params = ctx.params.clone();
+                        let result = execute_directive(&cmd, &params, ctx);
+                        out.extend_from_slice(&result);
+                        ctx.state = SsiState::Start;
+                        i += 3;
+                    } else { ctx.state = SsiState::Error; i += 1; }
+                } else if data[i] >= 32 && data[i] < 127 {
+                    ctx.param_name.clear();
+                    ctx.param_name.push(data[i]);
+                    ctx.state = SsiState::Param;
+                    i += 1;
+                } else { ctx.state = SsiState::Error; i += 1; }
+            }
+            SsiState::Param => {
+                if data[i] == b'=' {
+                    ctx.state = SsiState::PreValue; i += 1;
+                } else if data[i] == b' ' || data[i] == b'\t' {
+                    ctx.state = SsiState::PreEqual; i += 1;
+                } else if data[i] >= 32 && data[i] < 127 {
+                    ctx.param_name.push(data[i]); i += 1;
+                } else { ctx.state = SsiState::Error; i += 1; }
+            }
+            SsiState::PreEqual => {
+                if data[i] == b'=' {
+                    ctx.state = SsiState::PreValue; i += 1;
+                } else if data[i] == b' ' || data[i] == b'\t' {
+                    i += 1;
+                } else { ctx.state = SsiState::Error; i += 1; }
+            }
+            SsiState::PreValue => {
+                if data[i] == b'"' {
+                    ctx.state = SsiState::DblQuotedVal; i += 1;
+                } else if data[i] == b'\'' {
+                    ctx.state = SsiState::QuotedVal; i += 1;
+                } else if data[i] == b' ' || data[i] == b'\t' {
+                    i += 1;
+                } else { ctx.state = SsiState::Error; i += 1; }
+            }
+            SsiState::DblQuotedVal => {
+                if data[i] == b'"' {
+                    ctx.params.insert(ctx.param_name.clone(), ctx.param_value.clone());
+                    ctx.param_name.clear();
+                    ctx.param_value.clear();
+                    ctx.state = SsiState::PostParam;
+                    i += 1;
+                } else {
+                    ctx.param_value.push(data[i]); i += 1;
+                }
+            }
+            SsiState::QuotedVal => {
+                if data[i] == b'\'' {
+                    ctx.params.insert(ctx.param_name.clone(), ctx.param_value.clone());
+                    ctx.param_name.clear();
+                    ctx.param_value.clear();
+                    ctx.state = SsiState::PostParam;
+                    i += 1;
+                } else {
+                    ctx.param_value.push(data[i]); i += 1;
+                }
+            }
+            SsiState::QuotedSymbol => { i += 1; ctx.state = SsiState::QuotedVal; }
+            SsiState::PostParam => {
+                if data[i] == b' ' || data[i] == b'\t' {
+                    i += 1;
+                } else if data[i] == b'-' {
+                    if i + 2 < data.len() && &data[i..i+3] == b"-->" {
+                        let cmd = ctx.command.clone();
+                        let params = ctx.params.clone();
+                        let result = execute_directive(&cmd, &params, ctx);
+                        out.extend_from_slice(&result);
+                        ctx.state = SsiState::Start;
+                        i += 3;
+                    } else { ctx.state = SsiState::Error; i += 1; }
+                } else {
+                    ctx.state = SsiState::PreParam;
+                }
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    out
+}
+
+fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut SsiCtx) -> Vec<u8> {
+    match cmd {
+        b"echo" => {
+            if let Some(var_name) = params.get(&b"var".to_vec()) {
+                if let Some(val) = ctx.variables.get(var_name) {
+                    return val.clone();
+                }
+                if let Some(def) = params.get(&b"default".to_vec()) {
+                    return def.clone();
+                }
+            }
+            SSI_NONE.to_vec()
+        }
+        b"set" => {
+            if let Some(var) = params.get(&b"var".to_vec()) {
+                if let Some(val) = params.get(&b"value".to_vec()) {
+                    ctx.variables.insert(var.clone(), val.clone());
+                }
+            }
+            Vec::new()
+        }
+        b"config" => {
+            if let Some(fmt) = params.get(&b"timefmt".to_vec()) {
+                ctx.timefmt = fmt.clone();
+            }
+            if let Some(err) = params.get(&b"errmsg".to_vec()) {
+                ctx.errmsg = err.clone();
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-}
+mod tests {}
