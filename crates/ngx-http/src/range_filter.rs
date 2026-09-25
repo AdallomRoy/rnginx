@@ -115,8 +115,12 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
                 return set_accept_ranges_and_pass(r, next).await;
             }
         } else {
-            // Date comparison (simplified: skip for now)
-            return set_accept_ranges_and_pass(r, next).await;
+            // Date comparison against Last-Modified.
+            let lm_time = r.headers_out.borrow().last_modified_time;
+            match ngx_core::parse::parse_http_time(val) {
+                Some(t) if t == lm_time => {}
+                _ => return set_accept_ranges_and_pass(r, next).await,
+            }
         }
     }
     let mut ctx = RangeCtx {
