@@ -10,6 +10,8 @@ use ngx_core::rc::*;
 use ngx_core::regex::Regex;
 use ngx_core::string::{atoi, B};
 
+use ngx_core::open_file_cache::*;
+
 use crate::core::*;
 use crate::core_rt::*;
 use crate::request::*;
@@ -43,6 +45,42 @@ pub enum Code {
     Set { var_idx: usize, value: ComplexValue },
     Return { status: i64, text: Option<ComplexValue> },
     Break,
+    If { condition: IfCondition, codes: Vec<Code> },
+}
+
+/// Condition types for if blocks
+#[derive(Clone)]
+pub enum IfCondition {
+    /// Variable is non-empty and not "0"
+    Variable(usize),
+    /// String equality: $var = "value"
+    Equal(usize, Vec<u8>),
+    /// String inequality: $var != "value"
+    NotEqual(usize, Vec<u8>),
+    /// Regex match: $var ~ pattern
+    RegexMatch(usize, Rc<Regex>),
+    /// Case-insensitive regex: $var ~* pattern
+    RegexMatchCaseInsensitive(usize, Rc<Regex>),
+    /// Negated regex: $var !~ pattern
+    RegexNotMatch(usize, Rc<Regex>),
+    /// Negated case-insensitive: $var !~* pattern
+    RegexNotMatchCaseInsensitive(usize, Rc<Regex>),
+    /// File exists: -f "path"
+    FileExists(Vec<u8>),
+    /// File does not exist: !-f "path"
+    FileNotExists(Vec<u8>),
+    /// Directory exists: -d "path"
+    DirectoryExists(Vec<u8>),
+    /// Directory does not exist: !-d "path"
+    DirectoryNotExists(Vec<u8>),
+    /// Entity exists: -e "path"
+    EntityExists(Vec<u8>),
+    /// Entity does not exist: !-e "path"
+    EntityNotExists(Vec<u8>),
+    /// Executable: -x "path"
+    Executable(Vec<u8>),
+    /// Not executable: !-x "path"
+    NotExecutable(Vec<u8>),
 }
 
 pub struct RewriteConf {
@@ -50,6 +88,244 @@ pub struct RewriteConf {
     pub stack_size: Val<i64>,
     pub log: Val<bool>,
     pub uninitialized_variable_warn: Val<bool>,
+}
+
+/// Parse if condition from directive arguments
+fn parse_if_condition(cf: &mut Conf, args_orig: &[Vec<u8>]) -> Result<IfCondition, ConfError> {
+    if args_orig.is_empty() {
+        return Err(cf.emerg(format_args!("no condition specified")));
+    }
+
+    // Handle parentheses around condition: if ($var) or if ( $var )
+    let mut args = args_orig.to_vec();
+
+    // Remove leading '(' from first arg if present
+    if args[0].starts_with(b"(") {
+        if args[0].len() == 1 {
+            // Just "(" - remove it and shift subsequent args
+            args.remove(0);
+        } else {
+            // "($var" etc - remove the leading paren
+            args[0] = args[0][1..].to_vec();
+        }
+    }
+
+    // Remove trailing ')' from last arg if present
+    if !args.is_empty() && args[args.len() - 1].ends_with(b")") {
+        let last_idx = args.len() - 1;
+        if args[last_idx].len() == 1 {
+            // Just ")" - remove it
+            args.pop();
+        } else {
+            // "var)" etc - remove the trailing paren
+            args[last_idx] = args[last_idx][..args[last_idx].len() - 1].to_vec();
+        }
+    }
+
+    if args.is_empty() {
+        return Err(cf.emerg(format_args!("no condition specified")));
+    }
+
+    // Check for file test operators: -f, -d, -e, -x (and negated !-f, !-d, etc)
+    let first = std::str::from_utf8(&args[0]).unwrap_or("");
+    let is_negated = first.starts_with('!');
+    let test_str = if is_negated { &first[1..] } else { first };
+
+    if test_str.starts_with('-') && test_str.len() == 2 {
+        // File test operator
+        if args.len() < 2 {
+            return Err(cf.emerg(format_args!("file test needs an argument")));
+        }
+
+        let test_char = test_str.chars().nth(1).unwrap();
+        let path = args[1].clone();
+
+        let cond = match (test_char, is_negated) {
+            ('f', false) => IfCondition::FileExists(path),
+            ('f', true) => IfCondition::FileNotExists(path),
+            ('d', false) => IfCondition::DirectoryExists(path),
+            ('d', true) => IfCondition::DirectoryNotExists(path),
+            ('e', false) => IfCondition::EntityExists(path),
+            ('e', true) => IfCondition::EntityNotExists(path),
+            ('x', false) => IfCondition::Executable(path),
+            ('x', true) => IfCondition::NotExecutable(path),
+            _ => return Err(cf.emerg(format_args!("unknown file test operator: {}", test_str))),
+        };
+
+        return Ok(cond);
+    }
+
+    // Variable-based condition
+    if !first.starts_with('$') {
+        return Err(cf.emerg(format_args!("invalid condition: {}", B(&args[0]))));
+    }
+
+    let var_name = &args[0][1..]; // Remove leading '$'
+    // Create variable if it doesn't exist (for if conditions, make it weak so assignments override)
+    let _var = crate::variables::add_variable(cf, var_name, crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_WEAK).ok();
+    let var_idx = get_variable_index(cf, var_name)?;
+
+    // If only variable, check if non-empty and not "0"
+    if args.len() == 1 {
+        return Ok(IfCondition::Variable(var_idx));
+    }
+
+    // Check for comparison/regex operators
+    let op = std::str::from_utf8(&args[1]).unwrap_or("");
+
+    if args.len() < 3 {
+        return Err(cf.emerg(format_args!("operator {} needs a value", op)));
+    }
+
+    let value = &args[2];
+
+    match op {
+        "=" => Ok(IfCondition::Equal(var_idx, value.clone())),
+        "!=" => Ok(IfCondition::NotEqual(var_idx, value.clone())),
+        "~" => {
+            let regex = match ngx_core::regex::Regex::compile(value, 0) {
+                Ok(r) => r,
+                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+            };
+            Ok(IfCondition::RegexMatch(var_idx, regex))
+        }
+        "~*" => {
+            let regex = match ngx_core::regex::Regex::compile(value, ngx_core::regex::NGX_REGEX_CASELESS) {
+                Ok(r) => r,
+                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+            };
+            Ok(IfCondition::RegexMatchCaseInsensitive(var_idx, regex))
+        }
+        "!~" => {
+            let regex = match ngx_core::regex::Regex::compile(value, 0) {
+                Ok(r) => r,
+                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+            };
+            Ok(IfCondition::RegexNotMatch(var_idx, regex))
+        }
+        "!~*" => {
+            let regex = match ngx_core::regex::Regex::compile(value, ngx_core::regex::NGX_REGEX_CASELESS) {
+                Ok(r) => r,
+                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+            };
+            Ok(IfCondition::RegexNotMatchCaseInsensitive(var_idx, regex))
+        }
+        _ => Err(cf.emerg(format_args!("unknown operator: {}", op))),
+    }
+}
+
+/// Check file existence and type
+fn check_file_type(r: &R, path: &[u8], is_dir: bool, _is_exec: bool) -> bool {
+    // Convert path to string
+    let path_str = match std::str::from_utf8(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Try to stat the file
+    match std::fs::metadata(path_str) {
+        Ok(metadata) => {
+            if is_dir {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Evaluate if condition at runtime
+fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
+    match condition {
+        IfCondition::Variable(idx) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                !vv.not_found && !vv.data.is_empty() && !(vv.data.len() == 1 && vv.data[0] == b'0')
+            } else {
+                false
+            }
+        }
+        IfCondition::Equal(idx, expected) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                !vv.not_found && vv.data == *expected
+            } else {
+                false
+            }
+        }
+        IfCondition::NotEqual(idx, expected) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                vv.not_found || vv.data != *expected
+            } else {
+                true
+            }
+        }
+        IfCondition::RegexMatch(idx, regex) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                if vv.not_found {
+                    return false;
+                }
+                regex.exec(&vv.data).is_some()
+            } else {
+                false
+            }
+        }
+        IfCondition::RegexMatchCaseInsensitive(idx, regex) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                if vv.not_found {
+                    return false;
+                }
+                regex.exec(&vv.data).is_some()
+            } else {
+                false
+            }
+        }
+        IfCondition::RegexNotMatch(idx, regex) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                if vv.not_found {
+                    return true;
+                }
+                regex.exec(&vv.data).is_none()
+            } else {
+                true
+            }
+        }
+        IfCondition::RegexNotMatchCaseInsensitive(idx, regex) => {
+            if let Some(vv) = get_indexed_variable(r, *idx) {
+                if vv.not_found {
+                    return true;
+                }
+                regex.exec(&vv.data).is_none()
+            } else {
+                true
+            }
+        }
+        IfCondition::FileExists(path) => {
+            check_file_type(&r, path, false, false)
+        }
+        IfCondition::FileNotExists(path) => {
+            !check_file_type(&r, path, false, false)
+        }
+        IfCondition::DirectoryExists(path) => {
+            check_file_type(&r, path, true, false)
+        }
+        IfCondition::DirectoryNotExists(path) => {
+            !check_file_type(&r, path, true, false)
+        }
+        IfCondition::EntityExists(path) => {
+            check_file_type(&r, path, false, false) || check_file_type(&r, path, true, false)
+        }
+        IfCondition::EntityNotExists(path) => {
+            !(check_file_type(&r, path, false, false) || check_file_type(&r, path, true, false))
+        }
+        IfCondition::Executable(_path) => {
+            // TODO: implement executable checking
+            false
+        }
+        IfCondition::NotExecutable(_path) => {
+            // TODO: implement executable checking
+            true
+        }
+    }
 }
 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
@@ -205,7 +481,8 @@ fn set_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
 
     let var_name = &args[1];
 
-    // Get or create variable index
+    // Create or get variable index - set makes variables changeable
+    let _var = crate::variables::add_variable(cf, var_name, crate::variables::NGX_HTTP_VAR_CHANGEABLE)?;
     let var_idx = get_variable_index(cf, var_name)?;
 
     // Compile the value as a ComplexValue
@@ -226,17 +503,22 @@ fn break_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> 
     Ok(())
 }
 
-/// ngx_http_rewrite_if directive handler - parses if block
-fn if_block(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // Parse the condition
+/// ngx_http_rewrite_if directive handler - parses if block with condition
+fn if_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
 
     if args.len() < 2 {
         return Err(cf.emerg(format_args!("no condition specified")));
     }
 
-    // Parse "if (condition) { ... }" block
-    // Save current context and parse a new location context for the if block
+    // Parse condition from args[1..]
+    let condition = parse_if_condition(cf, &args[1..])?;
+
+    // Get current code count before parsing block
+    let cell = conf_rc::<RewriteConf>(conf.as_ref().unwrap());
+    let block_start = cell.borrow().codes.len();
+
+    // Parse the block content by temporarily switching context
     let saved_ct = cf.cmd_type;
     cf.cmd_type = if saved_ct == NGX_HTTP_SRV_CONF {
         NGX_HTTP_SIF_CONF
@@ -245,9 +527,28 @@ fn if_block(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfRe
     };
 
     let rv = cf.parse_block();
-
     cf.cmd_type = saved_ct;
-    rv
+
+    if rv.is_err() {
+        return rv;
+    }
+
+    // Extract codes that were added in the block
+    let block_codes = {
+        let mut c = cell.borrow_mut();
+        let all_codes = c.codes.clone();
+        let block = all_codes[block_start..].to_vec();
+        // Remove block codes from main list
+        c.codes.truncate(block_start);
+        block
+    };
+
+    // Add the If code to the main list
+    cell.borrow_mut()
+        .codes
+        .push(Code::If { condition, codes: block_codes });
+
+    Ok(())
 }
 
 fn accept_directive(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
@@ -361,9 +662,11 @@ async fn rewrite_handler(r: R) -> i64 {
                 *r.captures_data.borrow_mut() = uri.clone();
 
                 // Build replacement string from template
+                // Track which captures have been used for encoding on second+ use
                 let mut replacement = Vec::new();
                 let repl = &rule.replacement;
                 let mut i = 0;
+                let mut capture_use_count: [usize; 10] = [0; 10];
 
                 while i < repl.len() {
                     if repl[i] == b'$' && i + 1 < repl.len() {
@@ -380,7 +683,24 @@ async fn rewrite_handler(r: R) -> i64 {
                                     let s = start as usize;
                                     let e = end as usize;
                                     if e <= uri.len() {
-                                        replacement.extend_from_slice(&uri[s..e]);
+                                        let captured = &uri[s..e];
+                                        // URL-encode on second and subsequent uses
+                                        if capture_use_count[cap_num] > 0 {
+                                            // Percent-encode special characters
+                                            for &byte in captured {
+                                                match byte {
+                                                    b'%' | b'?' | b'#' | b'&' | b'=' | b'+' => {
+                                                        replacement.extend_from_slice(
+                                                            format!("%{:02X}", byte).as_bytes()
+                                                        );
+                                                    }
+                                                    _ => replacement.push(byte),
+                                                }
+                                            }
+                                        } else {
+                                            replacement.extend_from_slice(captured);
+                                        }
+                                        capture_use_count[cap_num] += 1;
                                     }
                                 }
                             }
@@ -545,6 +865,160 @@ async fn rewrite_handler(r: R) -> i64 {
             Code::Break => {
                 // Stop processing rules
                 break;
+            }
+
+            Code::If { condition, codes } => {
+                // Evaluate condition
+                if eval_if_condition(&r, condition) {
+                    // Execute codes inside the if block
+                    for inner_code in codes.iter() {
+                        match inner_code {
+                            Code::Rewrite(rule) => {
+                                // Test regex against current URI
+                                let uri = r.uri.borrow().clone();
+                                let captures = match rule.regex.exec(&uri) {
+                                    Some(c) => c,
+                                    None => continue,
+                                };
+
+                                let mut cap_vec = Vec::new();
+                                for (start, end) in &captures {
+                                    cap_vec.push(*start);
+                                    cap_vec.push(*end);
+                                }
+
+                                *r.captures.borrow_mut() = cap_vec.clone();
+                                *r.captures_data.borrow_mut() = uri.clone();
+
+                                // Build replacement (same logic as outer)
+                                let mut replacement = Vec::new();
+                                let repl = &rule.replacement;
+                                let mut i = 0;
+
+                                while i < repl.len() {
+                                    if repl[i] == b'$' && i + 1 < repl.len() {
+                                        if repl[i + 1].is_ascii_digit() {
+                                            let cap_num = (repl[i + 1] - b'0') as usize;
+                                            let cap_idx = cap_num * 2;
+
+                                            if cap_idx + 1 < cap_vec.len() {
+                                                let start = cap_vec[cap_idx];
+                                                let end = cap_vec[cap_idx + 1];
+                                                if start >= 0 && end >= start {
+                                                    let s = start as usize;
+                                                    let e = end as usize;
+                                                    if e <= uri.len() {
+                                                        replacement.extend_from_slice(&uri[s..e]);
+                                                    }
+                                                }
+                                            }
+                                            i += 2;
+                                            continue;
+                                        } else if repl[i + 1] == b'{' {
+                                            let end = match memchr::memchr(b'}', &repl[i + 2..]) {
+                                                Some(e) => e,
+                                                None => {
+                                                    replacement.push(b'$');
+                                                    i += 1;
+                                                    continue;
+                                                }
+                                            };
+
+                                            if let Ok(num_str) = std::str::from_utf8(&repl[i + 2..i + 2 + end]) {
+                                                if let Ok(cap_num) = num_str.parse::<usize>() {
+                                                    let cap_idx = cap_num * 2;
+                                                    if cap_idx + 1 < cap_vec.len() {
+                                                        let start = cap_vec[cap_idx];
+                                                        let end_val = cap_vec[cap_idx + 1];
+                                                        if start >= 0 && end_val >= start {
+                                                            let s = start as usize;
+                                                            let e = end_val as usize;
+                                                            if e <= uri.len() {
+                                                                replacement.extend_from_slice(&uri[s..e]);
+                                                            }
+                                                        }
+                                                    }
+                                                    i += 3 + end;
+                                                    continue;
+                                                }
+                                            }
+                                            replacement.push(b'$');
+                                            i += 1;
+                                            continue;
+                                        } else if repl[i + 1] == b'$' {
+                                            replacement.push(b'$');
+                                            i += 2;
+                                            continue;
+                                        }
+                                    }
+                                    replacement.push(repl[i]);
+                                    i += 1;
+                                }
+
+                                // Handle query string for internal rewrite
+                                let orig_args = r.args.borrow().clone();
+                                let (rewritten_uri, rewritten_args) = if replacement.ends_with(b"?") {
+                                    let uri_part = replacement[..replacement.len() - 1].to_vec();
+                                    (uri_part, Vec::new())
+                                } else if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
+                                    let uri_part = replacement[..qpos].to_vec();
+                                    let mut args_part = replacement[qpos + 1..].to_vec();
+                                    if !orig_args.is_empty() {
+                                        args_part.push(b'&');
+                                        args_part.extend_from_slice(&orig_args);
+                                    }
+                                    (uri_part, args_part)
+                                } else {
+                                    (replacement.clone(), orig_args)
+                                };
+
+                                *r.uri.borrow_mut() = rewritten_uri.clone();
+                                set_exten(&r);
+                                *r.args.borrow_mut() = rewritten_args;
+
+                                if rule.flags.break_cycle {
+                                    break;
+                                }
+                            }
+                            Code::Set { var_idx, value } => {
+                                match crate::script::complex_value(&r, value) {
+                                    Ok(val) => {
+                                        set_indexed_variable(&r, *var_idx, val);
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            Code::Return { status, text } => {
+                                let status = *status;
+
+                                if text.is_none() && status >= 400 {
+                                    r.headers_out.borrow_mut().status = status;
+                                    return status;
+                                }
+
+                                let text_val = text
+                                    .clone()
+                                    .unwrap_or_else(|| ComplexValue::constant(b""));
+                                let ct: Option<&[u8]> =
+                                    if text.is_some() && status < 300 {
+                                        Some(b"text/plain")
+                                    } else {
+                                        None
+                                    };
+
+                                let rc = send_response(&r, status, ct, &text_val).await;
+                                if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
+                                    return NGX_DONE;
+                                }
+                                return rc;
+                            }
+                            Code::Break => break,
+                            Code::If { .. } => {
+                                // Nested if not fully implemented
+                            }
+                        }
+                    }
+                }
             }
         }
     }
