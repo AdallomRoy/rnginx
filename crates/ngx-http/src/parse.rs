@@ -1071,6 +1071,7 @@ pub fn parse_complex_uri(
     let mut args_buf: Vec<u8> = Vec::new();
     let mut uri_ext: Option<usize> = None;
     let mut args_set = false;
+    let mut reprocess_ch = false;
 
     // Handle empty_path_in_uri: prepend /
     if r.empty_path_in_uri {
@@ -1330,19 +1331,27 @@ pub fn parse_complex_uri(
                 } else if decodedch == b'+' {
                     // Track plus_in_uri (caller will use this if needed)
                     state = quoted_state;
+                    ch = decodedch;
+                    reprocess_ch = true;
                 } else {
                     state = quoted_state;
+                    ch = decodedch;
+                    reprocess_ch = true;
                 }
             }
 
             _ => {}
         }
 
-        if p >= buf.len() {
-            break;
+        if !reprocess_ch {
+            if p >= buf.len() {
+                break;
+            }
+            ch = buf[p];
+            p += 1;
+        } else {
+            reprocess_ch = false;
         }
-        ch = buf[p];
-        p += 1;
     }
 
     // Handle trailing incomplete states
