@@ -340,7 +340,7 @@ async fn rewrite_handler(r: R) -> i64 {
         match code {
             Code::Rewrite(rule) => {
                 // Test regex against current URI
-                let uri = r.uri.borrow();
+                let uri = r.uri.borrow().clone();
 
                 // Try to match the regex
                 let captures = match rule.regex.exec(&uri) {
@@ -429,35 +429,28 @@ async fn rewrite_handler(r: R) -> i64 {
                     i += 1;
                 }
 
-                // Handle query string logic
-                let mut query_string = Vec::new();
-                let query_kept = if replacement.ends_with(b"?") {
-                    // "?" at end means drop query string
-                    replacement.pop();
-                    false
-                } else {
-                    // Otherwise preserve existing query string for non-redirects
-                    if !r.args.borrow().is_empty() {
-                        query_string = r.args.borrow().clone();
-                    }
-                    true
-                };
-
                 if log_enabled {
                     http_debug!(r, "rewrite: {} -> {}", B(&uri), B(&replacement));
                 }
 
                 // Handle redirect response
                 if rule.flags.redirect {
-                    // For redirects, build full URL with query string and send response
+                    // For redirects, check if trailing '?' suppresses original args
                     let mut response_url = replacement.clone();
-                    if query_kept && !query_string.is_empty() {
+                    let suppress_args = response_url.ends_with(b"?");
+                    if suppress_args {
+                        response_url.pop(); // Remove the trailing '?'
+                    }
+
+                    let orig_args = r.args.borrow();
+                    if !suppress_args && !orig_args.is_empty() {
+                        // Append original args to the replacement URL
                         if !response_url.contains(&b'?') {
                             response_url.push(b'?');
                         } else {
                             response_url.push(b'&');
                         }
-                        response_url.extend_from_slice(&query_string);
+                        response_url.extend_from_slice(&orig_args);
                     }
 
                     // Send redirect response
@@ -469,13 +462,25 @@ async fn rewrite_handler(r: R) -> i64 {
                     return rc;
                 }
 
-                // Update request URI for internal rewrites
-                *r.uri.borrow_mut() = replacement.clone();
-                set_exten(&r);
+                // For internal rewrites, parse replacement to separate URI and args
+                let (rewritten_uri, rewritten_args) = if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
+                    // Split on '?'
+                    let uri_part = replacement[..qpos].to_vec();
+                    let args_part = replacement[qpos + 1..].to_vec();
+                    (uri_part, args_part)
+                } else if replacement.ends_with(b"?") {
+                    // "?" at end means drop query string
+                    let uri_part = replacement[..replacement.len() - 1].to_vec();
+                    (uri_part, Vec::new())
+                } else {
+                    // No '?' - preserve original args
+                    (replacement.clone(), r.args.borrow().clone())
+                };
 
-                if !query_kept {
-                    *r.args.borrow_mut() = Vec::new();
-                }
+                // Update request URI and args for internal rewrites
+                *r.uri.borrow_mut() = rewritten_uri.clone();
+                set_exten(&r);
+                *r.args.borrow_mut() = rewritten_args;
 
                 // Check for "last" or "break" flags
                 if rule.flags.break_cycle {
@@ -506,32 +511,29 @@ async fn rewrite_handler(r: R) -> i64 {
             Code::Return { status, text } => {
                 let status = *status;
 
-                // Check if this is a redirect (3xx status with URL or text)
-                if status == NGX_HTTP_MOVED_PERMANENTLY
-                    || status == NGX_HTTP_MOVED_TEMPORARILY
-                    || status == NGX_HTTP_SEE_OTHER
-                    || status == NGX_HTTP_TEMPORARY_REDIRECT
-                    || status == NGX_HTTP_PERMANENT_REDIRECT
-                    || text.is_some()
-                {
-                    let text_val = text
-                        .clone()
-                        .unwrap_or_else(|| ComplexValue::constant(b""));
-                    let ct: Option<&[u8]> =
-                        if text.is_some() && status < 300 {
-                            Some(b"text/plain")
-                        } else {
-                            None
-                        };
-
-                    let rc = send_response(&r, status, ct, &text_val).await;
-                    if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
-                        return NGX_DONE;
-                    }
-                    return rc;
+                // If no explicit text, send error page HTML for error statuses
+                if text.is_none() && status >= 400 {
+                    // Set the error status and return it to be handled by error_page/default error page
+                    r.headers_out.borrow_mut().status = status;
+                    return status;
                 }
 
-                return status;
+                // Always send a response with explicit text or empty body
+                let text_val = text
+                    .clone()
+                    .unwrap_or_else(|| ComplexValue::constant(b""));
+                let ct: Option<&[u8]> =
+                    if text.is_some() && status < 300 {
+                        Some(b"text/plain")
+                    } else {
+                        None
+                    };
+
+                let rc = send_response(&r, status, ct, &text_val).await;
+                if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
+                    return NGX_DONE;
+                }
+                return rc;
             }
 
             Code::Break => {
