@@ -252,17 +252,17 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
             }
         }
         IfCondition::Equal(idx, expected) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
-                !vv.not_found && vv.data == *expected
-            } else {
-                false
+            // Match C ngx_http_script_equal_code: compare value bytes regardless
+            // of not_found (unset variables have empty data, so `$x = ""` is true).
+            match get_indexed_variable(r, *idx) {
+                Some(vv) => vv.data == *expected,
+                None => expected.is_empty(),
             }
         }
         IfCondition::NotEqual(idx, expected) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
-                vv.not_found || vv.data != *expected
-            } else {
-                true
+            match get_indexed_variable(r, *idx) {
+                Some(vv) => vv.data != *expected,
+                None => !expected.is_empty(),
             }
         }
         IfCondition::RegexMatch(idx, regex) => {
