@@ -60,6 +60,14 @@ pub struct NgxHttpProxyLocConf {
     pub next_upstream_mask: Val<u32>,
     /// proxy_next_upstream_tries: 0 = no limit.
     pub next_upstream_tries: Val<u32>,
+    /// proxy_redirect entries. Reuses CookieRewrite because the substitution
+    /// machinery is the same (literal, complex or regex pattern → replacement).
+    pub redirects: Vec<CookieRewrite>,
+    /// Set by `proxy_redirect off;` to disable inheritance and any rewrites.
+    pub redirect_off: bool,
+    /// Set by `proxy_redirect default` — resolved at first-request time by
+    /// combining the proxy_pass URL and the location name.
+    pub redirect_default: bool,
 }
 
 // Retry condition flags (ngx_http_upstream.h NGX_HTTP_UPSTREAM_FT_*).
@@ -132,6 +140,9 @@ impl Default for NgxHttpProxyLocConf {
             store: None,
             next_upstream_mask: Val::unset(),
             next_upstream_tries: Val::unset(),
+            redirects: Vec::new(),
+            redirect_off: false,
+            redirect_default: false,
         }
     }
 }
@@ -177,6 +188,18 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
         c.next_upstream_mask = Val::set(0);
     }
     c.next_upstream_tries.merge(&p.next_upstream_tries, 0);
+    // Inherit redirect rules unless this location explicitly disabled them
+    // with `proxy_redirect off;` or already set its own rules.
+    if !c.redirect_off && c.redirects.is_empty() && !c.redirect_default {
+        c.redirects = p.redirects.clone();
+        c.redirect_default = p.redirect_default;
+    }
+    // Match ngx_http_proxy_module: with no proxy_redirect directive at all,
+    // the effective mode is `default` (implicit). We only turn it off if the
+    // user explicitly wrote `proxy_redirect off;`.
+    if !c.redirect_off && c.redirects.is_empty() && !c.redirect_default {
+        c.redirect_default = true;
+    }
     Ok(())
 }
 
@@ -217,10 +240,52 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
     Ok(())
 }
 
-fn proxy_redirect_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
+fn proxy_redirect_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    if args.len() < 2 {
         return Err(msg("invalid number of arguments"));
     }
+    if args.len() == 2 {
+        if args[1] == b"off" {
+            let mut c = cell.borrow_mut();
+            c.redirect_off = true;
+            c.redirects.clear();
+            c.redirect_default = false;
+            return Ok(());
+        }
+        if args[1] == b"default" {
+            cell.borrow_mut().redirect_default = true;
+            return Ok(());
+        }
+        return Err(cf.emerg(format_args!("invalid parameter \"{}\"",
+            ngx_core::string::B(&args[1]))));
+    }
+    if args.len() != 3 {
+        return Err(msg("invalid number of arguments"));
+    }
+    let pattern_src = &args[1];
+    let replacement_src = &args[2];
+    let (pattern, replacement) = if !pattern_src.is_empty() && pattern_src[0] == b'~' {
+        let (caseless, body) = if pattern_src.len() >= 2 && pattern_src[1] == b'*' {
+            (true, &pattern_src[2..])
+        } else {
+            (false, &pattern_src[1..])
+        };
+        let flags = if caseless { ngx_core::regex::NGX_REGEX_CASELESS } else { 0 };
+        let re = ngx_core::regex::Regex::compile(body, flags)
+            .map_err(|e| cf.emerg(format_args!("regex error: {}", e)))?;
+        let repl = crate::script::compile_complex_value(cf, replacement_src, 0)?;
+        (CookieRewritePattern::Regex(re), repl)
+    } else {
+        // proxy_redirect uses a plain string-prefix substitution — matches
+        // ngx_http_proxy_rewrite_complex_handler which compares
+        // `value + prefix` against `pattern` and replaces on match.
+        let pat = crate::script::compile_complex_value(cf, pattern_src, 0)?;
+        let repl = crate::script::compile_complex_value(cf, replacement_src, 0)?;
+        (CookieRewritePattern::Path(pat), repl)
+    };
+    cell.borrow_mut().redirects.push(CookieRewrite { pattern, replacement });
     Ok(())
 }
 
@@ -983,6 +1048,9 @@ async fn proxy_handler(r: R) -> i64 {
     // and Path= attributes before the header filter serializes them.
     rewrite_set_cookies(&r);
 
+    // proxy_redirect: rewrite Location / Refresh (url=...) headers.
+    rewrite_redirect_headers(&r, &upstream_uri);
+
     // Send status and headers to client
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
     if send_hdr_rc != NGX_OK {
@@ -1173,7 +1241,7 @@ fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
 pub fn proxy_module() -> ModuleDef {
     let commands = vec![
         cmd_fn!("proxy_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_pass_handler),
-        cmd_fn!("proxy_redirect", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, proxy_redirect_handler),
+        cmd_fn!("proxy_redirect", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_redirect_handler),
         cmd_fn!("proxy_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_buffering_handler),
         cmd_fn!("proxy_request_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_request_buffering_handler),
         cmd_fn!("proxy_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_bind_handler),
@@ -1616,4 +1684,107 @@ fn proxy_next_upstream_tries_handler(cf: &mut Conf, _cmd: &Command, conf: Option
         .ok_or_else(|| msg("invalid number"))?;
     cell.borrow_mut().next_upstream_tries = Val::set(n);
     Ok(())
+}
+
+/// proxy_redirect: rewrite ho.location and any Refresh header per configured
+/// rules. Called after upstream headers have been parsed into ho.
+///
+/// `upstream_uri` is the raw proxy_pass URL (for `proxy_redirect default`).
+pub fn rewrite_redirect_headers(r: &R, upstream_uri: &[u8]) {
+    let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf_ref = plcf.borrow();
+    if plcf_ref.redirect_off {
+        return;
+    }
+    let mut effective: Vec<CookieRewrite> = plcf_ref.redirects.clone();
+    if plcf_ref.redirect_default {
+        // `default`: pattern = proxy_pass URL, replacement = location name.
+        let clcf = r.clcf();
+        let loc_name = clcf.borrow().name.clone();
+        effective.insert(0, CookieRewrite {
+            pattern: CookieRewritePattern::Path(crate::script::ComplexValue::constant(upstream_uri)),
+            replacement: crate::script::ComplexValue::constant(&loc_name),
+        });
+    }
+    if effective.is_empty() {
+        return;
+    }
+    drop(plcf_ref);
+
+    // Location: rewrite via header value.
+    {
+        let ho = r.headers_out.borrow();
+        if let Some(loc) = ho.location.clone() {
+            let orig = loc.value.borrow().clone();
+            drop(ho);
+            if let Some(new_val) = try_redirect_rewrite(r, &orig, 0, &effective) {
+                let ho = r.headers_out.borrow();
+                *ho.location.as_ref().unwrap().value.borrow_mut() = new_val;
+                drop(ho);
+                let _ = loc; // keep clippy quiet
+            }
+        }
+    }
+
+    // Refresh: value is like "7; url=<url>"; find "url=" and rewrite what's after.
+    {
+        let ho = r.headers_out.borrow();
+        let mut refresh_hdrs: Vec<crate::request::Header> = Vec::new();
+        for h in ho.headers.iter() {
+            if h.hash.get() == 0 { continue; }
+            if h.lowcase_key.eq_ignore_ascii_case(b"refresh") {
+                refresh_hdrs.push(h.clone());
+            }
+        }
+        drop(ho);
+        for h in refresh_hdrs {
+            let v = h.value.borrow().clone();
+            // Find "url=" case-insensitively.
+            let mut idx = None;
+            for i in 0..v.len().saturating_sub(3) {
+                if v[i..i+4].eq_ignore_ascii_case(b"url=") {
+                    idx = Some(i + 4);
+                    break;
+                }
+            }
+            let prefix = match idx { Some(i) => i, None => continue };
+            if let Some(new_val) = try_redirect_rewrite(r, &v, prefix, &effective) {
+                *h.value.borrow_mut() = new_val;
+            }
+        }
+    }
+}
+
+fn try_redirect_rewrite(r: &R, value: &[u8], prefix: usize, rewrites: &[CookieRewrite]) -> Option<Vec<u8>> {
+    if prefix > value.len() { return None; }
+    let target = &value[prefix..];
+    for pr in rewrites.iter() {
+        match &pr.pattern {
+            CookieRewritePattern::Path(pat) => {
+                // Prefix match (matches ngx_http_proxy_rewrite_complex_handler).
+                let pattern = crate::script::complex_value(r, pat).ok()?;
+                if pattern.is_empty() || target.len() < pattern.len() { continue; }
+                if target[..pattern.len()] != pattern[..] { continue; }
+                let repl = crate::script::complex_value(r, &pr.replacement).ok()?;
+                let mut out = Vec::with_capacity(prefix + repl.len() + target.len() - pattern.len());
+                out.extend_from_slice(&value[..prefix]);
+                out.extend_from_slice(&repl);
+                out.extend_from_slice(&target[pattern.len()..]);
+                return Some(out);
+            }
+            CookieRewritePattern::Domain(_) => continue, // not used for redirect
+            CookieRewritePattern::Regex(re) => {
+                // Regex-based: match against post-prefix portion; regex handler
+                // returns replacement with $N captures interpolated.
+                let re_body = &pr.replacement.value;
+                if let Some(new_tail) = re.replace(target, re_body) {
+                    let mut out = Vec::with_capacity(prefix + new_tail.len());
+                    out.extend_from_slice(&value[..prefix]);
+                    out.extend_from_slice(&new_tail);
+                    return Some(out);
+                }
+            }
+        }
+    }
+    None
 }

@@ -185,14 +185,21 @@ pub async fn header_filter(r: R) -> i64 {
             }
         }
     }
-    // Location: make absolute for relative redirects
+    // Location: emit ho.location. If relative and absolute_redirect on,
+    // prepend scheme://host; otherwise pass through verbatim.
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
         if let Some(loc) = &ho.location {
             let v = loc.value.borrow().clone();
-            if !v.is_empty() && v[0] == b'/' && *cl.absolute_redirect {
-                loc.hash.set(0);
+            loc.hash.set(0);
+            if v.is_empty() {
+                // nothing to emit
+            } else if !(v[0] == b'/' && *cl.absolute_redirect) {
+                out.extend_from_slice(b"Location: ");
+                out.extend_from_slice(&v);
+                out.extend_from_slice(b"\r\n");
+            } else {
                 out.extend_from_slice(b"Location: ");
                 out.extend_from_slice(if r.connection.ssl.borrow().is_some() { b"https://" } else { b"http://" });
                 // Match C ngx_http_header_filter_module Location host selection:
@@ -234,6 +241,7 @@ pub async fn header_filter(r: R) -> i64 {
             }
         }
     }
+    let _ = ();
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
