@@ -60,9 +60,10 @@ fn init(cf: &mut Conf) -> ConfResult {
 }
 
 async fn gunzip_header_filter(r: R, next: crate::HeaderFilter) -> i64 {
-    if !r.is_main() {
-        return next(r).await;
-    }
+    // C's ngx_http_gunzip_header_filter runs on subrequests too — it only
+    // uses r == r->main to decide the buffer's last_buf flag in the body
+    // filter. Skipping subrequests here means SSI includes that fetch
+    // gzipped content never get decoded.
     let conf = r.loc_conf::<GunzipConf>(ctx_index());
     if !*conf.borrow().enable {
         return next(r).await;
@@ -164,14 +165,18 @@ async fn gunzip_body_filter(r: R, input: Chain, next: crate::BodyFilter) -> i64 
             }
         }
     }
-    if last_buf || last_in_chain {
+    // Only the main request can produce a last_buf — subrequests bubble
+    // through the postpone filter and their last_buf flag is set upstream.
+    // Matches C: `b->last_buf = (r == r->main) ? 1 : 0;`.
+    let effective_last_buf = last_buf && r.is_main();
+    if effective_last_buf || last_in_chain {
         if let Some(back) = output.back_mut() {
-            back.last_buf = last_buf;
+            back.last_buf = effective_last_buf;
             back.last_in_chain = last_in_chain;
         } else {
             let mut b = Buf::from_vec(Vec::new());
             b.sync = true;
-            b.last_buf = last_buf;
+            b.last_buf = effective_last_buf;
             b.last_in_chain = last_in_chain;
             output.push_back(b);
         }
