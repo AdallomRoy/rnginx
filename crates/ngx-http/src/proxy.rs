@@ -503,6 +503,10 @@ async fn proxy_handler(r: R) -> i64 {
 
     // Set status in response headers and copy upstream headers
     let mut upstream_chunked = false;
+    let mut saw_content_length = false;
+    let mut saw_transfer_encoding = false;
+    let mut invalid_headers = false;
+    let mut duplicate_expires = false;
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = status;
@@ -524,8 +528,16 @@ async fn proxy_handler(r: R) -> i64 {
                 // Handle a few well-known headers specially so header_filter renders them.
                 match lc.as_slice() {
                     b"content-length" => {
-                        if let Ok(s) = std::str::from_utf8(value) {
-                            if let Ok(n) = s.trim().parse::<i64>() { ho.content_length_n = n; }
+                        if saw_content_length {
+                            invalid_headers = true;
+                        }
+                        saw_content_length = true;
+                        // Parse strictly: any non-digit → invalid. C sets
+                        // NGX_HTTP_UPSTREAM_INVALID_HEADER on parse failure.
+                        let vtrim = std::str::from_utf8(value).map(|s| s.trim()).unwrap_or("");
+                        match vtrim.parse::<i64>() {
+                            Ok(n) if n >= 0 => ho.content_length_n = n,
+                            _ => invalid_headers = true,
                         }
                         let h = crate::request::TableElt::new(name, value);
                         ho.content_length = Some(h);
@@ -535,10 +547,27 @@ async fn proxy_handler(r: R) -> i64 {
                         ho.content_type_len = value.len();
                     }
                     b"transfer-encoding" => {
-                        // Track chunked so we can decode the body; header itself
-                        // is not forwarded (we handle framing ourselves).
+                        // C rejects duplicate Transfer-Encoding, and any value
+                        // other than "chunked" or "identity".
+                        if saw_transfer_encoding {
+                            invalid_headers = true;
+                        }
+                        saw_transfer_encoding = true;
                         if value.eq_ignore_ascii_case(b"chunked") {
                             upstream_chunked = true;
+                        } else if !value.eq_ignore_ascii_case(b"identity") {
+                            invalid_headers = true;
+                        }
+                    }
+                    b"expires" => {
+                        // Only accept the first Expires; C's header handler for
+                        // Expires drops duplicates.
+                        if ho.expires.is_some() {
+                            duplicate_expires = true;
+                        } else {
+                            let h = crate::request::TableElt::new(name, value);
+                            ho.expires = Some(h.clone());
+                            ho.add(name, value);
                         }
                     }
                     b"connection" | b"keep-alive" | b"server" | b"date" => {
@@ -565,6 +594,17 @@ async fn proxy_handler(r: R) -> i64 {
             pos = line_end + 1;
         }
     }
+
+    // If the upstream sent malformed / duplicate framing headers per C
+    // ngx_http_proxy_process_header semantics, bail with 502 before we send
+    // anything to the client.
+    if invalid_headers
+        || (upstream_chunked && saw_content_length)
+    {
+        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+    }
+    // Suppress duplicate Expires (silently drop the second occurrence).
+    let _ = duplicate_expires;
 
     // Snapshot upstream Content-Length before send_header runs — filters like
     // addition_filter / sub_filter / gzip clear ho.content_length_n during
