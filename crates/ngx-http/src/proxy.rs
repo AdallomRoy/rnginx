@@ -898,8 +898,29 @@ async fn proxy_handler(r: R) -> i64 {
                         ho.content_length = Some(h);
                     }
                     b"content-type" => {
+                        // Mirror ngx_http_upstream_copy_content_type: split on
+                        // the first `;` that begins `; charset=…` and copy
+                        // the charset out to headers_out.charset so downstream
+                        // filters (e.g. charset_filter override) can find it.
                         ho.content_type = value.to_vec();
                         ho.content_type_len = value.len();
+                        let mut p = 0usize;
+                        while p < value.len() {
+                            if value[p] != b';' { p += 1; continue; }
+                            let semi = p;
+                            let mut q = p + 1;
+                            while q < value.len() && value[q] == b' ' { q += 1; }
+                            if q + 8 <= value.len() && value[q..q+8].eq_ignore_ascii_case(b"charset=") {
+                                let mut cs_start = q + 8;
+                                let mut cs_end = value.len();
+                                if cs_start < cs_end && value[cs_start] == b'"' { cs_start += 1; }
+                                if cs_end > cs_start && value[cs_end - 1] == b'"' { cs_end -= 1; }
+                                ho.content_type_len = semi;
+                                ho.charset = value[cs_start..cs_end].to_vec();
+                                break;
+                            }
+                            p = q;
+                        }
                     }
                     b"transfer-encoding" => {
                         // C rejects duplicate Transfer-Encoding, and any value
