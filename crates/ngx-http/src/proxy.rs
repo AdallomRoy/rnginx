@@ -628,9 +628,21 @@ async fn proxy_handler(r: R) -> i64 {
         // Save the upstream block name so proxy_next_upstream can iterate
         // its peers below — the pick overwrites `host` with a peer IP.
         named_upstream_name = Some(host.as_bytes().to_vec());
-        if let Some((h, p)) = crate::upstream::first_server_for(&r, host.as_bytes()) {
-            host = h;
-            port = p;
+        match crate::upstream::first_server_for(&r, host.as_bytes()) {
+            Some((h, p)) => { host = h; port = p; }
+            None => {
+                // All peers are `down` — record a "no live upstreams" state
+                // so $upstream_addr shows the upstream name and finalize
+                // returns 502 like ngx_http_upstream_get_round_robin_peer.
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None,
+                    "no live upstreams while connecting to upstream");
+                r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
+                    status: 502,
+                    peer: host.as_bytes().to_vec(),
+                    ..Default::default()
+                });
+                return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+            }
         }
     }
     // If proxy_pass URL includes a URI (e.g. "http://backend/local/"), rewrite:
