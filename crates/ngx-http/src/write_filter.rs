@@ -101,7 +101,12 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         }
     }
 
-    // limit rate
+    // limit rate — the _set flag flips on only when someone explicitly
+    // sets $limit_rate / $limit_rate_after (rewrite or X-Accel-Limit-Rate).
+    // Don't flip it on for a plain config read: after an internal redirect
+    // the new location's limit_rate needs to take effect, and caching the
+    // old location's value here freezes the wrong value for the rest of
+    // the response — see the X-Accel-Redirect check in limit_rate.t.
     let (limit_rate, limit_rate_after) = {
         let cl = clcf.borrow();
         let lr = if r.limit_rate_set.get() { r.limit_rate.get() } else { crate::script::complex_value_size(&r, &cl.limit_rate, 0) };
@@ -109,9 +114,7 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         (lr, lra)
     };
     r.limit_rate.set(limit_rate);
-    r.limit_rate_set.set(true);
     r.limit_rate_after.set(limit_rate_after);
-    r.limit_rate_after_set.set(true);
     let sendfile_max_chunk = *clcf.borrow().sendfile_max_chunk;
     let send_timeout = *clcf.borrow().send_timeout;
 
