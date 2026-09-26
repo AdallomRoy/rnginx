@@ -305,10 +305,11 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
         return next(r).await;
     }
 
-    // Ensure context exists
+    // Ensure context exists. set_ctx already wraps in Rc<RefCell<_>> —
+    // passing a pre-wrapped value here would double-wrap and every later
+    // get_ctx::<UserIdCtx>() would silently return None.
     if r.get_ctx::<UserIdCtx>(ctx_index()).is_none() {
-        let ctx = UserIdCtx { uid_got: [0; 4], uid_set: [0; 4] };
-        r.set_ctx(ctx_index(), Rc::new(std::cell::RefCell::new(ctx)));
+        r.set_ctx(ctx_index(), UserIdCtx { uid_got: [0; 4], uid_set: [0; 4] });
     }
 
     // Create a UID to set
@@ -322,20 +323,31 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
         }
 
         let uid_bytes = ctx.uid_set.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<_>>();
-        let encoded = base64_encode(&uid_bytes);
+        let mut encoded = base64_encode(&uid_bytes);
+        // userid_mark <char>: overwrite the second-to-last byte of the
+        // base64 output (matches C's `*(p - 2) = conf->mark;` in
+        // ngx_http_userid_set_uid). For a 16-byte UID that byte is the
+        // second `=` padding char.
+        let mark = *conf.mark.get();
+        if mark != 0 && encoded.len() >= 2 {
+            let idx = encoded.len() - 2;
+            encoded[idx] = mark;
+        }
 
         let mut cookie = Vec::new();
         cookie.extend_from_slice(conf.name.get());
         cookie.push(b'=');
         cookie.extend_from_slice(&encoded);
 
+        cookie.extend_from_slice(b"; path=");
         if !conf.path.get().is_empty() {
             cookie.extend_from_slice(conf.path.get());
         } else {
-            cookie.extend_from_slice(b"; path=/");
+            cookie.push(b'/');
         }
 
-        if !conf.domain.get().is_empty() {
+        if !conf.domain.get().is_empty() && conf.domain.get() != b"none" {
+            cookie.extend_from_slice(b"; domain=");
             cookie.extend_from_slice(conf.domain.get());
         }
 
