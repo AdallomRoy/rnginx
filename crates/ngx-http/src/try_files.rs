@@ -204,25 +204,38 @@ async fn try_files_handler(r: R) -> i64 {
             return NGX_DONE;
         }
 
-        // Middle entry: attempt to map this URI (relative-to-current-URI style)
-        // to a filesystem path and stat it. C uses ngx_open_cached_file with
-        // test_only=1. We use plain fs metadata.
+        // Middle entry: attempt to map to a filesystem path and stat it.
+        // ngx_http_try_files_module.c doesn't substitute r->uri to compute the
+        // candidate; it maps once (getting the root prefix) and then appends
+        // the expanded tf->name onto path[..root_length]. This matters for
+        // regex alias locations where map returns just the alias literal.
         let candidate_uri = expanded_name.clone();
         if candidate_uri.is_empty() {
             continue;
         }
 
-        // Temporarily replace r.uri to run map_uri_to_path against the candidate
-        // (so alias/root apply), then restore.
-        let saved_uri = r.uri.borrow().clone();
-        *r.uri.borrow_mut() = candidate_uri.clone();
         let mapped = crate::core_rt::map_uri_to_path(&r, 0);
-        *r.uri.borrow_mut() = saved_uri.clone();
-
-        let (path, _root) = match mapped {
+        let (base_path, root) = match mapped {
             Some(p) => p,
             None => continue,
         };
+        // Build candidate = base_path[..root] + expanded_name.
+        // For a values-form (complex) entry whose expansion begins with the
+        // alias prefix of the URI (typical for `$uri`), C strips that prefix
+        // before appending — otherwise the alias location would double up
+        // (`/alias/` + `/alias/foo` instead of `/alias/` + `foo`).
+        let mut path = base_path[..root.min(base_path.len())].to_vec();
+        let tail: Vec<u8> = if tf.value.is_some()
+            && alias_len != 0
+            && alias_len != usize::MAX
+            && candidate_uri.len() >= alias_len
+            && candidate_uri[..alias_len] == r.uri.borrow()[..alias_len]
+        {
+            candidate_uri[alias_len..].to_vec()
+        } else {
+            candidate_uri.clone()
+        };
+        path.extend_from_slice(&tail);
 
         // Stat the candidate. C uses open_file_cache; we simplify to std::fs.
         let os = std::ffi::OsStr::from_bytes(&path);
@@ -258,13 +271,13 @@ async fn try_files_handler(r: R) -> i64 {
         } else if alias_len == usize::MAX {
             if !tf.test_dir {
                 *r.uri.borrow_mut() = candidate_uri.clone();
-                // r.add_uri_to_alias.set(true) — TODO field not yet present
+                r.add_uri_to_alias.set(true);
             }
         } else {
             let cur = r.uri.borrow().clone();
             let prefix = cur.get(..alias_len).unwrap_or(&cur[..]).to_vec();
             let mut new_uri = prefix;
-            new_uri.extend_from_slice(&candidate_uri);
+            new_uri.extend_from_slice(&tail);
             *r.uri.borrow_mut() = new_uri;
         }
         crate::core_rt::set_exten(&r);
