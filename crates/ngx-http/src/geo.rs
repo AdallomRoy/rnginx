@@ -66,19 +66,27 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
 
     // Get the IP address to look up
     let ip_u32 = if let Some(src_var_idx) = ctx.source_var_index {
-        // Use the value from the source variable (as an IP string)
-        let vars = r.variables.borrow();
-        if let Some(var_val) = vars.get(src_var_idx) {
-            let ip_str = match std::str::from_utf8(&var_val.data) {
-                Ok(s) => s,
-                Err(_) => return NGX_OK,
-            };
-            match parse_ipv4_to_u32(ip_str.as_bytes()) {
-                Some(ip) => ip,
-                None => return NGX_OK,
+        // Evaluate the source variable now (its slot may be empty if this is
+        // the first read this request — get_indexed_variable does the eval).
+        let val = crate::variables::get_indexed_variable(r, src_var_idx);
+        let ip_bytes: Vec<u8> = match val {
+            Some(v) if !v.not_found => v.data,
+            _ => return NGX_OK,
+        };
+        let ip_str = match std::str::from_utf8(&ip_bytes) {
+            Ok(s) => s,
+            Err(_) => return NGX_OK,
+        };
+        match parse_ipv4_to_u32(ip_str.as_bytes()) {
+            Some(ip) => ip,
+            None => {
+                // No IP → use the geo default (fall through to default_value below).
+                if !ctx.default_value.is_empty() {
+                    v.data = ctx.default_value.clone();
+                    v.valid = true;
+                }
+                return NGX_OK;
             }
-        } else {
-            return NGX_OK;
         }
     } else if !ctx.proxies.is_empty() {
         // Get the IP from X-Forwarded-For header if trusted proxy
