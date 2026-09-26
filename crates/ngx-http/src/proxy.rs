@@ -920,6 +920,7 @@ async fn proxy_handler(r: R) -> i64 {
         // us until the socket is closed by them or the read timeout fires.
         let mut header_end: Option<usize> = None;
         let mut expected_body_len: Option<usize> = None;
+        let mut is_chunked = false;
         loop {
             match upstream.read(&mut buf).await {
                 Ok(0) => break,
@@ -961,6 +962,7 @@ async fn proxy_handler(r: R) -> i64 {
                                     && line[18..].to_ascii_lowercase().contains(&b'c')
                                 {
                                     expected_body_len = None;
+                                    is_chunked = true;
                                 }
                             }
                         }
@@ -968,6 +970,14 @@ async fn proxy_handler(r: R) -> i64 {
                     if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
                         if response.len() >= e + cl {
                             break;
+                        }
+                    }
+                    if is_chunked {
+                        if let Some(e) = header_end {
+                            let body = &response[e..];
+                            if chunked_complete(body) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1533,6 +1543,56 @@ async fn return_error(r: &R, status: i64) -> i64 {
     // which builds the default error body AND runs the header filter chain
     // (so headers_more / add_header 'always' apply).
     status
+}
+
+/// Returns true when `input` contains a fully-terminated HTTP/1.1 chunked
+/// body — i.e. the size-zero chunk followed by a terminating CRLF.
+fn chunked_complete(input: &[u8]) -> bool {
+    let mut i = 0;
+    while i < input.len() {
+        let line_end = match input[i..].iter().position(|&b| b == b'\n') {
+            Some(p) => i + p,
+            None => return false,
+        };
+        let mut size_end = line_end;
+        if size_end > i && input[size_end - 1] == b'\r' {
+            size_end -= 1;
+        }
+        let hex_end = input[i..size_end]
+            .iter()
+            .position(|&b| b == b';' || b == b' ' || b == b'\t')
+            .map(|p| i + p)
+            .unwrap_or(size_end);
+        let hex_str = match std::str::from_utf8(&input[i..hex_end]) {
+            Ok(s) => s.trim(),
+            Err(_) => return false,
+        };
+        let size = match usize::from_str_radix(hex_str, 16) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        i = line_end + 1;
+        if size == 0 {
+            // Consume trailer headers (if any) up to the final CRLF/blank line.
+            loop {
+                let end = match input[i..].iter().position(|&b| b == b'\n') {
+                    Some(p) => i + p,
+                    None => return false,
+                };
+                let line = &input[i..end];
+                let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
+                i = end + 1;
+                if line.is_empty() {
+                    return true;
+                }
+            }
+        }
+        if i + size > input.len() { return false; }
+        i += size;
+        if i < input.len() && input[i] == b'\r' { i += 1; }
+        if i < input.len() && input[i] == b'\n' { i += 1; }
+    }
+    false
 }
 
 /// Parse upstream URL of form "http://host:port/path" or "http://host/path" (assumes port 80)

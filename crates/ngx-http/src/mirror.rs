@@ -90,7 +90,16 @@ async fn mirror_handler(r: R) -> i64 {
     }
 
     let mirrors = conf.mirror.get().clone();
+    let request_body = *conf.request_body.get();
     drop(conf);
+
+    if request_body {
+        let rc = crate::request_body::read_client_request_body(&r).await;
+        if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+            return rc;
+        }
+        r.preserve_body.set(true);
+    }
 
     let args = r.args.borrow().clone();
     let args_ref = if args.is_empty() { None } else { Some(args.as_slice()) };
