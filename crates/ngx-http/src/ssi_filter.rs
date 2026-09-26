@@ -170,14 +170,56 @@ fn ssi_last_modified(cf: &mut Conf, _: &Command, conf: Option<Rc<dyn Any>>) -> C
     Ok(())
 }
 
-fn var_date_gmt(_r: &R, v: &mut VariableValue, _: usize) -> i64 {
-    v.data = times::http_time(times::time()).into_bytes();
-    v.not_found = false;
-    NGX_OK
+fn var_date_gmt(r: &R, v: &mut VariableValue, _: usize) -> i64 {
+    format_date_from_ctx(r, v, /*gmt=*/true)
 }
-fn var_date_local(_r: &R, v: &mut VariableValue, _: usize) -> i64 {
-    v.data = times::http_time(times::time()).into_bytes();
+fn var_date_local(r: &R, v: &mut VariableValue, _: usize) -> i64 {
+    format_date_from_ctx(r, v, /*gmt=*/false)
+}
+
+fn format_date_from_ctx(r: &R, v: &mut VariableValue, gmt: bool) -> i64 {
+    // Match ngx_http_ssi_date_gmt_local_variable: read timefmt from the SSI
+    // context if present, otherwise fall back to the module default.
+    let timefmt: Vec<u8> = match r.get_ctx::<SsiCtx>(ctx_index()) {
+        Some(ctx) => ctx.borrow().timefmt.clone(),
+        None => b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec(),
+    };
+    v.valid = true;
+    v.no_cacheable = false;
     v.not_found = false;
+    let now = times::time();
+    if timefmt == b"%s" {
+        v.data = format!("{}", now).into_bytes();
+        return NGX_OK;
+    }
+    // strftime with the platform's format string.
+    use std::os::raw::{c_char, c_int};
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let tt: libc::time_t = now as libc::time_t;
+    unsafe {
+        if gmt {
+            libc::gmtime_r(&tt, &mut tm);
+        } else {
+            libc::localtime_r(&tt, &mut tm);
+        }
+    }
+    // Ensure null-terminated format string.
+    let mut fmt_cstr = timefmt.clone();
+    fmt_cstr.push(0);
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            fmt_cstr.as_ptr() as *const c_char,
+            &tm,
+        )
+    };
+    let n = n as c_int;
+    if n == 0 {
+        return NGX_ERROR;
+    }
+    v.data = buf[..n as usize].to_vec();
     NGX_OK
 }
 
@@ -505,7 +547,8 @@ fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut S
         b"set" => {
             if let Some(var) = params.get(&b"var".to_vec()) {
                 if let Some(val) = params.get(&b"value".to_vec()) {
-                    ctx.variables.insert(var.clone(), val.clone());
+                    let expanded = ssi_eval_string(val, ctx, r);
+                    ctx.variables.insert(var.clone(), expanded);
                 }
             }
             Vec::new()
