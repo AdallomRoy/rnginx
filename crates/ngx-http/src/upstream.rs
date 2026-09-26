@@ -297,7 +297,7 @@ pub struct UpstreamMainConf {
     /// Servers per upstream name, kept alongside the Rc<Upstream> so
     /// proxy_pass to a named upstream can pick a peer without going through
     /// the peer_init dance yet.
-    pub server_lists: Vec<(Vec<u8>, Vec<UpstreamServer>)>,
+    pub server_lists: Vec<(Vec<u8>, std::cell::RefCell<PeerGroup>)>,
     /// While an `upstream NAME { ... }` block is being parsed, hold the pending
     /// server list here so server_handler knows where to append.
     pub current_builder: std::cell::RefCell<Option<UpstreamBuilder>>,
@@ -306,6 +306,20 @@ pub struct UpstreamMainConf {
 pub struct UpstreamBuilder {
     pub name: Vec<u8>,
     pub servers: Vec<UpstreamServer>,
+}
+
+/// Smooth weighted round-robin state for a single upstream {} block.
+/// Matches ngx_http_upstream_get_round_robin_peer.
+pub struct PeerState {
+    pub server: UpstreamServer,
+    pub effective_weight: i32,
+    pub current_weight: i32,
+    pub weight: i32,
+}
+
+pub struct PeerGroup {
+    pub peers: Vec<PeerState>,
+    pub backup: Vec<PeerState>,
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
@@ -360,9 +374,15 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
         };
         let peer_init: Rc<dyn PeerInit> = Rc::new(NoopPeerInit);
         let up = Upstream::new(&uconf, peer_init);
+        let mut group = PeerGroup { peers: Vec::new(), backup: Vec::new() };
+        for srv in servers.into_iter() {
+            let w = if srv.weight == 0 { 1 } else { srv.weight as i32 };
+            let ps = PeerState { server: srv.clone(), effective_weight: w, current_weight: 0, weight: w };
+            if srv.backup { group.backup.push(ps); } else { group.peers.push(ps); }
+        }
         let mut m = umcf.borrow_mut();
         m.upstreams.push((name.clone(), up));
-        m.server_lists.push((name, servers));
+        m.server_lists.push((name, std::cell::RefCell::new(group)));
     }
     rv
 }
@@ -370,24 +390,39 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
 /// Return (host, port) of the first usable server in the named upstream.
 /// Currently just picks the first non-down, non-backup entry; TODO: real
 /// round-robin with weights.
+/// Pick a peer for the given named upstream using smooth weighted round-robin.
+/// Mirrors ngx_http_upstream_get_round_robin_peer's inner loop.
 pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
     let m = umcf.borrow();
-    for (n, servers) in m.server_lists.iter() {
+    for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
-        for s in servers.iter() {
-            if s.down || s.backup { continue; }
-            let host = String::from_utf8_lossy(&s.addr).into_owned();
-            return Some((host, s.port));
-        }
-        // If only backup servers, pick the first backup.
-        for s in servers.iter() {
-            if s.down { continue; }
-            let host = String::from_utf8_lossy(&s.addr).into_owned();
-            return Some((host, s.port));
-        }
+        let mut g = cell.borrow_mut();
+        return pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup));
     }
     None
+}
+
+fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {
+    let mut total: i32 = 0;
+    let mut best_idx: Option<usize> = None;
+    let mut best_cw: i32 = i32::MIN;
+    for (i, p) in peers.iter_mut().enumerate() {
+        if p.server.down { continue; }
+        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
+        total = total.saturating_add(p.effective_weight);
+        if p.effective_weight < p.weight {
+            p.effective_weight += 1;
+        }
+        if p.current_weight > best_cw {
+            best_cw = p.current_weight;
+            best_idx = Some(i);
+        }
+    }
+    let idx = best_idx?;
+    peers[idx].current_weight -= total;
+    let s = &peers[idx].server;
+    Some((String::from_utf8_lossy(&s.addr).into_owned(), s.port))
 }
 
 struct NoopPeerInit;
