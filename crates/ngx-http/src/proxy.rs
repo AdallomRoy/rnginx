@@ -1010,7 +1010,7 @@ async fn proxy_handler(r: R) -> i64 {
                             parts.get(1)
                                 .and_then(|p| std::str::from_utf8(p).ok())
                                 .and_then(|s| s.parse::<u32>().ok())
-                                .map(|c| c == 204 || c == 304 || (100..200).contains(&c))
+                                .map(|c| c == 204 || c == 304 || ((100..200).contains(&c) && c != 101))
                                 .unwrap_or(false)
                         } else { false }
                     } else { false };
@@ -1058,7 +1058,7 @@ async fn proxy_handler(r: R) -> i64 {
                     parts.get(1)
                         .and_then(|p| std::str::from_utf8(p).ok())
                         .and_then(|s| s.parse::<u32>().ok())
-                        .map(|c| c == 204 || c == 304 || (100..200).contains(&c))
+                        .map(|c| c == 204 || c == 304 || ((100..200).contains(&c) && c != 101))
                         .unwrap_or(false)
                 } else { false }
             } else { false };
