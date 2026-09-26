@@ -913,17 +913,62 @@ async fn proxy_handler(r: R) -> i64 {
         // response), record header_ms, then continue reading.
         let mut buf = [0u8; 4096];
         let mut got_header = false;
+        // Once we see the terminating CRLF pair we parse Content-Length so
+        // we can stop reading at body_start + content_length instead of
+        // waiting for EOF. Without this, upstreams that leave the socket
+        // open after sending the full response (proxy_noclose case) hang
+        // us until the socket is closed by them or the read timeout fires.
+        let mut header_end: Option<usize> = None;
+        let mut expected_body_len: Option<usize> = None;
         loop {
             match upstream.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
-                    if !got_header
-                        && (response.windows(4).any(|w| w == b"\r\n\r\n")
-                            || response.windows(2).any(|w| w == b"\n\n"))
-                    {
-                        header_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
-                        got_header = true;
+                    if !got_header {
+                        let crlf = response.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                        let lf = response.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
+                        let end = match (crlf, lf) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        if let Some(e) = end {
+                            header_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
+                            got_header = true;
+                            header_end = Some(e);
+                            // Parse Content-Length from the header block.
+                            let headers = &response[..e];
+                            for line in headers.split(|&b| b == b'\n') {
+                                let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
+                                if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+                                    let v = &line[15..];
+                                    let v = v.iter().position(|&b| b != b' ' && b != b'\t')
+                                        .map(|s| &v[s..])
+                                        .unwrap_or(v);
+                                    if let Ok(s) = std::str::from_utf8(v) {
+                                        if let Ok(n) = s.trim().parse::<usize>() {
+                                            expected_body_len = Some(n);
+                                        }
+                                    }
+                                }
+                                // Transfer-Encoding: chunked ⇒ still need to
+                                // read until 0-length terminator, which
+                                // signals the same as EOF here. Keep the
+                                // EOF-driven loop for chunked.
+                                if line.len() > 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:")
+                                    && line[18..].to_ascii_lowercase().contains(&b'c')
+                                {
+                                    expected_body_len = None;
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
+                        if response.len() >= e + cl {
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,
