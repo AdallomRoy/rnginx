@@ -742,12 +742,6 @@ pub fn addition_filter_module() -> ModuleDef {
     ])
 }
 
-pub fn gunzip_filter_module() -> ModuleDef {
-    stub("ngx_http_gunzip_filter_module", vec![
-        Command::new("gunzip", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("gunzip_buffers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, accept),
-    ])
-}
 
 pub fn userid_filter_module() -> ModuleDef {
     stub("ngx_http_userid_filter_module", vec![

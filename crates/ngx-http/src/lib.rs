@@ -67,6 +67,7 @@ pub mod userid;
 pub mod addition_filter;
 pub mod random_index;
 pub mod autoindex;
+pub mod gunzip;
 pub mod degradation;
 pub mod sub_filter;
 pub mod charset_filter;
@@ -619,7 +620,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::image_filter_module(),
         sub_filter::sub_filter_module(),
         addition_filter::addition_filter_module(),
-        stubs::gunzip_filter_module(),
+        gunzip::gunzip_filter_module(),
         userid::userid_module(),
         headers_filter::headers_filter_module(),
         copy_filter::copy_filter_module(),

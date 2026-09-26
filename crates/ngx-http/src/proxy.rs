@@ -945,6 +945,15 @@ async fn proxy_handler(r: R) -> i64 {
                         let h = crate::request::TableElt::new(name, value);
                         ho.etag = Some(h);
                     }
+                    b"content-encoding" => {
+                        // Populate the typed slot so gunzip_filter can detect
+                        // upstream-gzipped responses (matches C's
+                        // ngx_http_upstream_process_header stash into
+                        // headers_in.content_encoding).
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.content_encoding = Some(h.clone());
+                        ho.headers.push(h);
+                    }
                     _ => {
                         ho.add(name, value);
                     }

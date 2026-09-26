@@ -94,10 +94,13 @@ async fn handler(r: R) -> i64 {
     // Derive Content-Type from the ORIGINAL uri extension (not `.gz`); charset_filter
     // will layer on the configured charset if applicable.
     crate::core_rt::set_content_type(&r);
-    if accept_gzip {
-        let h = TableElt::new(b"Content-Encoding", b"gzip");
-        r.headers_out.borrow_mut().content_encoding = Some(h);
-    }
+    // We're serving a .gz file. Always set Content-Encoding: gzip — even in
+    // `always` mode where the client didn't advertise gzip, since gunzip
+    // filter may still decompress downstream. Matches C's
+    // ngx_http_gzip_static_handler which sets the header unconditionally.
+    let h = TableElt::new(b"Content-Encoding", b"gzip");
+    r.headers_out.borrow_mut().content_encoding = Some(h);
+    let _ = accept_gzip;
     r.allow_ranges.set(true);
     let rc = crate::core_rt::send_header(&r).await;
     if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() { return rc; }
