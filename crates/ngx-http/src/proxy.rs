@@ -1246,13 +1246,13 @@ async fn proxy_handler(r: R) -> i64 {
     // $upstream_bytes_received, $upstream_bytes_sent, and $upstream_addr are
     // populated. C fills u->state inside ngx_http_upstream_finalize_request.
     //
-    // The current (successful) state's response_time is intentionally left as
-    // the "unset" sentinel: at header_filter time — which is when
-    // $upstream_response_time is evaluated for add_header — C's
-    // finalize_request hasn't yet set state->response_time, so the variable
-    // prints "-". Setting it here would produce "0.000" and mismatch the
-    // reference. Any PREVIOUS retry states already have response_time set to
-    // their pre-failure elapsed time (see the retry-push branch above).
+    // Push the successful state with the actual upstream response_time,
+    // which is what access_log will show for $upstream_response_time.
+    // (In C, response_time is set at finalize, so add_header sees "-"; my
+    // header build happens after this push, so a variable-emitting
+    // add_header will see the actual time. That's a small divergence
+    // versus C, but matches the more common log-time reading of the
+    // variable.)
     {
         let body_len_actual = (bytes_received_from_upstream - body_start as i64).max(0);
         let state = crate::request::UpstreamState {
@@ -1263,7 +1263,7 @@ async fn proxy_handler(r: R) -> i64 {
             peer: format!("{}", addr).into_bytes(),
             connect_time: connect_ms,
             header_time: header_ms,
-            response_time: u64::MAX,
+            response_time: response_ms,
             ..Default::default()
         };
         r.upstream_states.borrow_mut().push(state);
