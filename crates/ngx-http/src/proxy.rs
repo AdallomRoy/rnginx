@@ -52,6 +52,18 @@ pub struct NgxHttpProxyLocConf {
     /// unset (inherit); Some(LocalBind::Off) means explicitly disabled;
     /// Some(LocalBind::Addr(cv)) means bind to the evaluated ComplexValue.
     pub local_bind: Option<LocalBind>,
+    /// proxy_store: write successful upstream responses to disk.
+    /// `None` = inherit; Some(ProxyStore::Off/On/Path(cv)).
+    pub store: Option<ProxyStore>,
+}
+
+#[derive(Clone)]
+pub enum ProxyStore {
+    Off,
+    /// Path derived from map_uri_to_path (root/alias).
+    On,
+    /// Explicit script-evaluated path (may include $vars).
+    Path(crate::script::ComplexValue),
 }
 
 #[derive(Clone)]
@@ -93,6 +105,7 @@ impl Default for NgxHttpProxyLocConf {
             cookie_domains: Vec::new(),
             cookie_paths: Vec::new(),
             local_bind: None,
+            store: None,
         }
     }
 }
@@ -128,6 +141,9 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     }
     if c.local_bind.is_none() {
         c.local_bind = p.local_bind.clone();
+    }
+    if c.store.is_none() {
+        c.store = p.store.clone();
     }
     Ok(())
 }
@@ -770,6 +786,9 @@ async fn proxy_handler(r: R) -> i64 {
     if head_only {
         return NGX_OK;
     }
+    // proxy_store: if configured, buffer the whole body and write it out
+    // once we know the final decoded length.
+    let body_snapshot_for_store: Vec<u8>;
     if body_start < response.len() {
         let mut short_response = false;
         let body_owned: Vec<u8>;
@@ -828,9 +847,16 @@ async fn proxy_handler(r: R) -> i64 {
 
         chain.push_back(buf);
 
+        body_snapshot_for_store = body.to_vec();
         if crate::core_rt::output_filter(&r, chain).await != NGX_OK {
             return NGX_ERROR;
         }
+        if !short_response {
+            maybe_store_body(&r, &body_snapshot_for_store);
+        }
+    } else {
+        // Empty 200 response — still honor proxy_store (writes an empty file).
+        maybe_store_body(&r, &[]);
     }
 
     NGX_OK
@@ -957,7 +983,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_store_handler),
         cmd_fn!("proxy_store_access", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_limit_rate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
@@ -1268,4 +1294,68 @@ async fn connect_with_optional_bind(
             sock.connect(remote).await
         }
     }
+}
+
+fn proxy_store_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    if args.len() != 2 {
+        return Err(msg("invalid number of arguments"));
+    }
+    let store = if args[1] == b"on" {
+        ProxyStore::On
+    } else if args[1] == b"off" {
+        ProxyStore::Off
+    } else {
+        let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+        ProxyStore::Path(cv)
+    };
+    cell.borrow_mut().store = Some(store);
+    Ok(())
+}
+
+/// Write the just-received upstream body to disk as configured by proxy_store.
+/// Called after we've fully consumed the upstream (status is finalized and
+/// body bytes are known). Skips non-2xx responses to match C behavior.
+fn maybe_store_body(r: &R, body: &[u8]) {
+    let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf = plcf.borrow();
+    let mode = match &plcf.store {
+        Some(ProxyStore::Off) | None => return,
+        Some(m) => m.clone(),
+    };
+    let status = r.headers_out.borrow().status;
+    if !(200..300).contains(&status) {
+        return;
+    }
+    let path: Vec<u8> = match mode {
+        ProxyStore::Off => return,
+        ProxyStore::On => {
+            match crate::core_rt::map_uri_to_path(r, 0) {
+                Some((p, _)) => p,
+                None => return,
+            }
+        }
+        ProxyStore::Path(cv) => match crate::script::complex_value(r, &cv) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+    };
+    if path.is_empty() { return; }
+    use std::os::unix::ffi::OsStrExt;
+    let os = std::ffi::OsStr::from_bytes(&path);
+    // Write to a temporary sibling then rename atomically. C uses
+    // proxy_temp_path; we settle for `<target>.tmp` for now — it's on the
+    // same filesystem so rename is atomic.
+    let mut tmp = path.clone();
+    tmp.extend_from_slice(b".tmp");
+    let tmp_os = std::ffi::OsStr::from_bytes(&tmp);
+    // Ensure parent exists.
+    if let Some(parent) = std::path::Path::new(os).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(tmp_os, body).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(tmp_os, os);
 }
