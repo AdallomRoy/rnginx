@@ -244,6 +244,10 @@ fn map_include_file(cf: &mut Conf, filename: &[u8], ctx: &MapCtx) -> ConfResult 
         }
     };
 
+    // Register the included file for `nginx -T` dumps. add_config_dump
+    // dedups by name so re-including the same file is fine.
+    cf.cycle.add_config_dump(&full_path, &data);
+
     let content = match std::str::from_utf8(&data) {
         Ok(s) => s,
         Err(_) => return Err(cf.emerg(format_args!("invalid UTF-8 in \"{}\"", B(&full_path)))),
