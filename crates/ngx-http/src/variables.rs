@@ -163,6 +163,12 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         if !vv.not_found {
             vv.valid = true;
         }
+        // Propagate NGX_HTTP_VAR_NOCACHEABLE from the variable definition to
+        // the per-request slot so get_flushed_variable knows to re-evaluate
+        // this entry (used by e.g. `map ... { volatile; }`).
+        if var.flags.get() & NGX_HTTP_VAR_NOCACHEABLE != 0 {
+            vv.no_cacheable = true;
+        }
         let mut vars = r.variables.borrow_mut();
         vars[index] = vv.clone();
         return Some(vv);

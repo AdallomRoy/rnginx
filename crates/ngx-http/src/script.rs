@@ -135,7 +135,7 @@ pub fn complex_value(r: &R, cv: &ComplexValue) -> Result<Vec<u8>, i64> {
         match p {
             Part::Literal(l) => out.extend_from_slice(l),
             Part::Var(idx) => {
-                let vv = match get_indexed_variable(r, *idx) {
+                let vv = match crate::variables::get_flushed_variable(r, *idx) {
                     Some(v) => v,
                     None => return Err(NGX_ERROR),
                 };
