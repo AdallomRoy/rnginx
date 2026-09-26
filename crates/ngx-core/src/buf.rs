@@ -329,19 +329,18 @@ pub fn create_temp_file(
 
     let stats = connection::stats();
     let num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let num_hex = format!("{:016x}", num);
+    // ngx_create_temp_file uses a decimal 10-digit key; keep that so hashed
+    // level paths line up (0000000001, 0000000002, ...). The old code left
+    // NUL padding past 16 hex chars which leaked into the filename.
+    let key_str = format!("{:010}", num);
+    let filename = path.hashed_filename(key_str.as_bytes());
 
-    let mut key = [0u8; 32];
-    for (i, c) in num_hex.as_bytes().iter().enumerate() {
-        if i < 32 {
-            key[i] = *c;
-        }
-    }
-
-    let filename = path.hashed_filename(&key[..]);
-
-    match os::open(&filename, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, access) {
-        Ok(fd) => Ok(TempFile::new(filename, fd, access, clean)),
+    // Match ngx_open_tempfile: `access ? access : 0600` — fall back to 0600
+    // when the caller passed 0 so the owner can still read/write the temp
+    // file (client_body_in_file_only tests read it back from Perl).
+    let mode = if access == 0 { 0o600 } else { access };
+    match os::open(&filename, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
+        Ok(fd) => Ok(TempFile::new(filename, fd, mode, clean)),
         Err(err) => {
             ngx_log_error!(crate::log::NGX_LOG_CRIT, log, Some(err), "open temp file failed");
             Err(err)
