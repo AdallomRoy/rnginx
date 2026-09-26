@@ -101,8 +101,17 @@ fn var_secure_link(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     let conf = r.loc_conf::<SecureLinkConf>(ctx_index());
     let conf = conf.borrow();
 
-    // Check for legacy secure_link_secret mode
-    if !conf.secret.get().is_empty() {
+    // Check for legacy secure_link_secret mode. C's
+    // ngx_http_secure_link_old_variable only runs when neither `secure_link`
+    // (variable) nor `secure_link_md5` is set — the two directives are
+    // mutually exclusive with `secure_link_secret`. Without this guard we'd
+    // mis-handle inherited secure_link_secret when the inner location
+    // overrides with the modern pair.
+    let has_modern = conf.variable.as_option().and_then(|o| o.as_ref()).is_some()
+                  || conf.md5.as_option().and_then(|o| o.as_ref()).is_some();
+    if has_modern {
+        // Fall through to the modern secure_link/secure_link_md5 path below.
+    } else if !conf.secret.get().is_empty() {
         // Match C ngx_http_secure_link_old_variable: URI /PREFIX/HASH/URL,
         // hash = md5(URL + secret) hex-encoded.
         let unparsed_uri = r.unparsed_uri.borrow();
@@ -160,13 +169,15 @@ fn var_secure_link(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     }
 
     // New mode with secure_link + secure_link_md5
-    if conf.variable.get().is_none() || conf.md5.get().is_none() {
-        v.not_found = true;
-        return NGX_OK;
-    }
-
-    let var_cv = conf.variable.get().as_ref().unwrap();
-    let md5_cv = conf.md5.get().as_ref().unwrap();
+    let var_opt = conf.variable.as_option().and_then(|o| o.as_ref());
+    let md5_opt = conf.md5.as_option().and_then(|o| o.as_ref());
+    let (var_cv, md5_cv) = match (var_opt, md5_opt) {
+        (Some(v), Some(m)) => (v, m),
+        _ => {
+            v.not_found = true;
+            return NGX_OK;
+        }
+    };
 
     let val_result = match crate::script::complex_value(r, var_cv) {
         Ok(v) => v,

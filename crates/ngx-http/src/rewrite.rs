@@ -950,7 +950,12 @@ async fn rewrite_handler(r: R) -> i64 {
             Code::If { condition, codes } => {
                 // Evaluate condition
                 if eval_if_condition(&r, condition) {
-                    // Execute codes inside the if block
+                    // Execute codes inside the if block. `break` or a
+                    // `break_cycle` rewrite inside must stop the outer
+                    // rewrite-module processing too — otherwise a trailing
+                    // `return NNN;` after an `if { rewrite ... break; }`
+                    // would still fire and clobber the just-set URI.
+                    let mut stop_outer = false;
                     for inner_code in codes.iter() {
                         match inner_code {
                             Code::Rewrite(rule) => {
@@ -1055,9 +1060,19 @@ async fn rewrite_handler(r: R) -> i64 {
                                 *r.uri.borrow_mut() = rewritten_uri.clone();
                                 set_exten(&r);
                                 *r.args.borrow_mut() = rewritten_args;
-                                r.uri_changed.set(true);
+                                // `rewrite ... break;` (break_cycle=true) mutates
+                                // the URI in place without re-running phases —
+                                // uri_changed stays false so find_config_phase
+                                // does not repeat. `last` (and the default) sets
+                                // uri_changed=true so post_rewrite_phase loops
+                                // back to server_rewrite. Matches C's
+                                // ngx_http_script_regex_end_code.
+                                if !rule.flags.break_cycle {
+                                    r.uri_changed.set(true);
+                                }
 
                                 if rule.flags.break_cycle {
+                                    stop_outer = true;
                                     break;
                                 }
                             }
@@ -1100,12 +1115,13 @@ async fn rewrite_handler(r: R) -> i64 {
                                 }
                                 return rc;
                             }
-                            Code::Break { .. } => break,
+                            Code::Break { .. } => { stop_outer = true; break; }
                             Code::If { .. } => {
                                 // Nested if not fully implemented
                             }
                         }
                     }
+                    if stop_outer { break; }
                 }
             }
         }
