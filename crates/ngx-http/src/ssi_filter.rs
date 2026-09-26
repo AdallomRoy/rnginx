@@ -234,7 +234,30 @@ async fn ssi_header_filter(r: R, next: HeaderFilter) -> i64 {
         return next(r).await;
     }
     let _ctx = r.set_ctx(ctx_index(), SsiCtx::default());
-    r.headers_out.borrow_mut().content_length_n = -1;
+    // Match ngx_http_ssi_header_filter: drop Last-Modified / ETag /
+    // Accept-Ranges / Content-Length because the SSI-rendered body is
+    // synthetic (not a byte-for-byte file). content_length_n = -1 makes
+    // downstream chunked-encode it.
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        ho.content_length_n = -1;
+        ho.content_length = None;
+        ho.last_modified = None;
+        ho.last_modified_time = -1;
+        ho.etag = None;
+        ho.accept_ranges = None;
+        // Also drop any generic-list entries that would otherwise be re-emitted.
+        for h in ho.headers.iter() {
+            let lc = &h.lowcase_key;
+            if lc.eq_ignore_ascii_case(b"last-modified")
+                || lc.eq_ignore_ascii_case(b"etag")
+                || lc.eq_ignore_ascii_case(b"accept-ranges")
+                || lc.eq_ignore_ascii_case(b"content-length")
+            {
+                h.hash.set(0);
+            }
+        }
+    }
     r.filter_need_in_memory.set(true);
     next(r).await
 }
