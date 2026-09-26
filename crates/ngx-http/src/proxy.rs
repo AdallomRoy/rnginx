@@ -828,17 +828,28 @@ async fn proxy_handler(r: R) -> i64 {
         *c.http_version
     };
     let ver_str = if http_version == 1 { "HTTP/1.1" } else { "HTTP/1.0" };
+    // Only synthesize a `Connection: close` line if the user's config didn't
+    // set Connection via proxy_set_header (in which case its value — possibly
+    // empty to drop the header — lives in forward_headers already). This lets
+    // `proxy_set_header Connection ""` + `proxy_http_version 1.1` produce a
+    // keep-alive request suitable for an upstream {} block with `keepalive N;`.
+    let connection_overridden = overridden_names.iter().any(|n| n.as_slice() == b"connection");
+    let want_keepalive = http_version == 1 && connection_overridden
+        && named_upstream.as_ref()
+            .and_then(|n| crate::upstream_keepalive::limits_for(n))
+            .map(|l| l.max_cached > 0)
+            .unwrap_or(false);
+    let conn_line = if connection_overridden { "" } else { "Connection: close\r\n" };
     let request = format!(
         "{} {} {}\r\n\
          Host: {}\r\n\
-         Connection: close\r\n\
-         {}{}{}\r\n",
-        method, uri_with_args, ver_str, host, content_length_hdr, content_type_hdr, forward_headers
+         {}{}{}{}\r\n",
+        method, uri_with_args, ver_str, host, conn_line, content_length_hdr, content_type_hdr, forward_headers
     );
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
     // rotate to the next non-tried peer of the named upstream and reconnect.
-    let mut upstream: tokio::net::TcpStream;
+    let mut upstream: Option<tokio::net::TcpStream> = None;
     let mut addr: String;
     let mut response: Vec<u8>;
     let mut status: i64;
@@ -852,7 +863,16 @@ async fn proxy_handler(r: R) -> i64 {
     'retry: loop {
         let try_started_ms = ngx_core::times::current_msec();
         addr = format!("{}:{}", host, port);
-        upstream = match connect_with_optional_bind(&addr, bind_addr).await {
+        // Try the per-worker idle-connection pool first if this proxy
+        // is talking to a named upstream with `keepalive N;` set.
+        let pooled = if want_keepalive {
+            named_upstream.as_ref().and_then(|n| crate::upstream_keepalive::pool_take(n, &addr))
+        } else {
+            None
+        };
+        upstream = Some(match pooled {
+            Some(s) => { connect_ms = 0; s }
+            None => match connect_with_optional_bind(&addr, bind_addr).await {
             Ok(s) => s,
             Err(_e) => {
                 // Record this attempt as a failed peer so $upstream_addr
@@ -890,7 +910,7 @@ async fn proxy_handler(r: R) -> i64 {
                 }
                 return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
             }
-        };
+        } });
         connect_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
         // Send request + body in one write so a fast upstream that reads once and
         // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
@@ -899,7 +919,7 @@ async fn proxy_handler(r: R) -> i64 {
         if !body_bytes.is_empty() {
             wire.extend_from_slice(&body_bytes);
         }
-        if let Err(_) = upstream.write_all(&wire).await {
+        if let Err(_) = upstream.as_mut().unwrap().write_all(&wire).await {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
         bytes_sent_to_upstream = wire.len() as i64;
@@ -921,8 +941,9 @@ async fn proxy_handler(r: R) -> i64 {
         let mut header_end: Option<usize> = None;
         let mut expected_body_len: Option<usize> = None;
         let mut is_chunked = false;
+        let mut upstream_wants_close = false;
         loop {
-            match upstream.read(&mut buf).await {
+            match upstream.as_mut().unwrap().read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
@@ -964,8 +985,37 @@ async fn proxy_handler(r: R) -> i64 {
                                     expected_body_len = None;
                                     is_chunked = true;
                                 }
+                                if line.len() > 11 && line[..11].eq_ignore_ascii_case(b"connection:") {
+                                    if line[11..].to_ascii_lowercase().windows(5).any(|w| w == b"close") {
+                                        upstream_wants_close = true;
+                                    }
+                                }
                             }
                         }
+                    }
+                    // Status codes 204 / 304 / 1xx carry no body per RFC,
+                    // and neither does a HEAD response — even if the upstream
+                    // sent Content-Length. Break as soon as we have the
+                    // headers so a persistent (keepalive) upstream isn't
+                    // read-blocked waiting for body bytes it will never send.
+                    let bodyless = if got_header {
+                        if r.method.get() == crate::NGX_HTTP_HEAD {
+                            true
+                        } else if let Some(e) = header_end {
+                            let sl = &response[..e.min(response.len())];
+                            let nl = sl.iter().position(|&b| b == b'\n').unwrap_or(sl.len());
+                            let sl = &sl[..nl];
+                            let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
+                            let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
+                            parts.get(1)
+                                .and_then(|p| std::str::from_utf8(p).ok())
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .map(|c| c == 204 || c == 304 || (100..200).contains(&c))
+                                .unwrap_or(false)
+                        } else { false }
+                    } else { false };
+                    if bodyless {
+                        break;
                     }
                     if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
                         if response.len() >= e + cl {
@@ -987,6 +1037,48 @@ async fn proxy_handler(r: R) -> i64 {
         let read_ok = true;
         response_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
         if !got_header { header_ms = response_ms; }
+        // If we finished this read cleanly (framing terminated: known
+        // Content-Length reached, or chunked-complete saw the 0-chunk),
+        // and the upstream didn't send Connection: close, hand the socket
+        // back to the keepalive pool for the next request to reuse.
+        //
+        // Note: `upstream` is only read from below when we're in an error
+        // path (empty response, retry). On the success path it's simply
+        // dropped when the enclosing scope ends — so it's safe to take it
+        // out here via std::io before we hit that drop.
+        if want_keepalive && !upstream_wants_close && got_header {
+            let is_head = r.method.get() == crate::NGX_HTTP_HEAD;
+            // Status can be re-parsed briefly to detect 204/304/1xx bodyless.
+            let is_bodyless = if let Some(e) = header_end {
+                let sl = &response[..e.min(response.len())];
+                if let Some(nl) = sl.iter().position(|&b| b == b'\n') {
+                    let sl = &sl[..nl];
+                    let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
+                    let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
+                    parts.get(1)
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|c| c == 204 || c == 304 || (100..200).contains(&c))
+                        .unwrap_or(false)
+                } else { false }
+            } else { false };
+            let framing_complete = if is_head || is_bodyless {
+                true
+            } else if let Some(cl) = expected_body_len {
+                header_end.map(|e| response.len() >= e + cl).unwrap_or(false)
+            } else if is_chunked {
+                header_end.map(|e| chunked_complete(&response[e..])).unwrap_or(false)
+            } else {
+                false
+            };
+            if framing_complete {
+                if let Some(name) = &named_upstream {
+                    if let Some(old) = upstream.take() {
+                        crate::upstream_keepalive::pool_put(name, &addr, old);
+                    }
+                }
+            }
+        }
         if !read_ok || response.is_empty() {
             // Treat as a connection-level error: honor proxy_next_upstream
             // error/timeout retry (also covers non-idempotent gating for the

@@ -54,6 +54,7 @@ pub mod range_filter;
 pub mod proxy;
 pub mod upstream;
 pub mod upstream_keepalive;
+pub mod upstream_keepalive_pool;
 pub mod upstream_round_robin;
 pub mod event_pipe;
 pub mod ssl_module;

@@ -124,7 +124,7 @@ async fn handler(r: R) -> i64 {
             }
         }
     };
-    let (host, port, next_not_found, gzip_flag) = {
+    let (host, port, next_not_found, gzip_flag, ups_name) = {
         let conf = r.loc_conf::<MemcachedLocConf>(ctx_index());
         let c = conf.borrow();
         let uri = match &c.upstream {
@@ -135,26 +135,38 @@ async fn handler(r: R) -> i64 {
         // First try to resolve as a named upstream {} block. That path picks
         // the first server via smooth WRR — same as ngx_http_memcached_module
         // going through ngx_http_upstream's ngx_http_upstream_init.
-        let (h, p) = if crate::upstream::get_upstream_by_name(&r, s.as_bytes()).is_some() {
-            crate::upstream::first_server_for(&r, s.as_bytes())
-                .unwrap_or((s.clone(), 11211))
+        let (h, p, name) = if crate::upstream::get_upstream_by_name(&r, s.as_bytes()).is_some() {
+            let (h, p) = crate::upstream::first_server_for(&r, s.as_bytes())
+                .unwrap_or((s.clone(), 11211));
+            (h, p, Some(s.as_bytes().to_vec()))
         } else if let Some(colon) = s.rfind(':') {
             let host = &s[..colon];
             let port = s[colon+1..].parse::<u16>().unwrap_or(11211);
-            (host.to_string(), port)
+            (host.to_string(), port, None)
         } else {
-            (s, 11211u16)
+            (s, 11211u16, None)
         };
-        (h, p, c.next_upstream_not_found.get_or(false), *c.gzip_flag)
+        (h, p, c.next_upstream_not_found.get_or(false), *c.gzip_flag, name)
     };
     // Discard body — we don't proxy any body to memcached.
     let rc = crate::request_body::discard_request_body(&r).await;
     if rc != NGX_OK { return rc; }
 
     let addr = format!("{}:{}", host, port);
-    let mut stream = match tokio::net::TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(_) => return NGX_HTTP_BAD_GATEWAY,
+    // Reuse a pooled connection first if this upstream has `keepalive N;`.
+    let want_pool = ups_name.as_ref()
+        .and_then(|n| crate::upstream_keepalive::limits_for(n))
+        .map(|l| l.max_cached > 0)
+        .unwrap_or(false);
+    let pooled = if want_pool {
+        ups_name.as_ref().and_then(|n| crate::upstream_keepalive::pool_take(n, &addr))
+    } else { None };
+    let mut stream = match pooled {
+        Some(s) => s,
+        None => match tokio::net::TcpStream::connect(&addr).await {
+            Ok(s) => s,
+            Err(_) => return NGX_HTTP_BAD_GATEWAY,
+        },
     };
     let cmd = format!("get {}\r\n", std::str::from_utf8(&key).unwrap_or(""));
     if stream.write_all(cmd.as_bytes()).await.is_err() {
@@ -186,6 +198,16 @@ async fn handler(r: R) -> i64 {
                 if buf.len() > 1 << 20 { break; }
             }
             Err(_) => return NGX_HTTP_BAD_GATEWAY,
+        }
+    }
+
+    // Response is fully consumed by the read loop above (either the
+    // terminating "END\r\n" or an error line). Hand the socket back to
+    // the keepalive pool before we return to the filter chain so a
+    // subsequent memcached_pass reuses it.
+    if want_pool {
+        if let Some(name) = &ups_name {
+            crate::upstream_keepalive::pool_put(name, &addr, stream);
         }
     }
 
