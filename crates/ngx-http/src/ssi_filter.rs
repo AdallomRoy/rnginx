@@ -67,7 +67,7 @@ pub struct SsiCtx {
     pub variables: HashMap<Vec<u8>, Vec<u8>>,
     pub timefmt: Vec<u8>,
     pub errmsg: Vec<u8>,
-    pub pending_include: Option<Vec<u8>>, // URI for pending include
+    pub pending_include: Option<(Vec<u8>, Option<Vec<u8>>)>, // (path, args)
 }
 
 impl Default for SsiCtx {
@@ -255,7 +255,7 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     // triggers a subrequest that streams its output between neighboring text
     // segments. Preserving relative order is critical — the C module handles
     // this via ngx_http_postpone_filter; we materialize it directly.
-    enum Seg { Text(Vec<u8>), Include(Vec<u8>) }
+    enum Seg { Text(Vec<u8>), Include(Vec<u8>, Option<Vec<u8>>) }
     let mut segments: Vec<Seg> = Vec::new();
     let mut last_buf_flag = false;
     let mut last_in_chain_flag = false;
@@ -284,8 +284,8 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
             }
             pos += consumed;
             if had_include {
-                if let Some(uri) = ctx_rc.borrow_mut().pending_include.take() {
-                    segments.push(Seg::Include(uri));
+                if let Some((path, args)) = ctx_rc.borrow_mut().pending_include.take() {
+                    segments.push(Seg::Include(path, args));
                 }
             } else {
                 break;
@@ -306,18 +306,12 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
                     output.push_back(b);
                 }
             }
-            Seg::Include(uri) => {
+            Seg::Include(path, args) => {
                 if !output.is_empty() {
                     let result = next(r.clone(), output).await;
                     if result != NGX_OK { return result; }
                     output = Chain::new();
                 }
-                let (path, args) = if let Some(q_pos) = uri.iter().position(|&b| b == b'?') {
-                    let (p, a) = uri.split_at(q_pos);
-                    (p.to_vec(), Some(a[1..].to_vec()))
-                } else {
-                    (uri.clone(), None)
-                };
                 let args_ref = args.as_ref().map(|a| a.as_slice());
                 let _ = crate::request_rt::subrequest(&r, &path, args_ref, 0, None).await;
             }
@@ -617,12 +611,21 @@ fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut S
             Vec::new()
         }
         b"include" => {
-            // Store the include directive for async handling
+            // Store the include directive for async handling. Match C's
+            // ngx_http_ssi_include: split at the first LITERAL '?' (i.e.
+            // BEFORE any percent-decoding — an escaped '%3f' inside the path
+            // is a real file-name '?' and must not be treated as an args
+            // separator). Then unescape ONLY the path segment; args stay
+            // escaped and are decoded by the request parser downstream.
             if let Some(virt) = params.get(&b"virtual".to_vec()) {
-                // Evaluate variables in the virtual URI
-                let uri = ssi_eval_string(virt, ctx, r);
-                // Store it for the body filter to handle
-                ctx.pending_include = Some(uri);
+                let expanded = ssi_eval_string(virt, ctx, r);
+                let (path_raw, args_raw) = match expanded.iter().position(|&b| b == b'?') {
+                    Some(q) => (&expanded[..q], Some(&expanded[q + 1..])),
+                    None => (&expanded[..], None),
+                };
+                let (path_decoded, _) = ngx_core::string::unescape_uri(
+                    path_raw, ngx_core::string::NGX_UNESCAPE_URI);
+                ctx.pending_include = Some((path_decoded, args_raw.map(|a| a.to_vec())));
             }
             Vec::new()
         }
