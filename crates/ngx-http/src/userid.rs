@@ -63,10 +63,10 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
 
     c.enable.merge(&p.enable, NGX_HTTP_USERID_OFF);
     c.flags.merge(&p.flags, 0);
-    c.service.merge(&p.service, 0);
+    c.service.merge(&p.service, -1);
     c.name.merge(&p.name, b"uid".to_vec());
     c.domain.merge(&p.domain, Vec::new());
-    c.path.merge(&p.path, b"; path=/".to_vec());
+    c.path.merge(&p.path, b"/".to_vec());
     c.p3p.merge(&p.p3p, Vec::new());
     c.expires.merge(&p.expires, 0);
     c.mark.merge(&p.mark, 0);
@@ -194,7 +194,7 @@ fn var_uid_got(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     if let Some(ctx) = r.get_ctx::<UserIdCtx>(ctx_index()) {
         let ctx = ctx.borrow();
         if ctx.uid_got[3] != 0 {
-            v.data = format_uid(&ctx.uid_got, *conf.enable.get() == NGX_HTTP_USERID_V1);
+            v.data = format_var_uid(conf.name.get(), &ctx.uid_got);
             v.valid = true;
             return NGX_OK;
         }
@@ -218,7 +218,7 @@ fn var_uid_set(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     if let Some(ctx) = r.get_ctx::<UserIdCtx>(ctx_index()) {
         let ctx = ctx.borrow();
         if ctx.uid_set[3] != 0 {
-            v.data = format_uid(&ctx.uid_set, *conf.enable.get() == NGX_HTTP_USERID_V1);
+            v.data = format_var_uid(conf.name.get(), &ctx.uid_set);
             v.valid = true;
             return NGX_OK;
         }
@@ -226,6 +226,18 @@ fn var_uid_set(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
 
     v.not_found = true;
     NGX_OK
+}
+
+/// Format $uid_got / $uid_set: `<name>=<HEX32>` — matches C's
+/// ngx_http_userid_variable which prints `%V=%08XD%08XD%08XD%08XD`.
+/// The variable form is always hex (both v1 and v2), even though the cookie
+/// itself is decimal for v1 and base64 for v2.
+fn format_var_uid(name: &[u8], uid: &[u32; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len() + 33);
+    out.extend_from_slice(name);
+    out.push(b'=');
+    out.extend_from_slice(format!("{:08X}{:08X}{:08X}{:08X}", uid[0], uid[1], uid[2], uid[3]).as_bytes());
+    out
 }
 
 fn var_uid_reset(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
@@ -286,8 +298,207 @@ fn base64_encode(data: &[u8]) -> Vec<u8> {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
+    // Register a phase handler at PREACCESS so $uid_set is populated BEFORE
+    // add_header (in the response-header build pass) tries to read it.
+    // Without this, headers_filter runs first and $uid_set is not_found.
+    crate::core::add_phase_handler(cf, crate::NGX_HTTP_PREACCESS_PHASE,
+        std::rc::Rc::new(|r| Box::pin(userid_preaccess(r))));
     install_header_filter(|r, next| async move { userid_header_filter(r, next).await });
     Ok(())
+}
+
+async fn userid_preaccess(r: R) -> i64 {
+    if !r.is_main() { return crate::NGX_DECLINED; }
+    let conf = r.loc_conf::<UserIdConf>(ctx_index());
+    let cb = conf.borrow();
+    if *cb.enable.get() < NGX_HTTP_USERID_V1 {
+        return crate::NGX_DECLINED;
+    }
+    if r.get_ctx::<UserIdCtx>(ctx_index()).is_none() {
+        r.set_ctx(ctx_index(), UserIdCtx { uid_got: [0; 4], uid_set: [0; 4] });
+    }
+    // Parse Cookie: header(s) for a `<name>=<base64>` pair, decode into
+    // uid_got. Matches ngx_http_userid_get_uid in C.
+    let name = cb.name.get().clone();
+    let cookies: Vec<Vec<u8>> = {
+        let hin = r.headers_in.borrow();
+        hin.cookie.iter().map(|h| h.value.borrow().clone()).collect()
+    };
+    let mut got: [u32; 4] = [0; 4];
+    for c in &cookies {
+        if let Some(v) = find_cookie_value(c, &name) {
+            if v.len() >= 22 {
+                if let Some(decoded) = base64_decode_16(&v[..22]) {
+                    for (i, chunk) in decoded.chunks(4).enumerate().take(4) {
+                        got[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // Populate uid_set: if we got a cookie, echo it back; otherwise mint one
+    // (create_uid semantics from C — this way add_header $uid_set has a value
+    // during headers_filter, which runs before our own header filter).
+    let is_v1 = *cb.enable.get() == NGX_HTTP_USERID_V1;
+    let service = *cb.service.get();
+    // Read $uid_reset via the variable engine — matches C's
+    // ngx_http_get_indexed_variable(r, ngx_http_userid_reset_index).
+    // Empty or "0" ⇒ no reset (echo got); anything else ⇒ mint new uid_set;
+    // "log" ⇒ also emit "userid cookie \"...\" was reset" at NOTICE.
+    let (reset, log_reset) = {
+        let name = ngx_core::string::to_lower_vec(b"uid_reset");
+        match crate::variables::get_variable(&r, &name) {
+            Some(v) if !v.not_found => {
+                let d = v.data.as_slice();
+                let is_zero = d.is_empty() || (d.len() == 1 && d[0] == b'0');
+                let is_log = d == b"log";
+                (!is_zero, is_log)
+            }
+            _ => (false, false),
+        }
+    };
+    if log_reset && got[3] != 0 {
+        let msg = format!("userid cookie \"{}={:08X}{:08X}{:08X}{:08X}\" was reset",
+            String::from_utf8_lossy(cb.name.get()),
+            got[0], got[1], got[2], got[3]);
+        ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "{}", msg);
+    }
+    // Fetch local sockaddr up front — we can't borrow across the ctx borrow.
+    let local_addr = if !is_v1 && service < 0 {
+        r.connection.local_sockaddr()
+    } else {
+        None
+    };
+    if let Some(ctx) = r.get_ctx::<UserIdCtx>(ctx_index()) {
+        let mut ctx = ctx.borrow_mut();
+        if got[3] != 0 {
+            ctx.uid_got = got;
+        }
+        if ctx.uid_set[3] == 0 {
+            if ctx.uid_got[3] != 0 && !reset {
+                ctx.uid_set = ctx.uid_got;
+            } else if is_v1 {
+                // v1: host-order fields, no htonl. Service defaults to 0.
+                ctx.uid_set[0] = if service < 0 { 0 } else { service as u32 };
+                ctx.uid_set[1] = ngx_core::times::time() as u32;
+                ctx.uid_set[2] = start_value();
+                ctx.uid_set[3] = next_seq_v1();
+            } else {
+                // v2: network-order fields (htonl).
+                ctx.uid_set[0] = if service < 0 {
+                    match local_addr {
+                        Some(ngx_core::inet::SockAddr::V4(a)) => {
+                            // sin_addr.s_addr is network-order stored as u32.
+                            let octets = a.ip().octets();
+                            u32::from_ne_bytes(octets)
+                        }
+                        Some(ngx_core::inet::SockAddr::V6(a)) => {
+                            let s = a.ip().octets();
+                            u32::from_ne_bytes([s[12], s[13], s[14], s[15]])
+                        }
+                        Some(ngx_core::inet::SockAddr::Unix(_)) => 0,
+                        None => 0,
+                    }
+                } else {
+                    (service as u32).to_be()
+                };
+                ctx.uid_set[1] = (ngx_core::times::time() as u32).to_be();
+                ctx.uid_set[2] = start_value().to_be();
+                ctx.uid_set[3] = next_seq_v2().to_be();
+            }
+        }
+    }
+    crate::NGX_DECLINED
+}
+
+// Process-lifetime sequencers (see start_value / sequencer_v1 / sequencer_v2
+// in ngx_http_userid_filter_module.c).
+fn start_value() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static V: AtomicU32 = AtomicU32::new(0);
+    let cur = V.load(Ordering::Relaxed);
+    if cur == 0 {
+        let s = ngx_core::times::time() as u32;
+        V.store(s, Ordering::Relaxed);
+        s
+    } else {
+        cur
+    }
+}
+fn next_seq_v1() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static S: AtomicU32 = AtomicU32::new(1);
+    S.fetch_add(0x100, Ordering::Relaxed)
+}
+fn next_seq_v2() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static S: AtomicU32 = AtomicU32::new(0x03030302);
+    let v = S.fetch_add(0x100, Ordering::Relaxed);
+    v.max(0x03030302)
+}
+
+/// Split a Cookie: header value on `; ` and return the value for the pair
+/// whose name matches (case-insensitive).
+fn find_cookie_value(header: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 0;
+    while i < header.len() {
+        // skip leading whitespace/semicolons
+        while i < header.len() && (header[i] == b' ' || header[i] == b';' || header[i] == b'\t') {
+            i += 1;
+        }
+        let start = i;
+        while i < header.len() && header[i] != b'=' && header[i] != b';' {
+            i += 1;
+        }
+        let key = &header[start..i];
+        let mut val: Vec<u8> = Vec::new();
+        if i < header.len() && header[i] == b'=' {
+            i += 1;
+            let vs = i;
+            while i < header.len() && header[i] != b';' {
+                i += 1;
+            }
+            val.extend_from_slice(&header[vs..i]);
+        }
+        if key.eq_ignore_ascii_case(name) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Base64 decode the first 22 chars (16 bytes of a userid). Ignores the "=="
+/// trailer that may be corrupt in legacy cookies (matches C which truncates
+/// input to 22 bytes before ngx_decode_base64).
+fn base64_decode_16(src: &[u8]) -> Option<[u8; 16]> {
+    fn v(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    // Pad the 22-char input to 24 with 'A' (bits 0) so decoding produces 18
+    // bytes; take the first 16.
+    let mut buf = [b'A'; 24];
+    buf[..src.len().min(22)].copy_from_slice(&src[..src.len().min(22)]);
+    let mut out = [0u8; 18];
+    for i in 0..6 {
+        let a = v(buf[i*4])?;
+        let b = v(buf[i*4+1])?;
+        let c = v(buf[i*4+2])?;
+        let d = v(buf[i*4+3])?;
+        out[i*3]   = (a << 2) | (b >> 4);
+        out[i*3+1] = (b << 4) | (c >> 2);
+        out[i*3+2] = (c << 6) | d;
+    }
+    let mut r = [0u8; 16];
+    r.copy_from_slice(&out[..16]);
+    Some(r)
 }
 
 async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
@@ -321,6 +532,16 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
             ctx.uid_set[2] = rand_u32();
             ctx.uid_set[3] = rand_u32();
         }
+        // If the client's cookie is valid and we're echoing it back
+        // unchanged (no `userid_mark`), don't emit Set-Cookie at all — the
+        // browser already has the same cookie. Matches C's create_uid path
+        // where uid_set stays 0 and set_uid returns early.
+        let mark = *conf.mark.get();
+        if ctx.uid_got[3] != 0 && ctx.uid_got == ctx.uid_set && mark == 0 {
+            drop(ctx);
+            drop(conf);
+            return next(r).await;
+        }
 
         let uid_bytes = ctx.uid_set.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<_>>();
         let mut encoded = base64_encode(&uid_bytes);
@@ -328,7 +549,6 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
         // base64 output (matches C's `*(p - 2) = conf->mark;` in
         // ngx_http_userid_set_uid). For a 16-byte UID that byte is the
         // second `=` padding char.
-        let mark = *conf.mark.get();
         if mark != 0 && encoded.len() >= 2 {
             let idx = encoded.len() - 2;
             encoded[idx] = mark;
@@ -340,11 +560,7 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
         cookie.extend_from_slice(&encoded);
 
         cookie.extend_from_slice(b"; path=");
-        if !conf.path.get().is_empty() {
-            cookie.extend_from_slice(conf.path.get());
-        } else {
-            cookie.push(b'/');
-        }
+        cookie.extend_from_slice(conf.path.get());
 
         if !conf.domain.get().is_empty() && conf.domain.get() != b"none" {
             cookie.extend_from_slice(b"; domain=");
