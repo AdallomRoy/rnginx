@@ -820,8 +820,20 @@ fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut S
                     Some(q) => (&expanded[..q], Some(&expanded[q + 1..])),
                     None => (&expanded[..], None),
                 };
-                let (path_decoded, _) = ngx_core::string::unescape_uri(
+                let (mut path_decoded, _) = ngx_core::string::unescape_uri(
                     path_raw, ngx_core::string::NGX_UNESCAPE_URI);
+                // Relative virtual= paths are resolved against the parent
+                // request's URI directory — matches C where
+                // ngx_http_subrequest turns `foo.html` from a request at
+                // `/dir/index.html` into `/dir/foo.html`. Absolute paths
+                // (starting with `/`) pass through unchanged.
+                if !path_decoded.starts_with(b"/") {
+                    let parent_uri = r.uri.borrow().clone();
+                    let dir_end = parent_uri.iter().rposition(|&b| b == b'/').map(|p| p + 1).unwrap_or(0);
+                    let mut resolved = parent_uri[..dir_end].to_vec();
+                    resolved.extend_from_slice(&path_decoded);
+                    path_decoded = resolved;
+                }
                 ctx.pending_include = Some((path_decoded, args_raw.map(|a| a.to_vec())));
             }
             Vec::new()
