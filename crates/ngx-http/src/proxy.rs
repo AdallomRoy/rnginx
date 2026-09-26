@@ -68,6 +68,36 @@ pub struct NgxHttpProxyLocConf {
     /// Set by `proxy_redirect default` — resolved at first-request time by
     /// combining the proxy_pass URL and the location name.
     pub redirect_default: bool,
+    /// proxy_cookie_flags entries.
+    pub cookie_flags: Vec<CookieFlagsRule>,
+}
+
+// Cookie flag bits (matches ngx_http_proxy_module NGX_HTTP_PROXY_COOKIE_*).
+pub const CF_SECURE_ON: u32          = 0x0001;
+pub const CF_SECURE_OFF: u32         = 0x0002;
+pub const CF_HTTPONLY_ON: u32        = 0x0004;
+pub const CF_HTTPONLY_OFF: u32       = 0x0008;
+pub const CF_SAMESITE_STRICT: u32    = 0x0010;
+pub const CF_SAMESITE_LAX: u32       = 0x0020;
+pub const CF_SAMESITE_NONE: u32      = 0x0040;
+pub const CF_SAMESITE_OFF: u32       = 0x0080;
+
+#[derive(Clone)]
+pub struct CookieFlagsRule {
+    pub matcher: CookieMatcher,
+    pub flags: u32,
+    /// Complex-value flag tokens whose text is evaluated per request.
+    pub complex_flags: Vec<crate::script::ComplexValue>,
+}
+
+#[derive(Clone)]
+pub enum CookieMatcher {
+    /// Off sentinel (from `proxy_cookie_flags off`).
+    Off,
+    /// Complex value matched exactly against the cookie's Name attribute.
+    Name(crate::script::ComplexValue),
+    /// Regex against cookie Name (case-sensitive or insensitive).
+    Regex(Rc<ngx_core::regex::Regex>),
 }
 
 // Retry condition flags (ngx_http_upstream.h NGX_HTTP_UPSTREAM_FT_*).
@@ -143,6 +173,7 @@ impl Default for NgxHttpProxyLocConf {
             redirects: Vec::new(),
             redirect_off: false,
             redirect_default: false,
+            cookie_flags: Vec::new(),
         }
     }
 }
@@ -199,6 +230,10 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     // user explicitly wrote `proxy_redirect off;`.
     if !c.redirect_off && c.redirects.is_empty() && !c.redirect_default {
         c.redirect_default = true;
+    }
+    // Inherit cookie_flags unless this location listed its own.
+    if c.cookie_flags.is_empty() {
+        c.cookie_flags = p.cookie_flags.clone();
     }
     Ok(())
 }
@@ -1265,7 +1300,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_domain_handler),
         cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_path_handler),
-        cmd_fn!("proxy_cookie_flags", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cookie_flags", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, proxy_cookie_flags_handler),
         cmd_fn!("proxy_set_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_set_body_handler),
         cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_hide_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -1420,9 +1455,20 @@ fn cookie_rewrite_off() -> CookieRewrite {
 pub fn rewrite_set_cookies(r: &R) {
     let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let plcf = plcf.borrow();
-    if plcf.cookie_domains.is_empty() && plcf.cookie_paths.is_empty() {
+    let need_domain_or_path = !plcf.cookie_domains.is_empty() || !plcf.cookie_paths.is_empty();
+    let need_flags = !plcf.cookie_flags.is_empty();
+    drop(plcf);
+    if !need_domain_or_path && !need_flags {
         return;
     }
+    if need_flags {
+        apply_cookie_flags(r);
+    }
+    if !need_domain_or_path {
+        return;
+    }
+    let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf = plcf.borrow();
 
     let mut ho = r.headers_out.borrow_mut();
     for h in ho.headers.iter() {
@@ -1787,4 +1833,182 @@ fn try_redirect_rewrite(r: &R, value: &[u8], prefix: usize, rewrites: &[CookieRe
         }
     }
     None
+}
+
+fn proxy_cookie_flags_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    // `proxy_cookie_flags off;` (2 args, no cookie name)
+    if args.len() == 2 && args[1] == b"off" {
+        let mut c = cell.borrow_mut();
+        c.cookie_flags.clear();
+        c.cookie_flags.push(CookieFlagsRule { matcher: CookieMatcher::Off, flags: 0, complex_flags: Vec::new() });
+        return Ok(());
+    }
+    if args.len() < 3 {
+        return Err(msg("invalid number of arguments"));
+    }
+    let cookie_arg = &args[1];
+    // Parse flag tokens. Literal tokens set a bit immediately; tokens that
+    // contain a `$` are stored as complex values and re-parsed per request.
+    let mut flags: u32 = 0;
+    let mut complex_flags: Vec<crate::script::ComplexValue> = Vec::new();
+    for tok in args.iter().skip(2) {
+        if tok.iter().any(|&b| b == b'$') {
+            let cv = crate::script::compile_complex_value(cf, tok, 0)?;
+            complex_flags.push(cv);
+            continue;
+        }
+        let bit = flag_bit_for(tok.as_slice())
+            .ok_or_else(|| cf.emerg(format_args!("invalid parameter \"{}\"",
+                ngx_core::string::B(tok))))?;
+        flags |= bit;
+    }
+    let matcher = if !cookie_arg.is_empty() && cookie_arg[0] == b'~' {
+        // ngx_http_proxy_cookie_flags compiles the ~pattern with
+        // NGX_REGEX_CASELESS unconditionally (there's no ~* variant here).
+        let body = &cookie_arg[1..];
+        let re = ngx_core::regex::Regex::compile(body, ngx_core::regex::NGX_REGEX_CASELESS)
+            .map_err(|e| cf.emerg(format_args!("regex error: {}", e)))?;
+        CookieMatcher::Regex(re)
+    } else {
+        let cv = crate::script::compile_complex_value(cf, cookie_arg, 0)?;
+        CookieMatcher::Name(cv)
+    };
+    cell.borrow_mut().cookie_flags.push(CookieFlagsRule { matcher, flags, complex_flags });
+    Ok(())
+}
+
+fn flag_bit_for(tok: &[u8]) -> Option<u32> {
+    let lower = tok.to_ascii_lowercase();
+    Some(match lower.as_slice() {
+        b"secure"          => CF_SECURE_ON,
+        b"nosecure"        => CF_SECURE_OFF,
+        b"httponly"        => CF_HTTPONLY_ON,
+        b"nohttponly"      => CF_HTTPONLY_OFF,
+        b"samesite=strict" => CF_SAMESITE_STRICT,
+        b"samesite=lax"    => CF_SAMESITE_LAX,
+        b"samesite=none"   => CF_SAMESITE_NONE,
+        b"nosamesite"      => CF_SAMESITE_OFF,
+        _ => return None,
+    })
+}
+
+/// Apply proxy_cookie_flags to Set-Cookie headers. Called from rewrite_set_cookies
+/// after Domain/Path substitution so both effects compose.
+fn apply_cookie_flags(r: &R) {
+    let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf = plcf.borrow();
+    let rules: Vec<CookieFlagsRule> = plcf.cookie_flags.iter()
+        .filter(|r| !matches!(r.matcher, CookieMatcher::Off))
+        .cloned()
+        .collect();
+    if rules.is_empty() { return; }
+    drop(plcf);
+
+    let ho = r.headers_out.borrow();
+    let mut cookies: Vec<crate::request::Header> = Vec::new();
+    for h in ho.headers.iter() {
+        if h.hash.get() == 0 { continue; }
+        if h.lowcase_key.eq_ignore_ascii_case(b"set-cookie") {
+            cookies.push(h.clone());
+        }
+    }
+    drop(ho);
+
+    for h in cookies {
+        let value = h.value.borrow().clone();
+        let attrs = parse_cookie(&value);
+        if attrs.is_empty() { continue; }
+        // attrs[0].0 is the cookie name (part before '=' of the name=value pair).
+        let cookie_name = attrs[0].0.clone();
+        // Compute effective flag mask for this cookie by ORing all matching rules.
+        let mut mask: u32 = 0;
+        for rule in rules.iter() {
+            let matched = match &rule.matcher {
+                CookieMatcher::Off => false,
+                CookieMatcher::Name(cv) => {
+                    let pattern = match crate::script::complex_value(r, cv) { Ok(v) => v, Err(_) => continue };
+                    pattern.eq_ignore_ascii_case(&cookie_name)
+                }
+                CookieMatcher::Regex(re) => re.is_match(&cookie_name),
+            };
+            if !matched { continue; }
+            mask |= rule.flags;
+            // Evaluate complex-value flag tokens now.
+            for cv in &rule.complex_flags {
+                let v = match crate::script::complex_value(r, cv) { Ok(v) => v, Err(_) => continue };
+                if v.is_empty() { continue; }
+                if let Some(bit) = flag_bit_for(&v) { mask |= bit; }
+            }
+        }
+        if mask == 0 { continue; }
+
+        // Edit existing attrs; drop those key.data==NULL analogues (we use retain).
+        let mut new_attrs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(attrs.len() + 3);
+        let mut remaining = mask;
+        let mut have_secure = false;
+        let mut have_httponly = false;
+        let mut have_samesite = false;
+        for (i, (k, v)) in attrs.iter().enumerate() {
+            if i == 0 { new_attrs.push((k.clone(), v.clone())); continue; }
+            let kl = k.to_ascii_lowercase();
+            if kl == b"secure" {
+                have_secure = true;
+                if remaining & CF_SECURE_ON != 0 { remaining &= !CF_SECURE_ON; new_attrs.push((k.clone(), v.clone())); continue; }
+                if remaining & CF_SECURE_OFF != 0 { continue; } // drop
+                new_attrs.push((k.clone(), v.clone()));
+                continue;
+            }
+            if kl == b"httponly" {
+                have_httponly = true;
+                if remaining & CF_HTTPONLY_ON != 0 { remaining &= !CF_HTTPONLY_ON; new_attrs.push((k.clone(), v.clone())); continue; }
+                if remaining & CF_HTTPONLY_OFF != 0 { continue; }
+                new_attrs.push((k.clone(), v.clone()));
+                continue;
+            }
+            if kl == b"samesite" {
+                have_samesite = true;
+                if remaining & CF_SAMESITE_STRICT != 0 {
+                    remaining &= !CF_SAMESITE_STRICT;
+                    new_attrs.push((b"SameSite".to_vec(), Some(b"Strict".to_vec()))); continue;
+                }
+                if remaining & CF_SAMESITE_LAX != 0 {
+                    remaining &= !CF_SAMESITE_LAX;
+                    new_attrs.push((b"SameSite".to_vec(), Some(b"Lax".to_vec()))); continue;
+                }
+                if remaining & CF_SAMESITE_NONE != 0 {
+                    remaining &= !CF_SAMESITE_NONE;
+                    new_attrs.push((b"SameSite".to_vec(), Some(b"None".to_vec()))); continue;
+                }
+                if remaining & CF_SAMESITE_OFF != 0 { continue; }
+                new_attrs.push((k.clone(), v.clone()));
+                continue;
+            }
+            new_attrs.push((k.clone(), v.clone()));
+        }
+        // Append any *_ON flags still not consumed.
+        if remaining & CF_SECURE_ON != 0 && !have_secure {
+            new_attrs.push((b"Secure".to_vec(), None));
+        }
+        if remaining & CF_HTTPONLY_ON != 0 && !have_httponly {
+            new_attrs.push((b"HttpOnly".to_vec(), None));
+        }
+        if !have_samesite {
+            if remaining & CF_SAMESITE_STRICT != 0 {
+                new_attrs.push((b"SameSite".to_vec(), Some(b"Strict".to_vec())));
+            } else if remaining & CF_SAMESITE_LAX != 0 {
+                new_attrs.push((b"SameSite".to_vec(), Some(b"Lax".to_vec())));
+            } else if remaining & CF_SAMESITE_NONE != 0 {
+                new_attrs.push((b"SameSite".to_vec(), Some(b"None".to_vec())));
+            }
+        }
+        let mut out = Vec::new();
+        for (i, (k, v)) in new_attrs.iter().enumerate() {
+            if i > 0 { out.extend_from_slice(b"; "); }
+            out.extend_from_slice(k);
+            if let Some(val) = v { out.push(b'='); out.extend_from_slice(val); }
+        }
+        *h.value.borrow_mut() = out;
+    }
 }
