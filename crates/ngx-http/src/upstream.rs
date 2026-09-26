@@ -403,50 +403,28 @@ pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     None
 }
 
-/// Pick the next best peer from the named upstream that isn't in `tried`.
-/// Used by proxy_next_upstream to iterate servers on retryable failures.
-/// Returns None once every non-down peer has been attempted.
-pub fn next_server_for(r: &R, name: &[u8], tried: &[(String, u16)]) -> Option<(String, u16)> {
+/// Number of non-down peers (main + backup) in the named upstream.
+/// proxy_next_upstream uses this as its per-request retry ceiling: after
+/// `peer_count` attempts we've cycled through every distinct peer entry
+/// (even if two entries happen to share a host:port).
+pub fn peer_count_for(r: &R, name: &[u8]) -> usize {
     let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
     let m = umcf.borrow();
     for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
-        let mut g = cell.borrow_mut();
-        if let Some(pick) = pick_wrr_excluding(&mut g.peers, tried) {
-            return Some(pick);
-        }
-        if let Some(pick) = pick_wrr_excluding(&mut g.backup, tried) {
-            return Some(pick);
-        }
-        return None;
+        let g = cell.borrow();
+        return g.peers.iter().filter(|p| !p.server.down).count()
+             + g.backup.iter().filter(|p| !p.server.down).count();
     }
-    None
+    0
 }
 
-fn pick_wrr_excluding(peers: &mut [PeerState], tried: &[(String, u16)]) -> Option<(String, u16)> {
-    let mut total: i32 = 0;
-    let mut best_idx: Option<usize> = None;
-    let mut best_cw: i32 = i32::MIN;
-    for (i, p) in peers.iter_mut().enumerate() {
-        if p.server.down { continue; }
-        let host = String::from_utf8_lossy(&p.server.addr).to_string();
-        if tried.iter().any(|(h, port)| h == &host && *port == p.server.port) {
-            continue;
-        }
-        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
-        total = total.saturating_add(p.effective_weight);
-        if p.effective_weight < p.weight {
-            p.effective_weight += 1;
-        }
-        if p.current_weight > best_cw {
-            best_cw = p.current_weight;
-            best_idx = Some(i);
-        }
-    }
-    let idx = best_idx?;
-    peers[idx].current_weight -= total;
-    let s = &peers[idx].server;
-    Some((String::from_utf8_lossy(&s.addr).into_owned(), s.port))
+/// Pick the next peer for a retry — just runs one more round of smooth WRR
+/// (which naturally rotates among peers). The caller must enforce an
+/// attempt ceiling via [`peer_count_for`] so we don't loop forever when
+/// only one peer exists.
+pub fn next_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
+    first_server_for(r, name)
 }
 
 fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {

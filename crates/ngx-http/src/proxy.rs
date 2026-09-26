@@ -427,11 +427,13 @@ async fn proxy_handler(r: R) -> i64 {
     let named_upstream: Option<Vec<u8>> = named_upstream_name.clone();
     let next_upstream_mask = conf_borrowed.next_upstream_mask.get_or(FT_ERROR | FT_TIMEOUT);
     let next_upstream_tries = conf_borrowed.next_upstream_tries.get_or(0);
-    let mut tried_peers: Vec<(String, u16)> = Vec::new();
-    // Populate the initial peer as tried since we've already picked it.
-    if let Some(_) = &named_upstream {
-        tried_peers.push((host.clone(), port));
-    }
+    // Attempts already made against a named upstream's peers. The very
+    // first pick (via first_server_for) counts as attempt #1.
+    let mut attempts: u32 = if named_upstream.is_some() { 1 } else { 0 };
+    let peer_limit: u32 = match &named_upstream {
+        Some(n) => crate::upstream::peer_count_for(&r, n) as u32,
+        None => 0,
+    };
 
     let bind_addr: Option<std::net::SocketAddr> = match &conf_borrowed.local_bind {
         None | Some(LocalBind::Off) => None,
@@ -601,12 +603,24 @@ async fn proxy_handler(r: R) -> i64 {
         upstream = match connect_with_optional_bind(&addr, bind_addr).await {
             Ok(s) => s,
             Err(_e) => {
+                // Record this attempt as a failed peer so $upstream_addr
+                // reflects every hop (matches C's u->state list-append).
+                r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
+                    status: 502,
+                    response_length: 0,
+                    bytes_received: 0,
+                    bytes_sent: 0,
+                    peer: addr.clone().into_bytes(),
+                    ..Default::default()
+                });
                 if next_upstream_mask & FT_ERROR != 0 {
                     if let Some(name) = &named_upstream {
-                        if next_upstream_tries == 0 || (tried_peers.len() as u32) < next_upstream_tries {
-                            if let Some((h, p)) = crate::upstream::next_server_for(&r, name, &tried_peers) {
+                        let can_try = attempts < peer_limit
+                            && (next_upstream_tries == 0 || attempts < next_upstream_tries);
+                        if can_try {
+                            if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
                                 host = h; port = p;
-                                tried_peers.push((host.clone(), port));
+                                attempts += 1;
                                 continue 'retry;
                             }
                         }
@@ -628,10 +642,38 @@ async fn proxy_handler(r: R) -> i64 {
         bytes_sent_to_upstream = wire.len() as i64;
 
         response = Vec::new();
-        if let Err(_) = upstream.read_to_end(&mut response).await {
-            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-        }
-        if response.is_empty() {
+        let read_ok = upstream.read_to_end(&mut response).await.is_ok();
+        if !read_ok || response.is_empty() {
+            // Treat as a connection-level error: honor proxy_next_upstream
+            // error/timeout retry (also covers non-idempotent gating for the
+            // client method here: non_idempotent flag makes GET/HEAD/PUT/DELETE
+            // eligible for retry; POST needs it explicitly).
+            let idempotent = matches!(
+                r.method.get(),
+                crate::NGX_HTTP_GET | crate::NGX_HTTP_HEAD | crate::NGX_HTTP_PUT | crate::NGX_HTTP_DELETE
+            );
+            let allow_by_idem = idempotent || (next_upstream_mask & FT_NON_IDEMPOTENT != 0);
+            r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
+                status: 502,
+                response_length: 0,
+                bytes_received: bytes_sent_to_upstream, // reuse; approximate
+                bytes_sent: bytes_sent_to_upstream,
+                peer: addr.clone().into_bytes(),
+                ..Default::default()
+            });
+            if next_upstream_mask & FT_ERROR != 0 && allow_by_idem {
+                if let Some(name) = &named_upstream {
+                    let can_try = attempts < peer_limit
+                        && (next_upstream_tries == 0 || attempts < next_upstream_tries);
+                    if can_try {
+                        if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
+                            host = h; port = p;
+                            attempts += 1;
+                            continue 'retry;
+                        }
+                    }
+                }
+            }
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
         bytes_received_from_upstream = response.len() as i64;
@@ -672,12 +714,32 @@ async fn proxy_handler(r: R) -> i64 {
             _ => false,
         };
         if matches_ft {
-            if let Some(name) = &named_upstream {
-                if next_upstream_tries == 0 || (tried_peers.len() as u32) < next_upstream_tries {
-                    if let Some((h, p)) = crate::upstream::next_server_for(&r, name, &tried_peers) {
-                        host = h; port = p;
-                        tried_peers.push((host.clone(), port));
-                        continue 'retry;
+            // Idempotency gate: match C — non-idempotent methods (POST, LOCK,
+            // PATCH) don't retry unless proxy_next_upstream has the
+            // non_idempotent flag. See ngx_http_upstream_next.
+            let idempotent = matches!(
+                r.method.get(),
+                crate::NGX_HTTP_GET | crate::NGX_HTTP_HEAD | crate::NGX_HTTP_PUT | crate::NGX_HTTP_DELETE
+            );
+            let allow_by_idem = idempotent || (next_upstream_mask & FT_NON_IDEMPOTENT != 0);
+            if allow_by_idem {
+                if let Some(name) = &named_upstream {
+                    let can_try = attempts < peer_limit
+                        && (next_upstream_tries == 0 || attempts < next_upstream_tries);
+                    if can_try {
+                        if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
+                            r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
+                                status,
+                                response_length: (bytes_received_from_upstream - body_start as i64).max(0),
+                                bytes_received: bytes_received_from_upstream,
+                                bytes_sent: bytes_sent_to_upstream,
+                                peer: addr.clone().into_bytes(),
+                                ..Default::default()
+                            });
+                            host = h; port = p;
+                            attempts += 1;
+                            continue 'retry;
+                        }
                     }
                 }
             }
@@ -1014,15 +1076,23 @@ async fn proxy_handler(r: R) -> i64 {
 }
 
 async fn return_error(r: &R, status: i64) -> i64 {
-    let mut ho = r.headers_out.borrow_mut();
-    ho.status = status;
-    drop(ho);
-
-    if crate::core_rt::send_header(r).await != NGX_OK {
-        return NGX_ERROR;
+    // Populate a synthetic upstream state so $upstream_addr / $upstream_status
+    // in add_header 'always' show the failed peer(s) — otherwise the client's
+    // error response has no way to reflect which upstream was tried.
+    if r.upstream_states.borrow().is_empty() {
+        r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
+            status,
+            response_length: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+            peer: Vec::new(),
+            ..Default::default()
+        });
     }
-
-    NGX_OK
+    // Return the status; finalize_request will invoke special_response_handler
+    // which builds the default error body AND runs the header filter chain
+    // (so headers_more / add_header 'always' apply).
+    status
 }
 
 /// Parse upstream URL of form "http://host:port/path" or "http://host/path" (assumes port 80)
