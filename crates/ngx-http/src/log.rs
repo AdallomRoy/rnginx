@@ -286,9 +286,10 @@ fn log_handler(r: &R) -> i64 {
                             _ => line.extend_from_slice(&escape_default(&v.data)),
                         },
                         _ => {
-                            if *escape == ESCAPE_JSON {
-                                // nothing
-                            } else {
+                            // Only default-escape emits the '-' placeholder for
+                            // missing / empty variables; json and none leave
+                            // the slot empty (matches ngx_http_log_escape).
+                            if *escape != ESCAPE_JSON && *escape != ESCAPE_NONE {
                                 line.push(b'-');
                             }
                         }
