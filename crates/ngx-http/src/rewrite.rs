@@ -72,21 +72,21 @@ pub enum IfCondition {
     /// Negated case-insensitive: $var !~* pattern
     RegexNotMatchCaseInsensitive(usize, Rc<Regex>),
     /// File exists: -f "path"
-    FileExists(Vec<u8>),
+    FileExists(crate::script::ComplexValue),
     /// File does not exist: !-f "path"
-    FileNotExists(Vec<u8>),
+    FileNotExists(crate::script::ComplexValue),
     /// Directory exists: -d "path"
-    DirectoryExists(Vec<u8>),
+    DirectoryExists(crate::script::ComplexValue),
     /// Directory does not exist: !-d "path"
-    DirectoryNotExists(Vec<u8>),
+    DirectoryNotExists(crate::script::ComplexValue),
     /// Entity exists: -e "path"
-    EntityExists(Vec<u8>),
+    EntityExists(crate::script::ComplexValue),
     /// Entity does not exist: !-e "path"
-    EntityNotExists(Vec<u8>),
+    EntityNotExists(crate::script::ComplexValue),
     /// Executable: -x "path"
-    Executable(Vec<u8>),
+    Executable(crate::script::ComplexValue),
     /// Not executable: !-x "path"
-    NotExecutable(Vec<u8>),
+    NotExecutable(crate::script::ComplexValue),
 }
 
 pub struct RewriteConf {
@@ -144,17 +144,17 @@ fn parse_if_condition(cf: &mut Conf, args_orig: &[Vec<u8>]) -> Result<IfConditio
         }
 
         let test_char = test_str.chars().nth(1).unwrap();
-        let path = args[1].clone();
+        let path_cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
 
         let cond = match (test_char, is_negated) {
-            ('f', false) => IfCondition::FileExists(path),
-            ('f', true) => IfCondition::FileNotExists(path),
-            ('d', false) => IfCondition::DirectoryExists(path),
-            ('d', true) => IfCondition::DirectoryNotExists(path),
-            ('e', false) => IfCondition::EntityExists(path),
-            ('e', true) => IfCondition::EntityNotExists(path),
-            ('x', false) => IfCondition::Executable(path),
-            ('x', true) => IfCondition::NotExecutable(path),
+            ('f', false) => IfCondition::FileExists(path_cv),
+            ('f', true) => IfCondition::FileNotExists(path_cv),
+            ('d', false) => IfCondition::DirectoryExists(path_cv),
+            ('d', true) => IfCondition::DirectoryNotExists(path_cv),
+            ('e', false) => IfCondition::EntityExists(path_cv),
+            ('e', true) => IfCondition::EntityNotExists(path_cv),
+            ('x', false) => IfCondition::Executable(path_cv),
+            ('x', true) => IfCondition::NotExecutable(path_cv),
             _ => return Err(cf.emerg(format_args!("unknown file test operator: {}", test_str))),
         };
 
@@ -221,21 +221,23 @@ fn parse_if_condition(cf: &mut Conf, args_orig: &[Vec<u8>]) -> Result<IfConditio
 }
 
 /// Check file existence and type
-fn check_file_type(r: &R, path: &[u8], is_dir: bool, _is_exec: bool) -> bool {
-    // Convert path to string
-    let path_str = match std::str::from_utf8(path) {
-        Ok(s) => s,
+fn check_file_type(r: &R, cv: &crate::script::ComplexValue, is_dir: bool, is_exec: bool, entity: bool) -> bool {
+    let path = match crate::script::complex_value(r, cv) {
+        Ok(v) => v,
         Err(_) => return false,
     };
-
-    // Try to stat the file
-    match std::fs::metadata(path_str) {
-        Ok(metadata) => {
-            if is_dir {
-                metadata.is_dir()
-            } else {
-                metadata.is_file()
-            }
+    use std::os::unix::ffi::OsStrExt;
+    let os = std::ffi::OsStr::from_bytes(&path);
+    match std::fs::metadata(os) {
+        Ok(m) => {
+            if entity { true }
+            else if is_dir { m.is_dir() }
+            else if is_exec {
+                // -x matches file or directory with any execute bit set
+                // (C: ngx_file_info + (fi.st_mode & S_IXUSR)).
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o111 != 0
+            } else { m.is_file() }
         }
         Err(_) => false,
     }
@@ -305,31 +307,29 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
                 true
             }
         }
-        IfCondition::FileExists(path) => {
-            check_file_type(&r, path, false, false)
+        IfCondition::FileExists(cv) => {
+            check_file_type(&r, cv, false, false, false)
         }
-        IfCondition::FileNotExists(path) => {
-            !check_file_type(&r, path, false, false)
+        IfCondition::FileNotExists(cv) => {
+            !check_file_type(&r, cv, false, false, false)
         }
-        IfCondition::DirectoryExists(path) => {
-            check_file_type(&r, path, true, false)
+        IfCondition::DirectoryExists(cv) => {
+            check_file_type(&r, cv, true, false, false)
         }
-        IfCondition::DirectoryNotExists(path) => {
-            !check_file_type(&r, path, true, false)
+        IfCondition::DirectoryNotExists(cv) => {
+            !check_file_type(&r, cv, true, false, false)
         }
-        IfCondition::EntityExists(path) => {
-            check_file_type(&r, path, false, false) || check_file_type(&r, path, true, false)
+        IfCondition::EntityExists(cv) => {
+            check_file_type(&r, cv, false, false, true)
         }
-        IfCondition::EntityNotExists(path) => {
-            !(check_file_type(&r, path, false, false) || check_file_type(&r, path, true, false))
+        IfCondition::EntityNotExists(cv) => {
+            !check_file_type(&r, cv, false, false, true)
         }
-        IfCondition::Executable(_path) => {
-            // TODO: implement executable checking
-            false
+        IfCondition::Executable(cv) => {
+            check_file_type(&r, cv, false, true, false)
         }
-        IfCondition::NotExecutable(_path) => {
-            // TODO: implement executable checking
-            true
+        IfCondition::NotExecutable(cv) => {
+            !check_file_type(&r, cv, false, true, false)
         }
     }
 }
