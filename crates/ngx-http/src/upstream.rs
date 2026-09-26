@@ -665,19 +665,41 @@ fn upstream_status_variable(r: &R, v: &mut crate::request::VariableValue, _data:
     NGX_OK
 }
 
-fn upstream_connect_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return upstream connection time in milliseconds (first try)
-    v.not_found = true; NGX_OK
+fn format_upstream_times(r: &R, field: fn(&crate::request::UpstreamState) -> u64) -> Vec<u8> {
+    let states = r.upstream_states.borrow();
+    if states.is_empty() {
+        return Vec::new();
+    }
+    // C's ngx_http_upstream_response_time_variable prints "-" when the state
+    // was never measured (ms == -1). We use u64::MAX as the same sentinel;
+    // any smaller value is a real millisecond count.
+    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
+        let ms = field(s);
+        if ms == u64::MAX {
+            b"-".to_vec()
+        } else {
+            format!("{}.{:03}", ms / 1000, ms % 1000).into_bytes()
+        }
+    }).collect();
+    parts.join(&b", "[..])
 }
 
-fn upstream_header_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return time to receive upstream response headers
-    v.not_found = true; NGX_OK
+fn upstream_connect_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let data = format_upstream_times(r, |s| s.connect_time);
+    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
+    NGX_OK
 }
 
-fn upstream_response_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return total upstream response time
-    v.not_found = true; NGX_OK
+fn upstream_header_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let data = format_upstream_times(r, |s| s.header_time);
+    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
+    NGX_OK
+}
+
+fn upstream_response_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let data = format_upstream_times(r, |s| s.response_time);
+    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
+    NGX_OK
 }
 
 fn upstream_zero_variable(r: &R, v: &mut crate::request::VariableValue, data: usize) -> i64 {
@@ -723,21 +745,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             get: Some(upstream_connect_time_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_header_time",
             get: Some(upstream_header_time_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_response_time",
             get: Some(upstream_response_time_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_response_length",

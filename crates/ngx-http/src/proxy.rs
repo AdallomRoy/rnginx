@@ -390,19 +390,78 @@ fn proxy_set_header_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn A
     Ok(())
 }
 
-fn proxy_host_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return proxy_host (hostname being proxied to)
-    v.not_found = true; NGX_OK
+fn proxy_target_hostport(r: &R) -> Option<(String, u16)> {
+    let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let uri = conf.borrow().upstream_uri.clone()?;
+    let s = std::str::from_utf8(&uri).ok()?;
+    parse_upstream_uri(s).map(|(h, p, _)| (h, p))
 }
 
-fn proxy_port_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return proxy_port (port being proxied to)
-    v.not_found = true; NGX_OK
+fn proxy_host_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // C: $proxy_host = ctx->vars.host_header. When the URL uses an explicit
+    // non-default port, host_header includes ":<port>"; else just the hostname.
+    // See ngx_http_proxy_set_vars.
+    let hp = proxy_target_hostport(r);
+    let scheme_is_https = {
+        let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let uri = conf.borrow().upstream_uri.clone();
+        uri.as_deref().map(|u| u.starts_with(b"https://")).unwrap_or(false)
+    };
+    match hp {
+        Some((h, p)) => {
+            let default = if scheme_is_https { 443 } else { 80 };
+            let out = if p == default { h } else { format!("{}:{}", h, p) };
+            v.data = out.into_bytes();
+            v.valid = true;
+        }
+        None => { v.not_found = true; }
+    }
+    NGX_OK
 }
 
-fn proxy_add_x_forwarded_for_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return whether to add X-Forwarded-For header
-    v.not_found = true; NGX_OK
+fn proxy_port_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let hp = proxy_target_hostport(r);
+    let scheme_is_https = {
+        let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let uri = conf.borrow().upstream_uri.clone();
+        uri.as_deref().map(|u| u.starts_with(b"https://")).unwrap_or(false)
+    };
+    match hp {
+        Some((_, p)) => {
+            // C behavior: if no explicit port or port==default, return "80"/"443"
+            // depending on scheme. My parse_upstream_uri always returns a port,
+            // so we can't tell "no port" from "port explicitly = default". Since
+            // the emitted value is the same either way (default-string), no bug.
+            v.data = p.to_string().into_bytes();
+            v.valid = true;
+            let _ = scheme_is_https;
+        }
+        None => { v.not_found = true; }
+    }
+    NGX_OK
+}
+
+fn proxy_add_x_forwarded_for_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // C: if the client sent X-Forwarded-For, append ", $remote_addr"; else just
+    // $remote_addr. Multi-value X-Forwarded-For entries are comma-joined.
+    let existing: Vec<u8> = {
+        let hin = r.headers_in.borrow();
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        for h in hin.x_forwarded_for.iter() {
+            parts.push(h.value.borrow().clone());
+        }
+        parts.join(&b", "[..])
+    };
+    let remote = r.connection.addr_text.borrow().clone();
+    let mut out = Vec::new();
+    if !existing.is_empty() {
+        out.extend_from_slice(&existing);
+        out.extend_from_slice(b", ");
+    }
+    out.extend_from_slice(&remote);
+    v.data = out;
+    v.valid = true;
+    NGX_OK
 }
 
 fn preconfiguration(cf: &mut Conf) -> ConfResult {
@@ -707,19 +766,30 @@ async fn proxy_handler(r: R) -> i64 {
     let mut body_start: usize;
     let mut bytes_received_from_upstream: i64;
     let mut bytes_sent_to_upstream: i64;
+    let mut connect_ms: u64 = 0;
+    let mut header_ms: u64 = 0;
+    let mut response_ms: u64 = 0;
     'retry: loop {
+        let try_started_ms = ngx_core::times::current_msec();
         addr = format!("{}:{}", host, port);
         upstream = match connect_with_optional_bind(&addr, bind_addr).await {
             Ok(s) => s,
             Err(_e) => {
                 // Record this attempt as a failed peer so $upstream_addr
-                // reflects every hop (matches C's u->state list-append).
+                // reflects every hop (matches C's u->state list-append). The
+                // connect timer already captured how long we spent before
+                // failing; header/response times get the "unset" sentinel
+                // (u64::MAX ⇒ formatted as "-" like C's ms == -1).
+                let connect_ms_err = ngx_core::times::current_msec().saturating_sub(try_started_ms);
                 r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
                     status: 502,
                     response_length: 0,
                     bytes_received: 0,
                     bytes_sent: 0,
                     peer: addr.clone().into_bytes(),
+                    connect_time: connect_ms_err,
+                    header_time: u64::MAX,
+                    response_time: u64::MAX,
                     ..Default::default()
                 });
                 if let Some(name) = &named_upstream {
@@ -741,6 +811,7 @@ async fn proxy_handler(r: R) -> i64 {
                 return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
             }
         };
+        connect_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
         // Send request + body in one write so a fast upstream that reads once and
         // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
         let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
@@ -754,7 +825,33 @@ async fn proxy_handler(r: R) -> i64 {
         bytes_sent_to_upstream = wire.len() as i64;
 
         response = Vec::new();
-        let read_ok = upstream.read_to_end(&mut response).await.is_ok();
+        // Read headers first so header_time is separate from response_time.
+        // read_to_end waits for EOF (proxy Connection: close), so we can't
+        // isolate the moment headers arrive without switching to a chunked
+        // reader. Approximate with two timestamps: read once to grab
+        // whatever the kernel has (that's usually the whole small
+        // response), record header_ms, then continue reading.
+        let mut buf = [0u8; 4096];
+        let mut got_header = false;
+        loop {
+            match upstream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if !got_header
+                        && (response.windows(4).any(|w| w == b"\r\n\r\n")
+                            || response.windows(2).any(|w| w == b"\n\n"))
+                    {
+                        header_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
+                        got_header = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let read_ok = true;
+        response_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
+        if !got_header { header_ms = response_ms; }
         if !read_ok || response.is_empty() {
             // Treat as a connection-level error: honor proxy_next_upstream
             // error/timeout retry (also covers non-idempotent gating for the
@@ -765,12 +862,19 @@ async fn proxy_handler(r: R) -> i64 {
                 crate::NGX_HTTP_GET | crate::NGX_HTTP_HEAD | crate::NGX_HTTP_PUT | crate::NGX_HTTP_DELETE
             );
             let allow_by_idem = idempotent || (next_upstream_mask & FT_NON_IDEMPOTENT != 0);
+            // response_time = elapsed since we started this try (matches C's
+            // "if response_time == -1 set to now - start_time" on the
+            // previous state when a new connect starts).
+            let response_ms_err = ngx_core::times::current_msec().saturating_sub(try_started_ms);
             r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
                 status: 502,
                 response_length: 0,
                 bytes_received: bytes_sent_to_upstream, // reuse; approximate
                 bytes_sent: bytes_sent_to_upstream,
                 peer: addr.clone().into_bytes(),
+                connect_time: connect_ms,
+                header_time: u64::MAX,
+                response_time: response_ms_err,
                 ..Default::default()
             });
             if let Some(name) = &named_upstream {
@@ -859,6 +963,9 @@ async fn proxy_handler(r: R) -> i64 {
                                 bytes_received: bytes_received_from_upstream,
                                 bytes_sent: bytes_sent_to_upstream,
                                 peer: addr.clone().into_bytes(),
+                                connect_time: connect_ms,
+                                header_time: header_ms,
+                                response_time: response_ms,
                                 ..Default::default()
                             });
                             host = h; port = p;
@@ -1085,6 +1192,14 @@ async fn proxy_handler(r: R) -> i64 {
     // Record an upstream state so $upstream_status, $upstream_response_length,
     // $upstream_bytes_received, $upstream_bytes_sent, and $upstream_addr are
     // populated. C fills u->state inside ngx_http_upstream_finalize_request.
+    //
+    // The current (successful) state's response_time is intentionally left as
+    // the "unset" sentinel: at header_filter time — which is when
+    // $upstream_response_time is evaluated for add_header — C's
+    // finalize_request hasn't yet set state->response_time, so the variable
+    // prints "-". Setting it here would produce "0.000" and mismatch the
+    // reference. Any PREVIOUS retry states already have response_time set to
+    // their pre-failure elapsed time (see the retry-push branch above).
     {
         let body_len_actual = (bytes_received_from_upstream - body_start as i64).max(0);
         let state = crate::request::UpstreamState {
@@ -1093,6 +1208,9 @@ async fn proxy_handler(r: R) -> i64 {
             bytes_received: bytes_received_from_upstream,
             bytes_sent: bytes_sent_to_upstream,
             peer: format!("{}", addr).into_bytes(),
+            connect_time: connect_ms,
+            header_time: header_ms,
+            response_time: u64::MAX,
             ..Default::default()
         };
         r.upstream_states.borrow_mut().push(state);

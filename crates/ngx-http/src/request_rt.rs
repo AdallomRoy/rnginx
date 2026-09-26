@@ -1070,6 +1070,28 @@ pub fn free_request(r: &R, rc: i64) {
 
 /// ngx_http_log_request: run log phase handlers.
 pub fn log_request(r: &R) {
+    // Finalize any upstream_states whose response_time we deliberately left
+    // as u64::MAX at header-emit time. C's ngx_http_upstream_finalize_request
+    // sets state->response_time = ngx_current_msec - u->start_time if it's
+    // still -1, and that runs BEFORE the log phase — so $upstream_response_time
+    // in access_log sees the real duration while an add_header referencing the
+    // same variable saw "-". Approximate the same behavior by using
+    // request-lifetime elapsed for the last state at log time.
+    {
+        let mut states = r.upstream_states.borrow_mut();
+        if let Some(last) = states.last_mut() {
+            if last.response_time == u64::MAX {
+                // r.start_sec / start_msec store WALL-clock time (msec is
+                // 0-999 subsecond portion). Compute elapsed against wall time
+                // in the same way $request_time does.
+                let now = ngx_core::times::cached();
+                let elapsed_ms =
+                    (now.sec - r.start_sec.get()) * 1000
+                    + (now.msec as i64 - r.start_msec.get() as i64);
+                last.response_time = elapsed_ms.max(0) as u64;
+            }
+        }
+    }
     let cmcf = r.cmcf();
     let handlers = cmcf.borrow().log_handlers.clone();
     for h in handlers.iter() {
