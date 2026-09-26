@@ -136,10 +136,61 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
                 Ok(v) => v,
                 Err(_) => return NGX_ERROR,
             };
+            // Match ngx_http_set_response_header / set_last_modified /
+            // set_content_length semantics: an empty value on a well-known
+            // header slot CLEARS that slot rather than being appended.
             if v.is_empty() {
+                let lc = name.to_ascii_lowercase();
+                match lc.as_slice() {
+                    b"last-modified" => {
+                        let mut ho = r.headers_out.borrow_mut();
+                        if let Some(h) = ho.last_modified.take() {
+                            h.hash.set(0);
+                        }
+                        ho.last_modified_time = -1;
+                    }
+                    b"etag" => {
+                        let mut ho = r.headers_out.borrow_mut();
+                        if let Some(h) = ho.etag.take() {
+                            h.hash.set(0);
+                        }
+                    }
+                    b"expires" => {
+                        let mut ho = r.headers_out.borrow_mut();
+                        if let Some(h) = ho.expires.take() {
+                            h.hash.set(0);
+                        }
+                    }
+                    b"location" => {
+                        let mut ho = r.headers_out.borrow_mut();
+                        if let Some(h) = ho.location.take() {
+                            h.hash.set(0);
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
-            r.headers_out.borrow_mut().add(name, &v);
+            // Set specific slots when the user overrides a well-known header,
+            // so downstream filters (range, not_modified, header_filter emit)
+            // see the new value rather than stale cache.
+            let lc = name.to_ascii_lowercase();
+            match lc.as_slice() {
+                b"last-modified" => {
+                    let mut ho = r.headers_out.borrow_mut();
+                    let h = crate::request::TableElt::new(name, &v);
+                    ho.last_modified = Some(h);
+                    ho.last_modified_time = ngx_core::parse::parse_http_time(&v).unwrap_or(-1);
+                }
+                b"etag" => {
+                    let mut ho = r.headers_out.borrow_mut();
+                    let h = crate::request::TableElt::new(name, &v);
+                    ho.etag = Some(h);
+                }
+                _ => {
+                    r.headers_out.borrow_mut().add(name, &v);
+                }
+            }
         }
     }
     let trailers = conf.borrow().trailers.clone();
