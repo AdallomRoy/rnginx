@@ -942,6 +942,7 @@ async fn proxy_handler(r: R) -> i64 {
         let mut expected_body_len: Option<usize> = None;
         let mut is_chunked = false;
         let mut upstream_wants_close = false;
+        let mut has_xar = false;
         loop {
             match upstream.as_mut().unwrap().read(&mut buf).await {
                 Ok(0) => break,
@@ -990,6 +991,18 @@ async fn proxy_handler(r: R) -> i64 {
                                         upstream_wants_close = true;
                                     }
                                 }
+                                if line.len() > 17 && line[..17].eq_ignore_ascii_case(b"x-accel-redirect:") {
+                                    // C aborts the upstream request as soon as
+                                    // the header block is processed and issues
+                                    // the internal redirect; the response body
+                                    // never reaches this proxy. Follow suit so
+                                    // an upstream rate-limiter doesn't gate
+                                    // our first byte to the redirected
+                                    // location.
+                                    if !line[17..].iter().all(|&b| b == b' ' || b == b'\t') {
+                                        has_xar = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1014,7 +1027,7 @@ async fn proxy_handler(r: R) -> i64 {
                                 .unwrap_or(false)
                         } else { false }
                     } else { false };
-                    if bodyless {
+                    if bodyless || has_xar {
                         break;
                     }
                     if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
