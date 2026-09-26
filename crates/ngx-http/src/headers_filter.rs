@@ -13,14 +13,26 @@ use crate::*;
 
 crate::http_module_index!("ngx_http_headers_filter_module");
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ExpiresKind { Off, Epoch, Max, Access, Modified, DailyAt }
+
 pub struct HeadersConf {
     pub headers: Option<Vec<(Vec<u8>, ComplexValue, bool)>>,
     pub trailers: Option<Vec<(Vec<u8>, ComplexValue, bool)>>,
+    pub expires: Option<ExpiresKind>,
+    /// Base offset in seconds (or seconds-since-midnight for DailyAt).
+    pub expires_time: i64,
     pub expires_set: bool,
 }
 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(HeadersConf { headers: None, trailers: None, expires_set: false })
+    make_slot(HeadersConf {
+        headers: None,
+        trailers: None,
+        expires: None,
+        expires_time: 0,
+        expires_set: false,
+    })
 }
 
 fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
@@ -32,6 +44,66 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     if c.trailers.is_none() {
         c.trailers = p.trailers.clone();
     }
+    if !c.expires_set {
+        c.expires_set = p.expires_set;
+        c.expires = p.expires;
+        c.expires_time = p.expires_time;
+    }
+    Ok(())
+}
+
+fn set_expires(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<HeadersConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    // Minimal parser for common forms:
+    //   expires off
+    //   expires epoch
+    //   expires max
+    //   expires <time>            (relative from access)
+    //   expires modified <time>
+    //   expires @HH:MM[:SS]       (daily-at)
+    let (kind, time_str_opt) = if args.len() == 2 {
+        let a = &args[1];
+        if a == b"off" { return { cell.borrow_mut().expires = Some(ExpiresKind::Off); cell.borrow_mut().expires_set = true; Ok(()) } }
+        if a == b"epoch" { return { cell.borrow_mut().expires = Some(ExpiresKind::Epoch); cell.borrow_mut().expires_set = true; Ok(()) } }
+        if a == b"max" { return { cell.borrow_mut().expires = Some(ExpiresKind::Max); cell.borrow_mut().expires_set = true; Ok(()) } }
+        if a.first() == Some(&b'@') {
+            (ExpiresKind::DailyAt, Some(a[1..].to_vec()))
+        } else {
+            (ExpiresKind::Access, Some(a.clone()))
+        }
+    } else if args.len() == 3 && args[1] == b"modified" {
+        (ExpiresKind::Modified, Some(args[2].clone()))
+    } else {
+        return Err(cf.emerg(format_args!("invalid expires arguments")));
+    };
+    let mut secs: i64 = 0;
+    if let Some(s) = time_str_opt {
+        if kind == ExpiresKind::DailyAt {
+            // HH:MM[:SS]
+            let s_str = std::str::from_utf8(&s).map_err(|_| cf.emerg(format_args!("invalid time")))?;
+            let parts: Vec<&str> = s_str.split(':').collect();
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(cf.emerg(format_args!("invalid daily-at expires")));
+            }
+            let h: i64 = parts[0].parse().map_err(|_| cf.emerg(format_args!("invalid hours")))?;
+            let m: i64 = parts[1].parse().map_err(|_| cf.emerg(format_args!("invalid minutes")))?;
+            let sec: i64 = if parts.len() == 3 { parts[2].parse().map_err(|_| cf.emerg(format_args!("invalid seconds")))? } else { 0 };
+            secs = h * 3600 + m * 60 + sec;
+        } else {
+            // Signed time value like 1d, 30m, 60s, or bare seconds.
+            let (sign, tail): (i64, &[u8]) = if s.first() == Some(&b'-') { (-1, &s[1..]) }
+                else if s.first() == Some(&b'+') { (1, &s[1..]) } else { (1, &s[..]) };
+            match ngx_core::parse::parse_time(tail, true) {
+                Some(v) => secs = sign * v,
+                None => return Err(cf.emerg(format_args!("invalid expires time"))),
+            }
+        }
+    }
+    let mut c = cell.borrow_mut();
+    c.expires = Some(kind);
+    c.expires_time = secs;
+    c.expires_set = true;
     Ok(())
 }
 
@@ -67,7 +139,7 @@ pub fn headers_filter_module() -> ModuleDef {
     let def = HttpModuleDef { postconfiguration: Some(init), create_loc_conf: Some(create_conf), merge_loc_conf: Some(merge_conf), ..Default::default() };
     let commands = vec![
         ngx_core::cmd_fn!("add_header", F | NGX_CONF_TAKE23, ConfLevel::Loc, add_header),
-        ngx_core::cmd_fn!("expires", F | NGX_CONF_TAKE12, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd_fn!("expires", F | NGX_CONF_TAKE12, ConfLevel::Loc, set_expires),
         ngx_core::cmd_fn!("add_trailer", F | NGX_CONF_TAKE23, ConfLevel::Loc, add_trailer),
     ];
     http_module_def("ngx_http_headers_filter_module", def, commands)
@@ -119,14 +191,88 @@ async fn trailers_body_filter(r: R, input: ngx_core::buf::Chain, next: BodyFilte
     next(r, input).await
 }
 
+fn apply_expires(r: &R, kind: ExpiresKind, base: i64) {
+    // Determine the Expires date + Cache-Control value per C set_expires.
+    let (expires_date, cc_val): (Vec<u8>, Vec<u8>) = match kind {
+        ExpiresKind::Off => return,
+        ExpiresKind::Epoch => (
+            b"Thu, 01 Jan 1970 00:00:01 GMT".to_vec(),
+            b"no-cache".to_vec(),
+        ),
+        ExpiresKind::Max => (
+            b"Thu, 31 Dec 2037 23:55:55 GMT".to_vec(),
+            b"max-age=315360000".to_vec(),
+        ),
+        ExpiresKind::Access | ExpiresKind::Modified | ExpiresKind::DailyAt => {
+            let now = ngx_core::times::time();
+            let expires_time = match kind {
+                ExpiresKind::Modified => {
+                    let lm = r.headers_out.borrow().last_modified_time;
+                    if lm == -1 { now + base } else { lm + base }
+                }
+                ExpiresKind::DailyAt => {
+                    // Next occurrence of "base" seconds past midnight (UTC).
+                    let day = 86400;
+                    let today_midnight = now - (now.rem_euclid(day));
+                    let mut candidate = today_midnight + base;
+                    if candidate < now { candidate += day; }
+                    candidate
+                }
+                _ => now + base,
+            };
+            let date_s = ngx_core::times::http_time(expires_time);
+            let cc = if base <= 0 { b"no-cache".to_vec() } else { format!("max-age={}", base).into_bytes() };
+            (date_s.into_bytes(), cc)
+        }
+    };
+
+    let mut ho = r.headers_out.borrow_mut();
+    // Clear any existing Expires (both slot and stray headers entries) so we
+    // don't emit duplicates.
+    if let Some(old) = ho.expires.take() {
+        old.hash.set(0);
+    }
+    for h in ho.headers.iter() {
+        if h.lowcase_key.as_slice() == b"expires" {
+            h.hash.set(0);
+        }
+    }
+    let e = crate::request::TableElt::new(b"Expires", &expires_date);
+    ho.expires = Some(e.clone());
+    ho.headers.push(e);
+
+    // Clear all pre-existing Cache-Control headers, then add ours.
+    for h in ho.headers.iter() {
+        if h.lowcase_key.as_slice() == b"cache-control" {
+            h.hash.set(0);
+        }
+    }
+    ho.cache_control.clear();
+    let cc = crate::request::TableElt::new(b"Cache-Control", &cc_val);
+    ho.cache_control.push(cc.clone());
+    ho.headers.push(cc);
+}
+
 async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
     if !r.is_main() {
         return next(r).await;
     }
     let conf = r.loc_conf::<HeadersConf>(ctx_index());
     let headers = conf.borrow().headers.clone();
+    let expires = conf.borrow().expires;
+    let expires_time = conf.borrow().expires_time;
     let status = r.headers_out.borrow().status;
     let safe = matches!(status, 200 | 201 | 204 | 206 | 301 | 302 | 303 | 304 | 307 | 308);
+
+    // Apply expires before add_header — matches C which runs
+    // ngx_http_set_expires early in the header filter for safe statuses.
+    if safe {
+        if let Some(kind) = expires {
+            if kind != ExpiresKind::Off {
+                apply_expires(&r, kind, expires_time);
+            }
+        }
+    }
     if let Some(hs) = headers {
         for (name, cv, always) in hs.iter() {
             if !safe && !always {
