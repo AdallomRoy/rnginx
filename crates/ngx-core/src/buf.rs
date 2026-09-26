@@ -328,22 +328,27 @@ pub fn create_temp_file(
     use crate::connection;
 
     let stats = connection::stats();
-    let num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // ngx_create_temp_file uses a decimal 10-digit key; keep that so hashed
-    // level paths line up (0000000001, 0000000002, ...). The old code left
-    // NUL padding past 16 hex chars which leaked into the filename.
-    let key_str = format!("{:010}", num);
-    let filename = path.hashed_filename(key_str.as_bytes());
-
-    // Match ngx_open_tempfile: `access ? access : 0600` — fall back to 0600
-    // when the caller passed 0 so the owner can still read/write the temp
-    // file (client_body_in_file_only tests read it back from Perl).
+    // level paths line up (0000000001, 0000000002, ...). On EEXIST collision
+    // (matching ngx_next_temp_number(1)), bump the counter by a pseudo-random
+    // stride so retries don't just re-collide on the next slot.
     let mode = if access == 0 { 0o600 } else { access };
-    match os::open(&filename, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
-        Ok(fd) => Ok(TempFile::new(filename, fd, mode, clean)),
-        Err(err) => {
-            ngx_log_error!(crate::log::NGX_LOG_CRIT, log, Some(err), "open temp file failed");
-            Err(err)
+    let mut num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let key_str = format!("{:010}", num);
+        let filename = path.hashed_filename(key_str.as_bytes());
+        match os::open(&filename, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
+            Ok(fd) => return Ok(TempFile::new(filename, fd, mode, clean)),
+            Err(err) if err == libc::EEXIST => {
+                // Random increment stride (nginx's ngx_random_number).
+                let stride = 123456u64;
+                num = stats.temp_number.fetch_add(stride, std::sync::atomic::Ordering::Relaxed) + stride;
+                continue;
+            }
+            Err(err) => {
+                ngx_log_error!(crate::log::NGX_LOG_CRIT, log, Some(err), "open temp file failed");
+                return Err(err);
+            }
         }
     }
 }
