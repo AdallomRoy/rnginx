@@ -126,14 +126,22 @@ pub async fn header_filter(r: R) -> i64 {
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
-        if ho.server.is_none() {
+        if let Some(sv) = &ho.server {
+            out.extend_from_slice(b"Server: ");
+            out.extend_from_slice(&sv.value.borrow());
+            out.extend_from_slice(b"\r\n");
+        } else {
             match *cl.server_tokens {
                 NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
                 NGX_HTTP_SERVER_TOKENS_BUILD => out.extend_from_slice(SERVER_BUILD_STRING),
                 _ => out.extend_from_slice(SERVER_STRING),
             }
         }
-        if ho.date.is_none() {
+        if let Some(dt) = &ho.date {
+            out.extend_from_slice(b"Date: ");
+            out.extend_from_slice(&dt.value.borrow());
+            out.extend_from_slice(b"\r\n");
+        } else {
             out.extend_from_slice(b"Date: ");
             out.extend_from_slice(ngx_core::times::cached_http_time().as_bytes());
             out.extend_from_slice(b"\r\n");

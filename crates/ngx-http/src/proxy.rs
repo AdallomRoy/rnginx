@@ -77,7 +77,27 @@ pub struct NgxHttpProxyLocConf {
     pub cookie_flags: Vec<CookieFlagsRule>,
     /// proxy_http_version: 0 = 1.0 (default), 1 = 1.1.
     pub http_version: Val<u32>,
+    /// proxy_hide_header entries (lowercase). `None` = inherit from parent;
+    /// `Some(list)` = explicit local list (still merged with defaults).
+    pub hide_headers: Option<Vec<Vec<u8>>>,
+    /// proxy_pass_header entries (lowercase). Same inheritance rule as
+    /// hide_headers. Pass overrides any hide (default or explicit) for the
+    /// named header.
+    pub pass_headers: Option<Vec<Vec<u8>>>,
 }
+
+/// Default list of upstream response headers that nginx hides. See
+/// ngx_http_proxy_hide_headers in C.
+pub const PROXY_HIDE_HEADERS: &[&[u8]] = &[
+    b"date",
+    b"server",
+    b"x-pad",
+    b"x-accel-expires",
+    b"x-accel-redirect",
+    b"x-accel-limit-rate",
+    b"x-accel-buffering",
+    b"x-accel-charset",
+];
 
 // Cookie flag bits (matches ngx_http_proxy_module NGX_HTTP_PROXY_COOKIE_*).
 pub const CF_SECURE_ON: u32          = 0x0001;
@@ -183,6 +203,8 @@ impl Default for NgxHttpProxyLocConf {
             redirect_default: false,
             cookie_flags: Vec::new(),
             http_version: Val::unset(),
+            hide_headers: None,
+            pass_headers: None,
         }
     }
 }
@@ -248,6 +270,11 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
         c.cookie_flags = p.cookie_flags.clone();
     }
     c.http_version.merge(&p.http_version, 0);
+    // Inherit hide/pass lists independently: if child didn't set its own,
+    // inherit from parent. Matches ngx_http_upstream_hide_headers_hash
+    // which pulls each list from prev when NGX_CONF_UNSET_PTR.
+    if c.hide_headers.is_none() { c.hide_headers = p.hide_headers.clone(); }
+    if c.pass_headers.is_none() { c.pass_headers = p.pass_headers.clone(); }
     Ok(())
 }
 
@@ -1047,6 +1074,23 @@ async fn proxy_handler(r: R) -> i64 {
     let mut saw_transfer_encoding = false;
     let mut invalid_headers = false;
     let mut duplicate_expires = false;
+    // Effective hide list: default PROXY_HIDE_HEADERS + user's hide_headers,
+    // minus user's pass_headers (pass wins over hide). Precompute once so the
+    // per-header check is a linear scan on a short vec.
+    let effective_hide: Vec<Vec<u8>> = {
+        let lcf_h = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let c = lcf_h.borrow();
+        let mut set: Vec<Vec<u8>> = PROXY_HIDE_HEADERS.iter().map(|s| s.to_vec()).collect();
+        if let Some(hide) = &c.hide_headers {
+            for h in hide {
+                if !set.iter().any(|x| x == h) { set.push(h.clone()); }
+            }
+        }
+        if let Some(pass) = &c.pass_headers {
+            set.retain(|h| !pass.iter().any(|p| p == h));
+        }
+        set
+    };
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = status;
@@ -1065,6 +1109,13 @@ async fn proxy_handler(r: R) -> i64 {
                 // Stash into upstream_headers_in so $upstream_http_* can read them.
                 r.upstream_headers_in.borrow_mut().push(crate::request::TableElt::new(name, value));
                 let lc = name.to_ascii_lowercase();
+                // proxy_hide_header / default hide: skip emission entirely.
+                // upstream_headers_in above already captured it for
+                // $upstream_http_* variables.
+                if effective_hide.iter().any(|h| h == &lc) {
+                    pos = line_end + 1;
+                    continue;
+                }
                 // Handle a few well-known headers specially so header_filter renders them.
                 match lc.as_slice() {
                     b"content-length" => {
@@ -1131,8 +1182,23 @@ async fn proxy_handler(r: R) -> i64 {
                             ho.add(name, value);
                         }
                     }
-                    b"connection" | b"keep-alive" | b"server" | b"date" => {
-                        // suppress: our header_filter emits its own
+                    b"connection" | b"keep-alive" => {
+                        // Hop-by-hop headers: never emit to client. `server`
+                        // and `date` are handled through the effective_hide
+                        // list above so `proxy_pass_header Date;` can override
+                        // the default hide.
+                    }
+                    b"date" => {
+                        // Only reached if not hidden (proxy_pass_header Date).
+                        // Populate the typed slot so header_filter's "if
+                        // ho.date.is_none()" branch does NOT then also emit
+                        // its own Date, which would give two Date lines.
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.date = Some(h);
+                    }
+                    b"server" => {
+                        let h = crate::request::TableElt::new(name, value);
+                        ho.server = Some(h);
                     }
                     b"location" => {
                         let h = crate::request::TableElt::new(name, value);
@@ -1537,8 +1603,22 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_path_handler),
         cmd_fn!("proxy_cookie_flags", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, proxy_cookie_flags_handler),
         cmd_fn!("proxy_set_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_set_body_handler),
-        cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_hide_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let name = cf.args[1].to_ascii_lowercase();
+            let mut c = cell.borrow_mut();
+            let list = c.pass_headers.get_or_insert_with(Vec::new);
+            if !list.iter().any(|x| x == &name) { list.push(name); }
+            Ok(())
+        }),
+        cmd_fn!("proxy_hide_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let name = cf.args[1].to_ascii_lowercase();
+            let mut c = cell.borrow_mut();
+            let list = c.hide_headers.get_or_insert_with(Vec::new);
+            if !list.iter().any(|x| x == &name) { list.push(name); }
+            Ok(())
+        }),
         cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
