@@ -13,7 +13,7 @@ use ngx_core::radix_tree::RadixTree;
 use ngx_core::rc::*;
 use ngx_core::string::B;
 
-use crate::variables::{add_variable, get_variable_index, NGX_HTTP_VAR_CHANGEABLE};
+use crate::variables::{add_variable, get_variable_index, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE};
 use crate::{request::*, *};
 
 crate::http_module_index!("ngx_http_geo_module");
@@ -33,6 +33,7 @@ pub struct GeoCtx {
     pub ranges: Vec<GeoRange>,
     pub proxies: Vec<u32>, // Trusted proxy addresses
     pub proxy_recursive: bool,
+    pub volatile: bool,
     pub source_var_index: Option<usize>, // Index of the source variable (if specified)
 }
 
@@ -68,7 +69,7 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     let ip_u32 = if let Some(src_var_idx) = ctx.source_var_index {
         // Evaluate the source variable now (its slot may be empty if this is
         // the first read this request — get_indexed_variable does the eval).
-        let val = crate::variables::get_indexed_variable(r, src_var_idx);
+        let val = crate::variables::get_flushed_variable(r, src_var_idx);
         let ip_bytes: Vec<u8> = match val {
             Some(v) if !v.not_found => v.data,
             _ => return NGX_OK,
@@ -97,13 +98,25 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     };
 
     if ctx.ranges_mode {
-        // Binary search in ranges array
+        // Pick the narrowest range that contains the IP: matches C's ranges
+        // module, where a smaller/more-specific range shadows a wider one
+        // that also covers the same address.
+        let mut best: Option<&GeoRange> = None;
         for r in &ctx.ranges {
-            if ip_u32 >= r.start && ip_u32 <= r.end {
-                if r.value_idx < ctx.values.len() {
-                    v.data.clone_from(&ctx.values[r.value_idx]);
-                    return NGX_OK;
+            if ip_u32 < r.start || ip_u32 > r.end { continue; }
+            let width = r.end.saturating_sub(r.start);
+            match best {
+                None => best = Some(r),
+                Some(cur) => {
+                    let curw = cur.end.saturating_sub(cur.start);
+                    if width < curw { best = Some(r); }
                 }
+            }
+        }
+        if let Some(r) = best {
+            if r.value_idx < ctx.values.len() {
+                v.data.clone_from(&ctx.values[r.value_idx]);
+                return NGX_OK;
             }
         }
     } else {
@@ -274,6 +287,7 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         ranges: Vec::new(),
         proxies: Vec::new(),
         proxy_recursive: false,
+        volatile: false,
         source_var_index,
     }));
 
@@ -290,6 +304,12 @@ fn geo_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
 
     cf.handler = saved_h;
     cf.handler_conf = saved_hc;
+
+    // If the block set `volatile;`, mark the variable slot NOCACHEABLE so
+    // re-evaluation happens across internal redirects (matches C).
+    if ctx.volatile {
+        var.flags.set(var.flags.get() | NGX_HTTP_VAR_NOCACHEABLE);
+    }
 
     // Sort ranges if in ranges mode
     if ctx.ranges_mode {
@@ -387,6 +407,13 @@ fn geo_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
             ctx.ranges_mode = true;
             Ok(())
         }
+        b"volatile" => {
+            // Handled at directive-setup time via a post-processing pass —
+            // we stash the flag on GeoCtx and the outer geo() directive picks
+            // it up when setting variable flags. TODO: propagate here directly.
+            ctx.volatile = true;
+            Ok(())
+        }
         b"include" => {
             if args.len() >= 2 {
                 geo_include_file(cf, &args[1], ctx)
@@ -398,9 +425,27 @@ fn geo_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
             if args.len() >= 2 {
                 let ip_bytes = &args[1];
                 if ctx.ranges_mode {
-                    // Parse as IP range and remove from ranges
-                    if let Some((start, end)) = parse_ip_range(ip_bytes) {
-                        ctx.ranges.retain(|r| !(r.start == start && r.end == end));
+                    // Parse as IP range and subtract from existing ranges,
+                    // possibly splitting them. Matches ngx_http_geo_delete_range.
+                    if let Some((dstart, dend)) = parse_ip_range(ip_bytes) {
+                        let mut kept: Vec<GeoRange> = Vec::with_capacity(ctx.ranges.len());
+                        for r in ctx.ranges.drain(..) {
+                            // No overlap?
+                            if r.end < dstart || r.start > dend {
+                                kept.push(r);
+                                continue;
+                            }
+                            // Left remainder [r.start, dstart-1]
+                            if r.start < dstart {
+                                kept.push(GeoRange { start: r.start, end: dstart - 1, value_idx: r.value_idx });
+                            }
+                            // Right remainder [dend+1, r.end]
+                            if r.end > dend && dend < u32::MAX {
+                                kept.push(GeoRange { start: dend + 1, end: r.end, value_idx: r.value_idx });
+                            }
+                            // Fully-covered case drops the range.
+                        }
+                        ctx.ranges = kept;
                     } else {
                         return Err(cf.emerg(format_args!("invalid range in \"{}\"", B(ip_bytes))));
                     }
