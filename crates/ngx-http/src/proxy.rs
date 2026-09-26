@@ -713,6 +713,9 @@ async fn proxy_handler(r: R) -> i64 {
                     peer: addr.clone().into_bytes(),
                     ..Default::default()
                 });
+                if let Some(name) = &named_upstream {
+                    crate::upstream::mark_bad_server(&r, name, &host, port);
+                }
                 if next_upstream_mask & FT_ERROR != 0 {
                     if let Some(name) = &named_upstream {
                         let can_try = attempts < peer_limit
@@ -761,6 +764,9 @@ async fn proxy_handler(r: R) -> i64 {
                 peer: addr.clone().into_bytes(),
                 ..Default::default()
             });
+            if let Some(name) = &named_upstream {
+                crate::upstream::mark_bad_server(&r, name, &host, port);
+            }
             if next_upstream_mask & FT_ERROR != 0 && allow_by_idem {
                 if let Some(name) = &named_upstream {
                     let can_try = attempts < peer_limit
@@ -822,6 +828,16 @@ async fn proxy_handler(r: R) -> i64 {
                 crate::NGX_HTTP_GET | crate::NGX_HTTP_HEAD | crate::NGX_HTTP_PUT | crate::NGX_HTTP_DELETE
             );
             let allow_by_idem = idempotent || (next_upstream_mask & FT_NON_IDEMPOTENT != 0);
+            // 5xx that triggers proxy_next_upstream counts against
+            // max_fails (NGX_PEER_FAILED). 403 and 404 use NGX_PEER_NEXT,
+            // which doesn't touch the fail counter — see ngx_http_upstream
+            // _next's ft_type switch.
+            let hard_fail = !matches!(status, 403 | 404);
+            if hard_fail {
+                if let Some(name) = &named_upstream {
+                    crate::upstream::mark_bad_server(&r, name, &host, port);
+                }
+            }
             if allow_by_idem {
                 if let Some(name) = &named_upstream {
                     let can_try = attempts < peer_limit

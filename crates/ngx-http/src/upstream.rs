@@ -315,6 +315,14 @@ pub struct PeerState {
     pub effective_weight: i32,
     pub current_weight: i32,
     pub weight: i32,
+    /// Consecutive failure count. When >= max_fails, peer is considered
+    /// down until `checked + fail_timeout` (see ngx_http_upstream_free_
+    /// round_robin_peer / ngx_peer_get_round_robin).
+    pub fails: u32,
+    /// Wall-clock seconds when the peer was last "checked" (either used
+    /// or its first failure since being healthy).
+    pub checked: u64,
+    pub accessed: u64,
 }
 
 pub struct PeerGroup {
@@ -377,7 +385,15 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
         let mut group = PeerGroup { peers: Vec::new(), backup: Vec::new() };
         for srv in servers.into_iter() {
             let w = if srv.weight == 0 { 1 } else { srv.weight as i32 };
-            let ps = PeerState { server: srv.clone(), effective_weight: w, current_weight: 0, weight: w };
+            let ps = PeerState {
+                server: srv.clone(),
+                effective_weight: w,
+                current_weight: 0,
+                weight: w,
+                fails: 0,
+                checked: 0,
+                accessed: 0,
+            };
             if srv.backup { group.backup.push(ps); } else { group.peers.push(ps); }
         }
         let mut m = umcf.borrow_mut();
@@ -428,11 +444,24 @@ pub fn next_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
 }
 
 fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {
+    let now = ngx_core::times::time() as u64;
     let mut total: i32 = 0;
     let mut best_idx: Option<usize> = None;
     let mut best_cw: i32 = i32::MIN;
     for (i, p) in peers.iter_mut().enumerate() {
         if p.server.down { continue; }
+        // max_fails / fail_timeout: skip peers whose consecutive-fail
+        // count reached the ceiling until fail_timeout has elapsed since
+        // the first failure of the current window. Matches ngx_http_
+        // upstream_get_round_robin_peer's `if (peer->max_fails && …)`.
+        if p.server.max_fails > 0 && p.fails >= p.server.max_fails {
+            if now.saturating_sub(p.checked) < p.server.fail_timeout / 1000 {
+                continue;
+            }
+            // Fail window elapsed — give the peer another chance.
+            p.fails = 0;
+            p.checked = now;
+        }
         p.current_weight = p.current_weight.saturating_add(p.effective_weight);
         total = total.saturating_add(p.effective_weight);
         if p.effective_weight < p.weight {
@@ -445,8 +474,63 @@ fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {
     }
     let idx = best_idx?;
     peers[idx].current_weight -= total;
+    peers[idx].checked = now;
     let s = &peers[idx].server;
     Some((String::from_utf8_lossy(&s.addr).into_owned(), s.port))
+}
+
+/// Record a connect/read failure against the peer identified by (addr,
+/// port). Increments fails; on transition to failed, records `accessed`
+/// timestamp so pick_wrr can respect fail_timeout. Mirrors
+/// ngx_http_upstream_free_round_robin_peer(state=NGX_PEER_FAILED).
+pub fn mark_bad_server(r: &R, name: &[u8], addr: &str, port: u16) {
+    let now = ngx_core::times::time() as u64;
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    for (n, cell) in m.server_lists.iter() {
+        if n.as_slice() != name { continue; }
+        let mut g = cell.borrow_mut();
+        let PeerGroup { peers, backup } = &mut *g;
+        for p in peers.iter_mut().chain(backup.iter_mut()) {
+            let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
+            if paddr == addr && p.server.port == port {
+                p.fails = p.fails.saturating_add(1);
+                p.accessed = now;
+                if p.fails == 1 {
+                    p.checked = now;
+                }
+                // Penalise via effective_weight (matches C: peer->
+                // effective_weight -= peer->weight / peer->max_fails).
+                let per = if p.server.max_fails > 0 {
+                    p.weight / p.server.max_fails as i32
+                } else { p.weight };
+                p.effective_weight = (p.effective_weight - per).max(0);
+                return;
+            }
+        }
+    }
+}
+
+/// Reset a peer's failure counter after a successful use. Called on the
+/// happy path so a stray failure doesn't linger.
+pub fn mark_good_server(r: &R, name: &[u8], addr: &str, port: u16) {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    for (n, cell) in m.server_lists.iter() {
+        if n.as_slice() != name { continue; }
+        let mut g = cell.borrow_mut();
+        let PeerGroup { peers, backup } = &mut *g;
+        for p in peers.iter_mut().chain(backup.iter_mut()) {
+            let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
+            if paddr == addr && p.server.port == port {
+                p.fails = 0;
+                if p.effective_weight < p.weight {
+                    p.effective_weight = p.weight;
+                }
+                return;
+            }
+        }
+    }
 }
 
 struct NoopPeerInit;
