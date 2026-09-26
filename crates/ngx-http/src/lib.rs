@@ -68,6 +68,7 @@ pub mod userid;
 pub mod addition_filter;
 pub mod random_index;
 pub mod autoindex;
+pub mod dav;
 pub mod gunzip;
 pub mod degradation;
 pub mod sub_filter;
@@ -563,7 +564,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::v3_module(),
         static_module::static_module(),
         gzip_static::gzip_static_module(),
-        stubs::dav_module(),
+        dav::dav_module(),
         autoindex::autoindex_module(),
         index::index_module(),
         random_index::random_index_module(),
