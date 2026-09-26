@@ -252,8 +252,12 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
 
     let mut output = Chain::new();
     let mut pending_includes = Vec::new();
+    let mut last_buf_flag = false;
+    let mut last_in_chain_flag = false;
 
     while let Some(buf) = input.pop_front() {
+        if buf.last_buf { last_buf_flag = true; }
+        if buf.last_in_chain { last_in_chain_flag = true; }
         let data = match &buf.data {
             BufData::Memory(v) => v.clone(),
             _ => {
@@ -264,12 +268,32 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
 
         let processed = process_ssi(&data, &mut ctx_rc.borrow_mut(), &r);
         if !processed.is_empty() {
-            output.push_back(Buf::from_vec(processed));
+            let mut b = Buf::from_vec(processed);
+            b.last_buf = false; // set on the FINAL emitted buf below
+            b.last_in_chain = false;
+            output.push_back(b);
         }
 
         // Collect pending includes
         if let Some(uri) = ctx_rc.borrow_mut().pending_include.take() {
             pending_includes.push(uri);
+        }
+    }
+
+    // Propagate last_buf / last_in_chain onto the final emitted buffer so
+    // downstream filters know the stream is complete. If we consumed the
+    // last_buf but produced nothing (empty output), emit a sync empty buf
+    // carrying the flag.
+    if last_buf_flag || last_in_chain_flag {
+        if let Some(back) = output.back_mut() {
+            back.last_buf = last_buf_flag;
+            back.last_in_chain = last_in_chain_flag;
+        } else {
+            let mut b = Buf::from_vec(Vec::new());
+            b.sync = true;
+            b.last_buf = last_buf_flag;
+            b.last_in_chain = last_in_chain_flag;
+            output.push_back(b);
         }
     }
 
