@@ -195,21 +195,29 @@ pub async fn header_filter(r: R) -> i64 {
                 loc.hash.set(0);
                 out.extend_from_slice(b"Location: ");
                 out.extend_from_slice(if r.connection.ssl.borrow().is_some() { b"https://" } else { b"http://" });
-                let host = if *cl.server_name_in_redirect {
+                // Match C ngx_http_header_filter_module Location host selection:
+                //   server_name_in_redirect on  -> server_name
+                //   headers_in.server not empty -> the client Host header
+                //   else                        -> local sockaddr
+                let host: Vec<u8> = if *cl.server_name_in_redirect {
                     let cscf = r.cscf();
                     let n = cscf.borrow().server_name.clone();
                     n
-                } else if let Some(h) = &r.headers_in.borrow().server.clone().into() {
-                    let h: &Vec<u8> = h;
-                    if h.is_empty() {
+                } else {
+                    let hin_server = r.headers_in.borrow().server.clone();
+                    if !hin_server.is_empty() {
+                        hin_server
+                    } else if let Some(local) = r.connection.local_sockaddr() {
+                        match local {
+                            ngx_core::inet::SockAddr::V4(a) => a.ip().to_string().into_bytes(),
+                            ngx_core::inet::SockAddr::V6(a) => a.ip().to_string().into_bytes(),
+                            ngx_core::inet::SockAddr::Unix(_) => Vec::new(),
+                        }
+                    } else {
                         let cscf = r.cscf();
                         let n = cscf.borrow().server_name.clone();
                         n
-                    } else {
-                        h.clone()
                     }
-                } else {
-                    Vec::new()
                 };
                 out.extend_from_slice(&host);
                 if *cl.port_in_redirect {
