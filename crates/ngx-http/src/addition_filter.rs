@@ -17,6 +17,8 @@ crate::http_module_index!("ngx_http_addition_filter_module");
 pub struct AdditionLocConf {
     pub before_body: Val<Vec<u8>>,
     pub after_body: Val<Vec<u8>>,
+    /// addition_types list (lowercased). None -> use default ("text/html").
+    pub types: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -28,6 +30,7 @@ fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(AdditionLocConf {
         before_body: Val::unset(),
         after_body: Val::unset(),
+        types: None,
     })
 }
 
@@ -37,6 +40,9 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
 
     c.before_body.merge(&p.before_body, Vec::new());
     c.after_body.merge(&p.after_body, Vec::new());
+    if c.types.is_none() {
+        c.types = p.types.clone();
+    }
 
     Ok(())
 }
@@ -51,13 +57,18 @@ pub fn addition_filter_module() -> ModuleDef {
     let commands = vec![
         ngx_core::cmd!("add_before_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, AdditionLocConf, before_body, set_str),
         ngx_core::cmd!("add_after_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, AdditionLocConf, after_body, set_str),
-        ngx_core::cmd_fn!("addition_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, stub_types),
+        ngx_core::cmd_fn!("addition_types", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, set_types),
     ];
     http_module_def("ngx_http_addition_filter_module", def, commands)
 }
 
-fn stub_types(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // TODO: implement types filtering
+fn set_types(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<AdditionLocConf>(conf.as_ref().unwrap());
+    let mut types: Vec<Vec<u8>> = Vec::new();
+    for arg in cf.args.iter().skip(1) {
+        types.push(arg.to_ascii_lowercase());
+    }
+    cell.borrow_mut().types = Some(types);
     Ok(())
 }
 
@@ -81,13 +92,33 @@ async fn addition_header_filter(r: R, next: HeaderFilter) -> i64 {
         return next(r).await;
     }
 
+    // Match C: only fire addition for content-types in addition_types
+    // (default: text/html only). "*" matches any.
+    {
+        let ct = r.headers_out.borrow().content_type.clone();
+        let ct_bare: Vec<u8> = ct.split(|&b| b == b';').next().unwrap_or(&ct).to_ascii_lowercase();
+        let matched = if let Some(types) = &conf.types {
+            if types.iter().any(|t| t.as_slice() == b"*") {
+                true
+            } else {
+                types.iter().any(|t| t.as_slice() == ct_bare.as_slice())
+            }
+        } else {
+            ct_bare.as_slice() == b"text/html"
+        };
+        if !matched {
+            drop(conf);
+            return next(r).await;
+        }
+    }
+
     drop(conf);
 
     // Create context
     let ctx = AdditionCtx {
         before_body_sent: false,
     };
-    r.set_ctx(ctx_index(), Rc::new(RefCell::new(ctx)));
+    r.set_ctx(ctx_index(), ctx);
 
     r.clear_content_length();
     r.clear_accept_ranges();
@@ -109,12 +140,18 @@ async fn addition_body_filter(r: R, chain: Chain, next: BodyFilter) -> i64 {
     let conf = r.loc_conf::<AdditionLocConf>(ctx_index());
     let conf_ref = conf.borrow();
 
+    let mut chain = chain;
     if let Some(ctx) = ctx_opt {
         let mut ctx_ref = ctx.borrow_mut();
         if !ctx_ref.before_body_sent {
             ctx_ref.before_body_sent = true;
             if !conf_ref.before_body.get().is_empty() {
-                let _ = subrequest(&r, conf_ref.before_body.get(), None, 0, None).await;
+                let before_uri = conf_ref.before_body.get().clone();
+                drop(ctx_ref);
+                let _ = subrequest(&r, &before_uri, None, 0, None).await;
+                // Subrequest wrote through write_filter to the shared
+                // connection before returning, so its bytes are already in
+                // flight — nothing more to do here.
             }
         }
     }
@@ -151,12 +188,27 @@ async fn addition_body_filter(r: R, chain: Chain, next: BodyFilter) -> i64 {
         return rc;
     }
 
-    // Send the after_body subrequest
+    // Send the after_body subrequest, again absorbing its output into our
+    // chain so it appears after the main body.
     let after_body = conf_ref.after_body.get().clone();
     drop(conf_ref);
 
+    // After the last body chunk, run the after_body subrequest. Same shared-
+    // connection story as before_body — write_filter sends its bytes.
     let _ = subrequest(&r, &after_body, None, 0, None).await;
 
+    // Terminate the response with an empty last_buf so write_filter flushes
+    // the connection. Without postpone_filter we have to inject this
+    // ourselves; C achieves it because the subrequest's postpone-flush
+    // eventually propagates last_buf into the parent's chain.
+    use ngx_core::buf::Buf;
+    let mut end_chain: Chain = Chain::new();
+    let mut b = Buf::from_vec(Vec::new());
+    b.last_buf = true;
+    b.last_in_chain = true;
+    b.sync = true;
+    end_chain.push_back(b);
+    let _ = next(r.clone(), end_chain).await;
     NGX_OK
 }
 

@@ -692,13 +692,21 @@ async fn proxy_handler(r: R) -> i64 {
         return NGX_OK;
     }
     if body_start < response.len() {
+        let mut short_response = false;
         let body_owned: Vec<u8>;
         let body: &[u8] = if upstream_chunked {
             body_owned = decode_chunked(&response[body_start..]);
             &body_owned
         } else {
             let end = if upstream_content_length >= 0 {
-                (body_start + upstream_content_length as usize).min(response.len())
+                let want = body_start + upstream_content_length as usize;
+                if want > response.len() {
+                    // Upstream sent fewer bytes than Content-Length promised.
+                    short_response = true;
+                    response.len()
+                } else {
+                    want
+                }
             } else {
                 response.len()
             };
@@ -710,6 +718,14 @@ async fn proxy_handler(r: R) -> i64 {
         use std::collections::VecDeque;
 
         let mut chain: Chain = VecDeque::new();
+
+        // Only mark as last_buf when the response is well-formed. A short
+        // response (fewer bytes than Content-Length) has to signal "no more
+        // data" without triggering downstream last_buf handlers like
+        // addition_filter's after_body. C achieves this by never delivering
+        // last_buf to the filter chain in the short case; the client sees the
+        // truncated body via connection close.
+        let final_buf = !short_response;
 
         let buf = Buf {
             pos: 0,
@@ -724,9 +740,9 @@ async fn proxy_handler(r: R) -> i64 {
             mmap: false,
             recycled: false,
             in_file: false,
-            flush: false,
+            flush: !final_buf,
             sync: false,
-            last_buf: true,
+            last_buf: final_buf,
             last_in_chain: true,
             temp_file: false,
         };

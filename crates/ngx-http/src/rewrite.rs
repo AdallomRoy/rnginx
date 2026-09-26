@@ -928,12 +928,10 @@ async fn rewrite_handler(r: R) -> i64 {
                 let text_val = text
                     .clone()
                     .unwrap_or_else(|| ComplexValue::constant(b""));
-                let ct: Option<&[u8]> =
-                    if text.is_some() && status < 300 {
-                        Some(b"text/plain")
-                    } else {
-                        None
-                    };
+                // Match C: `return NNN "text"` passes ct=NULL, so
+                // set_content_type applies from the extension/types_hash.
+                let ct: Option<&[u8]> = None;
+                let _ = text;
 
                 let rc = send_response(&r, status, ct, &text_val).await;
                 if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
@@ -1094,12 +1092,7 @@ async fn rewrite_handler(r: R) -> i64 {
                                 let text_val = text
                                     .clone()
                                     .unwrap_or_else(|| ComplexValue::constant(b""));
-                                let ct: Option<&[u8]> =
-                                    if text.is_some() && status < 300 {
-                                        Some(b"text/plain")
-                                    } else {
-                                        None
-                                    };
+                                let ct: Option<&[u8]> = None;
 
                                 let rc = send_response(&r, status, ct, &text_val).await;
                                 if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
