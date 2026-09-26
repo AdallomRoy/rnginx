@@ -91,6 +91,9 @@ async fn handler(r: R) -> i64 {
         ho.content_length_n = of.size;
         ho.last_modified_time = of.mtime;
     }
+    // Derive Content-Type from the ORIGINAL uri extension (not `.gz`); charset_filter
+    // will layer on the configured charset if applicable.
+    crate::core_rt::set_content_type(&r);
     if accept_gzip {
         let h = TableElt::new(b"Content-Encoding", b"gzip");
         r.headers_out.borrow_mut().content_encoding = Some(h);
