@@ -763,7 +763,28 @@ pub fn range_body_filter_module() -> ModuleDef {
 }
 
 pub fn slice_filter_module() -> ModuleDef {
-    stub("ngx_http_slice_filter_module", vec![
+    // The slice filter is not implemented, but configs commonly reference
+    // `$slice_range` in `proxy_set_header Range $slice_range;` — register a
+    // no-op variable so complex_value can evaluate it without emitting a
+    // "cycle while evaluating" alert. Without slice_range the sub-request
+    // pipeline won't actually issue byte ranges; we just avoid noise.
+    let def = HttpModuleDef {
+        preconfiguration: Some(|cf: &mut Conf| {
+            use crate::variables::{VarDef, add_variables, NGX_HTTP_VAR_NOCACHEABLE};
+            let vars = vec![
+                VarDef {
+                    name: "slice_range",
+                    set: None,
+                    get: Some(|_r, v, _d| { v.data = Vec::new(); v.valid = true; crate::NGX_OK }),
+                    data: 0,
+                    flags: NGX_HTTP_VAR_NOCACHEABLE,
+                },
+            ];
+            add_variables(cf, &vars)
+        }),
+        ..Default::default()
+    };
+    http_module_def("ngx_http_slice_filter_module", def, vec![
         Command::new("slice", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
     ])
 }
