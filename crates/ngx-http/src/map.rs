@@ -49,8 +49,8 @@ pub struct MapCtx {
     default: RefCell<Option<MapEntry>>,
     entries: RefCell<Vec<(Vec<u8>, MapEntry)>>,
     regexes: RefCell<Vec<MapRegex>>,
-    volatile: bool,
-    hostnames: bool,
+    volatile: std::cell::Cell<bool>,
+    hostnames: std::cell::Cell<bool>,
 }
 
 fn is_wildcard_pattern(key: &[u8]) -> bool {
@@ -121,13 +121,13 @@ fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
 
     v.valid = true;
     v.not_found = false;
-    v.no_cacheable = ctx.volatile;
+    v.no_cacheable = ctx.volatile.get();
     v.escape = false;
     v.data.clear();
 
     match crate::script::complex_value(r, &ctx.cv) {
         Ok(mut lookup_key) => {
-            if ctx.hostnames && !lookup_key.is_empty() && lookup_key[lookup_key.len() - 1] == b'.' {
+            if ctx.hostnames.get() && !lookup_key.is_empty() && lookup_key[lookup_key.len() - 1] == b'.' {
                 lookup_key.pop();
             }
 
@@ -152,24 +152,46 @@ fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
                 }
             }
 
-            // Try wildcard patterns (exact and then with wildcards)
+            // Wildcard matches: mimic C hostnames hash lookup semantics by
+            // picking the LONGEST matching pattern rather than first match. The
+            // three families sorted separately:
+            //   left-wildcard  (*.suffix and .suffix)  — longest suffix wins
+            //   right-wildcard (prefix.*)              — longest prefix wins
+            // Left-wildcard beats right-wildcard because hwc_head is checked
+            // before hwc_tail in ngx_http_map_find_ctx / ngx_hash_find_combined.
+            let mut best_left: Option<(usize, &MapEntry)> = None;
+            let mut best_right: Option<(usize, &MapEntry)> = None;
             for (key, entry) in entries.iter() {
                 if !is_wildcard_pattern(key) || (key.len() > 0 && key[0] == b'~') {
-                    continue;  // Skip non-wildcard and regex patterns
+                    continue;
                 }
-                if wildcard_match(key, &lookup_key) {
-                    match entry {
-                        MapEntry::Static(val) => {
-                            v.data.clone_from(val);
-                        }
-                        MapEntry::Complex(cv) => {
-                            if let Ok(val) = crate::script::complex_value(r, cv) {
-                                v.data = val;
-                            }
+                if !wildcard_match(key, &lookup_key) {
+                    continue;
+                }
+                let is_left = key[0] == b'*' || key[0] == b'.';
+                if is_left {
+                    let suffix_len = if key[0] == b'*' { key.len() - 1 } else { key.len() };
+                    if best_left.map_or(true, |(l, _)| suffix_len > l) {
+                        best_left = Some((suffix_len, entry));
+                    }
+                } else {
+                    // prefix.*
+                    let prefix_len = key.len() - 1;
+                    if best_right.map_or(true, |(l, _)| prefix_len > l) {
+                        best_right = Some((prefix_len, entry));
+                    }
+                }
+            }
+            if let Some((_, entry)) = best_left.or(best_right) {
+                match entry {
+                    MapEntry::Static(val) => v.data.clone_from(val),
+                    MapEntry::Complex(cv) => {
+                        if let Ok(val) = crate::script::complex_value(r, cv) {
+                            v.data = val;
                         }
                     }
-                    return NGX_OK;
                 }
+                return NGX_OK;
             }
 
             // Try regexes
@@ -295,9 +317,14 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
         .ok_or_else(|| msg("invalid conf"))?;
     let ctx = unsafe { &*(ctx_ptr as *const MapCtx) };
 
-    // Single argument: flags
+    // Single argument: flags (hostnames / volatile inside the block).
+    // C ngx_http_map_block does the same recognition inside the block body.
     if args.len() == 1 {
-        // Flags are set during ctx creation and block parsing, not handled here
+        if key.as_slice() == b"hostnames" {
+            ctx.hostnames.set(true);
+        } else if key.as_slice() == b"volatile" {
+            ctx.volatile.set(true);
+        }
         return Ok(());
     }
 
@@ -394,8 +421,8 @@ fn map_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
         default: RefCell::new(None),
         entries: RefCell::new(Vec::new()),
         regexes: RefCell::new(Vec::new()),
-        volatile,
-        hostnames,
+        volatile: std::cell::Cell::new(volatile),
+        hostnames: std::cell::Cell::new(hostnames),
     }));
 
     var.get_handler.set(Some(map_variable));
