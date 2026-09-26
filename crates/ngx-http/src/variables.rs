@@ -732,7 +732,12 @@ fn var_connection_requests(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_connection_time(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let ms = ngx_core::times::current_msec().saturating_sub(r.connection.start_msec.get());
+    // Both timestamps are wall-clock ms since epoch (connection.start_msec
+    // is set from cached sec*1000 + msec). current_msec() is MONOTONIC and
+    // cannot be subtracted from that. Use the cached wall time.
+    let now = ngx_core::times::cached();
+    let now_ms = now.sec as u64 * 1000 + now.msec;
+    let ms = now_ms.saturating_sub(r.connection.start_msec.get());
     set_str(v, format!("{}.{:03}", ms / 1000, ms % 1000).as_bytes());
     NGX_OK
 }

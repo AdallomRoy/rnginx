@@ -315,7 +315,15 @@ pub fn update_location_config(r: &R) {
             r.keepalive.set(false);
         } else if r.connection.requests.get() as i64 >= *c.keepalive_requests {
             r.keepalive.set(false);
-        } else if ngx_core::times::current_msec().saturating_sub(r.connection.start_msec.get()) > *c.keepalive_time {
+        } else if {
+            // Both timestamps are wall-clock milliseconds since epoch.
+            // ngx_core::times::current_msec() returns MONOTONIC time
+            // (secs since boot × 1000), which is a different clock and would
+            // give a nonsense diff. Use cached wall time to compare.
+            let now = ngx_core::times::cached();
+            let now_ms = now.sec as u64 * 1000 + now.msec;
+            now_ms.saturating_sub(r.connection.start_msec.get()) > *c.keepalive_time
+        } {
             r.keepalive.set(false);
         } else if hin.msie6 && r.method.get() == NGX_HTTP_POST && (c.keepalive_disable & NGX_HTTP_KEEPALIVE_DISABLE_MSIE6) != 0 {
             r.keepalive.set(false);
