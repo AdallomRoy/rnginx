@@ -66,6 +66,7 @@ pub mod mirror;
 pub mod userid;
 pub mod addition_filter;
 pub mod random_index;
+pub mod autoindex;
 pub mod degradation;
 pub mod sub_filter;
 pub mod charset_filter;
@@ -561,7 +562,7 @@ pub fn modules() -> Vec<ModuleDef> {
         static_module::static_module(),
         gzip_static::gzip_static_module(),
         stubs::dav_module(),
-        stubs::autoindex_module(),
+        autoindex::autoindex_module(),
         index::index_module(),
         random_index::random_index_module(),
         mirror::mirror_module(),

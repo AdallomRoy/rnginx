@@ -97,14 +97,6 @@ pub fn dav_module() -> ModuleDef {
     ])
 }
 
-pub fn autoindex_module() -> ModuleDef {
-    stub("ngx_http_autoindex_module", vec![
-        Command::new("autoindex", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("autoindex_format", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("autoindex_localtime", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("autoindex_exact_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-    ])
-}
 
 pub fn random_index_module() -> ModuleDef {
     stub("ngx_http_random_index_module", vec![
