@@ -278,7 +278,7 @@ fn log_handler(r: &R) -> i64 {
             match op {
                 LogOp::Literal(l) => line.extend_from_slice(l),
                 LogOp::Var(idx, escape) => {
-                    let v = get_indexed_variable(r, *idx);
+                    let v = crate::variables::get_flushed_variable(r, *idx);
                     match v {
                         Some(v) if !v.not_found => match *escape {
                             ESCAPE_JSON => line.extend_from_slice(&ngx_core::string::escape_json(&v.data)),

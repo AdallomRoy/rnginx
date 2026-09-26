@@ -807,6 +807,10 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
 pub fn create_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<HttpLogCtx>) -> R {
     let r = alloc_request(c, hc, log_ctx);
     c.requests.set(c.requests.get() + 1);
+    // Propagate the connection's pipelined flag onto the request so
+    // $pipe evaluates to "p" for pipelined requests (matches C where
+    // c->pipeline drives r->pipeline).
+    r.pipeline.set(c.pipeline.get());
     let clcf = r.clcf();
     c.log.set_chain(clcf.borrow().error_log.clone().expect("error_log"));
     *log_ctx.request.borrow_mut() = Some(Rc::downgrade(&r));
