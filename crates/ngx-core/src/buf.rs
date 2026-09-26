@@ -337,7 +337,10 @@ pub fn create_temp_file(
     loop {
         let key_str = format!("{:010}", num);
         let filename = path.hashed_filename(key_str.as_bytes());
-        match os::open(&filename, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
+        // O_RDWR (not O_WRONLY): downstream readers (e.g. proxy body-in-file
+        // forwarding) pread() through the same fd, and pread on a write-only
+        // fd returns EBADF.
+        match os::open(&filename, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode) {
             Ok(fd) => return Ok(TempFile::new(filename, fd, mode, clean)),
             Err(err) if err == libc::EEXIST => {
                 // Random increment stride (nginx's ngx_random_number).
