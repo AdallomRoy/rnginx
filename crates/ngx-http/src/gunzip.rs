@@ -143,7 +143,19 @@ async fn gunzip_body_filter(r: R, input: Chain, next: crate::BodyFilter) -> i64 
                 output.push_back(b);
             }
             match status {
-                Ok(Status::StreamEnd) => { ctx.borrow_mut().done = true; break; }
+                Ok(Status::StreamEnd) => {
+                    // A single gzip stream ended. If there's more input we
+                    // may be inside a multi-member gzip file (RFC1952
+                    // allows concatenating members). Reset the decoder and
+                    // keep going; only report done once all input is
+                    // consumed.
+                    if in_pos >= data.len() {
+                        ctx.borrow_mut().done = true;
+                        break;
+                    }
+                    ctx.borrow_mut().decoder = Decompress::new_gzip(15);
+                    continue;
+                }
                 Ok(Status::BufError) | Ok(Status::Ok) => {
                     if consumed == 0 && produced == 0 { break; }
                     if in_pos >= data.len() { break; }
