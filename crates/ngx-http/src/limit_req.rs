@@ -127,7 +127,7 @@ pub fn limit_req_module() -> ModuleDef {
     };
     let commands = vec![
         cmd_fn!("limit_req_zone", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::Main, limit_req_zone),
-        cmd_fn!("limit_req", NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, limit_req),
+        cmd_fn!("limit_req", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, limit_req),
         cmd_fn!("limit_req_log_level", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, limit_req_log_level),
         cmd_fn!("limit_req_status", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, limit_req_status),
         cmd_fn!("limit_req_dry_run", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, limit_req_dry_run),
