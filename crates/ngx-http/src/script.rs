@@ -237,12 +237,14 @@ pub fn test_predicates(r: &R, preds: &Option<Rc<Vec<ComplexValue>>>) -> i64 {
         None => return NGX_OK,
         Some(p) => p,
     };
+    // Matches ngx_http_test_predicates in C: any truthy predicate ⇒
+    // NGX_DECLINED; all empty/"0" (and predicates non-empty) ⇒ NGX_OK.
     for cv in preds.iter() {
         let val = match complex_value(r, cv) {
             Ok(v) => v,
             Err(_) => return NGX_ERROR,
         };
-        if val.is_empty() || (val.len() == 1 && val[0] == b'0') {
+        if !val.is_empty() && !(val.len() == 1 && val[0] == b'0') {
             return NGX_DECLINED;
         }
     }

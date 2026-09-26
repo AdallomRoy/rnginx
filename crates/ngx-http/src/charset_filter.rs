@@ -212,6 +212,24 @@ async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
     if status != NGX_HTTP_OK || !r.is_main() {
         return next(r).await;
     }
+    // If the response is content-encoded AND we'd actually be recoding
+    // bytes (source_charset != destination_charset), skip: we can't
+    // touch compressed bytes. Matches C's check in the "source_charset
+    // != charset" branch of ngx_http_charset_header_filter. When only
+    // adding a charset label without recoding, keep going.
+    let has_encoding = {
+        let ho = r.headers_out.borrow();
+        ho.content_encoding.as_ref()
+            .map(|ce| !ce.value.borrow().is_empty())
+            .unwrap_or(false)
+    };
+    if has_encoding {
+        let c_cell = r.loc_conf::<CharsetLocConf>(ctx_index());
+        let has_src = !c_cell.borrow().source_charset.get().is_empty();
+        if has_src {
+            return next(r).await;
+        }
+    }
 
     let conf = r.loc_conf::<CharsetLocConf>(ctx_index());
     let conf_ref = conf.borrow();
@@ -294,8 +312,16 @@ async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
         return next(r).await;
     }
 
-    // Charset was applied: content will be recoded, so length becomes unknown
-    r.clear_content_length();
+    // Only clear content_length when the recoding might change the byte
+    // count (utf-8 either side). Pure single-byte→single-byte tables
+    // preserve length, so leaving Content-Length intact keeps byte-range
+    // requests working. Matches C: ngx_http_clear_content_length is only
+    // called when to_utf8 or from_utf8. We don't do utf8 yet, so this is
+    // always a no-op — leaving the branch for when we implement utf8.
+    let _need_clear = false;
+    if _need_clear {
+        r.clear_content_length();
+    }
 
     next(r).await
 }

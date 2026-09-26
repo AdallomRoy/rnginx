@@ -53,8 +53,33 @@ pub async fn read_early_body(r: &R) -> i64 {
             return NGX_OK;
         }
     }
-    if crate::script::test_predicates(r, &preds) != NGX_OK {
+    let rc = crate::script::test_predicates(r, &preds);
+    if rc == NGX_ERROR {
+        crate::request_rt::finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR).await;
+        return NGX_ERROR;
+    }
+    if rc == NGX_OK {
+        // Predicates all false: the directive did NOT ask for early read;
+        // let the handler chain do it later.
         return NGX_OK;
+    }
+    // rc == NGX_DECLINED (a predicate is truthy). Enforce the SERVER-level
+    // client_max_body_size before we spend memory buffering the request —
+    // clcf here is the initial server default location (find_config hasn't
+    // matched a nested location yet), so its limit is what applies. Matches
+    // C's ngx_http_read_early_body which uses the loc_conf at this point.
+    {
+        let clcf = r.clcf();
+        let c = clcf.borrow();
+        let max = *c.client_max_body_size;
+        let cl = r.headers_in.borrow().content_length_n;
+        if cl != -1 && !r.discard_body.get() && max != 0 && max < cl {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "client intended to send too large body: {} bytes", cl);
+            r.expect_tested.set(true);
+            let _ = discard_request_body(r).await;
+            crate::request_rt::finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE).await;
+            return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+        }
     }
     let rc = read_client_request_body(r).await;
     if rc >= NGX_HTTP_SPECIAL_RESPONSE {
