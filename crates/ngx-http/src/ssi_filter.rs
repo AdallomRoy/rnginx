@@ -251,7 +251,12 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     };
 
     let mut output = Chain::new();
-    let mut pending_includes = Vec::new();
+    // Segments to emit in order: `Text` bytes are pushed to output; `Include`
+    // triggers a subrequest that streams its output between neighboring text
+    // segments. Preserving relative order is critical — the C module handles
+    // this via ngx_http_postpone_filter; we materialize it directly.
+    enum Seg { Text(Vec<u8>), Include(Vec<u8>) }
+    let mut segments: Vec<Seg> = Vec::new();
     let mut last_buf_flag = false;
     let mut last_in_chain_flag = false;
 
@@ -261,22 +266,61 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         let data = match &buf.data {
             BufData::Memory(v) => v.clone(),
             _ => {
+                // Emit any pending output before the pass-through to keep
+                // order.
                 output.push_back(buf);
                 continue;
             }
         };
 
-        let processed = process_ssi(&data, &mut ctx_rc.borrow_mut(), &r);
-        if !processed.is_empty() {
-            let mut b = Buf::from_vec(processed);
-            b.last_buf = false; // set on the FINAL emitted buf below
-            b.last_in_chain = false;
-            output.push_back(b);
+        let mut pos = 0;
+        while pos < data.len() {
+            let (chunk, consumed, had_include) = {
+                let mut ctx = ctx_rc.borrow_mut();
+                process_ssi(&data[pos..], &mut ctx, &r)
+            };
+            if !chunk.is_empty() {
+                segments.push(Seg::Text(chunk));
+            }
+            pos += consumed;
+            if had_include {
+                if let Some(uri) = ctx_rc.borrow_mut().pending_include.take() {
+                    segments.push(Seg::Include(uri));
+                }
+            } else {
+                break;
+            }
         }
+    }
 
-        // Collect pending includes
-        if let Some(uri) = ctx_rc.borrow_mut().pending_include.take() {
-            pending_includes.push(uri);
+    // Walk segments in order: flush text into `output`, and for each include
+    // flush accumulated output, then fire the subrequest (whose output goes
+    // to the shared connection write chain in order).
+    for seg in segments {
+        match seg {
+            Seg::Text(bytes) => {
+                if !bytes.is_empty() {
+                    let mut b = Buf::from_vec(bytes);
+                    b.last_buf = false;
+                    b.last_in_chain = false;
+                    output.push_back(b);
+                }
+            }
+            Seg::Include(uri) => {
+                if !output.is_empty() {
+                    let result = next(r.clone(), output).await;
+                    if result != NGX_OK { return result; }
+                    output = Chain::new();
+                }
+                let (path, args) = if let Some(q_pos) = uri.iter().position(|&b| b == b'?') {
+                    let (p, a) = uri.split_at(q_pos);
+                    (p.to_vec(), Some(a[1..].to_vec()))
+                } else {
+                    (uri.clone(), None)
+                };
+                let args_ref = args.as_ref().map(|a| a.as_slice());
+                let _ = crate::request_rt::subrequest(&r, &path, args_ref, 0, None).await;
+            }
         }
     }
 
@@ -297,34 +341,17 @@ async fn ssi_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         }
     }
 
-    // Handle pending includes before calling next
-    for uri in pending_includes {
-        // Emit buffered output before the include
-        if !output.is_empty() {
-            let result = next(r.clone(), output).await;
-            if result != NGX_OK {
-                return result;
-            }
-            output = Chain::new();
-        }
-
-        // Split URI and query string if needed
-        let (path, args) = if let Some(q_pos) = uri.iter().position(|&b| b == b'?') {
-            let (p, a) = uri.split_at(q_pos);
-            (p.to_vec(), Some(a[1..].to_vec())) // Skip the '?'
-        } else {
-            (uri.clone(), None)
-        };
-
-        // Make the subrequest - its output goes to downstream
-        let args_ref = args.as_ref().map(|a| a.as_slice());
-        let _ = crate::request_rt::subrequest(&r, &path, args_ref, 0, None).await;
-    }
-
     next(r, output).await
 }
 
-fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
+/// Returns (rendered_prefix, bytes_consumed, hit_include).
+///
+/// When an `<!--#include -->` directive fires, we stop as soon as the include
+/// is resolved (ctx.pending_include is populated by execute_directive) so the
+/// caller can flush `rendered_prefix`, fire the subrequest, and re-enter with
+/// the remainder of `data`. Without this split the trailing bytes after the
+/// include would be flushed BEFORE the subrequest output, jumbling the page.
+fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
     let mut out = Vec::new();
     let mut i = 0;
     let mut tag_start = 0;
@@ -492,6 +519,9 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
                         out.extend_from_slice(&result);
                         ctx.state = SsiState::Start;
                         i += 3;
+                        if ctx.pending_include.is_some() {
+                            return (out, i, true);
+                        }
                     } else { ctx.state = SsiState::Error; i += 1; }
                 } else {
                     ctx.state = SsiState::PreParam;
@@ -501,7 +531,7 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
         }
     }
 
-    out
+    (out, i, false)
 }
 
 fn ssi_get_variable(var_name: &[u8], ctx: &SsiCtx, r: &R) -> Option<Vec<u8>> {
