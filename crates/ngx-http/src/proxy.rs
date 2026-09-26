@@ -24,7 +24,12 @@ crate::http_module_index!("ngx_http_proxy_module");
 
 /// Proxy location configuration
 pub struct NgxHttpProxyLocConf {
-    pub upstream_uri: Option<Vec<u8>>,  // proxy_pass URL
+    pub upstream_uri: Option<Vec<u8>>,  // proxy_pass URL (literal, for static parsing)
+    /// If the proxy_pass URI contains `$variable` references, we compile it
+    /// as a ComplexValue at config time and expand at request time. Matches
+    /// C's ngx_http_proxy_eval path: parse the expanded string as a URL,
+    /// resolve host/port, and forward the rest as the upstream path.
+    pub upstream_uri_cv: Option<crate::script::ComplexValue>,
     /// proxy_method: overrides the request method sent to upstream. Supports
     /// variable interpolation via ComplexValue. Defaults to forwarding the
     /// client's method.
@@ -159,6 +164,7 @@ impl Default for NgxHttpProxyLocConf {
     fn default() -> Self {
         NgxHttpProxyLocConf {
             upstream_uri: None,
+            upstream_uri_cv: None,
             method: None,
             intercept_errors: Val::unset(),
             pass_request_headers: Val::unset(),
@@ -190,6 +196,9 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     let mut c = conf_cell::<NgxHttpProxyLocConf>(conf).borrow_mut();
     if c.upstream_uri.is_none() {
         c.upstream_uri = p.upstream_uri.clone();
+    }
+    if c.upstream_uri_cv.is_none() {
+        c.upstream_uri_cv = p.upstream_uri_cv.clone();
     }
     if c.method.is_none() {
         c.method = p.method.clone();
@@ -265,7 +274,15 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
 
     if let Some(c) = conf {
         let conf = conf_rc::<NgxHttpProxyLocConf>(&c);
-        conf.borrow_mut().upstream_uri = Some(cf.args[1].clone());
+        let uri = cf.args[1].clone();
+        // If it contains a `$`, compile as ComplexValue for per-request
+        // expansion. Otherwise keep the literal (fast path — matches C
+        // where only URLs with variables go through the eval branch).
+        if uri.contains(&b'$') {
+            let cv = crate::script::compile_complex_value(cf, &uri, 0)?;
+            conf.borrow_mut().upstream_uri_cv = Some(cv);
+        }
+        conf.borrow_mut().upstream_uri = Some(uri);
     }
 
     // Set the location handler to our proxy_handler and mark auto_redirect for `/xxx/` locs.
@@ -518,12 +535,40 @@ async fn proxy_handler(r: R) -> i64 {
     let conf_borrowed = lcf.borrow();
 
     // Check if this location has proxy_pass configured
-    let upstream_uri = match &conf_borrowed.upstream_uri {
-        Some(uri) => uri.clone(),
-        None => {
-            return NGX_DECLINED;
+    let upstream_uri = if let Some(cv) = &conf_borrowed.upstream_uri_cv {
+        // Variable-based proxy_pass: expand per request. Fallback to the
+        // stored literal on failure so a bad variable expansion doesn't
+        // panic — matches C's fallback of returning NGX_ERROR from
+        // ngx_http_proxy_eval on complex_value failure.
+        let cv_cloned = cv.clone();
+        drop(conf_borrowed);
+        let expanded = match crate::script::complex_value(&r, &cv_cloned) {
+            Ok(v) => v,
+            Err(_) => return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR as i64).await,
+        };
+        // Prepend scheme if missing: `$arg_b` typically expands to host:port.
+        let mut u = if expanded.starts_with(b"http://") || expanded.starts_with(b"https://") {
+            expanded
+        } else {
+            let mut prefixed = b"http://".to_vec();
+            prefixed.extend_from_slice(&expanded);
+            prefixed
+        };
+        // Ensure a trailing slash for path so parse_upstream_uri finds "/".
+        if !u.contains(&b'/') || (u.starts_with(b"http://") && !u[7..].contains(&b'/')) {
+            u.push(b'/');
+        }
+        u
+    } else {
+        match &conf_borrowed.upstream_uri {
+            Some(uri) => uri.clone(),
+            None => {
+                return NGX_DECLINED;
+            }
         }
     };
+    let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let conf_borrowed = lcf.borrow();
 
     // Parse upstream URI
     let upstream_uri_str = match std::str::from_utf8(&upstream_uri) {
@@ -567,7 +612,13 @@ async fn proxy_handler(r: R) -> i64 {
     let clcf = r.clcf();
     let loc_name = clcf.borrow().name.clone();
     let request_uri = r.uri.borrow().clone();
-    let forwarded_uri: Vec<u8> = if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[7..].contains('/') {
+    // Variable-based proxy_pass: use the expanded URL's URI verbatim,
+    // matching C's `if (proxy_lengths && vars.uri.len) u->uri = vars.uri;`
+    // — the client's request URI is NOT appended.
+    let is_variable_pass = conf_borrowed.upstream_uri_cv.is_some();
+    let forwarded_uri: Vec<u8> = if is_variable_pass {
+        upstream_path.as_bytes().to_vec()
+    } else if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[7..].contains('/') {
         let mut u = upstream_path.as_bytes().to_vec();
         // Strip trailing slash if adding suffix that starts with /
         let tail = if request_uri.starts_with(loc_name.as_slice()) {
@@ -627,7 +678,9 @@ async fn proxy_handler(r: R) -> i64 {
     // borrow_mut() the same cell, silently killing the request task.
     let uri_with_args = {
         let args = r.args.borrow().clone();
-        if !args.is_empty() {
+        // Variable-based proxy_pass: args are dropped — the expanded URL is
+        // used verbatim as the upstream URI. Matches C's proxy_lengths path.
+        if !args.is_empty() && !is_variable_pass {
             format!("{}?{}", uri_path, std::str::from_utf8(&args).unwrap_or(""))
         } else {
             uri_path
