@@ -294,10 +294,26 @@ impl Upstream {
 
 pub struct UpstreamMainConf {
     pub upstreams: Vec<(Vec<u8>, Rc<Upstream>)>,
+    /// Servers per upstream name, kept alongside the Rc<Upstream> so
+    /// proxy_pass to a named upstream can pick a peer without going through
+    /// the peer_init dance yet.
+    pub server_lists: Vec<(Vec<u8>, Vec<UpstreamServer>)>,
+    /// While an `upstream NAME { ... }` block is being parsed, hold the pending
+    /// server list here so server_handler knows where to append.
+    pub current_builder: std::cell::RefCell<Option<UpstreamBuilder>>,
+}
+
+pub struct UpstreamBuilder {
+    pub name: Vec<u8>,
+    pub servers: Vec<UpstreamServer>,
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(UpstreamMainConf { upstreams: Vec::new() })
+    make_slot(UpstreamMainConf {
+        upstreams: Vec::new(),
+        server_lists: Vec::new(),
+        current_builder: std::cell::RefCell::new(None),
+    })
 }
 
 fn init_main_conf(_cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult {
@@ -315,33 +331,140 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
     }
 
     let name = cf.args[1].clone();
+    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
 
-    // Parse the upstream { ... } block
-    // Set command type to UPS_CONF so directives inside the block know we're in upstream context
+    // Set up a builder that server_handler will push into.
+    *umcf.borrow().current_builder.borrow_mut() = Some(UpstreamBuilder {
+        name: name.clone(),
+        servers: Vec::new(),
+    });
+
     let saved_ct = cf.cmd_type;
     cf.cmd_type = NGX_HTTP_UPS_CONF;
-
     let rv = cf.parse_block();
-
     cf.cmd_type = saved_ct;
 
-    // TODO: Register the upstream in main conf
-    // For now, just accept any upstream block
-
+    // Take the builder back and finalize into an Upstream entry.
+    let builder = umcf.borrow().current_builder.borrow_mut().take();
+    if let Some(b) = builder {
+        let servers = b.servers.clone();
+        let uconf = UpstreamConf {
+            name: b.name.clone(),
+            servers: b.servers,
+            backup_servers: Vec::new(),
+            peer_init: None,
+            keepalive: 0,
+            keepalive_time: 0,
+            keepalive_timeout: 0,
+            keepalive_requests: 0,
+        };
+        let peer_init: Rc<dyn PeerInit> = Rc::new(NoopPeerInit);
+        let up = Upstream::new(&uconf, peer_init);
+        let mut m = umcf.borrow_mut();
+        m.upstreams.push((name.clone(), up));
+        m.server_lists.push((name, servers));
+    }
     rv
 }
 
+/// Return (host, port) of the first usable server in the named upstream.
+/// Currently just picks the first non-down, non-backup entry; TODO: real
+/// round-robin with weights.
+pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    for (n, servers) in m.server_lists.iter() {
+        if n.as_slice() != name { continue; }
+        for s in servers.iter() {
+            if s.down || s.backup { continue; }
+            let host = String::from_utf8_lossy(&s.addr).into_owned();
+            return Some((host, s.port));
+        }
+        // If only backup servers, pick the first backup.
+        for s in servers.iter() {
+            if s.down { continue; }
+            let host = String::from_utf8_lossy(&s.addr).into_owned();
+            return Some((host, s.port));
+        }
+    }
+    None
+}
+
+struct NoopPeerInit;
+impl PeerInit for NoopPeerInit {
+    fn init(&self, _r: &R, _upstream: &Upstream) -> Rc<dyn Peer> {
+        Rc::new(DummyPeer)
+    }
+}
+
 fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // server address [parameters]
     if cf.args.len() < 2 {
         return Err(msg("no server address specified"));
     }
+    // Parse host:port from args[1]. IPv6 [::1]:8080 supported.
+    let addr = cf.args[1].clone();
+    let addr_str = std::str::from_utf8(&addr).unwrap_or("");
+    let (host, port) = if addr_str.starts_with('[') {
+        // [ipv6]:port
+        if let Some(end) = addr_str.find(']') {
+            let host_part = &addr_str[..=end];
+            let rest = &addr_str[end + 1..];
+            let port = rest.strip_prefix(':').and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
+            (host_part.to_string(), port)
+        } else {
+            (addr_str.to_string(), 80)
+        }
+    } else if let Some(colon) = addr_str.rfind(':') {
+        let host_part = &addr_str[..colon];
+        let port = addr_str[colon + 1..].parse::<u16>().unwrap_or(80);
+        (host_part.to_string(), port)
+    } else {
+        (addr_str.to_string(), 80)
+    };
 
-    // TODO: Parse server directive parameters
-    // address, weight=, max_conns=, max_fails=, fail_timeout=, backup, down, resolve, service=, slow_start=
-    // cf.args[1] = address (host:port or unix socket path)
-    // cf.args[2+] = parameters like "weight=5" "backup" "down" etc
-
+    let mut server = UpstreamServer {
+        name: addr.clone(),
+        addr: host.as_bytes().to_vec(),
+        port,
+        weight: 1,
+        max_conns: 0,
+        max_fails: 1,
+        fail_timeout: 10_000,
+        slow_start: 0,
+        backup: false,
+        down: false,
+        resolve: false,
+        service: Vec::new(),
+    };
+    for arg in cf.args.iter().skip(2) {
+        let s = std::str::from_utf8(arg).unwrap_or("");
+        if s == "backup" { server.backup = true; }
+        else if s == "down" { server.down = true; }
+        else if s == "resolve" { server.resolve = true; }
+        else if let Some(rest) = s.strip_prefix("weight=") {
+            if let Ok(n) = rest.parse::<u32>() { server.weight = n; }
+        } else if let Some(rest) = s.strip_prefix("max_conns=") {
+            if let Ok(n) = rest.parse::<u32>() { server.max_conns = n; }
+        } else if let Some(rest) = s.strip_prefix("max_fails=") {
+            if let Ok(n) = rest.parse::<u32>() { server.max_fails = n; }
+        } else if let Some(rest) = s.strip_prefix("fail_timeout=") {
+            if let Some(ms) = ngx_core::parse::parse_time(rest.as_bytes(), false) {
+                server.fail_timeout = ms as u64;
+            }
+        } else if let Some(rest) = s.strip_prefix("slow_start=") {
+            if let Some(ms) = ngx_core::parse::parse_time(rest.as_bytes(), false) {
+                server.slow_start = ms as u64;
+            }
+        } else if let Some(rest) = s.strip_prefix("service=") {
+            server.service = rest.as_bytes().to_vec();
+        }
+    }
+    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
+    let m = umcf.borrow();
+    let mut b = m.current_builder.borrow_mut();
+    if let Some(bld) = b.as_mut() {
+        bld.servers.push(server);
+    }
     Ok(())
 }
 

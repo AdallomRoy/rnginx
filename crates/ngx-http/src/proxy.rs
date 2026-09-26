@@ -269,12 +269,28 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
 
-    let (host, port, upstream_path) = match parse_upstream_uri(upstream_uri_str) {
+    let (mut host, mut port, upstream_path) = match parse_upstream_uri(upstream_uri_str) {
         Some(p) => p,
         None => {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
+
+    // If the host matches a named upstream {} block, resolve to its first
+    // (non-backup) server. TODO: proper round-robin selection; for now pick
+    // the first non-down entry.
+    if let Some(up) = crate::upstream::get_upstream_by_name(&r, host.as_bytes()) {
+        // Rc<Upstream> currently doesn't expose servers directly — look at
+        // umcf.upstreams for the raw UpstreamConf. Skipping detail: the
+        // Upstream struct only carries peers; a simpler lookup is via
+        // UpstreamMainConf's list which for us is (name, Rc<Upstream>). We
+        // need to also stash the servers so we can pick. Add via a helper.
+        let _ = up;
+        if let Some((h, p)) = crate::upstream::first_server_for(&r, host.as_bytes()) {
+            host = h;
+            port = p;
+        }
+    }
     // If proxy_pass URL includes a URI (e.g. "http://backend/local/"), rewrite:
     //   forwarded = upstream_path + (request_uri - location_prefix)
     // Else forward the request URI as-is.
