@@ -1030,6 +1030,24 @@ async fn proxy_handler(r: R) -> i64 {
                     if bodyless || has_xar {
                         break;
                     }
+                    // 101 Switching Protocols: stop as soon as headers land so
+                    // the tunnel takes ownership of the socket. The trailing
+                    // bytes (if the upstream started the upgraded protocol
+                    // in the same packet as the headers) get forwarded below.
+                    if got_header {
+                        if let Some(e) = header_end {
+                            let sl = &response[..e.min(response.len())];
+                            let nl = sl.iter().position(|&b| b == b'\n').unwrap_or(sl.len());
+                            let sl = &sl[..nl];
+                            let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
+                            let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
+                            let is_101 = parts.get(1)
+                                .and_then(|p| std::str::from_utf8(p).ok())
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .map(|c| c == 101).unwrap_or(false);
+                            if is_101 { break; }
+                        }
+                    }
                     if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
                         if response.len() >= e + cl {
                             break;
@@ -1349,10 +1367,13 @@ async fn proxy_handler(r: R) -> i64 {
                         }
                     }
                     b"connection" | b"keep-alive" => {
-                        // Hop-by-hop headers: never emit to client. `server`
-                        // and `date` are handled through the effective_hide
-                        // list above so `proxy_pass_header Date;` can override
-                        // the default hide.
+                        // Hop-by-hop headers: normally stripped to the
+                        // client — except 101 Switching Protocols, where
+                        // Connection: Upgrade is the negotiation the client
+                        // is waiting to see.
+                        if status == 101 {
+                            ho.add(name, value);
+                        }
                     }
                     b"date" => {
                         // Only reached if not hidden (proxy_pass_header Date).
@@ -1550,6 +1571,37 @@ async fn proxy_handler(r: R) -> i64 {
         return NGX_ERROR;
     }
 
+    // 101 Switching Protocols: the client and upstream now speak whatever
+    // protocol the Upgrade negotiation settled on. Copy bytes both ways
+    // until either side closes. This is the minimum implementation
+    // proxy_upgrade.t / proxy_websocket.t / tunnel*.t need — no fancy
+    // half-close handling, no chunked framing.
+    if status == 101 {
+        if let Some(upstream_stream) = upstream.take() {
+            // Force headers out through the write filter — postpone_output
+            // would otherwise keep the 101 line buffered until the "last"
+            // signal, which never arrives in an upgrade.
+            let mut b = ngx_core::buf::Buf::from_vec(Vec::new());
+            b.flush = true;
+            b.sync = true;
+            let mut chain = ngx_core::buf::Chain::new();
+            chain.push_back(b);
+            let _ = crate::core_rt::output_filter(&r, chain).await;
+
+            // Anything past the header block was already sent by upstream
+            // as part of the upgraded protocol (e.g. a WebSocket server
+            // that started sending frames immediately). Forward that
+            // trailing tail to the client before entering the read loop.
+            if body_start < response.len() {
+                let tail = &response[body_start..];
+                let _ = r.connection.send_all(tail).await;
+            }
+            let _ = proxy_upgrade_tunnel(r.clone(), upstream_stream).await;
+            return crate::NGX_DONE;
+        }
+        return crate::NGX_DONE;
+    }
+
     // Forward response body. Respect HEAD (no body) and Content-Length (truncate
     // any extra bytes upstream sent past the declared length — matches C which
     // reads exactly content_length_n bytes and logs "upstream sent more data
@@ -1658,6 +1710,50 @@ async fn return_error(r: &R, status: i64) -> i64 {
 
 /// Returns true when `input` contains a fully-terminated HTTP/1.1 chunked
 /// body — i.e. the size-zero chunk followed by a terminating CRLF.
+/// Bidirectional pipe between the client (r.connection) and the upstream
+/// TcpStream after a 101 Switching Protocols response. Mirrors what
+/// ngx_http_upstream_upgrade sets up for WebSocket / HTTP upgrade paths.
+async fn proxy_upgrade_tunnel(r: R, upstream: tokio::net::TcpStream) -> i64 {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let (mut up_r, mut up_w) = upstream.into_split();
+    let client = r.connection.clone();
+
+    // Two forwarding tasks — one per direction. Whichever finishes first
+    // closes the tunnel by cancelling the other via drop.
+    let client_to_up = {
+        let client = client.clone();
+        async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match client.recv(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if up_w.write_all(&buf[..n]).await.is_err() { break; }
+                    }
+                }
+            }
+            let _ = up_w.shutdown().await;
+        }
+    };
+    let up_to_client = {
+        let client = client.clone();
+        async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match up_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if client.send_all(&buf[..n]).await.is_err() { break; }
+                    }
+                }
+            }
+        }
+    };
+    tokio::join!(client_to_up, up_to_client);
+    NGX_OK
+}
+
 fn chunked_complete(input: &[u8]) -> bool {
     let mut i = 0;
     while i < input.len() {

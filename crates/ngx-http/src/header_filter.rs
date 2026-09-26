@@ -29,6 +29,7 @@ pub const SERVER_FULL_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 pub const SERVER_BUILD_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 
 static STATUS_LINES: &[(i64, &str)] = &[
+    (101, "101 Switching Protocols"),
     (200, "200 OK"),
     (201, "201 Created"),
     (202, "202 Accepted"),
