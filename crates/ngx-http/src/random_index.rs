@@ -51,9 +51,11 @@ async fn random_index_handler(r: R) -> i64 {
     use ngx_core::rc::*;
 
     // Only handle directory requests (URI ends with /)
-    let uri = r.uri.borrow();
-    if uri.is_empty() || uri[uri.len() - 1] != b'/' {
-        return NGX_DECLINED;
+    {
+        let uri = r.uri.borrow();
+        if uri.is_empty() || uri[uri.len() - 1] != b'/' {
+            return NGX_DECLINED;
+        }
     }
 
     // Only handle GET, HEAD, POST
@@ -80,17 +82,19 @@ async fn random_index_handler(r: R) -> i64 {
         return NGX_DECLINED;
     };
 
-    // Collect regular files (skip . and ..)
+    // Collect regular files (skip . and .., follow symlinks per C's
+    // ngx_de_info which stats the target).
     let mut files = Vec::new();
     for entry in dir_entries.flatten() {
-        if let Ok(metadata) = entry.metadata() {
-            if metadata.is_file() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if !name.starts_with('.') {
-                        files.push(name.as_bytes().to_vec());
-                    }
-                }
-            }
+        let name = match entry.file_name().into_string() { Ok(s) => s, Err(_) => continue };
+        if name.starts_with('.') { continue; }
+        // Follow symlinks: fs::metadata does stat(), symlink_metadata does lstat().
+        let md = match fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if md.is_file() {
+            files.push(name.as_bytes().to_vec());
         }
     }
 
