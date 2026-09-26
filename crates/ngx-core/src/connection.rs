@@ -509,8 +509,16 @@ impl Connection {
 
     /// Mark connection reusable/idle (ngx_reusable_connection).
     pub fn set_reusable(&self, reusable: bool) {
-        self.reusable.set(reusable);
+        // Mirror ngx_reusable_connection's $connections_waiting side effect:
+        // transitioning off ⇒ decrement, transitioning on ⇒ increment. The
+        // idle flag doubles as our "am I on the reusable queue" bit.
+        let was = self.reusable.replace(reusable);
         self.idle.set(reusable);
+        if was && !reusable {
+            stats().waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        } else if !was && reusable {
+            stats().waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// ngx_close_connection
@@ -534,6 +542,12 @@ impl Connection {
         // finally dropped (stray Rcs on request tasks would otherwise inflate
         // the gauge for the lifetime of the response).
         stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // If we were on the reusable queue (waiting for a request), pull
+        // ourselves off it before dropping the connection so
+        // $connections_waiting stays consistent.
+        if self.reusable.replace(false) {
+            stats().waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.destroyed.set(true);
         self.log.set_context(None);
     }
