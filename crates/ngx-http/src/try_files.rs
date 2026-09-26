@@ -1,6 +1,7 @@
 //! ngx_http_try_files_module - try files with fallback
 
 use std::any::Any;
+use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
@@ -22,7 +23,10 @@ pub struct TryFilesConf {
 
 #[derive(Clone)]
 pub struct TryFile {
+    /// Raw configured token (with $vars intact) — kept for @named etc.
     pub name: Vec<u8>,
+    /// Compiled complex value; `None` means the name was a literal without vars.
+    pub value: Option<ComplexValue>,
     pub test_dir: bool,
     pub code: i64, // For last entry: HTTP status code (e.g., 404)
 }
@@ -57,6 +61,7 @@ fn try_files_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
                         }
                         files.push(TryFile {
                             name: Vec::new(),
+                            value: None,
                             test_dir: false,
                             code,
                         });
@@ -66,25 +71,38 @@ fn try_files_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
                 return Err(cf.emerg(format_args!("invalid code \"{}\"", B(arg))));
             } else {
                 // Fallback path or named location
+                let value = if arg.contains(&b'$') {
+                    Some(crate::script::compile_complex_value(cf, arg, 0)?)
+                } else {
+                    None
+                };
                 files.push(TryFile {
                     name: arg.clone(),
+                    value,
                     test_dir: false,
                     code: 0,
                 });
             }
         } else {
-            // Not the last argument
+            // Not the last argument — non-terminal entries are file/dir tests.
             let mut name = arg.clone();
             let mut test_dir = false;
 
-            // Check for trailing '/' indicating directory test
-            if name.ends_with(b"/") && args.len() > i + 2 {
-                // Remove trailing '/' and set test_dir flag
+            // Check for trailing '/' indicating directory test. C only strips it
+            // when the entry isn't the last (i + 2 < nelts); our loop already
+            // handles the terminal separately, so any non-terminal '/' means
+            // "test as directory".
+            if name.ends_with(b"/") {
                 name.pop();
                 test_dir = true;
             }
 
-            files.push(TryFile { name, test_dir, code: 0 });
+            let value = if name.contains(&b'$') {
+                Some(crate::script::compile_complex_value(cf, &name, 0)?)
+            } else {
+                None
+            };
+            files.push(TryFile { name, value, test_dir, code: 0 });
         }
     }
 
@@ -130,19 +148,127 @@ async fn try_files_handler(r: R) -> i64 {
         Some(f) => f.clone(),
         None => return NGX_DECLINED,
     };
+    if files.is_empty() {
+        return NGX_DECLINED;
+    }
 
-    http_debug!(r, "try_files handler");
+    http_debug!(r, "try files handler");
 
-    // TODO: Implement file checking using open_file_cache
-    // For now, just accept the first URI and continue processing
-    if !files.is_empty() {
-        // Use the first file's path
-        let first_file = &files[0];
-        if !first_file.name.is_empty() {
-            // Set the URI to the first file and continue
-            *r.uri.borrow_mut() = first_file.name.clone();
-            crate::core_rt::set_exten(&r);
+    let clcf = r.clcf();
+    let alias_len = clcf.borrow().alias;
+
+    // Walk entries: for each non-terminal one, expand and stat; for the terminal
+    // entry, dispatch (=code, @named, or /internal_redirect).
+    for idx in 0..files.len() {
+        let tf = &files[idx];
+        let is_last = idx + 1 == files.len();
+
+        // The terminal entry with empty name may be a =code fallback.
+        if is_last && tf.name.is_empty() {
+            if tf.code > 0 {
+                return tf.code;
+            }
         }
+
+        // Expand the entry's name (may contain $vars).
+        let expanded_name: Vec<u8> = if let Some(cv) = &tf.value {
+            match crate::script::complex_value(&r, cv) {
+                Ok(v) => v,
+                Err(_) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+            }
+        } else {
+            tf.name.clone()
+        };
+
+        // Terminal entry with a name: internal redirect (either @name or /uri).
+        if is_last {
+            let name = &expanded_name;
+            if name.first() == Some(&b'@') {
+                let rc = crate::core_rt::named_location(&r, name).await;
+                if rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE {
+                    return rc;
+                }
+                return NGX_DONE;
+            }
+            // Split at '?' to detect args
+            let (uri_part, args_part): (Vec<u8>, Option<Vec<u8>>) =
+                if let Some(q) = name.iter().position(|&b| b == b'?') {
+                    (name[..q].to_vec(), Some(name[q + 1..].to_vec()))
+                } else {
+                    (name.clone(), None)
+                };
+            let rc = crate::core_rt::internal_redirect(&r, &uri_part, args_part.as_deref()).await;
+            if rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE {
+                return rc;
+            }
+            return NGX_DONE;
+        }
+
+        // Middle entry: attempt to map this URI (relative-to-current-URI style)
+        // to a filesystem path and stat it. C uses ngx_open_cached_file with
+        // test_only=1. We use plain fs metadata.
+        let candidate_uri = expanded_name.clone();
+        if candidate_uri.is_empty() {
+            continue;
+        }
+
+        // Temporarily replace r.uri to run map_uri_to_path against the candidate
+        // (so alias/root apply), then restore.
+        let saved_uri = r.uri.borrow().clone();
+        *r.uri.borrow_mut() = candidate_uri.clone();
+        let mapped = crate::core_rt::map_uri_to_path(&r, 0);
+        *r.uri.borrow_mut() = saved_uri.clone();
+
+        let (path, _root) = match mapped {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Stat the candidate. C uses open_file_cache; we simplify to std::fs.
+        let os = std::ffi::OsStr::from_bytes(&path);
+        let md = match std::fs::metadata(os) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(errno) = e.raw_os_error() {
+                    if errno != libc::ENOENT && errno != libc::ENOTDIR && errno != libc::ENAMETOOLONG {
+                        ngx_core::ngx_log_error!(
+                            ngx_core::log::NGX_LOG_CRIT,
+                            r.connection.log,
+                            Some(errno),
+                            "stat \"{}\" failed",
+                            ngx_core::string::B(&path)
+                        );
+                    }
+                }
+                continue;
+            }
+        };
+        let is_dir = md.is_dir();
+        if is_dir != tf.test_dir {
+            continue;
+        }
+
+        // Match found. Set r.uri per C:
+        //   no alias        -> r.uri = candidate_uri
+        //   alias==MAX (regex or exact-string alias):
+        //     only if !test_dir; also set add_uri_to_alias
+        //   alias>0         -> keep prefix of length alias, append candidate tail
+        if alias_len == 0 {
+            *r.uri.borrow_mut() = candidate_uri.clone();
+        } else if alias_len == usize::MAX {
+            if !tf.test_dir {
+                *r.uri.borrow_mut() = candidate_uri.clone();
+                // r.add_uri_to_alias.set(true) — TODO field not yet present
+            }
+        } else {
+            let cur = r.uri.borrow().clone();
+            let prefix = cur.get(..alias_len).unwrap_or(&cur[..]).to_vec();
+            let mut new_uri = prefix;
+            new_uri.extend_from_slice(&candidate_uri);
+            *r.uri.borrow_mut() = new_uri;
+        }
+        crate::core_rt::set_exten(&r);
+        return NGX_DECLINED;
     }
 
     NGX_DECLINED
