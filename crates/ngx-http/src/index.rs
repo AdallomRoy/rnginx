@@ -127,6 +127,12 @@ async fn index_handler(r: R) -> i64 {
             }
         } else {
             name = entry.name.clone();
+            // Absolute path: internal redirect (per C — only the last entry
+            // is allowed to be absolute and it triggers redirect to that URI).
+            if name.first() == Some(&b'/') {
+                let args = r.args.borrow().clone();
+                return internal_redirect(&r, &name, Some(&args)).await;
+            }
             if path.is_empty() {
                 match map_uri_to_path(&r, 0) {
                     Some((p, rl)) => {
@@ -165,10 +171,15 @@ async fn index_handler(r: R) -> i64 {
                 if of.err == 0 {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                if of.err == libc::EACCES {
-                    // ngx_http_index_error
-                    ngx_log_error!(NGX_LOG_ERR, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&full));
-                    return NGX_HTTP_FORBIDDEN;
+                // Match C: ENOTDIR / ENAMETOOLONG / EACCES on the candidate
+                // go straight to index_error (which returns 404 or 403 and
+                // conditionally logs via log_not_found). test_dir only runs
+                // when open fails with ENOENT.
+                if of.err == libc::ENOTDIR
+                    || of.err == libc::ENAMETOOLONG
+                    || of.err == libc::EACCES
+                {
+                    return index_error(&r, &clcf, &full, of.err);
                 }
                 if !dir_tested {
                     let rc = test_dir(&r, &clcf, &path[..dir_len], root_len).await;
@@ -186,6 +197,20 @@ async fn index_handler(r: R) -> i64 {
         }
     }
     NGX_DECLINED
+}
+
+fn index_error(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, file: &[u8], err: i32) -> i64 {
+    // Match ngx_http_index_error: EACCES -> 403 with 'is forbidden' log;
+    // otherwise 404, log conditionally on log_not_found.
+    if err == libc::EACCES {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(err), "\"{}\" is forbidden", B(file));
+        return NGX_HTTP_FORBIDDEN;
+    }
+    let log_nf = *clcf.borrow().log_not_found;
+    if log_nf {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(err), "\"{}\" is not found", B(file));
+    }
+    NGX_HTTP_NOT_FOUND
 }
 
 async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, dir: &[u8], root_len: usize) -> i64 {
@@ -211,12 +236,13 @@ async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, dir: &[u8],
             NGX_OK
         }
         Err(()) => {
+            // Route ENOENT / ENOTDIR through index_error so log_not_found is
+            // respected.
             if of.err == libc::ENOENT || of.err == libc::ENOTDIR {
-                ngx_log_error!(NGX_LOG_ERR, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&d));
-                return NGX_HTTP_NOT_FOUND;
+                return index_error(r, clcf, &d, of.err);
             }
             if of.err == libc::EACCES {
-                ngx_log_error!(NGX_LOG_ERR, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&d));
+                let _ = index_error(r, clcf, &d, of.err);
                 return NGX_HTTP_FORBIDDEN;
             }
             ngx_log_error!(NGX_LOG_CRIT, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&d));
