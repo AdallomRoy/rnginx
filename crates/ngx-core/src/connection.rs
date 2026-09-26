@@ -521,6 +521,11 @@ impl Connection {
                 ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "close() socket failed");
             }
         }
+        // Mirror ngx_close_connection: decrement $connections_active as soon
+        // as the socket is torn down, not when the Rust Rc<Connection> is
+        // finally dropped (stray Rcs on request tasks would otherwise inflate
+        // the gauge for the lifetime of the response).
+        stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.destroyed.set(true);
         self.log.set_context(None);
     }
