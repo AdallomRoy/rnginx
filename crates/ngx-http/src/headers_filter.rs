@@ -75,7 +75,48 @@ pub fn headers_filter_module() -> ModuleDef {
 
 fn init(_cf: &mut Conf) -> ConfResult {
     install_header_filter(|r, next| async move { headers_filter(r, next).await });
+    install_body_filter(|r, chain, next| async move { trailers_body_filter(r, chain, next).await });
     Ok(())
+}
+
+async fn trailers_body_filter(r: R, input: ngx_core::buf::Chain, next: BodyFilter) -> i64 {
+    // Match ngx_http_trailers_filter: on last_buf, evaluate each add_trailer
+    // complex value and push into r.headers_out.trailers so the chunked filter
+    // can emit them in the terminator.
+    if input.is_empty() || r.header_only.get() || !r.expect_trailers.get() {
+        return next(r, input).await;
+    }
+    let has_last = input.iter().any(|b| b.last_buf);
+    if !has_last {
+        return next(r, input).await;
+    }
+    let conf = r.loc_conf::<HeadersConf>(ctx_index());
+    let trailers = conf.borrow().trailers.clone();
+    let ts = match trailers { Some(t) if !t.is_empty() => t, _ => return next(r, input).await };
+
+    let status = r.headers_out.borrow().status;
+    let safe_status = matches!(
+        status,
+        NGX_HTTP_OK | NGX_HTTP_CREATED | NGX_HTTP_NO_CONTENT | NGX_HTTP_PARTIAL_CONTENT
+        | NGX_HTTP_MOVED_PERMANENTLY | NGX_HTTP_MOVED_TEMPORARILY | NGX_HTTP_SEE_OTHER
+        | NGX_HTTP_NOT_MODIFIED | NGX_HTTP_TEMPORARY_REDIRECT | NGX_HTTP_PERMANENT_REDIRECT
+    );
+
+    for (name, cv, always) in ts.iter() {
+        if !safe_status && !always {
+            continue;
+        }
+        let value = match crate::script::complex_value(&r, cv) {
+            Ok(v) => v,
+            Err(_) => return NGX_ERROR,
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let h = crate::request::TableElt::new(name, &value);
+        r.headers_out.borrow_mut().trailers.push(h);
+    }
+    next(r, input).await
 }
 
 async fn headers_filter(r: R, next: HeaderFilter) -> i64 {

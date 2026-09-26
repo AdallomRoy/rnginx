@@ -203,6 +203,10 @@ async fn set_accept_ranges_and_pass(r: R, next: HeaderFilter) -> i64 {
     let mut ho = r.headers_out.borrow_mut();
     if ho.accept_ranges.is_none() {
         let ar = TableElt::new(b"Accept-Ranges", b"bytes");
+        // Also push into the general headers list so $sent_http_accept_ranges
+        // can find it (C sets both r->headers_out.accept_ranges and the same
+        // ngx_list_push entry in headers_out.headers).
+        ho.headers.push(ar.clone());
         ho.accept_ranges = Some(ar);
     }
     drop(ho);
