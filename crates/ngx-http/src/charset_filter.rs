@@ -224,10 +224,21 @@ async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
             .unwrap_or(false)
     };
     if has_encoding {
+        // Skip only when we'd actually recode: source_charset set AND
+        // source != dst. If source == dst we just label the response.
         let c_cell = r.loc_conf::<CharsetLocConf>(ctx_index());
-        let has_src = !c_cell.borrow().source_charset.get().is_empty();
-        if has_src {
-            return next(r).await;
+        let src = c_cell.borrow().source_charset.get().to_ascii_lowercase();
+        if !src.is_empty() {
+            let dst_bytes = match c_cell.borrow().charset.as_option() {
+                Some(cv) => match crate::script::complex_value(&r, cv) {
+                    Ok(v) => v.to_ascii_lowercase(),
+                    Err(_) => return next(r).await,
+                },
+                None => return next(r).await,
+            };
+            if src != dst_bytes {
+                return next(r).await;
+            }
         }
     }
 

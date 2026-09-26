@@ -70,6 +70,8 @@ pub struct NgxHttpProxyLocConf {
     pub redirect_default: bool,
     /// proxy_cookie_flags entries.
     pub cookie_flags: Vec<CookieFlagsRule>,
+    /// proxy_http_version: 0 = 1.0 (default), 1 = 1.1.
+    pub http_version: Val<u32>,
 }
 
 // Cookie flag bits (matches ngx_http_proxy_module NGX_HTTP_PROXY_COOKIE_*).
@@ -174,6 +176,7 @@ impl Default for NgxHttpProxyLocConf {
             redirect_off: false,
             redirect_default: false,
             cookie_flags: Vec::new(),
+            http_version: Val::unset(),
         }
     }
 }
@@ -235,6 +238,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.cookie_flags.is_empty() {
         c.cookie_flags = p.cookie_flags.clone();
     }
+    c.http_version.merge(&p.http_version, 0);
     Ok(())
 }
 
@@ -680,12 +684,17 @@ async fn proxy_handler(r: R) -> i64 {
         }
     }
 
+    let http_version = {
+        let c = lcf.borrow();
+        *c.http_version
+    };
+    let ver_str = if http_version == 1 { "HTTP/1.1" } else { "HTTP/1.0" };
     let request = format!(
-        "{} {} HTTP/1.0\r\n\
+        "{} {} {}\r\n\
          Host: {}\r\n\
          Connection: close\r\n\
          {}{}{}\r\n",
-        method, uri_with_args, host, content_length_hdr, content_type_hdr, forward_headers
+        method, uri_with_args, ver_str, host, content_length_hdr, content_type_hdr, forward_headers
     );
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
@@ -1342,7 +1351,16 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_headers, set_flag),
         ngx_core::cmd!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_body, set_flag),
         cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
-        cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let v = match cf.args[1].as_slice() {
+                b"1.0" => 0u32,
+                b"1.1" => 1,
+                _ => return Err(msg("invalid version")),
+            };
+            cell.borrow_mut().http_version = Val::set(v);
+            Ok(())
+        }),
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_domain_handler),
         cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_path_handler),
