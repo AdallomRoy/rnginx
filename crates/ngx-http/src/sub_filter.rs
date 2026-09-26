@@ -29,6 +29,11 @@ pub struct SubLocConf {
 struct SubCtx {
     applied: u32,
     once: bool,
+    /// Trailing bytes of the last chunk that could be the prefix of a still-
+    /// pending pattern match (e.g. seeing 'z' when the pattern is 'za'). These
+    /// stay buffered across body_filter calls, waiting for the next chunk to
+    /// either complete a match or reveal that no match starts here.
+    pending: Vec<u8>,
 }
 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
@@ -117,7 +122,7 @@ async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
     // Set up context
     let once = r.loc_conf::<SubLocConf>(ctx_index()).borrow().once.get_or(false);
 
-    let ctx = SubCtx { applied: 0, once };
+    let ctx = SubCtx { applied: 0, once, pending: Vec::new() };
     r.set_ctx(ctx_index(), ctx);
 
     r.clear_content_length();
@@ -142,9 +147,10 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     }
 
     let ctx_opt = r.get_ctx::<SubCtx>(ctx_index());
-    if ctx_opt.is_none() {
-        return next(r, input).await;
-    }
+    let ctx_rc = match ctx_opt {
+        Some(c) => c,
+        None => return next(r, input).await,
+    };
 
     let conf = r.loc_conf::<SubLocConf>(ctx_index());
     let conf_ref = conf.borrow();
@@ -163,8 +169,11 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let mut last_buf_flag = false;
     let mut had_memory_buf = false;
 
-    // Collect all memory buffers and pass through non-memory buffers
-    let mut full_content = Vec::new();
+    // Collect all memory buffers and pass through non-memory buffers.
+    // Prepend any leftover partial-match buffer from the previous chunk so
+    // we can detect matches straddling chunk boundaries (e.g. "z" tail + "a"
+    // head of next chunk == "za").
+    let mut full_content = ctx_rc.borrow_mut().pending.split_off(0);
     for buf in input.iter() {
         match &buf.data {
             ngx_core::buf::BufData::Memory(v) => {
@@ -243,12 +252,52 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         processed = result;
     }
 
-    // Create output buffer(s) from processed content
-    if !processed.is_empty() {
-        let mut new_buf = Buf::from_vec(processed);
+    // Compute the largest trailing suffix of `processed` that could still
+    // be a prefix of one of our patterns. That tail is buffered until the
+    // next chunk arrives; on last_buf we flush it as-is (no more data can
+    // complete the match).
+    let tail_len = if last_buf_flag {
+        0
+    } else {
+        let mut max = 0usize;
+        for pair in pairs.iter() {
+            let m = match crate::script::complex_value(&r, &pair.match_val) {
+                Ok(b) => b.to_ascii_lowercase(),
+                Err(_) => continue,
+            };
+            if m.is_empty() { continue; }
+            // Check if any suffix of `processed` (length 1..m.len()-1) matches
+            // a prefix of `m`. Pick the longest one.
+            let start = processed.len().saturating_sub(m.len() - 1);
+            for k in start..processed.len() {
+                let suf = &processed[k..];
+                if suf.len() >= m.len() { continue; }
+                let lc: Vec<u8> = suf.iter().map(|b| b.to_ascii_lowercase()).collect();
+                if m.starts_with(&lc[..]) {
+                    let cand = processed.len() - k;
+                    if cand > max { max = cand; }
+                    break;
+                }
+            }
+        }
+        max
+    };
+    let (emit, tail) = processed.split_at(processed.len() - tail_len);
+    let emit_vec = emit.to_vec();
+    let tail_vec = tail.to_vec();
+    if !emit_vec.is_empty() {
+        let mut new_buf = Buf::from_vec(emit_vec);
         new_buf.last_buf = last_buf_flag;
         output.push_back(new_buf);
+    } else if last_buf_flag {
+        // Preserve the last_buf signal downstream even if nothing to emit.
+        let mut new_buf = Buf::from_vec(Vec::new());
+        new_buf.last_buf = true;
+        new_buf.sync = true;
+        output.push_back(new_buf);
     }
+    ctx_rc.borrow_mut().pending = tail_vec;
+    let _ = did_replace;
 
     if output.is_empty() {
         return NGX_OK;
