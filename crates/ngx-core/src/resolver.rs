@@ -146,7 +146,9 @@ impl Resolver {
     /// Parse the `resolver` directive arguments and create a new resolver.
     /// args[0] is the directive name, args[1..] are the arguments.
     pub fn create(_cf: &mut conf::Conf, args: &[Vec<u8>]) -> Result<Rc<Resolver>, conf::ConfError> {
-        if args.len() < 2 {
+        // Callers strip the directive name before invoking us, so `args`
+        // is already the pure arguments list. Require at least one.
+        if args.is_empty() {
             return Err(conf::msg("no resolver addresses specified"));
         }
 
@@ -155,7 +157,7 @@ impl Resolver {
         let mut ipv6 = true;
         let mut valid: Option<i64> = None;
 
-        for arg in &args[1..] {
+        for arg in args.iter() {
             let s = std::str::from_utf8(arg).map_err(|_| conf::msg("invalid UTF-8 in resolver argument"))?;
 
             if s.starts_with("valid=") {
