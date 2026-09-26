@@ -11,10 +11,10 @@ OUT=${OUT:-/tmp/rnginx-tests.txt}
 cd $ROOT/nginx-tests
 if [ $# -eq 0 ]; then set -- .; fi
 TEST_NGINX_BINARY=$BIN timeout 1200 prove -j $JOBS --timer --exec "timeout 60 perl" "$@" > $OUT 2>&1
-grep -E "\.t \.+ ok" $OUT | sed -E 's/^\[[^]]*\] \.\///; s/ \.+ ok.*//' | sort > /tmp/rnginx-pass.txt
+grep -aE "\.t \.+ ok" $OUT | sed -E 's/^\[[^]]*\] \.\///; s/ \.+ ok.*//' | sort > /tmp/rnginx-pass.txt
 echo "pass: $(wc -l < /tmp/rnginx-pass.txt)   C-pass: $(wc -l < $ROOT/docs/c-pass.txt)"
 if [ "$1" = "." ]; then
   echo "--- passing under C but not under Rust: $(comm -13 /tmp/rnginx-pass.txt $ROOT/docs/c-pass.txt | wc -l)"
   comm -13 /tmp/rnginx-pass.txt $ROOT/docs/c-pass.txt | tr '\n' ' '; echo
 fi
-grep -E "^(Files=|Result:)" $OUT
+grep -aE "^(Files=|Result:)" $OUT
