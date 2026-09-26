@@ -256,9 +256,16 @@ pub async fn header_filter(r: R) -> i64 {
         if r.chunked.get() {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
+        // Suppress keep-alive during graceful shutdown so this response
+        // signals to the client that no further requests should follow —
+        // matches C's ngx_http_header_filter check of ngx_terminate /
+        // ngx_exiting.
+        let terminating = ngx_core::process::SIG_TERMINATE
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || ngx_core::event::is_exiting();
         if ho.status == NGX_HTTP_SWITCHING_PROTOCOLS {
             out.extend_from_slice(b"Connection: upgrade\r\n");
-        } else if r.keepalive.get() {
+        } else if r.keepalive.get() && !terminating {
             out.extend_from_slice(b"Connection: keep-alive\r\n");
             if *cl.keepalive_header > 0 {
                 out.extend_from_slice(format!("Keep-Alive: timeout={}\r\n", *cl.keepalive_header).as_bytes());
