@@ -23,6 +23,7 @@ pub mod variables;
 pub mod script;
 pub mod header_filter;
 pub mod write_filter;
+pub mod memcached;
 pub mod special_response;
 pub mod static_module;
 pub mod index;
@@ -590,7 +591,7 @@ pub fn modules() -> Vec<ModuleDef> {
         stubs::proxy_v2_module(),
         stubs::tunnel_module(),
         stubs::perl_module(),
-        stubs::memcached_module(),
+        memcached::memcached_module(),
         empty_gif::empty_gif_module(),
         browser::browser_module(),
         secure_link::secure_link_module(),
