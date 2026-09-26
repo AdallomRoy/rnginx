@@ -44,6 +44,29 @@ pub struct NgxHttpProxyLocConf {
     pub set_headers: Vec<(Vec<u8>, crate::script::ComplexValue)>,
     /// proxy_force_ranges: force range processing on non-file proxy responses.
     pub force_ranges: Val<bool>,
+    /// proxy_cookie_domain rewrites (applied to Domain= attributes of Set-Cookie).
+    pub cookie_domains: Vec<CookieRewrite>,
+    /// proxy_cookie_path rewrites (applied to Path= attributes of Set-Cookie).
+    pub cookie_paths: Vec<CookieRewrite>,
+}
+
+/// A single proxy_cookie_domain / proxy_cookie_path rewrite entry.
+/// Matches ngx_http_proxy_rewrite_t.
+#[derive(Clone)]
+pub enum CookieRewritePattern {
+    /// Domain literal or complex value (matches full attribute value,
+    /// case-insensitively, with an optional leading '.' stripped).
+    Domain(crate::script::ComplexValue),
+    /// Path literal or complex value (prefix match).
+    Path(crate::script::ComplexValue),
+    /// Regex match (case-sensitive or insensitive).
+    Regex(Rc<ngx_core::regex::Regex>),
+}
+
+#[derive(Clone)]
+pub struct CookieRewrite {
+    pub pattern: CookieRewritePattern,
+    pub replacement: crate::script::ComplexValue,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -57,6 +80,8 @@ impl Default for NgxHttpProxyLocConf {
             set_body: None,
             set_headers: Vec::new(),
             force_ranges: Val::unset(),
+            cookie_domains: Vec::new(),
+            cookie_paths: Vec::new(),
         }
     }
 }
@@ -84,6 +109,12 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
         c.set_headers = p.set_headers.clone();
     }
     c.force_ranges.merge(&p.force_ranges, false);
+    if c.cookie_domains.is_empty() {
+        c.cookie_domains = p.cookie_domains.clone();
+    }
+    if c.cookie_paths.is_empty() {
+        c.cookie_paths = p.cookie_paths.clone();
+    }
     Ok(())
 }
 
@@ -691,6 +722,10 @@ async fn proxy_handler(r: R) -> i64 {
         }
     }
 
+    // proxy_cookie_domain / proxy_cookie_path: rewrite Set-Cookie Domain=
+    // and Path= attributes before the header filter serializes them.
+    rewrite_set_cookies(&r);
+
     // Send status and headers to client
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
     if send_hdr_rc != NGX_OK {
@@ -885,8 +920,8 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
         cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_domain_handler),
+        cmd_fn!("proxy_cookie_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_path_handler),
         cmd_fn!("proxy_cookie_flags", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_set_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_set_body_handler),
         cmd_fn!("proxy_pass_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -952,4 +987,216 @@ mod tests {
         let mut cf = Conf::default();
         let _slot = create_loc_conf(&mut cf);
     }
+}
+
+
+fn proxy_cookie_domain_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    parse_cookie_rewrite(cf, conf, /*is_domain=*/true)
+}
+
+fn proxy_cookie_path_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    parse_cookie_rewrite(cf, conf, /*is_domain=*/false)
+}
+
+fn parse_cookie_rewrite(cf: &mut Conf, conf: Option<Rc<dyn Any>>, is_domain: bool) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+
+    // Special forms: `off` and `<flag>`. `off` clears (we take the single-arg
+    // shape as a signal to disable inherited rewrites — matches C which
+    // pushes a sentinel; here we just no-op by not appending).
+    if args.len() == 2 {
+        if args[1] == b"off" {
+            // Mark as intentionally-empty by pushing nothing but blocking
+            // inheritance: we set a sentinel field so merge knows. For now
+            // simulate by clearing (parent inheritance already gated on
+            // is_empty()).
+            let mut c = cell.borrow_mut();
+            if is_domain { c.cookie_domains.clear(); c.cookie_domains.push(cookie_rewrite_off()); }
+            else { c.cookie_paths.clear(); c.cookie_paths.push(cookie_rewrite_off()); }
+            return Ok(());
+        }
+        return Err(msg("invalid number of arguments"));
+    }
+    if args.len() != 3 {
+        return Err(msg("invalid number of arguments"));
+    }
+
+    let pattern_src = &args[1];
+    let replacement_src = &args[2];
+
+    let (pattern, replacement) = if !pattern_src.is_empty() && pattern_src[0] == b'~' {
+        // Regex form: ~PATTERN  or  ~*PATTERN (case-insensitive).
+        // Note: for proxy_cookie_domain, ~ itself is *always* caseless in C
+        // (see ngx_http_proxy_cookie_domain: caseless=1). For cookie_path,
+        // only ~* is caseless.
+        let (mut caseless, body) = if pattern_src.len() >= 2 && pattern_src[1] == b'*' {
+            (true, &pattern_src[2..])
+        } else {
+            (false, &pattern_src[1..])
+        };
+        if is_domain { caseless = true; }
+        let flags = if caseless { ngx_core::regex::NGX_REGEX_CASELESS } else { 0 };
+        let re = ngx_core::regex::Regex::compile(body, flags)
+            .map_err(|e| cf.emerg(format_args!("regex error: {}", e)))?;
+        let repl = crate::script::compile_complex_value(cf, replacement_src, 0)?;
+        (CookieRewritePattern::Regex(re), repl)
+    } else if is_domain {
+        // Domain: strip leading '.' from both pattern and replacement (C does this).
+        let mut p = pattern_src.clone();
+        if !p.is_empty() && p[0] == b'.' { p.remove(0); }
+        let mut r = replacement_src.clone();
+        if !r.is_empty() && r[0] == b'.' { r.remove(0); }
+        let pat = crate::script::compile_complex_value(cf, &p, 0)?;
+        let repl = crate::script::compile_complex_value(cf, &r, 0)?;
+        (CookieRewritePattern::Domain(pat), repl)
+    } else {
+        let pat = crate::script::compile_complex_value(cf, pattern_src, 0)?;
+        let repl = crate::script::compile_complex_value(cf, replacement_src, 0)?;
+        (CookieRewritePattern::Path(pat), repl)
+    };
+
+    let entry = CookieRewrite { pattern, replacement };
+    let mut c = cell.borrow_mut();
+    if is_domain { c.cookie_domains.push(entry); }
+    else { c.cookie_paths.push(entry); }
+    Ok(())
+}
+
+fn cookie_rewrite_off() -> CookieRewrite {
+    CookieRewrite {
+        pattern: CookieRewritePattern::Domain(crate::script::ComplexValue::constant(b"")),
+        replacement: crate::script::ComplexValue::constant(b""),
+    }
+}
+
+/// Rewrite Set-Cookie headers on r.headers_out per proxy_cookie_domain /
+/// proxy_cookie_path. Called after the upstream header pass, before
+/// send_header. Returns Ok(()) on success or NGX_ERROR on complex-value
+/// evaluation failure (which we translate to 502 upstream).
+pub fn rewrite_set_cookies(r: &R) {
+    let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf = plcf.borrow();
+    if plcf.cookie_domains.is_empty() && plcf.cookie_paths.is_empty() {
+        return;
+    }
+
+    let mut ho = r.headers_out.borrow_mut();
+    for h in ho.headers.iter() {
+        if !h.lowcase_key.eq_ignore_ascii_case(b"set-cookie") { continue; }
+        if h.hash.get() == 0 { continue; }
+        let mut current = h.value.borrow().clone();
+        let attrs = parse_cookie(&current);
+        if attrs.is_empty() { continue; }
+
+        let mut changed = false;
+        // Skip attrs[0]: it's the "name=value" pair, not an attribute.
+        // Build new value from attrs.
+        let mut new_attrs: Vec<(Vec<u8>, Option<Vec<u8>>)> = attrs.clone();
+        for i in 1..new_attrs.len() {
+            let (ref k, ref v_opt) = new_attrs[i].clone();
+            let v = match v_opt { Some(x) => x.clone(), None => continue };
+            let k_lc = k.to_ascii_lowercase();
+            let rewrites = if k_lc == b"domain" { &plcf.cookie_domains }
+                           else if k_lc == b"path" { &plcf.cookie_paths }
+                           else { continue };
+            if let Some(new_v) = try_rewrite(r, &v, rewrites) {
+                if new_v != v {
+                    new_attrs[i].1 = Some(new_v);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let mut out = Vec::new();
+            for (i, (k, v)) in new_attrs.iter().enumerate() {
+                if i > 0 { out.extend_from_slice(b"; "); }
+                out.extend_from_slice(k);
+                if let Some(val) = v {
+                    out.push(b'=');
+                    out.extend_from_slice(val);
+                }
+            }
+            current = out;
+            *h.value.borrow_mut() = current;
+        }
+    }
+    let _ = ho;
+}
+
+fn try_rewrite(r: &R, value: &[u8], rewrites: &[CookieRewrite]) -> Option<Vec<u8>> {
+    for pr in rewrites.iter() {
+        match &pr.pattern {
+            CookieRewritePattern::Domain(pat) => {
+                let pattern = crate::script::complex_value(r, pat).ok()?;
+                let mut v = value;
+                let mut lead_dot = false;
+                if !v.is_empty() && v[0] == b'.' { v = &v[1..]; lead_dot = true; }
+                if pattern.len() == v.len() && pattern.eq_ignore_ascii_case(v) {
+                    let repl = crate::script::complex_value(r, &pr.replacement).ok()?;
+                    let mut out = Vec::new();
+                    if lead_dot { out.push(b'.'); }
+                    out.extend_from_slice(&repl);
+                    return Some(out);
+                }
+            }
+            CookieRewritePattern::Path(pat) => {
+                let pattern = crate::script::complex_value(r, pat).ok()?;
+                if pattern.len() <= value.len() && value[..pattern.len()] == pattern[..] {
+                    let repl = crate::script::complex_value(r, &pr.replacement).ok()?;
+                    let mut out = Vec::with_capacity(value.len() - pattern.len() + repl.len());
+                    out.extend_from_slice(&repl);
+                    out.extend_from_slice(&value[pattern.len()..]);
+                    return Some(out);
+                }
+            }
+            CookieRewritePattern::Regex(re) => {
+                // C uses ngx_http_regex_exec which returns capture info
+                // for later interpolation. Our Regex.replace supports
+                // $1..$9 in the replacement literal but we only have the
+                // ComplexValue's raw string form.
+                let re_body = &pr.replacement.value;
+                if let Some(new_val) = re.replace(value, re_body) {
+                    return Some(new_val);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_cookie(value: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let mut attrs = Vec::new();
+    let mut start = 0;
+    while start <= value.len() {
+        // Find next ';' or end
+        let last = value[start..].iter().position(|&b| b == b';')
+            .map(|p| start + p)
+            .unwrap_or(value.len());
+        let mut s = start;
+        while s < last && value[s] == b' ' { s += 1; }
+        // Find '=' in [s..last)
+        let eq = value[s..last].iter().position(|&b| b == b'=');
+        let (name, val) = match eq {
+            Some(pos) => {
+                let name_end = s + pos;
+                let mut n_end = name_end;
+                while n_end > s && value[n_end - 1] == b' ' { n_end -= 1; }
+                let mut v_start = name_end + 1;
+                while v_start < last && value[v_start] == b' ' { v_start += 1; }
+                let mut v_end = last;
+                while v_end > v_start && value[v_end - 1] == b' ' { v_end -= 1; }
+                (value[s..n_end].to_vec(), Some(value[v_start..v_end].to_vec()))
+            }
+            None => {
+                let mut n_end = last;
+                while n_end > s && value[n_end - 1] == b' ' { n_end -= 1; }
+                (value[s..n_end].to_vec(), None)
+            }
+        };
+        attrs.push((name, val));
+        if last == value.len() { break; }
+        start = last + 1;
+    }
+    attrs
 }

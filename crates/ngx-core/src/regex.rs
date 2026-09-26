@@ -82,6 +82,31 @@ impl Regex {
     pub fn is_match(&self, s: &[u8]) -> bool {
         self.re.is_match(s).unwrap_or(false)
     }
+
+    /// Match `s`, and if matched, produce the replacement string with
+    /// $1..$9 substituted by capture groups. Returns `None` when no match
+    /// (the caller keeps the original value).
+    pub fn replace(&self, s: &[u8], template: &[u8]) -> Option<Vec<u8>> {
+        let locs = self.exec(s)?;
+        let mut out = Vec::with_capacity(s.len() + template.len());
+        let mut i = 0;
+        while i < template.len() {
+            if template[i] == b'$' && i + 1 < template.len() && template[i + 1].is_ascii_digit() {
+                let idx = (template[i + 1] - b'0') as usize;
+                if idx < locs.len() {
+                    let (a, b) = locs[idx];
+                    if a >= 0 && b >= a {
+                        out.extend_from_slice(&s[a as usize..b as usize]);
+                    }
+                }
+                i += 2;
+            } else {
+                out.push(template[i]);
+                i += 1;
+            }
+        }
+        Some(out)
+    }
 }
 
 pub struct RegexConf {
