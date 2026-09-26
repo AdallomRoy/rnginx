@@ -120,10 +120,20 @@ async fn auth_basic_handler(r: R) -> i64 {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    // Get user_file path
-    let user_file_bytes = match complex_value(&r, &conf.user_file.as_ref().unwrap()) {
+    // Get user_file path. C compiles with conf_prefix=1 so relative paths get
+    // the conf prefix prepended (compile-time for static values, runtime for
+    // dynamic). Do the runtime version for both cases so `$arg_f` works.
+    let user_file_bytes_raw = match complex_value(&r, &conf.user_file.as_ref().unwrap()) {
         Ok(v) => v,
         Err(_) => return NGX_ERROR,
+    };
+    let user_file_bytes: Vec<u8> = if user_file_bytes_raw.first() == Some(&b'/') {
+        user_file_bytes_raw
+    } else {
+        let mut full = ngx_core::cycle::cycle().conf_prefix.clone();
+        if !full.ends_with(b"/") { full.push(b'/'); }
+        full.extend_from_slice(&user_file_bytes_raw);
+        full
     };
 
     // Read the htpasswd file

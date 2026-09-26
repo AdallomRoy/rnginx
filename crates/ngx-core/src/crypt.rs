@@ -95,7 +95,10 @@ fn crypt_apr1(key: &[u8], salt: &[u8]) -> Result<Vec<u8>, i32> {
             ctx.update(key);
         }
 
-        if i & 1 == 0 {
+        // Match C: `if (i & 1) update(final, 16); else update(key, keylen);`
+        // (odd → final; even → key). The FIRST update in the pair is the
+        // inverse (odd → key; even → final).
+        if i & 1 == 1 {
             ctx.update(&final_digest);
         } else {
             ctx.update(key);
@@ -344,6 +347,15 @@ mod tests {
         // The result should be deterministic
         assert!(result.starts_with(b"$apr1$salt1234$"));
         assert!(result.len() > 14); // $apr1$salt1234$ + encoded hash
+    }
+
+    #[test]
+    fn test_apr1_openssl_vector() {
+        // openssl passwd -apr1 -salt salt password
+        let key = b"password";
+        let salt = b"$apr1$salt$Xxd1irWT9ycqoYxGFn4cb.";
+        let result = crypt(key, salt).unwrap();
+        assert_eq!(&result[..], b"$apr1$salt$Xxd1irWT9ycqoYxGFn4cb." as &[u8]);
     }
 
     #[test]
