@@ -55,7 +55,31 @@ pub struct NgxHttpProxyLocConf {
     /// proxy_store: write successful upstream responses to disk.
     /// `None` = inherit; Some(ProxyStore::Off/On/Path(cv)).
     pub store: Option<ProxyStore>,
+    /// proxy_next_upstream: bitmask of conditions that trigger a retry.
+    /// See NGX_HTTP_UPSTREAM_FT_* below. `Val::unset()` means inherit.
+    pub next_upstream_mask: Val<u32>,
+    /// proxy_next_upstream_tries: 0 = no limit.
+    pub next_upstream_tries: Val<u32>,
 }
+
+// Retry condition flags (ngx_http_upstream.h NGX_HTTP_UPSTREAM_FT_*).
+pub const FT_ERROR: u32          = 0x00000002;
+pub const FT_TIMEOUT: u32        = 0x00000004;
+pub const FT_INVALID_HEADER: u32 = 0x00000008;
+pub const FT_HTTP_500: u32       = 0x00000010;
+pub const FT_HTTP_502: u32       = 0x00000020;
+pub const FT_HTTP_503: u32       = 0x00000040;
+pub const FT_HTTP_504: u32       = 0x00000080;
+pub const FT_HTTP_403: u32       = 0x00000100;
+pub const FT_HTTP_404: u32       = 0x00000200;
+pub const FT_HTTP_429: u32       = 0x00000400;
+pub const FT_UPDATING: u32       = 0x00000800;
+pub const FT_BUSY_LOCK: u32      = 0x00001000;
+pub const FT_MAX_WAITING: u32    = 0x00002000;
+pub const FT_NON_IDEMPOTENT: u32 = 0x00004000;
+pub const FT_NOLIVE: u32         = 0x40000000;
+pub const FT_OFF: u32            = 0x80000000;
+
 
 #[derive(Clone)]
 pub enum ProxyStore {
@@ -106,6 +130,8 @@ impl Default for NgxHttpProxyLocConf {
             cookie_paths: Vec::new(),
             local_bind: None,
             store: None,
+            next_upstream_mask: Val::unset(),
+            next_upstream_tries: Val::unset(),
         }
     }
 }
@@ -145,6 +171,12 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.store.is_none() {
         c.store = p.store.clone();
     }
+    // FT_ERROR | FT_TIMEOUT is the C default (see ngx_http_proxy_module.c).
+    c.next_upstream_mask.merge(&p.next_upstream_mask, FT_ERROR | FT_TIMEOUT);
+    if c.next_upstream_mask.is_set() && *c.next_upstream_mask.get() & FT_OFF != 0 {
+        c.next_upstream_mask = Val::set(0);
+    }
+    c.next_upstream_tries.merge(&p.next_upstream_tries, 0);
     Ok(())
 }
 
@@ -345,9 +377,12 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
 
+    // Name of the upstream {} block if `host` is one; used by
+    // proxy_next_upstream to iterate its peers after the initial pick
+    // overwrites `host` with a resolved peer IP.
+    let mut named_upstream_name: Option<Vec<u8>> = None;
     // If the host matches a named upstream {} block, resolve to its first
-    // (non-backup) server. TODO: proper round-robin selection; for now pick
-    // the first non-down entry.
+    // (non-backup) server.
     if let Some(up) = crate::upstream::get_upstream_by_name(&r, host.as_bytes()) {
         // Rc<Upstream> currently doesn't expose servers directly — look at
         // umcf.upstreams for the raw UpstreamConf. Skipping detail: the
@@ -355,6 +390,9 @@ async fn proxy_handler(r: R) -> i64 {
         // UpstreamMainConf's list which for us is (name, Rc<Upstream>). We
         // need to also stash the servers so we can pick. Add via a helper.
         let _ = up;
+        // Save the upstream block name so proxy_next_upstream can iterate
+        // its peers below — the pick overwrites `host` with a peer IP.
+        named_upstream_name = Some(host.as_bytes().to_vec());
         if let Some((h, p)) = crate::upstream::first_server_for(&r, host.as_bytes()) {
             host = h;
             port = p;
@@ -385,8 +423,16 @@ async fn proxy_handler(r: R) -> i64 {
     // For byte-preservation in the request line below.
     let request_uri_bytes = forwarded_uri;
 
-    // Try to connect to upstream, honoring proxy_bind if set.
-    let addr = format!("{}:{}", host, port);
+    // proxy_next_upstream state.
+    let named_upstream: Option<Vec<u8>> = named_upstream_name.clone();
+    let next_upstream_mask = conf_borrowed.next_upstream_mask.get_or(FT_ERROR | FT_TIMEOUT);
+    let next_upstream_tries = conf_borrowed.next_upstream_tries.get_or(0);
+    let mut tried_peers: Vec<(String, u16)> = Vec::new();
+    // Populate the initial peer as tried since we've already picked it.
+    if let Some(_) = &named_upstream {
+        tried_peers.push((host.clone(), port));
+    }
+
     let bind_addr: Option<std::net::SocketAddr> = match &conf_borrowed.local_bind {
         None | Some(LocalBind::Off) => None,
         Some(LocalBind::Addr(cv)) => {
@@ -395,12 +441,8 @@ async fn proxy_handler(r: R) -> i64 {
             parse_bind_addr(&s)
         }
     };
-    let mut upstream = match connect_with_optional_bind(&addr, bind_addr).await {
-        Ok(s) => s,
-        Err(_e) => {
-            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-        }
-    };
+
+
 
     // Build request line. proxy_method overrides the client method if set.
     let method_owned: Vec<u8> = if let Some(mcv) = conf_borrowed.method.clone() {
@@ -544,66 +586,107 @@ async fn proxy_handler(r: R) -> i64 {
         method, uri_with_args, host, content_length_hdr, content_type_hdr, forward_headers
     );
 
-    // Send request + body in one write so a fast upstream that reads once and
-    // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
-    let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
-    wire.extend_from_slice(request.as_bytes());
-    if !body_bytes.is_empty() {
-        wire.extend_from_slice(&body_bytes);
-    }
-    if let Err(_) = upstream.write_all(&wire).await {
-        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-    }
-
-    // Track bytes sent (request line + headers + body).
-    let bytes_sent_to_upstream = wire.len() as i64;
-
-    // Read entire response
-    let mut response = Vec::new();
-    if let Err(_) = upstream.read_to_end(&mut response).await {
-        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-    }
-
-    if response.is_empty() {
-        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-    }
-    let bytes_received_from_upstream = response.len() as i64;
-
-    // Parse status line
-    // Pick the earliest header/body separator. \r\n\r\n and \n\n can both occur;
-    // if the upstream uses \n line endings but the body is chunked, a stray
-    // "0\r\n\r\n" later in the response fools a pure \r\n\r\n search into
-    // treating the trailer as the header terminator.
-    let sep_crlf = response.windows(4).position(|w| w == b"\r\n\r\n");
-    let sep_lf = response.windows(2).position(|w| w == b"\n\n");
-    let (status_line_end, body_start) = match (sep_crlf, sep_lf) {
-        (Some(a), Some(b)) if a <= b => (a, a + 4),
-        (Some(_), Some(b)) => (b, b + 2),
-        (Some(a), None) => (a, a + 4),
-        (None, Some(b)) => (b, b + 2),
-        (None, None) => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
-    };
-
-    let headers_section = &response[..status_line_end];
-
-    // Parse status line
-    let status_line_end_nl = match headers_section.iter().position(|&b| b == b'\n') {
-        Some(pos) => pos,
-        None => {
+    // proxy_next_upstream retry loop: on connect error / matching HTTP status,
+    // rotate to the next non-tried peer of the named upstream and reconnect.
+    let mut upstream: tokio::net::TcpStream;
+    let mut addr: String;
+    let mut response: Vec<u8>;
+    let mut status: i64;
+    let mut status_line_end: usize;
+    let mut body_start: usize;
+    let mut bytes_received_from_upstream: i64;
+    let mut bytes_sent_to_upstream: i64;
+    'retry: loop {
+        addr = format!("{}:{}", host, port);
+        upstream = match connect_with_optional_bind(&addr, bind_addr).await {
+            Ok(s) => s,
+            Err(_e) => {
+                if next_upstream_mask & FT_ERROR != 0 {
+                    if let Some(name) = &named_upstream {
+                        if next_upstream_tries == 0 || (tried_peers.len() as u32) < next_upstream_tries {
+                            if let Some((h, p)) = crate::upstream::next_server_for(&r, name, &tried_peers) {
+                                host = h; port = p;
+                                tried_peers.push((host.clone(), port));
+                                continue 'retry;
+                            }
+                        }
+                    }
+                }
+                return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+            }
+        };
+        // Send request + body in one write so a fast upstream that reads once and
+        // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
+        let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
+        wire.extend_from_slice(request.as_bytes());
+        if !body_bytes.is_empty() {
+            wire.extend_from_slice(&body_bytes);
+        }
+        if let Err(_) = upstream.write_all(&wire).await {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
-    };
+        bytes_sent_to_upstream = wire.len() as i64;
 
-    let status_line = &headers_section[..status_line_end_nl];
-    let status_line_str = std::str::from_utf8(status_line).unwrap_or("HTTP/1.0 500 Internal Server Error");
+        response = Vec::new();
+        if let Err(_) = upstream.read_to_end(&mut response).await {
+            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+        }
+        if response.is_empty() {
+            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+        }
+        bytes_received_from_upstream = response.len() as i64;
 
-    // Parse "HTTP/1.x NNN Reason"
-    let parts: Vec<&str> = status_line_str.split_whitespace().collect();
-    let status: i64 = if parts.len() >= 2 {
-        parts[1].parse().unwrap_or(502)
-    } else {
-        502
-    };
+        // Parse status line. Pick the earliest header/body separator.
+        let sep_crlf = response.windows(4).position(|w| w == b"\r\n\r\n");
+        let sep_lf = response.windows(2).position(|w| w == b"\n\n");
+        let (sle, bs) = match (sep_crlf, sep_lf) {
+            (Some(a), Some(b)) if a <= b => (a, a + 4),
+            (Some(_), Some(b)) => (b, b + 2),
+            (Some(a), None) => (a, a + 4),
+            (None, Some(b)) => (b, b + 2),
+            (None, None) => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
+        };
+        status_line_end = sle;
+        body_start = bs;
+        let headers_section_local = &response[..status_line_end];
+        let status_line_end_nl = match headers_section_local.iter().position(|&b| b == b'\n') {
+            Some(pos) => pos,
+            None => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
+        };
+        let status_line = &headers_section_local[..status_line_end_nl];
+        let status_line_str = std::str::from_utf8(status_line).unwrap_or("HTTP/1.0 500 Internal Server Error");
+        let parts: Vec<&str> = status_line_str.split_whitespace().collect();
+        status = if parts.len() >= 2 { parts[1].parse().unwrap_or(502) } else { 502 };
+
+        // proxy_next_upstream: if this status matches, hop to the next peer
+        // of the named upstream (if any). Only meaningful for named upstreams;
+        // implicit upstreams have exactly one peer.
+        let matches_ft = match status {
+            500 => next_upstream_mask & FT_HTTP_500 != 0,
+            502 => next_upstream_mask & FT_HTTP_502 != 0,
+            503 => next_upstream_mask & FT_HTTP_503 != 0,
+            504 => next_upstream_mask & FT_HTTP_504 != 0,
+            403 => next_upstream_mask & FT_HTTP_403 != 0,
+            404 => next_upstream_mask & FT_HTTP_404 != 0,
+            429 => next_upstream_mask & FT_HTTP_429 != 0,
+            _ => false,
+        };
+        if matches_ft {
+            if let Some(name) = &named_upstream {
+                if next_upstream_tries == 0 || (tried_peers.len() as u32) < next_upstream_tries {
+                    if let Some((h, p)) = crate::upstream::next_server_for(&r, name, &tried_peers) {
+                        host = h; port = p;
+                        tried_peers.push((host.clone(), port));
+                        continue 'retry;
+                    }
+                }
+            }
+        }
+        break 'retry;
+    }
+    let headers_section = &response[..status_line_end];
+    let status_line_end_nl = headers_section.iter().position(|&b| b == b'\n').unwrap_or(headers_section.len());
+    let _ = status_line_end_nl;
 
     // Fresh upstream request: any $upstream_http_* headers left over from a
     // previous proxy round (e.g. X-Accel-Redirect that triggered this one)
@@ -1034,8 +1117,8 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_buffers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_busy_buffers_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_max_temp_file_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_next_upstream", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_next_upstream_tries", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_next_upstream", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, proxy_next_upstream_handler),
+        cmd_fn!("proxy_next_upstream_tries", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_next_upstream_tries_handler),
         cmd_fn!("proxy_next_upstream_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         ngx_core::cmd!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_headers, set_flag),
         ngx_core::cmd!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_body, set_flag),
@@ -1428,3 +1511,39 @@ fn maybe_store_body(r: &R, body: &[u8]) {
     let _ = std::fs::rename(tmp_os, os);
 }
 
+
+fn proxy_next_upstream_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut mask = 0u32;
+    for arg in cf.args.iter().skip(1) {
+        let v = arg.as_slice();
+        let bit = match v {
+            b"off"            => { mask = FT_OFF; break; }
+            b"error"          => FT_ERROR,
+            b"timeout"        => FT_TIMEOUT,
+            b"invalid_header" => FT_INVALID_HEADER,
+            b"http_500"       => FT_HTTP_500,
+            b"http_502"       => FT_HTTP_502,
+            b"http_503"       => FT_HTTP_503,
+            b"http_504"       => FT_HTTP_504,
+            b"http_403"       => FT_HTTP_403,
+            b"http_404"       => FT_HTTP_404,
+            b"http_429"       => FT_HTTP_429,
+            b"updating"       => FT_UPDATING,
+            b"non_idempotent" => FT_NON_IDEMPOTENT,
+            _ => return Err(cf.emerg(format_args!("invalid value \"{}\"", ngx_core::string::B(v)))),
+        };
+        mask |= bit;
+    }
+    cell.borrow_mut().next_upstream_mask = Val::set(mask);
+    Ok(())
+}
+
+fn proxy_next_upstream_tries_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let n = std::str::from_utf8(&cf.args[1]).ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| msg("invalid number"))?;
+    cell.borrow_mut().next_upstream_tries = Val::set(n);
+    Ok(())
+}

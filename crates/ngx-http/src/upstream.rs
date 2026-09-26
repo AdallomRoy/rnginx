@@ -403,6 +403,52 @@ pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     None
 }
 
+/// Pick the next best peer from the named upstream that isn't in `tried`.
+/// Used by proxy_next_upstream to iterate servers on retryable failures.
+/// Returns None once every non-down peer has been attempted.
+pub fn next_server_for(r: &R, name: &[u8], tried: &[(String, u16)]) -> Option<(String, u16)> {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    for (n, cell) in m.server_lists.iter() {
+        if n.as_slice() != name { continue; }
+        let mut g = cell.borrow_mut();
+        if let Some(pick) = pick_wrr_excluding(&mut g.peers, tried) {
+            return Some(pick);
+        }
+        if let Some(pick) = pick_wrr_excluding(&mut g.backup, tried) {
+            return Some(pick);
+        }
+        return None;
+    }
+    None
+}
+
+fn pick_wrr_excluding(peers: &mut [PeerState], tried: &[(String, u16)]) -> Option<(String, u16)> {
+    let mut total: i32 = 0;
+    let mut best_idx: Option<usize> = None;
+    let mut best_cw: i32 = i32::MIN;
+    for (i, p) in peers.iter_mut().enumerate() {
+        if p.server.down { continue; }
+        let host = String::from_utf8_lossy(&p.server.addr).to_string();
+        if tried.iter().any(|(h, port)| h == &host && *port == p.server.port) {
+            continue;
+        }
+        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
+        total = total.saturating_add(p.effective_weight);
+        if p.effective_weight < p.weight {
+            p.effective_weight += 1;
+        }
+        if p.current_weight > best_cw {
+            best_cw = p.current_weight;
+            best_idx = Some(i);
+        }
+    }
+    let idx = best_idx?;
+    peers[idx].current_weight -= total;
+    let s = &peers[idx].server;
+    Some((String::from_utf8_lossy(&s.addr).into_owned(), s.port))
+}
+
 fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {
     let mut total: i32 = 0;
     let mut best_idx: Option<usize> = None;
