@@ -202,54 +202,49 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         return NGX_OK;
     }
 
-    // Apply replacements
-    let mut processed = full_content;
+    // Compile all patterns / replacements up-front so we can walk the
+    // buffer left-to-right and pick the LONGEST match at each position
+    // (matches ngx_http_sub_filter_module: single pass, all patterns tried
+    // together, longest wins).
+    let compiled: Vec<(Vec<u8>, Vec<u8>)> = pairs
+        .iter()
+        .filter_map(|p| {
+            let m = crate::script::complex_value(&r, &p.match_val).ok()?;
+            let repl = crate::script::complex_value(&r, &p.replacement_val).ok()?;
+            if m.is_empty() { return None; }
+            Some((m.to_ascii_lowercase(), repl))
+        })
+        .collect();
+
+    // Per-pattern "already replaced" tracking for once=on (C's behavior: each
+    // pattern replaces at most once, independently, not the whole filter).
+    let mut used: Vec<bool> = vec![false; compiled.len()];
+    let mut processed = Vec::with_capacity(full_content.len());
     let mut did_replace = false;
-
-    for pair in pairs.iter() {
-        if once && did_replace {
-            break;
-        }
-
-        // Evaluate match pattern
-        let match_bytes = match crate::script::complex_value(&r, &pair.match_val) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-
-        // Evaluate replacement
-        let replacement = match crate::script::complex_value(&r, &pair.replacement_val) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-
-        // Lowercase the match bytes (following C behavior)
-        let match_lower = match_bytes.to_ascii_lowercase();
-
-        // Replace: compare lowercase against lowercased match
-        let mut result = Vec::new();
-        let mut pos = 0;
-
-        while pos < processed.len() {
-            if pos + match_lower.len() <= processed.len() {
-                let slice_lower = processed[pos..pos + match_lower.len()].to_ascii_lowercase();
-                if slice_lower == match_lower {
-                    result.extend_from_slice(&replacement);
-                    pos += match_lower.len();
-                    did_replace = true;
-
-                    // If once, stop after first replacement
-                    if once {
-                        result.extend_from_slice(&processed[pos..]);
-                        break;
-                    }
-                    continue;
+    let mut pos = 0;
+    while pos < full_content.len() {
+        // Try each pattern; pick the longest matching one (skip used ones
+        // in once mode).
+        let mut best: Option<(usize, usize)> = None; // (mlen, pair_idx)
+        for (i, (m, _repl)) in compiled.iter().enumerate() {
+            if once && used[i] { continue; }
+            if pos + m.len() > full_content.len() { continue; }
+            let slice = &full_content[pos..pos + m.len()];
+            if slice.to_ascii_lowercase() == *m {
+                if best.map_or(true, |(len, _)| m.len() > len) {
+                    best = Some((m.len(), i));
                 }
             }
-            result.push(processed[pos]);
+        }
+        if let Some((mlen, i)) = best {
+            processed.extend_from_slice(&compiled[i].1);
+            pos += mlen;
+            did_replace = true;
+            if once { used[i] = true; }
+        } else {
+            processed.push(full_content[pos]);
             pos += 1;
         }
-        processed = result;
     }
 
     // Compute the largest trailing suffix of `processed` that could still
