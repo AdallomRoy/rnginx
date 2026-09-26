@@ -1045,11 +1045,17 @@ async fn proxy_handler(r: R) -> i64 {
         status_line_end = sle;
         body_start = bs;
         let headers_section_local = &response[..status_line_end];
-        let status_line_end_nl = match headers_section_local.iter().position(|&b| b == b'\n') {
-            Some(pos) => pos,
-            None => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
-        };
+        // Status line ends at the first \n. When the response has zero headers
+        // (`HTTP/1.0 200 OK\r\n\r\n`) status_line_end sits at the start of that
+        // trailing CRLF pair, so headers_section_local is exactly the status
+        // line with no LF in it — fall back to the full header separator index
+        // rather than 502ing on a syntactically valid empty-header response.
+        let status_line_end_nl = headers_section_local
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(headers_section_local.len());
         let status_line = &headers_section_local[..status_line_end_nl];
+        let status_line = if status_line.last() == Some(&b'\r') { &status_line[..status_line.len()-1] } else { status_line };
         let status_line_str = std::str::from_utf8(status_line).unwrap_or("HTTP/1.0 500 Internal Server Error");
         let parts: Vec<&str> = status_line_str.split_whitespace().collect();
         status = if parts.len() >= 2 { parts[1].parse().unwrap_or(502) } else { 502 };
