@@ -459,6 +459,9 @@ async fn proxy_handler(r: R) -> i64 {
         return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
     }
 
+    // Track bytes sent (request line + headers + body).
+    let bytes_sent_to_upstream = wire.len() as i64;
+
     // Read entire response
     let mut response = Vec::new();
     if let Err(_) = upstream.read_to_end(&mut response).await {
@@ -468,6 +471,7 @@ async fn proxy_handler(r: R) -> i64 {
     if response.is_empty() {
         return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
     }
+    let bytes_received_from_upstream = response.len() as i64;
 
     // Parse status line
     // Pick the earliest header/body separator. \r\n\r\n and \n\n can both occur;
@@ -618,6 +622,22 @@ async fn proxy_handler(r: R) -> i64 {
     // addition_filter / sub_filter / gzip clear ho.content_length_n during
     // their header pass.
     let upstream_content_length = r.headers_out.borrow().content_length_n;
+
+    // Record an upstream state so $upstream_status, $upstream_response_length,
+    // $upstream_bytes_received, $upstream_bytes_sent, and $upstream_addr are
+    // populated. C fills u->state inside ngx_http_upstream_finalize_request.
+    {
+        let body_len_actual = (bytes_received_from_upstream - body_start as i64).max(0);
+        let state = crate::request::UpstreamState {
+            status,
+            response_length: body_len_actual,
+            bytes_received: bytes_received_from_upstream,
+            bytes_sent: bytes_sent_to_upstream,
+            peer: format!("{}", addr).into_bytes(),
+            ..Default::default()
+        };
+        r.upstream_states.borrow_mut().push(state);
+    }
 
     // Proxied responses (uncacheable) must skip the not_modified filter —
     // the backend is responsible for handling If-Modified-Since / If-None-Match.

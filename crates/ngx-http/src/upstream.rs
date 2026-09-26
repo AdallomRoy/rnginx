@@ -365,16 +365,38 @@ fn resolver_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn 
 // VARIABLE GETTERS
 // ============================================================================
 
-fn upstream_addr_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return upstream server addresses
-    // Format: comma-separated list of addrs
-    v.not_found = true; NGX_OK
+fn upstream_addr_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    // Comma-separated peer addresses per try. Empty peer means the try wasn't
+    // dispatched (matches C which emits "-" in that case).
+    let states = r.upstream_states.borrow();
+    if states.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
+        if s.peer.is_empty() { b"-".to_vec() } else { s.peer.clone() }
+    }).collect();
+    v.data = parts.join(&b", "[..]);
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+    NGX_OK
 }
 
-fn upstream_status_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // TODO: Return upstream response status codes
-    // Format: comma-separated list of HTTP status codes (one per try)
-    v.not_found = true; NGX_OK
+fn upstream_status_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let states = r.upstream_states.borrow();
+    if states.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
+        if s.status == 0 { b"-".to_vec() } else { s.status.to_string().into_bytes() }
+    }).collect();
+    v.data = parts.join(&b", "[..]);
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+    NGX_OK
 }
 
 fn upstream_connect_time_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
@@ -392,11 +414,17 @@ fn upstream_response_time_variable(_r: &R, v: &mut crate::request::VariableValue
     v.not_found = true; NGX_OK
 }
 
-fn upstream_zero_variable(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // Placeholder for upstream_response_length / upstream_bytes_received /
-    // upstream_bytes_sent until we track them properly. Report 0 rather than
-    // not_found so log lines don't emit "cycle while evaluating variable" alerts.
-    v.data = b"0".to_vec();
+fn upstream_zero_variable(r: &R, v: &mut crate::request::VariableValue, data: usize) -> i64 {
+    // Aggregate the requested counter across all upstream states. `data`
+    // selects the field: 0=response_length, 1=bytes_received, 2=bytes_sent.
+    let states = r.upstream_states.borrow();
+    let sum: i64 = states.iter().map(|s| match data {
+        0 => s.response_length,
+        1 => s.bytes_received,
+        2 => s.bytes_sent,
+        _ => 0,
+    }).sum();
+    v.data = sum.to_string().into_bytes();
     v.valid = true;
     v.no_cacheable = false;
     v.not_found = false;
@@ -449,21 +477,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             name: "upstream_response_length",
             get: Some(upstream_zero_variable),
             set: None,
-            data: 0,
+            data: 0, // response body length
             flags: 0,
         },
         VarDef {
             name: "upstream_bytes_received",
             get: Some(upstream_zero_variable),
             set: None,
-            data: 0,
+            data: 1, // total bytes received from upstream
             flags: 0,
         },
         VarDef {
             name: "upstream_bytes_sent",
             get: Some(upstream_zero_variable),
             set: None,
-            data: 0,
+            data: 2, // total bytes sent to upstream
             flags: 0,
         },
     ];
