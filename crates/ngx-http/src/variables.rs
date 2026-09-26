@@ -704,6 +704,31 @@ fn var_request_id(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     NGX_OK
 }
 
+fn var_request_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    // C's ngx_http_variable_request_port: numeric port parsed from the
+    // Host header. When Host had no `:port`, the port stays 0 and the
+    // variable emits nothing.
+    let p = r.port.get();
+    if p == 0 {
+        v.data = Vec::new();
+        v.valid = true;
+        return NGX_OK;
+    }
+    set_str(v, p.to_string().as_bytes());
+    NGX_OK
+}
+
+fn var_is_request_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    // Emits `:` when a port is present so `$is_request_port$request_port`
+    // renders as `:8080` when needed and empty otherwise.
+    if r.port.get() == 0 {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    set_str(v, b":");
+    NGX_OK
+}
+
 fn var_status(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let status = if r.err_status.get() != 0 {
         r.err_status.get()
@@ -1085,6 +1110,8 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "request_length", set: None, get: Some(var_request_length), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "request_time", set: None, get: Some(var_request_time), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "request_id", set: None, get: Some(var_request_id), data: 0, flags: 0 },
+    VarDef { name: "request_port", set: None, get: Some(var_request_port), data: 0, flags: 0 },
+    VarDef { name: "is_request_port", set: None, get: Some(var_is_request_port), data: 0, flags: 0 },
     VarDef { name: "status", set: None, get: Some(var_status), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "sent_http_", set: None, get: Some(var_sent_http_prefix), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX },
     VarDef { name: "sent_trailer_", set: None, get: Some(var_sent_trailer_prefix), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX },
