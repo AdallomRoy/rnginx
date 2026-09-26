@@ -357,10 +357,19 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
         return Ok(());
     }
 
-    // Handle escaped keys like "\include" -> key is literally "include" (with backslash stripped by parser)
-    // The key is already unescaped by nginx parser, so just add it as a regular entry
+    // Handle escaped keys: nginx's tokenizer preserves a leading '\' when it
+    // introduces an otherwise-magic word (`\include`, `\default`, ...), which
+    // is how the user tells map "no, this is a literal key, not a directive".
+    // In our config parser the '\' also survives, so strip it here to match
+    // ngx_http_map_module.c's effective behavior of storing just the tail.
+    let key: Vec<u8> = if key.len() >= 2 && key[0] == b'\\' {
+        key[1..].to_vec()
+    } else {
+        key.clone()
+    };
+    let key_ref = key.as_slice();
 
-    if !key.is_empty() && key[0] == b'~' {
+    if !key_ref.is_empty() && key_ref[0] == b'~' {
         let is_case_sensitive = key.len() < 2 || key[1] != b'*';
         let pattern_start = if is_case_sensitive { 1 } else { 2 };
         let pattern = &key[pattern_start..];
