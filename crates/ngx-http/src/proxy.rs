@@ -42,6 +42,8 @@ pub struct NgxHttpProxyLocConf {
     /// header. Overrides same-name client headers. Matches C's list-of-entries
     /// semantic though we keep it simple (no upstream defaults inheritance).
     pub set_headers: Vec<(Vec<u8>, crate::script::ComplexValue)>,
+    /// proxy_force_ranges: force range processing on non-file proxy responses.
+    pub force_ranges: Val<bool>,
 }
 
 impl Default for NgxHttpProxyLocConf {
@@ -54,6 +56,7 @@ impl Default for NgxHttpProxyLocConf {
             pass_request_body: Val::unset(),
             set_body: None,
             set_headers: Vec::new(),
+            force_ranges: Val::unset(),
         }
     }
 }
@@ -80,6 +83,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.set_headers.is_empty() {
         c.set_headers = p.set_headers.clone();
     }
+    c.force_ranges.merge(&p.force_ranges, false);
     Ok(())
 }
 
@@ -616,6 +620,17 @@ async fn proxy_handler(r: R) -> i64 {
     // C sets this to `!u->cacheable` in ngx_http_upstream_send_response.
     r.disable_not_modified.set(true);
 
+    // proxy_force_ranges: opt in to server-side range processing even though
+    // the upstream response isn't file-backed. Matches C's `u->conf->force_ranges`
+    // setting `r->allow_ranges = 1; r->single_range = 1;`.
+    {
+        let lcf_fr = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        if lcf_fr.borrow().force_ranges.get_or(false) {
+            r.allow_ranges.set(true);
+            r.single_range.set(true);
+        }
+    }
+
     // proxy_intercept_errors: hand off to error_page instead of forwarding the
     // upstream body — but only if the location actually has an error_page
     // configured for this status. Matches ngx_http_upstream_intercept_errors.
@@ -826,7 +841,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_store_access", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_limit_rate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
         cmd_fn!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
