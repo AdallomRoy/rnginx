@@ -205,6 +205,19 @@ async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     r.clear_content_length();
     // Weaken ETag
     crate::core_rt::weak_etag(&r);
+    // Clear Accept-Ranges: gzipped bodies aren't byte-range-friendly. C nulls
+    // r->headers_out.accept_ranges; we also drop any upstream-supplied
+    // Accept-Ranges from the generic headers list.
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        ho.accept_ranges = None;
+        for h in ho.headers.iter() {
+            if h.lowcase_key.eq_ignore_ascii_case(b"accept-ranges") {
+                h.hash.set(0);
+            }
+        }
+    }
+    r.allow_ranges.set(false);
     if vary {
         add_vary(&r);
     }
