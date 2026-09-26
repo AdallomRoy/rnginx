@@ -132,7 +132,13 @@ async fn handler(r: R) -> i64 {
             None => return NGX_DECLINED,
         };
         let s = std::str::from_utf8(&uri).unwrap_or("").to_string();
-        let (h, p) = if let Some(colon) = s.rfind(':') {
+        // First try to resolve as a named upstream {} block. That path picks
+        // the first server via smooth WRR — same as ngx_http_memcached_module
+        // going through ngx_http_upstream's ngx_http_upstream_init.
+        let (h, p) = if crate::upstream::get_upstream_by_name(&r, s.as_bytes()).is_some() {
+            crate::upstream::first_server_for(&r, s.as_bytes())
+                .unwrap_or((s.clone(), 11211))
+        } else if let Some(colon) = s.rfind(':') {
             let host = &s[..colon];
             let port = s[colon+1..].parse::<u16>().unwrap_or(11211);
             (host.to_string(), port)
