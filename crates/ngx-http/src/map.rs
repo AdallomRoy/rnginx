@@ -275,7 +275,7 @@ fn map_include_file(cf: &mut Conf, filename: &[u8], ctx: &MapCtx) -> ConfResult 
         let value_bytes = value_str.as_bytes();
 
         // Parse the value (can be a variable or static string)
-        let value = if value_bytes.first() == Some(&b'$') {
+        let value = if value_bytes.contains(&b'$') {
             MapEntry::Complex(crate::script::compile_complex_value(cf, value_bytes, 0)?)
         } else {
             MapEntry::Static(value_bytes.to_vec())
@@ -346,7 +346,7 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
         // If file doesn't exist, fall through to treat as literal key
     }
 
-    let value = if value_str.first() == Some(&b'$') {
+    let value = if value_str.contains(&b'$') {
         MapEntry::Complex(crate::script::compile_complex_value(cf, value_str, 0)?)
     } else {
         MapEntry::Static(value_str.clone())
