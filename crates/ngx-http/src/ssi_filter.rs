@@ -68,6 +68,17 @@ pub struct SsiCtx {
     pub timefmt: Vec<u8>,
     pub errmsg: Vec<u8>,
     pub pending_include: Option<(Vec<u8>, Option<Vec<u8>>)>, // (path, args)
+    /// Stack of nested `#if` blocks. Each entry tracks (currently skipping
+    /// this branch, some branch has matched so any following elif/else
+    /// should be skipped). Matches ngx_http_ssi_ctx_t->conditional /
+    /// output_chosen.
+    pub if_stack: Vec<SsiIfFrame>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SsiIfFrame {
+    pub skipping: bool,
+    pub chosen: bool,
 }
 
 impl Default for SsiCtx {
@@ -84,8 +95,87 @@ impl Default for SsiCtx {
             timefmt: b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec(),
             errmsg: SSI_ERROR_MSG.to_vec(),
             pending_include: None,
+            if_stack: Vec::new(),
         }
     }
+}
+
+fn ssi_currently_skipping(ctx: &SsiCtx) -> bool {
+    ctx.if_stack.iter().any(|f| f.skipping)
+}
+
+/// Evaluate an SSI `<!--#if expr="…" -->` condition.
+///
+/// Supported forms (matching what ngx_http_ssi_evaluate_string plus
+/// ngx_http_ssi_expression parse):
+///  - `$var`  ⇒ true when non-empty and not "0"
+///  - `text`  ⇒ true when non-empty and not "0"
+///  - `a = b` / `a != b`
+///  - `a = /regex/` / `a != /regex/` (literal regex, case-sensitive; a
+///    trailing `i` — `/pat/i` — makes it caseless, matching C)
+fn ssi_eval_condition(expr: &[u8], ctx: &SsiCtx, r: &R) -> bool {
+    let s = ssi_eval_string(expr, ctx, r);
+    let trimmed = trim_bytes(&s);
+    // Split on = / != if present.
+    // Walk to find operator outside a `/…/` regex.
+    let mut in_re = false;
+    let mut op_pos: Option<(usize, bool)> = None; // (index, is_ne)
+    for i in 0..trimmed.len() {
+        let b = trimmed[i];
+        if b == b'/' { in_re = !in_re; continue; }
+        if in_re { continue; }
+        if b == b'!' && i + 1 < trimmed.len() && trimmed[i+1] == b'=' {
+            op_pos = Some((i, true));
+            break;
+        }
+        if b == b'=' {
+            op_pos = Some((i, false));
+            break;
+        }
+    }
+    match op_pos {
+        None => {
+            // truthy check
+            !trimmed.is_empty() && trimmed != b"0"
+        }
+        Some((pos, is_ne)) => {
+            let lhs = trim_bytes(&trimmed[..pos]);
+            let rhs_start = if is_ne { pos + 2 } else { pos + 1 };
+            let rhs = trim_bytes(&trimmed[rhs_start..]);
+            let matched = if rhs.starts_with(b"/") {
+                // regex literal: /pat/ or /pat/i
+                let mut end = rhs.len();
+                let mut caseless = false;
+                if end > 1 && rhs[end - 1] == b'i' && rhs[end - 2] == b'/' {
+                    caseless = true;
+                    end -= 1;
+                }
+                if end < 2 || rhs[end - 1] != b'/' {
+                    false
+                } else {
+                    let pat = &rhs[1..end - 1];
+                    let pat_str = if caseless {
+                        format!("(?i){}", String::from_utf8_lossy(pat))
+                    } else {
+                        String::from_utf8_lossy(pat).into_owned()
+                    };
+                    match ngx_core::regex::Regex::compile(pat_str.as_bytes(), 0) {
+                        Ok(re) => re.exec(lhs).is_some(),
+                        Err(_) => false,
+                    }
+                }
+            } else {
+                lhs == rhs
+            };
+            if is_ne { !matched } else { matched }
+        }
+    }
+}
+
+fn trim_bytes(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|p| p + 1).unwrap_or(0);
+    if start >= end { &[] } else { &s[start..end] }
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> { make_slot(SsiMainConf) }
@@ -181,7 +271,11 @@ fn format_date_from_ctx(r: &R, v: &mut VariableValue, gmt: bool) -> i64 {
     // Match ngx_http_ssi_date_gmt_local_variable: read timefmt from the SSI
     // context if present, otherwise fall back to the module default.
     let timefmt: Vec<u8> = match r.get_ctx::<SsiCtx>(ctx_index()) {
-        Some(ctx) => ctx.borrow().timefmt.clone(),
+        // SSI evaluates $date_gmt from inside `#set value="$date_gmt"`,
+        // which runs with ctx.borrow_mut() held. Use try_borrow to fall
+        // through to the default rather than panic.
+        Some(ctx) => ctx.try_borrow().map(|b| b.timefmt.clone())
+            .unwrap_or_else(|_| b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec()),
         None => b"%A, %d-%b-%Y %H:%M:%S %Z".to_vec(),
     };
     v.valid = true;
@@ -381,7 +475,7 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
                     ctx.looked = 1;
                     ctx.state = SsiState::Tag;
                 } else {
-                    out.push(data[i]);
+                    if !ssi_currently_skipping(ctx) { out.push(data[i]); }
                 }
                 i += 1;
             }
@@ -390,10 +484,10 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
                     ctx.looked = 2;
                     ctx.state = SsiState::Comment0;
                 } else if data[i] == b'<' {
-                    out.extend_from_slice(&data[tag_start..i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..i]); }
                     tag_start = i;
                 } else {
-                    out.extend_from_slice(&data[tag_start..=i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..=i]); }
                     ctx.state = SsiState::Start;
                 }
                 i += 1;
@@ -403,11 +497,11 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
                     ctx.looked = 3;
                     ctx.state = SsiState::Comment1;
                 } else if data[i] == b'<' {
-                    out.extend_from_slice(&data[tag_start..i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..i]); }
                     tag_start = i;
                     ctx.state = SsiState::Tag;
                 } else {
-                    out.extend_from_slice(&data[tag_start..=i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..=i]); }
                     ctx.state = SsiState::Start;
                 }
                 i += 1;
@@ -417,11 +511,11 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
                     ctx.looked = 4;
                     ctx.state = SsiState::Sharp;
                 } else if data[i] == b'<' {
-                    out.extend_from_slice(&data[tag_start..i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..i]); }
                     tag_start = i;
                     ctx.state = SsiState::Tag;
                 } else {
-                    out.extend_from_slice(&data[tag_start..=i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..=i]); }
                     ctx.state = SsiState::Start;
                 }
                 i += 1;
@@ -434,11 +528,11 @@ fn process_ssi(data: &[u8], ctx: &mut SsiCtx, r: &R) -> (Vec<u8>, usize, bool) {
                     ctx.param_value.clear();
                     ctx.state = SsiState::PreCommand;
                 } else if data[i] == b'<' {
-                    out.extend_from_slice(&data[tag_start..i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..i]); }
                     tag_start = i;
                     ctx.state = SsiState::Tag;
                 } else {
-                    out.extend_from_slice(&data[tag_start..=i]);
+                    if !ssi_currently_skipping(ctx) { out.extend_from_slice(&data[tag_start..=i]); }
                     ctx.state = SsiState::Start;
                 }
                 i += 1;
@@ -557,6 +651,14 @@ fn ssi_get_variable(var_name: &[u8], ctx: &SsiCtx, r: &R) -> Option<Vec<u8>> {
         return Some(val.clone());
     }
 
+    // Handle SSI built-ins that need the ctx timefmt directly. We can't
+    // go through the variable system for these because that indirects
+    // through r.get_ctx::<SsiCtx>().borrow(), and the caller holds the
+    // ctx borrow already.
+    if var_name == b"date_gmt" || var_name == b"date_local" {
+        return Some(format_ssi_date(&ctx.timefmt, var_name == b"date_gmt"));
+    }
+
     // Try to get from nginx variable system (handles arg_*, etc.)
     if let Some(vv) = get_variable(r, var_name) {
         if !vv.not_found {
@@ -565,6 +667,19 @@ fn ssi_get_variable(var_name: &[u8], ctx: &SsiCtx, r: &R) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+fn format_ssi_date(timefmt: &[u8], gmt: bool) -> Vec<u8> {
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let tt: libc::time_t = times::time() as libc::time_t;
+        if gmt { libc::gmtime_r(&tt, &mut tm); } else { libc::localtime_r(&tt, &mut tm); }
+        let mut cfmt = timefmt.to_vec();
+        cfmt.push(0);
+        let mut buf = [0u8; 256];
+        let n = libc::strftime(buf.as_mut_ptr() as *mut i8, buf.len(), cfmt.as_ptr() as *const i8, &tm);
+        buf[..n].to_vec()
+    }
 }
 
 fn ssi_encode(value: &[u8], encoding: Option<&[u8]>) -> Vec<u8> {
@@ -602,6 +717,65 @@ fn ssi_encode(value: &[u8], encoding: Option<&[u8]>) -> Vec<u8> {
 }
 
 fn execute_directive(cmd: &[u8], params: &HashMap<Vec<u8>, Vec<u8>>, ctx: &mut SsiCtx, r: &R) -> Vec<u8> {
+    // #if / #elif / #else / #endif manage a stack; when the top frame has
+    // skipping=true, all other directives (and interleaved text) are
+    // suppressed. Matches ngx_http_ssi_if / _else / _endif.
+    match cmd {
+        b"if" => {
+            let cond = params.get(&b"expr".to_vec())
+                .map(|e| ssi_eval_condition(e, ctx, r))
+                .unwrap_or(false);
+            let parent_skip = ssi_currently_skipping(ctx);
+            let frame = SsiIfFrame {
+                skipping: parent_skip || !cond,
+                chosen: cond && !parent_skip,
+            };
+            ctx.if_stack.push(frame);
+            return Vec::new();
+        }
+        b"elif" => {
+            if let Some(top) = ctx.if_stack.last_mut() {
+                if top.chosen {
+                    top.skipping = true;
+                } else {
+                    let cond = params.get(&b"expr".to_vec())
+                        .map(|e| ssi_eval_condition(e, ctx, r))
+                        .unwrap_or(false);
+                    // parent skipping is captured implicitly: if we're inside
+                    // a skipped outer if, all inner frames also skip; here
+                    // any_ancestor_skip is preserved because we only look at
+                    // this frame's state.
+                    let parent_skip = ctx.if_stack.iter().rev().skip(1).any(|f| f.skipping);
+                    let top = ctx.if_stack.last_mut().unwrap();
+                    top.skipping = parent_skip || !cond;
+                    if cond && !parent_skip { top.chosen = true; }
+                }
+            }
+            return Vec::new();
+        }
+        b"else" => {
+            if let Some(top) = ctx.if_stack.last_mut() {
+                if top.chosen {
+                    top.skipping = true;
+                } else {
+                    let parent_skip = ctx.if_stack.iter().rev().skip(1).any(|f| f.skipping);
+                    let top = ctx.if_stack.last_mut().unwrap();
+                    top.skipping = parent_skip;
+                    if !parent_skip { top.chosen = true; }
+                }
+            }
+            return Vec::new();
+        }
+        b"endif" => {
+            ctx.if_stack.pop();
+            return Vec::new();
+        }
+        _ => {}
+    }
+    // Any non-conditional directive inside a skipped branch is suppressed.
+    if ssi_currently_skipping(ctx) {
+        return Vec::new();
+    }
     match cmd {
         b"echo" => {
             if let Some(var_name) = params.get(&b"var".to_vec()) {
