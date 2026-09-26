@@ -1273,16 +1273,33 @@ fn listen(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResul
     let _ = backlog;
 
     let mut seen: Vec<SockAddr> = Vec::new();
+    // Expand each addr over any port range (`listen 127.0.0.1:8080-8083`).
     for a in &u.addrs {
-        if seen.iter().any(|s| s.cmp(&a.sockaddr, true)) {
-            continue;
+        let low = a.sockaddr.port();
+        let high = if u.last_port != 0 && u.last_port >= low { u.last_port } else { low };
+        for port in low..=high {
+            let mut sa = a.sockaddr.clone();
+            sa.set_port(port);
+            if seen.iter().any(|s| s.cmp(&sa, true)) {
+                continue;
+            }
+            seen.push(sa.clone());
+            let mut o = lsopt.clone();
+            let name = if port == low { a.name.clone() } else {
+                let mut n = a.name.clone();
+                // Rewrite trailing "…:PORT" to "…:port". The address text is
+                // best-effort — only used for logs / $server_addr etc.
+                if let Some(colon) = n.iter().rposition(|&b| b == b':') {
+                    n.truncate(colon + 1);
+                    n.extend_from_slice(port.to_string().as_bytes());
+                }
+                n
+            };
+            o.sockaddr = sa.clone();
+            o.addr_text = name;
+            o.wildcard = sa.is_wildcard();
+            add_listen(cf, &cscf, o)?;
         }
-        seen.push(a.sockaddr.clone());
-        let mut o = lsopt.clone();
-        o.sockaddr = a.sockaddr.clone();
-        o.addr_text = a.name.clone();
-        o.wildcard = a.sockaddr.is_wildcard();
-        add_listen(cf, &cscf, o)?;
     }
     Ok(())
 }
