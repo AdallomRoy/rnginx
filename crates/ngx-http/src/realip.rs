@@ -327,13 +327,13 @@ async fn realip_handler(r: R) -> i64 {
                 let hin = r.headers_in.borrow();
                 let mut found: Option<Vec<u8>> = None;
 
+                let _ = header_hash;
                 for h in &hin.headers {
-                    if h.key.len() == header_name.len() && h.hash.get() == header_hash {
-                        // Compare lowercased
-                        if h.key.iter().zip(&header_name).all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase()) {
-                            found = Some(h.value.borrow().clone());
-                            break;
-                        }
+                    if h.hash.get() == 0 { continue; }
+                    if h.key.len() != header_name.len() { continue; }
+                    if h.key.iter().zip(&header_name).all(|(&a, &b)| a.to_ascii_lowercase() == b.to_ascii_lowercase()) {
+                        found = Some(h.value.borrow().clone());
+                        break;
                     }
                 }
                 found
@@ -366,21 +366,18 @@ async fn realip_handler(r: R) -> i64 {
 async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
     let idx = ctx_index();
 
-    // Save original address
-    let original_sockaddr = r.connection.sockaddr.borrow().clone();
-    let original_addr_text = r.connection.addr_text.borrow().clone();
-
-    let ctx = RealipCtx {
-        original_sockaddr,
-        original_addr_text,
-    };
-
+    // Save original address on the connection (survives internal_redirect,
+    // which clears per-request ctx).
+    if r.connection.original_sockaddr.borrow().is_none() {
+        *r.connection.original_sockaddr.borrow_mut() =
+            Some(r.connection.sockaddr.borrow().clone());
+        *r.connection.original_addr_text.borrow_mut() =
+            Some(r.connection.addr_text.borrow().clone());
+    }
+    let original_sockaddr = r.connection.original_sockaddr.borrow().clone().unwrap();
+    let original_addr_text = r.connection.original_addr_text.borrow().clone().unwrap();
+    let ctx = RealipCtx { original_sockaddr, original_addr_text };
     r.set_ctx(idx, ctx);
-
-    // Set up cleanup - no need to explicitly restore since context is saved
-    r.add_cleanup(Box::new(move || {
-        // Cleanup happens - the context has the original values for variables to use
-    }));
 
     // Update connection address
     let new_text = new_addr.addr_text();
@@ -392,8 +389,13 @@ async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
 
 fn realip_remote_addr_var(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     let idx = ctx_index();
+    // Priority: per-request ctx (if realip already ran this request), else
+    // the persistent per-connection copy (survives internal_redirect that
+    // clears ctx), else the (possibly overwritten) current addr_text.
     let addr_text = if let Some(ctx) = r.get_ctx::<RealipCtx>(idx) {
         ctx.borrow().original_addr_text.clone()
+    } else if let Some(t) = r.connection.original_addr_text.borrow().clone() {
+        t
     } else {
         r.connection.addr_text.borrow().clone()
     };
@@ -409,6 +411,8 @@ fn realip_remote_port_var(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     let idx = ctx_index();
     let addr = if let Some(ctx) = r.get_ctx::<RealipCtx>(idx) {
         ctx.borrow().original_sockaddr.clone()
+    } else if let Some(a) = r.connection.original_sockaddr.borrow().clone() {
+        a
     } else {
         r.connection.sockaddr.borrow().clone()
     };

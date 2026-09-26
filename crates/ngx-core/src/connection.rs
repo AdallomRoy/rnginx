@@ -139,6 +139,12 @@ pub struct Connection {
     pub ty: i32,
     pub sockaddr: RefCell<SockAddr>,
     pub addr_text: RefCell<Vec<u8>>,
+    /// Client's original (pre-realip) address, populated once by
+    /// ngx_http_realip so $realip_remote_addr/$realip_remote_port survive
+    /// after set_real_ip_from rewrites addr_text/sockaddr and across
+    /// internal redirects (which clear per-request ctx).
+    pub original_sockaddr: RefCell<Option<SockAddr>>,
+    pub original_addr_text: RefCell<Option<Vec<u8>>>,
     pub local_sockaddr: RefCell<Option<SockAddr>>,
     pub proxy_protocol: RefCell<Option<Rc<dyn Any>>>,
     pub ssl: RefCell<Option<Rc<crate::ssl::SslConnection>>>,
@@ -199,6 +205,8 @@ impl Connection {
             ty,
             addr_text: RefCell::new(sockaddr.addr_text()),
             sockaddr: RefCell::new(sockaddr),
+            original_sockaddr: RefCell::new(None),
+            original_addr_text: RefCell::new(None),
             local_sockaddr: RefCell::new(None),
             proxy_protocol: RefCell::new(None),
             ssl: RefCell::new(None),
