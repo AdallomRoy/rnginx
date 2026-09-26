@@ -22,6 +22,9 @@ pub struct HeadersConf {
     pub expires: Option<ExpiresKind>,
     /// Base offset in seconds (or seconds-since-midnight for DailyAt).
     pub expires_time: i64,
+    /// If set, evaluate this complex value at request time and parse the
+    /// resulting bytes as an expires spec ("epoch"/"max"/"modified 60s"/etc.).
+    pub expires_value: Option<ComplexValue>,
     pub expires_set: bool,
 }
 
@@ -31,6 +34,7 @@ fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
         trailers: None,
         expires: None,
         expires_time: 0,
+        expires_value: None,
         expires_set: false,
     })
 }
@@ -48,6 +52,7 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
         c.expires_set = p.expires_set;
         c.expires = p.expires;
         c.expires_time = p.expires_time;
+        c.expires_value = p.expires_value.clone();
     }
     Ok(())
 }
@@ -55,6 +60,25 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
 fn set_expires(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<HeadersConf>(conf.as_ref().unwrap());
     let args = cf.args.clone();
+    // If any argument contains a $var, compile as a complex value; parse
+    // happens at request time (matches C's ngx_http_headers_expires when
+    // ngx_http_script_variables_count(&value[i]) > 0).
+    let any_var = args.iter().skip(1).any(|a| a.contains(&b'$'));
+    if any_var {
+        // Reconstruct the args as a single space-joined string.
+        let mut src: Vec<u8> = Vec::new();
+        for (i, a) in args.iter().enumerate().skip(1) {
+            if i > 1 { src.push(b' '); }
+            src.extend_from_slice(a);
+        }
+        let cv = crate::script::compile_complex_value(cf, &src, 0)?;
+        let mut c = cell.borrow_mut();
+        c.expires_value = Some(cv);
+        c.expires = None;
+        c.expires_time = 0;
+        c.expires_set = true;
+        return Ok(());
+    }
     // Minimal parser for common forms:
     //   expires off
     //   expires epoch
@@ -80,16 +104,27 @@ fn set_expires(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Conf
     let mut secs: i64 = 0;
     if let Some(s) = time_str_opt {
         if kind == ExpiresKind::DailyAt {
-            // HH:MM[:SS]
+            // Two forms: "HH:MM[:SS]" or an ngx_parse_time-style value like
+            // "15h30m33s" that expresses seconds-since-midnight.
             let s_str = std::str::from_utf8(&s).map_err(|_| cf.emerg(format_args!("invalid time")))?;
-            let parts: Vec<&str> = s_str.split(':').collect();
-            if parts.len() < 2 || parts.len() > 3 {
-                return Err(cf.emerg(format_args!("invalid daily-at expires")));
+            if s_str.contains(':') {
+                let parts: Vec<&str> = s_str.split(':').collect();
+                if parts.len() < 2 || parts.len() > 3 {
+                    return Err(cf.emerg(format_args!("invalid daily-at expires")));
+                }
+                let h: i64 = parts[0].parse().map_err(|_| cf.emerg(format_args!("invalid hours")))?;
+                let m: i64 = parts[1].parse().map_err(|_| cf.emerg(format_args!("invalid minutes")))?;
+                let sec: i64 = if parts.len() == 3 { parts[2].parse().map_err(|_| cf.emerg(format_args!("invalid seconds")))? } else { 0 };
+                secs = h * 3600 + m * 60 + sec;
+            } else {
+                match ngx_core::parse::parse_time(&s, true) {
+                    Some(v) => secs = v,
+                    None => return Err(cf.emerg(format_args!("invalid daily-at expires"))),
+                }
             }
-            let h: i64 = parts[0].parse().map_err(|_| cf.emerg(format_args!("invalid hours")))?;
-            let m: i64 = parts[1].parse().map_err(|_| cf.emerg(format_args!("invalid minutes")))?;
-            let sec: i64 = if parts.len() == 3 { parts[2].parse().map_err(|_| cf.emerg(format_args!("invalid seconds")))? } else { 0 };
-            secs = h * 3600 + m * 60 + sec;
+            if secs < 0 || secs >= 86400 {
+                return Err(cf.emerg(format_args!("invalid daily-at expires (out of range)")));
+            }
         } else {
             // Signed time value like 1d, 30m, 60s, or bare seconds.
             let (sign, tail): (i64, &[u8]) = if s.first() == Some(&b'-') { (-1, &s[1..]) }
@@ -191,6 +226,47 @@ async fn trailers_body_filter(r: R, input: ngx_core::buf::Chain, next: BodyFilte
     next(r, input).await
 }
 
+/// Parse "epoch"/"max"/"off"/"modified <time>"/"<time>"/"@<time>" into
+/// (kind, seconds). Same forms accepted at conf time; used at request time
+/// when `expires` uses a complex value.
+pub fn parse_expires_spec(bytes: &[u8]) -> Option<(ExpiresKind, i64)> {
+    let s = bytes;
+    if s.is_empty() { return None; }
+    if s == b"off" { return Some((ExpiresKind::Off, 0)); }
+    if s == b"epoch" { return Some((ExpiresKind::Epoch, 0)); }
+    if s == b"max" { return Some((ExpiresKind::Max, 0)); }
+    // "modified <time>"
+    if s.starts_with(b"modified ") {
+        let rest = &s[b"modified ".len()..];
+        let (sign, tail): (i64, &[u8]) = if rest.first() == Some(&b'-') { (-1, &rest[1..]) }
+            else if rest.first() == Some(&b'+') { (1, &rest[1..]) } else { (1, rest) };
+        let v = ngx_core::parse::parse_time(tail, true)?;
+        return Some((ExpiresKind::Modified, sign * v));
+    }
+    // "@time"
+    if s.first() == Some(&b'@') {
+        let rest = &s[1..];
+        let secs = if rest.contains(&b':') {
+            let s_str = std::str::from_utf8(rest).ok()?;
+            let parts: Vec<&str> = s_str.split(':').collect();
+            if parts.len() < 2 || parts.len() > 3 { return None; }
+            let h: i64 = parts[0].parse().ok()?;
+            let m: i64 = parts[1].parse().ok()?;
+            let sec: i64 = if parts.len() == 3 { parts[2].parse().ok()? } else { 0 };
+            h * 3600 + m * 60 + sec
+        } else {
+            ngx_core::parse::parse_time(rest, true)?
+        };
+        if !(0..86400).contains(&secs) { return None; }
+        return Some((ExpiresKind::DailyAt, secs));
+    }
+    // "<time>"
+    let (sign, tail): (i64, &[u8]) = if s.first() == Some(&b'-') { (-1, &s[1..]) }
+        else if s.first() == Some(&b'+') { (1, &s[1..]) } else { (1, s) };
+    let v = ngx_core::parse::parse_time(tail, true)?;
+    Some((ExpiresKind::Access, sign * v))
+}
+
 fn apply_expires(r: &R, kind: ExpiresKind, base: i64) {
     // Determine the Expires date + Cache-Control value per C set_expires.
     let (expires_date, cc_val): (Vec<u8>, Vec<u8>) = match kind {
@@ -259,10 +335,22 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
     }
     let conf = r.loc_conf::<HeadersConf>(ctx_index());
     let headers = conf.borrow().headers.clone();
-    let expires = conf.borrow().expires;
-    let expires_time = conf.borrow().expires_time;
+    let (mut expires, mut expires_time) = (conf.borrow().expires, conf.borrow().expires_time);
+    let expires_value = conf.borrow().expires_value.clone();
     let status = r.headers_out.borrow().status;
     let safe = matches!(status, 200 | 201 | 204 | 206 | 301 | 302 | 303 | 304 | 307 | 308);
+
+    // Resolve dynamic expires (from `expires <$var>` or similar).
+    if safe {
+        if let Some(cv) = &expires_value {
+            if let Ok(bytes) = crate::script::complex_value(&r, cv) {
+                if let Some((k, t)) = parse_expires_spec(&bytes) {
+                    expires = Some(k);
+                    expires_time = t;
+                }
+            }
+        }
+    }
 
     // Apply expires before add_header — matches C which runs
     // ngx_http_set_expires early in the header filter for safe statuses.
