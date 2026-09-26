@@ -48,6 +48,16 @@ pub struct NgxHttpProxyLocConf {
     pub cookie_domains: Vec<CookieRewrite>,
     /// proxy_cookie_path rewrites (applied to Path= attributes of Set-Cookie).
     pub cookie_paths: Vec<CookieRewrite>,
+    /// proxy_bind: local address to bind the upstream socket to. `None` means
+    /// unset (inherit); Some(LocalBind::Off) means explicitly disabled;
+    /// Some(LocalBind::Addr(cv)) means bind to the evaluated ComplexValue.
+    pub local_bind: Option<LocalBind>,
+}
+
+#[derive(Clone)]
+pub enum LocalBind {
+    Off,
+    Addr(crate::script::ComplexValue),
 }
 
 /// A single proxy_cookie_domain / proxy_cookie_path rewrite entry.
@@ -82,6 +92,7 @@ impl Default for NgxHttpProxyLocConf {
             force_ranges: Val::unset(),
             cookie_domains: Vec::new(),
             cookie_paths: Vec::new(),
+            local_bind: None,
         }
     }
 }
@@ -114,6 +125,9 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     }
     if c.cookie_paths.is_empty() {
         c.cookie_paths = p.cookie_paths.clone();
+    }
+    if c.local_bind.is_none() {
+        c.local_bind = p.local_bind.clone();
     }
     Ok(())
 }
@@ -176,10 +190,18 @@ fn proxy_request_buffering_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<
     Ok(())
 }
 
-fn proxy_bind_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
+fn proxy_bind_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let args = cf.args.clone();
+    if args.len() < 2 || args.len() > 3 {
         return Err(msg("invalid number of arguments"));
     }
+    if args[1] == b"off" {
+        cell.borrow_mut().local_bind = Some(LocalBind::Off);
+        return Ok(());
+    }
+    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+    cell.borrow_mut().local_bind = Some(LocalBind::Addr(cv));
     Ok(())
 }
 
@@ -347,13 +369,19 @@ async fn proxy_handler(r: R) -> i64 {
     // For byte-preservation in the request line below.
     let request_uri_bytes = forwarded_uri;
 
-    // Try to connect to upstream
+    // Try to connect to upstream, honoring proxy_bind if set.
     let addr = format!("{}:{}", host, port);
-    let mut upstream = match TcpStream::connect(&addr).await {
-        Ok(s) => {
-            s
+    let bind_addr: Option<std::net::SocketAddr> = match &conf_borrowed.local_bind {
+        None | Some(LocalBind::Off) => None,
+        Some(LocalBind::Addr(cv)) => {
+            let evaluated = crate::script::complex_value(&r, cv).unwrap_or_default();
+            let s = String::from_utf8_lossy(&evaluated).into_owned();
+            parse_bind_addr(&s)
         }
-        Err(e) => {
+    };
+    let mut upstream = match connect_with_optional_bind(&addr, bind_addr).await {
+        Ok(s) => s,
+        Err(_e) => {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
@@ -1199,4 +1227,45 @@ fn parse_cookie(value: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         start = last + 1;
     }
     attrs
+}
+
+/// Parse an `addr` or `addr:port` string into a SocketAddr.
+/// Handles `[::1]:8080` IPv6 form via std parser fallbacks.
+fn parse_bind_addr(s: &str) -> Option<std::net::SocketAddr> {
+    if s.is_empty() { return None; }
+    // If already host:port form, try direct parse.
+    if let Ok(a) = s.parse::<std::net::SocketAddr>() {
+        return Some(a);
+    }
+    // Otherwise assume it's an IP with implicit port 0.
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Some(std::net::SocketAddr::new(ip, 0));
+    }
+    None
+}
+
+/// Connect to `addr`, optionally binding the local endpoint to `bind` first.
+/// `bind` with port 0 lets the kernel pick the source port; a nonzero port
+/// (from `proxy_bind 127.0.0.1:$remote_port` style) will be used verbatim,
+/// with SO_REUSEADDR to allow rebinding TIME_WAIT sockets.
+async fn connect_with_optional_bind(
+    addr: &str,
+    bind: Option<std::net::SocketAddr>,
+) -> std::io::Result<TcpStream> {
+    match bind {
+        None => TcpStream::connect(addr).await,
+        Some(local) => {
+            let sock = match local {
+                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+            };
+            let _ = sock.set_reuseaddr(true);
+            sock.bind(local)?;
+            // Resolve `addr` (host:port) so we can call connect(SocketAddr).
+            let remote = tokio::net::lookup_host(addr).await?
+                .next()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address"))?;
+            sock.connect(remote).await
+        }
+    }
 }
