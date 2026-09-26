@@ -366,6 +366,22 @@ async fn userid_header_filter(r: R, next: HeaderFilter) -> i64 {
         } else if conf.flags.get() & NGX_HTTP_USERID_COOKIE_SAMESITE_NONE != 0 {
             cookie.extend_from_slice(b"; samesite=none");
         }
+        // userid_expires: emit `; expires=<HTTP-date>`. `max` (-1) resolves to
+        // the same far-future date C emits (Thu, 31-Dec-37 23:55:55 GMT), any
+        // positive value is added to the current time.
+        let exp = *conf.expires.get();
+        if exp != 0 {
+            cookie.extend_from_slice(b"; expires=");
+            if exp == 2145916555 {
+                // `userid_expires max` — C hard-codes this HTTP-date rather
+                // than computing it, so future clock skew doesn't turn the
+                // cookie into something with a different year formatting.
+                cookie.extend_from_slice(b"Thu, 31-Dec-37 23:55:55 GMT");
+            } else {
+                let t = ngx_core::times::time() + exp;
+                cookie.extend_from_slice(ngx_core::times::http_cookie_time(t).as_bytes());
+            }
+        }
 
         drop(ctx);
 
