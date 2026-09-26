@@ -664,21 +664,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             get: Some(upstream_http_variable),
             set: None,
             data: 0,
-            flags: NGX_HTTP_VAR_PREFIX,
+            flags: NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_trailer_",
             get: Some(upstream_trailer_variable),
             set: None,
             data: 0,
-            flags: NGX_HTTP_VAR_PREFIX,
+            flags: NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_cookie_",
             get: Some(upstream_cookie_variable),
             set: None,
             data: 0,
-            flags: NGX_HTTP_VAR_PREFIX,
+            flags: NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOCACHEABLE,
         },
     ];
     crate::variables::add_variables(cf, &prefix_vars)?;

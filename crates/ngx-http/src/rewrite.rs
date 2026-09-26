@@ -245,7 +245,7 @@ fn check_file_type(r: &R, path: &[u8], is_dir: bool, _is_exec: bool) -> bool {
 fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
     match condition {
         IfCondition::Variable(idx) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
+            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
                 !vv.not_found && !vv.data.is_empty() && !(vv.data.len() == 1 && vv.data[0] == b'0')
             } else {
                 false
@@ -254,19 +254,19 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
         IfCondition::Equal(idx, expected) => {
             // Match C ngx_http_script_equal_code: compare value bytes regardless
             // of not_found (unset variables have empty data, so `$x = ""` is true).
-            match get_indexed_variable(r, *idx) {
+            match crate::variables::get_flushed_variable(r, *idx) {
                 Some(vv) => vv.data == *expected,
                 None => expected.is_empty(),
             }
         }
         IfCondition::NotEqual(idx, expected) => {
-            match get_indexed_variable(r, *idx) {
+            match crate::variables::get_flushed_variable(r, *idx) {
                 Some(vv) => vv.data != *expected,
                 None => !expected.is_empty(),
             }
         }
         IfCondition::RegexMatch(idx, regex) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
+            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
                 if vv.not_found {
                     return false;
                 }
@@ -276,7 +276,7 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
             }
         }
         IfCondition::RegexMatchCaseInsensitive(idx, regex) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
+            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
                 if vv.not_found {
                     return false;
                 }
@@ -286,7 +286,7 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
             }
         }
         IfCondition::RegexNotMatch(idx, regex) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
+            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
                 if vv.not_found {
                     return true;
                 }
@@ -296,7 +296,7 @@ fn eval_if_condition(r: &R, condition: &IfCondition) -> bool {
             }
         }
         IfCondition::RegexNotMatchCaseInsensitive(idx, regex) => {
-            if let Some(vv) = get_indexed_variable(r, *idx) {
+            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
                 if vv.not_found {
                     return true;
                 }

@@ -414,12 +414,17 @@ async fn proxy_handler(r: R) -> i64 {
     let method = std::str::from_utf8(&method_owned).unwrap_or("GET");
 
     let uri_path = std::str::from_utf8(&request_uri_bytes).unwrap_or("/").to_string();
-    // Include query string if present
-    let args = r.args.borrow();
-    let uri_with_args = if !args.is_empty() {
-        format!("{}?{}", uri_path, std::str::from_utf8(&args).unwrap_or(""))
-    } else {
-        uri_path
+    // Include query string if present. Clone into a Vec so we don't hold a
+    // Ref on r.args across the many awaits that follow — a live Ref would
+    // panic when e.g. an X-Accel-Redirect internal_redirect tries to
+    // borrow_mut() the same cell, silently killing the request task.
+    let uri_with_args = {
+        let args = r.args.borrow().clone();
+        if !args.is_empty() {
+            format!("{}?{}", uri_path, std::str::from_utf8(&args).unwrap_or(""))
+        } else {
+            uri_path
+        }
     };
 
     // Read pass_request_headers/body, set_body, and set_headers configs.
@@ -600,6 +605,12 @@ async fn proxy_handler(r: R) -> i64 {
         502
     };
 
+    // Fresh upstream request: any $upstream_http_* headers left over from a
+    // previous proxy round (e.g. X-Accel-Redirect that triggered this one)
+    // must not leak into the new stash — that would cause a redirect loop
+    // when the second upstream returns without X-Accel-Redirect.
+    r.upstream_headers_in.borrow_mut().clear();
+
     // Set status in response headers and copy upstream headers
     let mut upstream_chunked = false;
     let mut saw_content_length = false;
@@ -708,6 +719,63 @@ async fn proxy_handler(r: R) -> i64 {
     }
     // Suppress duplicate Expires (silently drop the second occurrence).
     let _ = duplicate_expires;
+
+    // X-Accel-Redirect: if the upstream response carries this header, discard
+    // the response body (we've already read it) and internally redirect. Keep
+    // only the small allow-list of upstream headers marked `redirect=1` in
+    // ngx_http_upstream.c (Content-Type, Set-Cookie, Cache-Control, Expires,
+    // Accept-Ranges, Content-Disposition). Method coerces to GET (unless HEAD).
+    let xar_val = r.upstream_headers_in.borrow().iter()
+        .find(|h| h.lowcase_key.eq_ignore_ascii_case(b"x-accel-redirect"))
+        .map(|h| h.value.borrow().clone());
+    if let Some(xar) = xar_val {
+        if !xar.is_empty() {
+            const KEEP_LC: &[&[u8]] = &[
+                b"content-type", b"set-cookie", b"content-disposition",
+                b"cache-control", b"expires", b"accept-ranges",
+            ];
+            {
+                let mut ho = r.headers_out.borrow_mut();
+                ho.status = 0;
+                ho.content_length_n = -1;
+                ho.content_length = None;
+                ho.headers.retain(|h| {
+                    KEEP_LC.iter().any(|k| h.lowcase_key.eq_ignore_ascii_case(k))
+                });
+                ho.etag = None;
+                ho.last_modified = None;
+                ho.location = None;
+                ho.content_encoding = None;
+            }
+            r.upstream_states.borrow_mut().clear();
+            if xar.first() == Some(&b'@') {
+                let _ = crate::core_rt::named_location(&r, &xar).await;
+                return NGX_DONE;
+            }
+            // Non-named: unescape the URI (splitting off any query at '?'),
+            // then reject unsafe paths (../ etc.) with 404, matching the
+            // ngx_http_parse_unsafe_uri gate C runs before internal_redirect.
+            let (decoded, _) = ngx_core::string::unescape_uri(&xar, ngx_core::string::NGX_UNESCAPE_URI);
+            // Split at first '?' (unescape stops at '?', so it's the last byte if present).
+            let (uri_bytes, args_opt): (Vec<u8>, Option<Vec<u8>>) =
+                if let Some(q) = decoded.iter().position(|&b| b == b'?') {
+                    (decoded[..q].to_vec(), Some(decoded[q + 1..].to_vec()))
+                } else {
+                    (decoded, None)
+                };
+            let mut flags = 0u32;
+            let empty: [u8; 0] = [];
+            if crate::parse::parse_unsafe_uri(&uri_bytes, &empty, &mut flags) != NGX_OK {
+                return return_error(&r, crate::NGX_HTTP_NOT_FOUND).await;
+            }
+            if r.method.get() != crate::NGX_HTTP_HEAD {
+                r.method.set(crate::NGX_HTTP_GET);
+                *r.method_name.borrow_mut() = b"GET".to_vec();
+            }
+            let _ = crate::core_rt::internal_redirect(&r, &uri_bytes, args_opt.as_deref()).await;
+            return NGX_DONE;
+        }
+    }
 
     // Snapshot upstream Content-Length before send_header runs — filters like
     // addition_filter / sub_filter / gzip clear ho.content_length_n during
@@ -1359,3 +1427,4 @@ fn maybe_store_body(r: &R, body: &[u8]) {
     }
     let _ = std::fs::rename(tmp_os, os);
 }
+

@@ -457,6 +457,11 @@ pub fn test_content_type(r: &R, types_hash: &ngx_core::hash::Hash<Rc<Vec<u8>>>) 
 
 /// ngx_http_set_content_type
 pub fn set_content_type(r: &R) -> i64 {
+    // Match ngx_http_set_content_type: don't clobber an already-set
+    // Content-Type (e.g. one carried through from an upstream response).
+    if r.headers_out.borrow().content_type_len != 0 {
+        return NGX_OK;
+    }
     let clcf = r.clcf();
     let exten = r.exten.borrow().clone();
     if !exten.is_empty() {
