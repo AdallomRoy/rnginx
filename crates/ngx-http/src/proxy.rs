@@ -584,7 +584,11 @@ async fn proxy_handler(r: R) -> i64 {
                     b"last-modified" => {
                         let h = crate::request::TableElt::new(name, value);
                         ho.last_modified = Some(h);
-                        // best-effort time parse skipped; header_filter emits from .last_modified
+                        // Also parse into last_modified_time so If-Range and
+                        // If-Modified-Since date comparisons work.
+                        if let Some(t) = ngx_core::parse::parse_http_time(value) {
+                            ho.last_modified_time = t;
+                        }
                     }
                     b"etag" => {
                         let h = crate::request::TableElt::new(name, value);
