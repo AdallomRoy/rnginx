@@ -48,7 +48,12 @@ pub struct LimitReqZone {
 pub struct LimitReqLimit {
     pub zone_name: Vec<u8>,
     pub burst: u64,
-    pub delay: bool,  // false = nodelay, true = delay
+    /// `delay=N` in nginx: how many "excess" requests can accumulate before
+    /// the burst starts delaying. Stored in thousandths (matches C's
+    /// limit->delay = delay * 1000). `nodelay` maps to burst*1000 so no
+    /// requests within the burst are delayed. Absence of the parameter is
+    /// treated as 0 (any excess delays — the historical default).
+    pub delay: u64,
 }
 
 /// Location configuration
@@ -189,47 +194,28 @@ async fn limit_req_handler(r: R) -> i64 {
         let node = map.entry(key).or_default();
 
         // Compute rate in excess units per second
-        let rate_per_second = zone.rate_num * 1000 / zone.rate_per;
+        let _rate_per_second = zone.rate_num * 1000 / zone.rate_per;
 
         // Leaky bucket algorithm
         // Decay is: elapsed_ms * rate_num / rate_per thousandths
         // (rate_num requests / rate_per seconds = rate_num / rate_per requests per second)
         // = (rate_num / rate_per / 1000) requests per millisecond
         // = (rate_num / rate_per) thousandths per millisecond
-        let elapsed_ms = now.saturating_sub(node.last_ms);
-        let decay = elapsed_ms * zone.rate_num / zone.rate_per;
-        let excess = node.excess.saturating_sub(decay);
-
-        // Nginx C: compute new excess including this request, reject if > burst.
-        //   excess = lr->excess - ctx->rate * |ms| / 1000 + 1000;
-        //   if (excess > limit->burst) return NGX_BUSY;
-        let new_excess = excess + 1000;
+        // Match ngx_http_limit_req_lookup's signed math:
+        //   excess = lr->excess - ctx->rate * ms / 1000 + 1000
+        //   if (excess < 0) excess = 0;
+        // The order matters — decay and the +1000 combine BEFORE the floor.
+        // A saturating_sub would clamp the decay first and then add 1000
+        // unconditionally, which permanently biases excess upward for a
+        // freshly-created node whose last_ms is 0 (elapsed = now = huge).
+        let elapsed_ms = now.saturating_sub(node.last_ms) as i64;
+        let decay = elapsed_ms.saturating_mul(zone.rate_num as i64) / (zone.rate_per as i64);
+        let signed = (node.excess as i64) - decay + 1000;
+        let new_excess: u64 = if signed < 0 { 0 } else { signed as u64 };
         // burst is in requests; compare against thousandths.
         if new_excess > limit.burst * 1000 {
             // Reject - DON'T update state
             drop(map); // Release borrow before logging
-
-            let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
-            ngx_log_error!(*conf.limit_log_level.get() as u32, r.connection.log, None,
-                "limiting requests{}, excess: {:.3} by zone \"{}\"",
-                dry_run_str,
-                new_excess as f64 / 1000.0,
-                B(&limit.zone_name)
-            );
-
-            if *conf.dry_run.get() {
-                r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_REJECTED_DRY_RUN);
-                return NGX_DECLINED;
-            }
-
-            r.limit_req_status.set(NGX_HTTP_LIMIT_REQ_REJECTED);
-            return *conf.status_code.get() as i64;
-        }
-
-        // Check if delay would be needed (after counting this request)
-        if new_excess > rate_per_second && !limit.delay {
-            // nodelay=true but this request would need delay - reject without updating state
-            drop(map);
 
             let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
             ngx_log_error!(*conf.limit_log_level.get() as u32, r.connection.log, None,
@@ -255,10 +241,10 @@ async fn limit_req_handler(r: R) -> i64 {
 
         drop(map); // Release borrow before potential sleep/log
 
-        // Check if delay needed
-        if excess > rate_per_second {
-            // Delay needed to drain excess at rate zone.rate_num requests per (zone.rate_per * 1000) ms
-            let delay_ms = ((excess - rate_per_second) * zone.rate_per) / zone.rate_num;
+        // Delay decision: nginx's threshold is `limit->delay` (thousandths).
+        // If excess exceeds it, wait long enough to drain back down.
+        if excess > limit.delay {
+            let delay_ms = ((excess - limit.delay) * zone.rate_per) / zone.rate_num;
 
             let dry_run_str = if *conf.dry_run.get() { ", dry run" } else { "" };
             ngx_log_error!(*conf.delay_log_level.get() as u32, r.connection.log, None,
@@ -338,6 +324,7 @@ fn limit_req(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
     // Parse: limit_req zone=name [burst=N] [nodelay|delay=N]
     let mut zone_name: Option<Vec<u8>> = None;
     let mut burst: u64 = 0;
+    let mut delay: Option<u64> = None;
     let mut nodelay = false;
 
     for arg in &args[1..] {
@@ -349,6 +336,8 @@ fn limit_req(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
             burst = arg_str[6..].parse().unwrap_or(0);
         } else if arg_str == "nodelay" {
             nodelay = true;
+        } else if let Some(n) = arg_str.strip_prefix("delay=") {
+            delay = Some(n.parse().unwrap_or(0));
         }
     }
 
@@ -356,11 +345,23 @@ fn limit_req(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
         return Err(msg("zone required"));
     }
 
+    // Resolve delay threshold (in thousandths, matching C's `delay * 1000`):
+    //   - explicit delay=N ⇒ N * 1000
+    //   - nodelay          ⇒ burst * 1000 (no requests within burst are delayed)
+    //   - neither          ⇒ 0 (every excess request delays)
+    let delay_thousandths = if let Some(n) = delay {
+        n * 1000
+    } else if nodelay {
+        burst * 1000
+    } else {
+        0
+    };
+
     let loc_conf = conf_rc::<LimitReqLocConf>(conf.as_ref().unwrap());
     loc_conf.borrow_mut().limits.push(LimitReqLimit {
         zone_name: zone_name.unwrap(),
         burst,
-        delay: !nodelay,
+        delay: delay_thousandths,
     });
 
     Ok(())
@@ -409,7 +410,13 @@ fn limit_req_status(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) ->
 
 fn limit_req_dry_run(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let loc_conf = conf_rc::<LimitReqLocConf>(conf.as_ref().unwrap());
-    loc_conf.borrow_mut().dry_run = Val::set(true);
+    // NGX_CONF_FLAG: on/off.
+    let v = match cf.args.get(1).map(|a| a.as_slice()) {
+        Some(b"on") => true,
+        Some(b"off") => false,
+        _ => return Err(msg("invalid value")),
+    };
+    loc_conf.borrow_mut().dry_run = Val::set(v);
     Ok(())
 }
 
