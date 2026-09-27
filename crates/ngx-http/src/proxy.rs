@@ -10,6 +10,58 @@ use ngx_core::rc::*;
 use ngx_core::cmd_fn;
 use ngx_core::conf::{NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE3, NGX_CONF_TAKE4, NGX_CONF_TAKE12, NGX_CONF_TAKE123, NGX_CONF_TAKE1234, NGX_CONF_1MORE, NGX_CONF_2MORE};
 use tokio::net::TcpStream;
+
+/// Upstream connection — either TCP or UNIX so proxy_pass to
+/// http://unix:/path.sock:/uri works.
+pub enum UpstreamSock {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+impl AsyncRead for UpstreamSock {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+            }
+        }
+    }
+}
+impl AsyncWrite for UpstreamSock {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, b),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_write(cx, b),
+            }
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
+            }
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+            }
+        }
+    }
+}
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::cell::RefCell;
 
@@ -853,7 +905,10 @@ async fn proxy_handler(r: R) -> i64 {
             .unwrap_or(false);
     let conn_line = if connection_overridden { "" } else { "Connection: close\r\n" };
     // IPv6 literal hostnames need bracket-quoting in the Host header.
-    let host_hdr: String = if host.contains(':') && !host.starts_with('[') {
+    // For unix upstreams C sends "unix:<path>:" — copy that.
+    let host_hdr: String = if let Some(path) = host.strip_prefix("unix:") {
+        format!("unix:{}:", path)
+    } else if host.contains(':') && !host.starts_with('[') {
         format!("[{}]", host)
     } else {
         host.to_string()
@@ -867,7 +922,7 @@ async fn proxy_handler(r: R) -> i64 {
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
     // rotate to the next non-tried peer of the named upstream and reconnect.
-    let mut upstream: Option<tokio::net::TcpStream> = None;
+    let mut upstream: Option<UpstreamSock> = None;
     let mut addr: String;
     let mut response: Vec<u8>;
     let mut status: i64;
@@ -880,21 +935,27 @@ async fn proxy_handler(r: R) -> i64 {
     let mut response_ms: u64 = 0;
     'retry: loop {
         let try_started_ms = ngx_core::times::current_msec();
-        // IPv6 literals need bracket-quoting for tokio's SocketAddr parser.
-        addr = if host.contains(':') && !host.starts_with('[') {
+        // "unix:path" hosts pass through untouched (connect handles the
+        // ":0" sentinel port). IPv6 literals need bracket-quoting for
+        // tokio's SocketAddr parser.
+        addr = if host.starts_with("unix:") {
+            format!("{}:{}", host, port)
+        } else if host.contains(':') && !host.starts_with('[') {
             format!("[{}]:{}", host, port)
         } else {
             format!("{}:{}", host, port)
         };
         // Try the per-worker idle-connection pool first if this proxy
-        // is talking to a named upstream with `keepalive N;` set.
-        let pooled = if want_keepalive {
+        // is talking to a named upstream with `keepalive N;` set. Only
+        // TCP connections are pooled — unix sockets fall through to a
+        // fresh connect.
+        let pooled = if want_keepalive && !addr.starts_with("unix:") {
             named_upstream.as_ref().and_then(|n| crate::upstream_keepalive::pool_take(n, &addr))
         } else {
             None
         };
         upstream = Some(match pooled {
-            Some(s) => { connect_ms = 0; s }
+            Some(s) => { connect_ms = 0; UpstreamSock::Tcp(s) }
             None => match connect_with_optional_bind(&addr, bind_addr).await {
             Ok(s) => s,
             Err(_e) => {
@@ -1127,7 +1188,7 @@ async fn proxy_handler(r: R) -> i64 {
             };
             if framing_complete {
                 if let Some(name) = &named_upstream {
-                    if let Some(old) = upstream.take() {
+                    if let Some(UpstreamSock::Tcp(old)) = upstream.take() {
                         crate::upstream_keepalive::pool_put(name, &addr, old);
                     }
                 }
@@ -1736,10 +1797,10 @@ async fn return_error(r: &R, status: i64) -> i64 {
 /// Bidirectional pipe between the client (r.connection) and the upstream
 /// TcpStream after a 101 Switching Protocols response. Mirrors what
 /// ngx_http_upstream_upgrade sets up for WebSocket / HTTP upgrade paths.
-async fn proxy_upgrade_tunnel(r: R, upstream: tokio::net::TcpStream) -> i64 {
+async fn proxy_upgrade_tunnel(r: R, upstream: UpstreamSock) -> i64 {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
-    let (mut up_r, mut up_w) = upstream.into_split();
+    let (mut up_r, mut up_w) = tokio::io::split(upstream);
     let client = r.connection.clone();
 
     // Two forwarding tasks — one per direction. Whichever finishes first
@@ -1882,6 +1943,21 @@ fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
     } else {
         return None;
     };
+
+    // Unix socket form: "unix:/path/to.sock" or "unix:/path/to.sock:/uri"
+    if let Some(rest) = rest.strip_prefix("unix:") {
+        // Sock path ends at the LAST ":" before the URI (which starts with '/').
+        // Simple heuristic: split on ":/", treating everything before as the sock
+        // path and everything from '/' as the URI. If no ":/" found, the whole
+        // rest is the sock path and URI is "/".
+        let (sock, path) = match rest.rfind(":/") {
+            Some(p) => (&rest[..p], rest[p + 1..].to_string()),
+            None => (rest, "/".to_string()),
+        };
+        // Encode "unix:<path>" as the host and return sentinel port 0 so
+        // the caller uses UnixStream rather than TcpStream.
+        return Some((format!("unix:{}", sock), 0, path));
+    }
 
     // IPv6 form: [addr]:port/path or [addr]/path
     if let Some(r) = rest.strip_prefix('[') {
@@ -2283,9 +2359,14 @@ fn parse_bind_addr(s: &str) -> Option<std::net::SocketAddr> {
 async fn connect_with_optional_bind(
     addr: &str,
     bind: Option<std::net::SocketAddr>,
-) -> std::io::Result<TcpStream> {
+) -> std::io::Result<UpstreamSock> {
+    if let Some(path) = addr.strip_prefix("unix:") {
+        // Cut off the ":port" (port is a sentinel 0 for unix targets).
+        let path = path.rsplit_once(':').map(|(p, _)| p).unwrap_or(path);
+        return tokio::net::UnixStream::connect(path).await.map(UpstreamSock::Unix);
+    }
     match bind {
-        None => TcpStream::connect(addr).await,
+        None => TcpStream::connect(addr).await.map(UpstreamSock::Tcp),
         Some(local) => {
             let sock = match local {
                 std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -2293,11 +2374,10 @@ async fn connect_with_optional_bind(
             };
             let _ = sock.set_reuseaddr(true);
             sock.bind(local)?;
-            // Resolve `addr` (host:port) so we can call connect(SocketAddr).
             let remote = tokio::net::lookup_host(addr).await?
                 .next()
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address"))?;
-            sock.connect(remote).await
+            sock.connect(remote).await.map(UpstreamSock::Tcp)
         }
     }
 }

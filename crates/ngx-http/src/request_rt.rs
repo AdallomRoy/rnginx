@@ -672,6 +672,12 @@ async fn process_request_uri(r: &R) -> Result<(), ()> {
 
 /// ngx_http_validate_host: returns (lowercased host without port, port).
 pub fn validate_host(host: &[u8], _alloc: bool) -> Result<(Vec<u8>, u16), ()> {
+    // Special-case "unix:/path[:]" — nginx proxies over unix sockets set
+    // Host: unix:<path>: and the strict per-char validator below would
+    // reject the '/' inside.
+    if host.starts_with(b"unix:") {
+        return Ok((host.to_vec(), 0));
+    }
     #[derive(PartialEq, Clone, Copy)]
     enum St {
         HostStart,
