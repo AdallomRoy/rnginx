@@ -474,6 +474,9 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
 
     // Cache the response but skip 304-handling — we're serving a fresh copy.
     r.disable_not_modified.set(true);
+    // Full-body cached response is in memory — let the range filter serve
+    // partial content from it. Matches C's ngx_http_cache_send.
+    r.allow_ranges.set(true);
 
     let sh = crate::core_rt::send_header(r).await;
     if sh != NGX_OK { return NGX_ERROR; }
