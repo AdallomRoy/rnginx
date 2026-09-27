@@ -349,6 +349,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if !c.cache.revalidate { c.cache.revalidate = p.cache.revalidate; }
     if c.cache.use_stale == 0 { c.cache.use_stale = p.cache.use_stale; }
     if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
+    if c.cache.max_range_offset.is_none() { c.cache.max_range_offset = p.cache.max_range_offset; }
     Ok(())
 }
 
@@ -891,6 +892,26 @@ async fn proxy_handler(r: R) -> i64 {
             format!("Content-Type: {}\r\n", std::str::from_utf8(&ct.value.borrow()).unwrap_or(""))
         } else { String::new() }
     };
+    // proxy_cache_max_range_offset: when the client's Range starts at or
+    // below the offset, strip Range from the upstream request so the
+    // whole entry lands in cache and the range_filter serves the subrange
+    // from a memory buf. Matches ngx_http_upstream_cache_check_range.
+    let strip_range = {
+        let lcf_mro = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let c = lcf_mro.borrow();
+        match (c.cache.zone.as_ref(), c.cache.max_range_offset) {
+            (Some(_), Some(off)) => {
+                let hin = r.headers_in.borrow();
+                hin.range.first()
+                    .map(|h| crate::proxy_cache::range_below_offset(&h.value.borrow(), off))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    };
+    if strip_range {
+        r.allow_ranges.set(true);
+    }
     // Forward client request headers that aren't the ones we synthesize ourselves.
     // C proxies most client headers by default; the exact list is governed by
     // proxy_set_header, hide_headers, etc.  We don't implement those yet, so this
@@ -909,6 +930,9 @@ async fn proxy_handler(r: R) -> i64 {
                 b"content-length" | b"content-type" |
                 b"expect" | b"proxy-connection")
             {
+                continue;
+            }
+            if strip_range && lc.as_slice() == b"range" {
                 continue;
             }
             if overridden_names.iter().any(|n| n.as_slice() == lc.as_slice()) {
@@ -2357,7 +2381,12 @@ pub fn proxy_module() -> ModuleDef {
             cell.borrow_mut().cache.revalidate = cf.args[1] == b"on";
             Ok(())
         }),
-        cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let n = ngx_core::string::atoi(&cf.args[1]).ok_or_else(|| ngx_core::conf::msg("invalid number"))?;
+            cell.borrow_mut().cache.max_range_offset = Some(n as u64);
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_methods", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_purge", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {

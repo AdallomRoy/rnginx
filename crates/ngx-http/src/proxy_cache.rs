@@ -55,6 +55,7 @@ pub struct ProxyCacheConf {
     pub revalidate: bool,                     // proxy_cache_revalidate
     pub use_stale: u32,                       // proxy_cache_use_stale bitmask
     pub background_update: bool,              // proxy_cache_background_update
+    pub max_range_offset: Option<u64>,        // proxy_cache_max_range_offset
 }
 
 // proxy_cache_use_stale bitmask values (matches ngx_http_upstream_next_t).
@@ -125,8 +126,34 @@ impl ProxyCacheConf {
             revalidate: false,
             use_stale: 0,
             background_update: false,
+            max_range_offset: None,
         }
     }
+}
+
+/// Return true when the client's Range header specifies a start byte
+/// at or below `max_range_offset` (or "-N" suffix ranges — always
+/// treated as below since they read from EOF-N). Callers use this to
+/// decide whether to strip Range from the upstream request and let
+/// the file cache serve the range from a fully-fetched entry.
+pub fn range_below_offset(range: &[u8], max_offset: u64) -> bool {
+    // offset=0 disables the feature — always forward Range and let the
+    // request go uncached (matches C's == 0 → DECLINED).
+    if max_offset == 0 { return false; }
+    let rest = match range.strip_prefix(b"bytes=").or_else(|| range.strip_prefix(b"Bytes=")) {
+        Some(r) => r,
+        None => return false, // not a bytes= range → don't touch
+    };
+    // Multipart ranges (`bytes=1-2,3-4`) — not-below so we forward as-is.
+    if rest.contains(&b',') { return false; }
+    let dash = match rest.iter().position(|&b| b == b'-') { Some(i) => i, None => return false };
+    let start_bytes = &rest[..dash];
+    let start_str = std::str::from_utf8(start_bytes).unwrap_or("");
+    let start_trim = start_str.trim();
+    // "-N" suffix range — C treats these as uncacheable (forward Range as-is).
+    if start_trim.is_empty() { return false; }
+    // start < max_offset: cache full body and serve subrange from cache.
+    start_trim.parse::<u64>().map(|s| s < max_offset).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------
