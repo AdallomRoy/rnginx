@@ -2068,6 +2068,25 @@ async fn proxy_upgrade_tunnel(r: R, upstream: UpstreamSock) -> i64 {
     let (mut up_r, mut up_w) = tokio::io::split(upstream);
     let client = r.connection.clone();
 
+    // Push any bytes the client sent past the request headers to upstream
+    // before we start the recv/send loop. Without this, a client that
+    // pipelined data on top of the Upgrade request (e.g. the tests'
+    // upgrade_connect message => 'foo') loses that data — the tunnel
+    // only sees new bytes read from the socket after headers were
+    // consumed by the header parser.
+    let pipelined = {
+        let mut hb = r.http_connection.buffer.borrow_mut();
+        let tail = hb.unread().to_vec();
+        hb.pos = hb.last;
+        tail
+    };
+    if !pipelined.is_empty() {
+        if up_w.write_all(&pipelined).await.is_err() {
+            let _ = up_w.shutdown().await;
+            return NGX_OK;
+        }
+    }
+
     // Two forwarding tasks — one per direction. Whichever finishes first
     // closes the tunnel by cancelling the other via drop.
     let client_to_up = {
