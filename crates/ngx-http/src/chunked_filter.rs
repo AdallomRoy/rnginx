@@ -89,19 +89,31 @@ async fn chunked_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         }
     }
     if has_last {
-        let mut tail = b"0\r\n".to_vec();
-        let trailers = r.headers_out.borrow().trailers.clone();
-        for t in trailers.iter() {
-            if t.hash.get() == 0 {
-                continue;
+        // If the upstream chunked response was itself truncated (no
+        // 0-chunk seen), propagate that state to the client instead of
+        // synthesising a terminator. proxy_unfinished.t "chunked no
+        // final chunk" checks that the on-wire body ends mid-chunk.
+        let mut tail: Vec<u8> = if r.upstream_response_incomplete.get() {
+            Vec::new()
+        } else {
+            let mut t = b"0\r\n".to_vec();
+            let trailers = r.headers_out.borrow().trailers.clone();
+            for tr in trailers.iter() {
+                if tr.hash.get() == 0 { continue; }
+                t.extend_from_slice(&tr.key);
+                t.extend_from_slice(b": ");
+                t.extend_from_slice(&tr.value.borrow());
+                t.extend_from_slice(b"\r\n");
             }
-            tail.extend_from_slice(&t.key);
-            tail.extend_from_slice(b": ");
-            tail.extend_from_slice(&t.value.borrow());
-            tail.extend_from_slice(b"\r\n");
-        }
-        tail.extend_from_slice(b"\r\n");
-        let mut b = Buf::from_vec(tail);
+            t.extend_from_slice(b"\r\n");
+            t
+        };
+        // Reference `r.headers_out.trailers` to keep the borrow shape;
+        // real work happens in the tail construction above.
+        let _ = &r.headers_out;
+        let _ = &tail;
+        let tail_bytes = std::mem::take(&mut tail);
+        let mut b = Buf::from_vec(tail_bytes);
         b.last_buf = true;
         out.push_back(b);
     } else if flush_or_sync && size == 0 && out.is_empty() {
