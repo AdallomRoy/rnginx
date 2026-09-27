@@ -857,15 +857,17 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         // verification is enabled (verify=on/optional/optional_no_ca);
         // without it, SSL_do_handshake fails with "session id context
         // uninitialized" on the second connection to the same ctx.
-        // Matches ngx_ssl_session_id_context; we just use a per-server
-        // stable string derived from certificate path.
+        // Match C nginx: hash the concatenated cert paths with SHA1 to
+        // get a stable 16-byte context that's identical across worker
+        // restarts and unique per cert set (so shared session caches
+        // reliably distinguish reload boundaries).
         {
+            use sha1::{Sha1, Digest};
             let sess_ctx: Vec<u8> = if has_cert {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                use std::hash::{Hash, Hasher};
-                cert.hash(&mut hasher);
-                let h = hasher.finish();
-                h.to_le_bytes().to_vec()
+                let mut h = Sha1::new();
+                h.update(b"HTTP");
+                h.update(&cert);
+                h.finalize()[..16].to_vec()
             } else {
                 b"HTTP".to_vec()
             };
@@ -904,6 +906,7 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
             }
             // Match C's ngx_http_ssl_alpn_select: when the client sent
             // ALPN but nothing matched our list, fatal-alert the handshake.
+            // h2_ssl.t "alpn rejected" depends on this.
             2 // SSL_TLSEXT_ERR_ALERT_FATAL
         }
         unsafe {
