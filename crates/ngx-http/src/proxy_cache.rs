@@ -1035,6 +1035,15 @@ pub fn maybe_save(
     };
     if is_no_cache(r, conf) { return; }
     if is_no_store(r) { return; }
+    // proxy_cache_min_uses: only actually persist once the entry has
+    // been requested min_uses times — matches C's node->uses threshold.
+    if conf.min_uses > 1 {
+        let base_key = match &conf.key {
+            Some(cv) => crate::script::complex_value(r, cv).unwrap_or_else(|_| default_cache_key(r, upstream_uri)),
+            None => default_cache_key(r, upstream_uri),
+        };
+        if get_hits(&zone, &base_key) < conf.min_uses { return; }
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
