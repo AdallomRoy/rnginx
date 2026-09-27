@@ -1787,6 +1787,28 @@ async fn proxy_handler(r: R) -> i64 {
         }
     }
 
+    // Reject 101 Switching Protocols the client didn't ask for BEFORE we
+    // send any headers — an upstream that unilaterally decides to switch
+    // protocols on a plain request must not take over the client's socket.
+    // Matches ngx_http_upstream_process_upgrade's headers_in.upgrade
+    // check.
+    if status == 101 {
+        let client_wanted_upgrade = r.headers_in.borrow().headers.iter()
+            .any(|h| h.hash.get() != 0 && h.lowcase_key == b"upgrade");
+        if !client_wanted_upgrade {
+            // Send a bare 502 status line with no body — matches C's
+            // NGX_HTTP_UPSTREAM_INVALID_HEADER path where the response
+            // is closed without an error page (test expects
+            // body_bytes_sent == 0). Setting header_only makes the
+            // header_filter skip body emission and the default 502
+            // error_page.
+            r.headers_out.borrow_mut().status = NGX_HTTP_BAD_GATEWAY as i64;
+            r.header_only.set(true);
+            r.keepalive.set(false);
+            let _ = crate::core_rt::send_header(&r).await;
+            return crate::NGX_DONE;
+        }
+    }
     // proxy_intercept_errors: hand off to error_page instead of forwarding the
     // upstream body — but only if the location actually has an error_page
     // configured for this status. Matches ngx_http_upstream_intercept_errors.
@@ -1874,26 +1896,31 @@ async fn proxy_handler(r: R) -> i64 {
     // proxy_upgrade.t / proxy_websocket.t / tunnel*.t need — no fancy
     // half-close handling, no chunked framing.
     if status == 101 {
-        if let Some(upstream_stream) = upstream.take() {
-            // Force headers out through the write filter — postpone_output
-            // would otherwise keep the 101 line buffered until the "last"
-            // signal, which never arrives in an upgrade.
-            let mut b = ngx_core::buf::Buf::from_vec(Vec::new());
-            b.flush = true;
-            b.sync = true;
-            let mut chain = ngx_core::buf::Chain::new();
-            chain.push_back(b);
-            let _ = crate::core_rt::output_filter(&r, chain).await;
+        // The client-wanted-upgrade gate ran before send_header above, so
+        // reaching here always means the client did ask for an upgrade.
+        {
+            if let Some(upstream_stream) = upstream.take() {
+                // Force headers out through the write filter — postpone_output
+                // would otherwise keep the 101 line buffered until the "last"
+                // signal, which never arrives in an upgrade.
+                let mut b = ngx_core::buf::Buf::from_vec(Vec::new());
+                b.flush = true;
+                b.sync = true;
+                let mut chain = ngx_core::buf::Chain::new();
+                chain.push_back(b);
+                let _ = crate::core_rt::output_filter(&r, chain).await;
 
-            // Anything past the header block was already sent by upstream
-            // as part of the upgraded protocol (e.g. a WebSocket server
-            // that started sending frames immediately). Forward that
-            // trailing tail to the client before entering the read loop.
-            if body_start < response.len() {
-                let tail = &response[body_start..];
-                let _ = r.connection.send_all(tail).await;
+                // Anything past the header block was already sent by upstream
+                // as part of the upgraded protocol (e.g. a WebSocket server
+                // that started sending frames immediately). Forward that
+                // trailing tail to the client before entering the read loop.
+                if body_start < response.len() {
+                    let tail = &response[body_start..];
+                    let _ = r.connection.send_all(tail).await;
+                }
+                let _ = proxy_upgrade_tunnel(r.clone(), upstream_stream).await;
+                return crate::NGX_DONE;
             }
-            let _ = proxy_upgrade_tunnel(r.clone(), upstream_stream).await;
             return crate::NGX_DONE;
         }
         return crate::NGX_DONE;
