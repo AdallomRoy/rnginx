@@ -56,6 +56,7 @@ pub struct ProxyCacheConf {
     pub use_stale: u32,                       // proxy_cache_use_stale bitmask
     pub background_update: bool,              // proxy_cache_background_update
     pub max_range_offset: Option<u64>,        // proxy_cache_max_range_offset
+    pub explicitly_off: bool,                 // proxy_cache off — don't inherit
 }
 
 // proxy_cache_use_stale bitmask values (matches ngx_http_upstream_next_t).
@@ -127,6 +128,7 @@ impl ProxyCacheConf {
             use_stale: 0,
             background_update: false,
             max_range_offset: None,
+            explicitly_off: false,
         }
     }
 }
@@ -1279,6 +1281,7 @@ pub async fn background_refresh(
         use_stale: 0,
         background_update: false,
         max_range_offset: None,
+        explicitly_off: false,
     };
     // Compute expires the same way maybe_save does.
     let now = std::time::SystemTime::now()

@@ -334,7 +334,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     // proxy_cache_* inheritance — location-level overrides win, otherwise
     // pull each field from the parent (matches C's per-field
     // ngx_conf_merge_ptr_value / merge_str_value pattern).
-    if c.cache.zone.is_none() {
+    if c.cache.zone.is_none() && !c.cache.explicitly_off {
         c.cache.zone = p.cache.zone.clone();
         c.cache.zone_cv = p.cache.zone_cv.clone();
     }
@@ -897,6 +897,16 @@ async fn proxy_handler(r: R) -> i64 {
     // below the offset, strip Range from the upstream request so the
     // whole entry lands in cache and the range_filter serves the subrange
     // from a memory buf. Matches ngx_http_upstream_cache_check_range.
+    // proxy_cache implies we want the FULL upstream response so we can
+    // cache it, so strip client conditional headers unless the location
+    // has proxy_cache_revalidate on (which needs its own IMS/INM built
+    // from the cached response). Matches C's
+    // ngx_http_upstream_process_conditional_headers behavior.
+    let strip_conditional = {
+        let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        let c = lcf_c.borrow();
+        c.cache.zone.is_some()
+    };
     let strip_range = {
         let lcf_mro = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
         let c = lcf_mro.borrow();
@@ -951,6 +961,12 @@ async fn proxy_handler(r: R) -> i64 {
                 continue;
             }
             if strip_range && lc.as_slice() == b"range" {
+                continue;
+            }
+            if strip_conditional && matches!(lc.as_slice(),
+                b"if-modified-since" | b"if-unmodified-since" |
+                b"if-none-match" | b"if-match" | b"if-range")
+            {
                 continue;
             }
             if overridden_names.iter().any(|n| n.as_slice() == lc.as_slice()) {
@@ -2384,6 +2400,7 @@ pub fn proxy_module() -> ModuleDef {
                 let mut c = cell.borrow_mut();
                 c.cache.zone = None;
                 c.cache.zone_cv = None;
+                c.cache.explicitly_off = true;
             } else if cf.args[1].contains(&b'$') {
                 let cv = crate::script::compile_complex_value(cf, &cf.args[1].clone(), 0)?;
                 let mut c = cell.borrow_mut();
