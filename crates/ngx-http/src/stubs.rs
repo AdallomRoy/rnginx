@@ -839,12 +839,12 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
     crate::ssl_module::ssl_handshake(c, hc).await
 }
 
-pub fn ssl_verify_enabled(_cscf: &Rc<std::cell::RefCell<CoreSrvConf>>) -> bool {
-    false
+pub fn ssl_verify_enabled(cscf: &Rc<std::cell::RefCell<CoreSrvConf>>) -> bool {
+    crate::ssl_module::ssl_verify_enabled(cscf)
 }
 
-pub fn ssl_process_request_checks(_r: &R) -> Option<i64> {
-    None
+pub fn ssl_process_request_checks(r: &R) -> Option<i64> {
+    crate::ssl_module::ssl_process_request_checks(r)
 }
 
 pub async fn ssl_shutdown(c: &Rc<Connection>) { crate::ssl_module::ssl_shutdown(c).await }

@@ -17,6 +17,17 @@ use ngx_core::ngx_log_error;
 use openssl::ssl::{SslContext, SslContextBuilder, SslMethod, SslFiletype, SslVerifyMode};
 extern "C" {
     fn SSL_set_fd(s: *mut openssl_sys::SSL, fd: std::os::raw::c_int) -> std::os::raw::c_int;
+    // openssl-sys 0.9.117 gates SSL_get_peer_certificate behind #[cfg(not(ossl300))]
+    // and SSL_get1_peer_certificate behind #[cfg(ossl300)]. Both symbols are just
+    // aliases at the C level (the "1" refers to the reference-count-1 return
+    // convention), so we bind SSL_get1_peer_certificate directly here — OpenSSL 3
+    // exports both names and 1.1.1 exports SSL_get_peer_certificate as an alias.
+    fn SSL_get1_peer_certificate(ssl: *const openssl_sys::SSL) -> *mut openssl_sys::X509;
+}
+
+#[allow(non_snake_case)]
+unsafe fn SSL_get_peer_x509(ssl: *const openssl_sys::SSL) -> *mut openssl_sys::X509 {
+    SSL_get1_peer_certificate(ssl)
 }
 
 
@@ -33,7 +44,7 @@ use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, HttpModuleDef, http_module_de
 // virtual_names[hostname] without any thread/global synchronization.
 // ---------------------------------------------------------------------
 thread_local! {
-    static SNI_REGISTRY: RefCell<Vec<Option<Rc<AddrConf>>>> = const { RefCell::new(Vec::new()) };
+    static SNI_REGISTRY: RefCell<Vec<Option<Rc<HttpConnection>>>> = const { RefCell::new(Vec::new()) };
     static SNI_EX_INDEX: Cell<i32> = const { Cell::new(-1) };
 }
 
@@ -65,24 +76,21 @@ fn sni_ex_index() -> i32 {
     idx
 }
 
-fn sni_register(addr: Rc<AddrConf>) -> usize {
+fn sni_register(hc: Rc<HttpConnection>) -> usize {
     SNI_REGISTRY.with(|r| {
         let mut v = r.borrow_mut();
-        // Reuse a hole left by a freed connection if we have one — this
-        // keeps the vector bounded across a long-running worker's
-        // lifetime instead of leaking a slot per handshake.
         for (i, slot) in v.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(addr);
+                *slot = Some(hc);
                 return i;
             }
         }
-        v.push(Some(addr));
+        v.push(Some(hc));
         v.len() - 1
     })
 }
 
-fn sni_lookup(idx: usize) -> Option<Rc<AddrConf>> {
+fn sni_lookup(idx: usize) -> Option<Rc<HttpConnection>> {
     SNI_REGISTRY.with(|r| r.borrow().get(idx).and_then(|o| o.clone()))
 }
 
@@ -97,45 +105,44 @@ unsafe extern "C" fn sni_servername_cb(
     let idx_ptr = openssl_sys::SSL_get_ex_data(ssl, sni_ex_index());
     if idx_ptr.is_null() { return ok; }
     let idx = idx_ptr as usize - 1; // sentinel-shift so NULL != index 0
-    let addr = match sni_lookup(idx) { Some(a) => a, None => return ok };
+    let hc = match sni_lookup(idx) { Some(h) => h, None => return ok };
+    let addr = &hc.addr_conf;
     let name_c = openssl_sys::SSL_get_servername(ssl, 0 /* TLSEXT_NAMETYPE_host_name */);
     if name_c.is_null() {
-        // No SNI. If reject_handshake is on for the default server, refuse.
         if reject_handshake_for(&addr.default_server) {
             return fatal;
         }
         return ok;
     }
     let name = std::ffi::CStr::from_ptr(name_c).to_bytes();
-    // Lowercase copy so hash lookup matches.
     let host: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-    let cscf = find_server_by_name(&addr, &host);
+    let cscf = find_server_by_name(addr, &host);
     let cscf = match cscf {
         Some(c) => c,
         None => {
-            // No matching virtual server. If default has reject_handshake
-            // on, refuse; else fall through with the default cert.
             if reject_handshake_for(&addr.default_server) {
                 return fatal;
             }
             return ok;
         }
     };
-    // Fetch the target server's SslContext and swap.
-    let sctx = cscf.borrow().ctx.clone();
-    let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => return ok };
-    let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
     if reject_handshake_for(&cscf) {
         return fatal;
     }
+    // Point hc at the SNI'd server's config so subsequent request
+    // creation sees the right srv/loc slots. Matches C's
+    // hc->conf_ctx = cscf->ctx.
+    let target_ctx = cscf.borrow().ctx.clone();
+    *hc.conf_ctx.borrow_mut() = target_ctx.clone();
+    // Fetch the target server's SslContext and swap.
+    let srv_slots = match &target_ctx.srv { Some(s) => s.clone(), None => return ok };
+    let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
     let target = ssl_conf.borrow().ssl_ctx.borrow().clone();
     if let Some(target) = target {
         let raw = target.as_ptr() as *mut openssl_sys::SSL_CTX;
         if openssl_sys::SSL_set_SSL_CTX(ssl, raw).is_null() {
             return ok;
         }
-        // Match C's post-SSL_set_SSL_CTX adjustments so verify from the
-        // target ctx actually takes effect for this handshake.
         let mode = openssl_sys::SSL_CTX_get_verify_mode(raw);
         openssl_sys::SSL_set_verify(ssl, mode, None);
         // SSL_CTRL_OPTIONS=32 — set options via SSL_ctrl since 0.9.117
@@ -391,9 +398,9 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         VarDef { name: "ssl_session_reused", set: None, get: Some(var_ssl_session_reused), data: 0, flags: 0 },
         VarDef { name: "ssl_server_name", set: None, get: Some(var_ssl_server_name), data: 0, flags: 0 },
         VarDef { name: "ssl_client_verify", set: None, get: Some(var_ssl_client_verify), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_cert", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_raw_cert", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_escaped_cert", set: None, get: Some(var_notfound), data: 0, flags: 0 },
+        VarDef { name: "ssl_client_cert", set: None, get: Some(var_ssl_client_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
+        VarDef { name: "ssl_client_raw_cert", set: None, get: Some(var_ssl_client_raw_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
+        VarDef { name: "ssl_client_escaped_cert", set: None, get: Some(var_ssl_client_escaped_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
         VarDef { name: "ssl_client_s_dn", set: None, get: Some(var_notfound), data: 0, flags: 0 },
         VarDef { name: "ssl_client_i_dn", set: None, get: Some(var_notfound), data: 0, flags: 0 },
         VarDef { name: "ssl_client_s_dn_legacy", set: None, get: Some(var_notfound), data: 0, flags: 0 },
@@ -455,13 +462,43 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         // Protocol version limits
         set_protocols_on_builder(&mut builder, protocols);
         if verify_mode != 0 {
+            // NOTE: we deliberately do NOT set FAIL_IF_NO_PEER_CERT
+            // even for verify=on. C nginx handles the no-cert case in
+            // ngx_http_ssl_check_client (returning 400) rather than
+            // failing the TLS handshake — that's what the tests expect
+            // (client should see a 400, not a truncated TLS response).
             let mode = match verify_mode {
-                1 => SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-                2 | 3 => SslVerifyMode::PEER,
+                1 | 2 | 3 => SslVerifyMode::PEER,
                 _ => SslVerifyMode::NONE,
             };
-            builder.set_verify(mode);
+            // Match C's ngx_ssl_verify_callback: always return 1 from
+            // the TLS-layer callback so the handshake completes even on
+            // verify failure; the real check happens in the request
+            // processor via SSL_get_verify_result. This gives us the
+            // "FAILED:<reason>" $ssl_client_verify value that tests
+            // like ssl_verify_client 'bad optional cert' rely on.
+            builder.set_verify_callback(mode, |_ok, _ctx| true);
             if let Some(ca) = client_ca {
+                let ca_full = cf.cycle.full_name(&ca, true);
+                if let Ok(s) = std::str::from_utf8(&ca_full) {
+                    let _ = builder.set_ca_file(s);
+                    // Advertise these CA DNs in the CertificateRequest
+                    // so the client's cert-picker knows what to send.
+                    unsafe {
+                        let list = openssl_sys::SSL_load_client_CA_file(
+                            std::ffi::CString::new(s).unwrap().as_ptr());
+                        if !list.is_null() {
+                            openssl_sys::SSL_CTX_set_client_CA_list(
+                                builder.as_ptr() as *mut _, list);
+                        }
+                    }
+                }
+            }
+            // ssl_trusted_certificate: adds CAs used to verify chains
+            // WITHOUT sending them in the CertificateRequest. Matches
+            // ngx_ssl_trusted_certificate.
+            let trusted = ssl_conf.borrow().trusted_certificate.as_option().cloned();
+            if let Some(ca) = trusted {
                 let ca_full = cf.cycle.full_name(&ca, true);
                 if let Ok(s) = std::str::from_utf8(&ca_full) {
                     let _ = builder.set_ca_file(s);
@@ -567,7 +604,7 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
         // Attach addr_conf so the SNI callback can find the matching
         // virtual server and swap SSL_CTX. Store idx+1 so a NULL
         // ex_data (unset) is distinguishable from index 0.
-        let idx = sni_register(hc.addr_conf.clone());
+        let idx = sni_register(hc.clone());
         openssl_sys::SSL_set_ex_data(ssl.as_ptr(), sni_ex_index(), (idx + 1) as *mut c_void);
     }
     // Wrap and stash into the connection so recv/send route through TLS.
@@ -580,6 +617,18 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
         let rc = unsafe { openssl_sys::SSL_do_handshake(ssl_ptr) };
         if rc == 1 {
             ssl_conn.handshaked.set(true);
+            // Record the SNI hostname on the HttpConnection so
+            // set_virtual_server / the misdirected-request check
+            // downstream sees "an SNI was negotiated" and can compare
+            // against the Host header. Matches ngx_http_ssl_servername.
+            unsafe {
+                let name_c = openssl_sys::SSL_get_servername(ssl_ptr, 0);
+                if !name_c.is_null() {
+                    let bytes = std::ffi::CStr::from_ptr(name_c).to_bytes();
+                    let host: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+                    *hc.ssl_servername.borrow_mut() = Some(host);
+                }
+            }
             return true;
         }
         let err = unsafe { openssl_sys::SSL_get_error(ssl_ptr, rc) };
@@ -604,8 +653,48 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
     }
 }
 
-pub fn ssl_verify_enabled(_cscf: &Rc<RefCell<CoreSrvConf>>) -> bool { false }
-pub fn ssl_process_request_checks(_r: &R) -> Option<i64> { None }
+pub fn ssl_verify_enabled(cscf: &Rc<RefCell<CoreSrvConf>>) -> bool {
+    let sctx = cscf.borrow().ctx.clone();
+    let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => return false };
+    let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
+    let v = ssl_conf.borrow().verify.get_or(0);
+    v == 1 || v == 2
+}
+
+/// Match ngx_http_ssl_check_client (called after headers are parsed).
+/// Returns Some(status) to short-circuit the request, None to continue.
+///   verify=on and no/bad client cert  → 400 Bad Request
+///   verify=optional and bad client cert → 400 Bad Request
+///   verify=optional_no_ca — no check (accept any cert)
+///   SNI hostname doesn't match Host — 421 Misdirected Request when
+///   verify_client is on (avoids credential-mismatch)
+pub fn ssl_process_request_checks(r: &R) -> Option<i64> {
+    let cscf = r.cscf();
+    let sctx = cscf.borrow().ctx.clone();
+    let srv_slots = &sctx.srv.as_ref()?.clone();
+    let ssl_conf = slot_of::<HttpSslSrvConf>(srv_slots, ctx_index());
+    let verify = ssl_conf.borrow().verify.get_or(0);
+    if verify == 0 || verify == 3 { return None; }  // off or optional_no_ca
+    let sc = r.connection.ssl.borrow().clone()?;
+    if !sc.handshaked.get() { return None; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let cert = SSL_get_peer_x509(ptr);
+        if verify == 1 && cert.is_null() {
+            // required but not present
+            return Some(crate::NGX_HTTP_BAD_REQUEST as i64);
+        }
+        if !cert.is_null() {
+            let rc = openssl_sys::SSL_get_verify_result(ptr);
+            openssl_sys::X509_free(cert);
+            if rc != openssl_sys::X509_V_OK as i64 {
+                // required or optional but verify failed
+                return Some(crate::NGX_HTTP_BAD_REQUEST as i64);
+            }
+        }
+    }
+    None
+}
 
 pub async fn ssl_shutdown(c: &Rc<Connection>) {
     if let Some(ssl) = c.ssl.borrow().clone() {
@@ -698,8 +787,123 @@ fn var_ssl_server_name(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
         _ => { v.not_found = true; NGX_OK }
     }
 }
-fn var_ssl_client_verify(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
-    set_var(v, b"NONE".to_vec())
+fn var_ssl_client_verify(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
+    if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let cert = SSL_get_peer_x509(ptr);
+        if cert.is_null() {
+            return set_var(v, b"NONE".to_vec());
+        }
+        openssl_sys::X509_free(cert);
+        let rc = openssl_sys::SSL_get_verify_result(ptr);
+        if rc == openssl_sys::X509_V_OK as i64 {
+            set_var(v, b"SUCCESS".to_vec())
+        } else {
+            // C emits FAILED:<X509_verify_cert_error_string(rc)>
+            let s = openssl_sys::X509_verify_cert_error_string(rc);
+            let mut out = b"FAILED:".to_vec();
+            if !s.is_null() {
+                let bytes = std::ffi::CStr::from_ptr(s).to_bytes();
+                out.extend_from_slice(bytes);
+            }
+            set_var(v, out)
+        }
+    }
+}
+
+fn pem_encode_cert(cert_ptr: *mut openssl_sys::X509) -> Option<Vec<u8>> {
+    unsafe {
+        let bio = openssl_sys::BIO_new(openssl_sys::BIO_s_mem());
+        if bio.is_null() { return None; }
+        if openssl_sys::PEM_write_bio_X509(bio, cert_ptr) == 0 {
+            openssl_sys::BIO_free_all(bio);
+            return None;
+        }
+        let mut data_ptr: *mut u8 = std::ptr::null_mut();
+        let len = openssl_sys::BIO_get_mem_data(bio, &mut data_ptr as *mut *mut u8 as *mut *mut std::os::raw::c_char);
+        if len <= 0 {
+            openssl_sys::BIO_free_all(bio);
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(data_ptr, len as usize).to_vec();
+        openssl_sys::BIO_free_all(bio);
+        Some(bytes)
+    }
+}
+
+fn var_ssl_client_raw_cert(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
+    if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let cert = SSL_get_peer_x509(ptr);
+        if cert.is_null() { v.not_found = true; return NGX_OK; }
+        let pem = pem_encode_cert(cert);
+        openssl_sys::X509_free(cert);
+        match pem {
+            Some(p) => set_var(v, p),
+            None => { v.not_found = true; NGX_OK }
+        }
+    }
+}
+
+fn var_ssl_client_cert(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    // Same as raw_cert but with each \n prefixed by \t so the header value
+    // can span multiple lines and still be a valid single header field.
+    let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
+    if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let cert = SSL_get_peer_x509(ptr);
+        if cert.is_null() { v.not_found = true; return NGX_OK; }
+        let pem = pem_encode_cert(cert);
+        openssl_sys::X509_free(cert);
+        match pem {
+            Some(p) => {
+                let mut out = Vec::with_capacity(p.len() + 16);
+                for &b in &p {
+                    out.push(b);
+                    if b == b'\n' { out.push(b'\t'); }
+                }
+                // trim trailing tab if we added one after the final \n
+                if out.last() == Some(&b'\t') { out.pop(); }
+                set_var(v, out)
+            }
+            None => { v.not_found = true; NGX_OK }
+        }
+    }
+}
+
+fn var_ssl_client_escaped_cert(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
+    if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let cert = SSL_get_peer_x509(ptr);
+        if cert.is_null() { v.not_found = true; return NGX_OK; }
+        let pem = pem_encode_cert(cert);
+        openssl_sys::X509_free(cert);
+        match pem {
+            Some(p) => {
+                // uri-escape every char that isn't unreserved. Matches
+                // ngx_escape_uri with NGX_ESCAPE_URI_COMPONENT.
+                let mut out = Vec::with_capacity(p.len() * 3);
+                for &b in &p {
+                    let unreserved = b.is_ascii_alphanumeric()
+                        || matches!(b, b'-' | b'_' | b'.' | b'~');
+                    if unreserved {
+                        out.push(b);
+                    } else {
+                        out.extend_from_slice(format!("%{:02X}", b).as_bytes());
+                    }
+                }
+                set_var(v, out)
+            }
+            None => { v.not_found = true; NGX_OK }
+        }
+    }
 }
 
 // Keep the Cell/Ssl unused-import placeholder silenced for now.
