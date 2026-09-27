@@ -162,8 +162,10 @@ pub fn resolve_zone_name(r: &R, conf: &ProxyCacheConf) -> Option<Result<Vec<u8>,
 }
 
 pub fn parse_cache_valid(args: &[Vec<u8>]) -> Result<CacheValid, ConfError> {
-    // Last arg is time. Preceding args are status codes (or "any").
-    if args.len() < 2 {
+    // Last arg is time. Preceding args (if any) are status codes / "any";
+    // when only the time is given the default status set (200/301/302) is
+    // used. Matches ngx_http_file_cache_valid_set_slot.
+    if args.is_empty() {
         return Err(msg("proxy_cache_valid requires time"));
     }
     let time_arg = &args[args.len() - 1];
@@ -309,6 +311,39 @@ pub fn save(zone_name: &[u8], key: &[u8], resp: &CachedResponse) {
     let tmp = p.with_extension("tmp");
     if std::fs::write(&tmp, serialize(resp)).is_err() { return; }
     let _ = std::fs::rename(&tmp, &p);
+}
+
+/// Extract the comma-separated header names from a Vary header value.
+/// Returns lowercase names; "*" is treated as a special uncacheable marker.
+pub fn vary_names(vary: &[u8]) -> Vec<Vec<u8>> {
+    vary.split(|&b| b == b',')
+        .map(trim_ws)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// Build a variant key from the base cache key + the request-header values
+/// listed in Vary. Matches nginx's `u->cache->vary` handling in
+/// ngx_http_file_cache_vary.
+pub fn variant_key(r: &R, base: &[u8], vary_header: &[u8]) -> Vec<u8> {
+    let mut out = base.to_vec();
+    out.extend_from_slice(b"\0vary=");
+    for name in vary_names(vary_header) {
+        out.extend_from_slice(&name);
+        out.push(b':');
+        // Look up header value in the incoming request. Missing header → empty.
+        let hin = r.headers_in.borrow();
+        // Match against `hin.headers` (the raw header list).
+        for h in &hin.headers {
+            if h.lowcase_key == name {
+                out.extend_from_slice(&h.value.borrow());
+                break;
+            }
+        }
+        out.push(b'|');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -489,9 +524,24 @@ pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Opt
         set_status(r, CacheStatus::Bypass);
         return None;
     }
-    let key = match &conf.key {
+    let base_key = match &conf.key {
         Some(cv) => crate::script::complex_value(r, cv).ok()?,
         None => default_cache_key(r, upstream_uri),
+    };
+    // Follow a "vary marker" once: nginx stores the Vary header string in a
+    // primary node and reads variants under a per-request-header key. If the
+    // stored response has a Vary header, recompute the key and re-look-up.
+    let key = if let Some(marker) = lookup(&zone, &base_key) {
+        if let Some(vh) = marker.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(b"vary")) {
+            // "Vary: *" is a wildcard — always uncacheable.
+            let v = trim_ws(&vh.1);
+            if v == b"*" { set_status(r, CacheStatus::Miss); return None; }
+            variant_key(r, &base_key, &vh.1)
+        } else {
+            base_key.clone()
+        }
+    } else {
+        base_key.clone()
     };
     match lookup(&zone, &key) {
         Some(resp) => {
@@ -654,17 +704,46 @@ pub fn maybe_save(
     } else {
         return;
     };
+    // Extract Vary before we hand `headers` to CachedResponse.
+    let vary_val: Option<Vec<u8>> = if ignored(b"vary") {
+        None
+    } else {
+        headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(b"vary"))
+            .map(|(_, v)| v.clone())
+    };
+    let base_key = match &conf.key {
+        Some(cv) => crate::script::complex_value(r, cv).unwrap_or_else(|_| default_cache_key(r, upstream_uri)),
+        None => default_cache_key(r, upstream_uri),
+    };
     let resp = CachedResponse {
         expires_epoch,
         status,
         headers,
         body,
     };
-    let key = match &conf.key {
-        Some(cv) => crate::script::complex_value(r, cv).unwrap_or_else(|_| default_cache_key(r, upstream_uri)),
-        None => default_cache_key(r, upstream_uri),
-    };
-    save(&zone, &key, &resp);
+    match vary_val {
+        Some(vh) => {
+            let vt = trim_ws(&vh);
+            if vt == b"*" {
+                // Wildcard Vary is uncacheable — matches C's cache->vary=* skip.
+                return;
+            }
+            // Save a small marker under the primary key that just carries
+            // the Vary directive, then save the real response under the
+            // variant key derived from Vary'd request headers.
+            let marker = CachedResponse {
+                expires_epoch,
+                status: 0,
+                headers: vec![(b"Vary".to_vec(), vh.clone())],
+                body: Vec::new(),
+            };
+            save(&zone, &base_key, &marker);
+            let variant = variant_key(r, &base_key, &vh);
+            save(&zone, &variant, &resp);
+        }
+        None => save(&zone, &base_key, &resp),
+    }
 }
 
 fn trim_ws(mut s: &[u8]) -> &[u8] {
