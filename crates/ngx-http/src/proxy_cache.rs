@@ -578,6 +578,11 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
                 }
                 b"last-modified" => {
                     ho.last_modified = Some(crate::request::TableElt::new(k, v));
+                    // Parse into last_modified_time so not_modified_filter
+                    // can compare against If-Modified-Since / If-Unmodified-Since.
+                    if let Some(t) = ngx_core::parse::parse_http_time(v) {
+                        ho.last_modified_time = t;
+                    }
                 }
                 b"etag" => {
                     ho.etag = Some(crate::request::TableElt::new(k, v));
@@ -589,10 +594,12 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
         }
     }
 
-    // Cache the response but skip 304-handling — we're serving a fresh copy.
-    r.disable_not_modified.set(true);
     // Full-body cached response is in memory — let the range filter serve
-    // partial content from it. Matches C's ngx_http_cache_send.
+    // partial content from it. Matches C's ngx_http_cache_send. Do NOT set
+    // disable_not_modified: cached responses have their own ETag /
+    // Last-Modified that the not_modified filter should compare against
+    // If-None-Match / If-Modified-Since. Matches C where u->cacheable is
+    // true and disable_not_modified stays 0 on cache HITs.
     r.allow_ranges.set(true);
 
     let sh = crate::core_rt::send_header(r).await;
