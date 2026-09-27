@@ -930,12 +930,7 @@ async fn try_serve_once(
                 let use_stale_updating = (conf.use_stale & USE_STALE_UPDATING) != 0;
                 if swr_ok || use_stale_updating {
                     set_status(r, CacheStatus::Stale);
-                    // Note: no background upstream refresh yet — spawn
-                    // caused subsequent client requests to hit 500 during
-                    // the refresh window (likely a shared connection
-                    // resource conflict). Serve stale-only; next request
-                    // past the SWR window pays the full fetch.
-                    let _ = upstream_uri;
+                    spawn_background_refresh(r, conf, upstream_uri, zone, &key);
                     return Some(serve_hit(r, resp).await);
                 }
             }
