@@ -159,7 +159,10 @@ impl GzipCtx {
     }
 }
 
-fn should_gzip(r: &R) -> bool {
+/// True when this response is a candidate for gzipping — regardless of
+/// whether the client accepted gzip. Matches the C gzip_filter checks
+/// that happen BEFORE `r->gzip_vary = 1`.
+fn is_gzippable(r: &R) -> bool {
     let conf = r.loc_conf::<GzipConf>(ctx_index());
     let c = conf.borrow();
     if !*c.enable { return false; }
@@ -170,28 +173,31 @@ fn should_gzip(r: &R) -> bool {
     if r.headers_out.borrow().content_encoding.is_some() { return false; }
     let cl = r.headers_out.borrow().content_length_n;
     if cl != -1 && (cl as usize) < *c.min_length { return false; }
-    // types check
     let types = c.types.as_option().cloned().unwrap_or_default();
     let ct = r.headers_out.borrow().content_type.clone();
     let ct_type = if let Some(sc) = ct.iter().position(|&b| b == b';') { &ct[..sc] } else { &ct[..] };
     let ct_trim: Vec<u8> = ct_type.iter().copied().filter(|&b| b != b' ' && b != b'\t').collect();
-    let allowed = if types.is_empty() {
-        ct_trim == b"text/html"
-    } else {
-        types.iter().any(|t| t.as_slice() == ct_trim.as_slice())
-    };
-    if !allowed { return false; }
-    drop(c);
+    if types.is_empty() {
+        if ct_trim != b"text/html" { return false; }
+    } else if !types.iter().any(|t| t.as_slice() == ct_trim.as_slice()) {
+        return false;
+    }
+    true
+}
+
+fn should_gzip(r: &R) -> bool {
+    if !is_gzippable(r) { return false; }
     // gzip_ok checks Accept-Encoding, http_version, proxied
     crate::core_rt::gzip_ok(r) == NGX_OK
 }
 
 async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     if !should_gzip(&r) {
-        // Vary: Accept-Encoding when gzip_vary on and gzip disabled/not-applied.
-        // gzip_vary is registered on the core module (CoreLocConf), not our own
-        // GzipConf — so read via clcf() to hit the slot the parser populates.
-        if *r.clcf().borrow().gzip_vary {
+        // Vary: Accept-Encoding — only when the response IS gzippable
+        // but we chose not to compress (typically because the client
+        // didn't accept gzip). Matches C's `r->gzip_vary = 1;` gating,
+        // which happens only after the gzippable checks pass.
+        if is_gzippable(&r) && *r.clcf().borrow().gzip_vary {
             add_vary(&r);
         }
         return next(r).await;
