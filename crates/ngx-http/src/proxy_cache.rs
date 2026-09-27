@@ -49,6 +49,9 @@ pub struct ProxyCacheConf {
     pub bypass: Vec<Rc<ComplexValue>>,        // proxy_cache_bypass expressions
     pub no_cache: Vec<Rc<ComplexValue>>,      // proxy_no_cache expressions
     pub ignore_headers: Vec<Vec<u8>>,         // proxy_ignore_headers: lowercase names to skip
+    pub lock: bool,                           // proxy_cache_lock
+    pub lock_timeout_ms: u64,                 // proxy_cache_lock_timeout
+    pub lock_age_ms: u64,                     // proxy_cache_lock_age
 }
 
 impl ProxyCacheConf {
@@ -64,7 +67,64 @@ impl ProxyCacheConf {
             bypass: Vec::new(),
             no_cache: Vec::new(),
             ignore_headers: Vec::new(),
+            lock: false,
+            lock_timeout_ms: 5000,
+            lock_age_ms: 5000,
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// proxy_cache_lock: single-flight upstream fetch per cache key.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static IN_FLIGHT: RefCell<HashMap<Vec<u8>, Rc<tokio::sync::Notify>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Try to acquire the lock for a key. Returns Ok(true) if we became the
+/// leader (caller must call release_lock when done), Ok(false) after
+/// waiting for another leader to finish and finding a fresh cache entry,
+/// Err(()) if the wait timed out and the caller should just proceed
+/// without the lock.
+pub async fn acquire_lock(
+    zone_name: &[u8],
+    key: &[u8],
+    timeout_ms: u64,
+) -> Result<bool, ()> {
+    let existing = IN_FLIGHT.with(|m| m.borrow().get(key).cloned());
+    match existing {
+        Some(notify) => {
+            let wait = notify.notified();
+            tokio::pin!(wait);
+            let dur = std::time::Duration::from_millis(timeout_ms);
+            match tokio::time::timeout(dur, wait).await {
+                Ok(()) => {
+                    // Leader finished — cache should now be populated. Let the
+                    // caller re-lookup; if it's still MISS the caller falls back
+                    // to a direct upstream fetch.
+                    let _ = zone_name;
+                    Ok(false)
+                }
+                Err(_) => Err(()),
+            }
+        }
+        None => {
+            IN_FLIGHT.with(|m| {
+                m.borrow_mut()
+                    .insert(key.to_vec(), Rc::new(tokio::sync::Notify::new()));
+            });
+            Ok(true)
+        }
+    }
+}
+
+/// Wake every waiter blocked on `key` and drop the in-flight marker.
+pub fn release_lock(key: &[u8]) {
+    let entry = IN_FLIGHT.with(|m| m.borrow_mut().remove(key));
+    if let Some(notify) = entry {
+        notify.notify_waiters();
     }
 }
 
@@ -527,10 +587,21 @@ pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Opt
         set_status(r, CacheStatus::Bypass);
         return None;
     }
+    try_serve_once(r, conf, upstream_uri, &zone, false).await
+}
+
+async fn try_serve_once(
+    r: &R,
+    conf: &ProxyCacheConf,
+    upstream_uri: &[u8],
+    zone: &[u8],
+    is_retry: bool,
+) -> Option<i64> {
     let base_key = match &conf.key {
         Some(cv) => crate::script::complex_value(r, cv).ok()?,
         None => default_cache_key(r, upstream_uri),
     };
+    let _ = is_retry;
     // Follow a "vary marker" once: nginx stores the Vary header string in a
     // primary node and reads variants under a per-request-header key. If the
     // stored response has a Vary header, recompute the key and re-look-up.
@@ -584,9 +655,61 @@ pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Opt
         }
         None => {
             set_status(r, CacheStatus::Miss);
+            // proxy_cache_lock: if another request is already fetching this
+            // key, wait for it and re-serve from cache. If we become the
+            // leader, remember the key so the caller releases it after the
+            // upstream save completes.
+            if conf.lock && !is_retry {
+                match acquire_lock(zone, &key, conf.lock_timeout_ms).await {
+                    Ok(true) => {
+                        set_lock_key(r, key.clone());
+                    }
+                    Ok(false) => {
+                        // Leader finished — try again once (without waiting).
+                        return Box::pin(try_serve_once(r, conf, upstream_uri, zone, true)).await;
+                    }
+                    Err(()) => {
+                        // Timed out waiting for the leader. Fall back to
+                        // a direct upstream fetch and mark this response
+                        // uncacheable — matches C's behavior since 1.7.8:
+                        // parallel requests past the lock timeout still
+                        // hit upstream but must not overwrite the cache.
+                        set_no_store(r);
+                    }
+                }
+            }
             None
         }
     }
+}
+
+thread_local! {
+    static NO_STORE: RefCell<HashMap<u64, ()>> = RefCell::new(HashMap::new());
+}
+
+fn set_no_store(r: &R) {
+    let id = Rc::as_ptr(r) as u64;
+    NO_STORE.with(|m| { m.borrow_mut().insert(id, ()); });
+    r.add_cleanup(Box::new(move || {
+        NO_STORE.with(|m| { m.borrow_mut().remove(&id); });
+    }));
+}
+
+fn is_no_store(r: &R) -> bool {
+    NO_STORE.with(|m| m.borrow().contains_key(&(Rc::as_ptr(r) as u64)))
+}
+
+thread_local! {
+    static LOCK_KEYS: RefCell<HashMap<u64, Vec<u8>>> = RefCell::new(HashMap::new());
+}
+
+fn set_lock_key(r: &R, key: Vec<u8>) {
+    let id = Rc::as_ptr(r) as u64;
+    LOCK_KEYS.with(|m| { m.borrow_mut().insert(id, key); });
+    r.add_cleanup(Box::new(move || {
+        let k = LOCK_KEYS.with(|m| m.borrow_mut().remove(&id));
+        if let Some(k) = k { release_lock(&k); }
+    }));
 }
 
 /// Save the upstream response as a cache entry, subject to
@@ -604,6 +727,7 @@ pub fn maybe_save(
         _ => return,
     };
     if is_no_cache(r, conf) { return; }
+    if is_no_store(r) { return; }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
