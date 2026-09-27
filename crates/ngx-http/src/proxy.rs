@@ -1420,6 +1420,21 @@ async fn proxy_handler(r: R) -> i64 {
             }
         }
     }
+    // stale-if-error: upstream returned 5xx but the cached response had
+    // Cache-Control: stale-if-error=N and we're still within [expires,
+    // expires+N]. Serve the cached body as STALE — matches C's
+    // ngx_http_upstream_cache_send returning STALE on ngx_http_upstream_next
+    // when u->cache_status is EXPIRED and the entry is stale-if-error-ok.
+    if status >= 500 && status < 600 {
+        if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
+            if let Some(cached) = hints.cached.clone() {
+                if crate::proxy_cache::stale_if_error_ok(&cached) {
+                    crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Stale);
+                    return crate::proxy_cache::serve_hit(&r, cached).await;
+                }
+            }
+        }
+    }
     let headers_section = &response[..status_line_end];
     let status_line_end_nl = headers_section.iter().position(|&b| b == b'\n').unwrap_or(headers_section.len());
     let _ = status_line_end_nl;

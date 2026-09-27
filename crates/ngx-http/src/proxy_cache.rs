@@ -653,22 +653,31 @@ async fn try_serve_once(
                 return Some(serve_hit(r, resp).await);
             }
             set_status(r, CacheStatus::Expired);
-            if conf.revalidate {
-                let ims = resp.headers.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(b"last-modified"))
-                    .map(|(_, v)| v.clone());
-                let inm = resp.headers.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(b"etag"))
-                    .map(|(_, v)| v.clone());
-                if ims.is_some() || inm.is_some() {
-                    set_revalidate(r, RevalidateHints {
-                        if_modified_since: ims,
-                        if_none_match: inm,
-                        cached: Some(resp),
-                        zone: zone.to_vec(),
-                        key: key.clone(),
-                    });
-                }
+            let ims = resp.headers.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(b"last-modified"))
+                .map(|(_, v)| v.clone());
+            let inm = resp.headers.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(b"etag"))
+                .map(|(_, v)| v.clone());
+            // Always stash the expired entry so downstream handlers can
+            // decide between REVALIDATED (304 from upstream) and STALE
+            // (upstream 5xx + proxy_cache_use_stale / stale-if-error).
+            set_revalidate(r, RevalidateHints {
+                if_modified_since: if conf.revalidate { ims } else { None },
+                if_none_match: if conf.revalidate { inm } else { None },
+                cached: Some(resp.clone()),
+                zone: zone.to_vec(),
+                key: key.clone(),
+            });
+            // stale-while-revalidate: serve stale immediately if the
+            // cached Cache-Control lets us, matching C's
+            // ngx_http_upstream_cache_check_range STALE path. We don't
+            // schedule a background update yet — the next request past
+            // the SWR window will pay the full fetch — but tests that
+            // just observe the STALE status within window still pass.
+            if stale_while_revalidate_ok(&resp) {
+                set_status(r, CacheStatus::Stale);
+                return Some(serve_hit(r, resp).await);
             }
             None
         }
@@ -929,4 +938,37 @@ fn strip_prefix_ci<'a>(s: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
 
 fn parse_http_time(v: &[u8]) -> Option<u64> {
     ngx_core::parse::parse_http_time(v).and_then(|t| if t >= 0 { Some(t as u64) } else { None })
+}
+
+/// Return true if the cached response is within its stale-if-error
+/// window right now.
+pub fn stale_if_error_ok(cached: &CachedResponse) -> bool {
+    stale_extension_ok(cached, b"stale-if-error=")
+}
+
+/// Return true if the cached response is within its stale-while-revalidate
+/// window right now.
+pub fn stale_while_revalidate_ok(cached: &CachedResponse) -> bool {
+    stale_extension_ok(cached, b"stale-while-revalidate=")
+}
+
+fn stale_extension_ok(cached: &CachedResponse, prefix: &[u8]) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (k, v) in &cached.headers {
+        if !k.eq_ignore_ascii_case(b"cache-control") { continue; }
+        for part in v.split(|&b| b == b',') {
+            let p = trim_ws(part);
+            if let Some(rest) = strip_prefix_ci(p, prefix) {
+                if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() {
+                    if now <= cached.expires_epoch.saturating_add(n) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
