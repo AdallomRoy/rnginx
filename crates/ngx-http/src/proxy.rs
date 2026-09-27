@@ -852,11 +852,17 @@ async fn proxy_handler(r: R) -> i64 {
             .map(|l| l.max_cached > 0)
             .unwrap_or(false);
     let conn_line = if connection_overridden { "" } else { "Connection: close\r\n" };
+    // IPv6 literal hostnames need bracket-quoting in the Host header.
+    let host_hdr: String = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
     let request = format!(
         "{} {} {}\r\n\
          Host: {}\r\n\
          {}{}{}{}\r\n",
-        method, uri_with_args, ver_str, host, conn_line, content_length_hdr, content_type_hdr, forward_headers
+        method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, forward_headers
     );
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
@@ -874,7 +880,12 @@ async fn proxy_handler(r: R) -> i64 {
     let mut response_ms: u64 = 0;
     'retry: loop {
         let try_started_ms = ngx_core::times::current_msec();
-        addr = format!("{}:{}", host, port);
+        // IPv6 literals need bracket-quoting for tokio's SocketAddr parser.
+        addr = if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]:{}", host, port)
+        } else {
+            format!("{}:{}", host, port)
+        };
         // Try the per-worker idle-connection pool first if this proxy
         // is talking to a named upstream with `keepalive N;` set.
         let pooled = if want_keepalive {
@@ -1864,11 +1875,32 @@ fn decode_chunked(input: &[u8]) -> Vec<u8> {
 }
 
 fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
-    if !uri.starts_with("http://") {
+    let (rest, default_port) = if let Some(r) = uri.strip_prefix("http://") {
+        (r, 80u16)
+    } else if let Some(r) = uri.strip_prefix("https://") {
+        (r, 443u16)
+    } else {
         return None;
-    }
+    };
 
-    let rest = &uri[7..];
+    // IPv6 form: [addr]:port/path or [addr]/path
+    if let Some(r) = rest.strip_prefix('[') {
+        let end = r.find(']')?;
+        let host = r[..end].to_string();
+        let after = &r[end + 1..];
+        let (port, path) = if let Some(p) = after.strip_prefix(':') {
+            let slash = p.find('/').unwrap_or(p.len());
+            let port: u16 = p[..slash].parse().ok()?;
+            let path = if slash == p.len() { "/".to_string() } else { p[slash..].to_string() };
+            (port, path)
+        } else if after.is_empty() || after.starts_with('/') {
+            let path = if after.is_empty() { "/".to_string() } else { after.to_string() };
+            (default_port, path)
+        } else {
+            return None;
+        };
+        return Some((host, port, path));
+    }
 
     // Find host:port or just host
     let (host_port, path) = if let Some(pos) = rest.find('/') {
@@ -1883,7 +1915,7 @@ fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
         let p: u16 = host_port[pos+1..].parse().ok()?;
         (h.to_string(), p)
     } else {
-        (host_port.to_string(), 80)
+        (host_port.to_string(), default_port)
     };
 
     Some((host, port, path))
