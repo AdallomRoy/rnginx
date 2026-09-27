@@ -23,6 +23,7 @@ pub mod variables;
 pub mod script;
 pub mod header_filter;
 pub mod write_filter;
+pub mod http2;
 pub mod memcached;
 pub mod special_response;
 pub mod static_module;

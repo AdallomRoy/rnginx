@@ -179,6 +179,12 @@ pub struct Connection {
     pub write_ready: Cell<bool>,
     pub read_eof: Cell<bool>,
     pub read_pending_eof: Cell<bool>,
+    /// When set, all send/writev/sendfile calls append into this buffer
+    /// instead of writing to the socket. Used by the HTTP/2 dispatcher
+    /// to capture the pipeline's HTTP/1 wire output, re-parse it, and
+    /// emit it as h2 frames. `sendfile` is materialized (read from disk)
+    /// so the h2 side sees a plain byte stream.
+    pub send_capture: RefCell<Option<Vec<u8>>>,
 }
 
 impl Connection {
@@ -237,6 +243,7 @@ impl Connection {
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
+            send_capture: RefCell::new(None),
         });
         ACTIVE.with(|a| a.set(a.get() + 1));
         CONNECTIONS.with(|m| m.borrow_mut().insert(number, Rc::downgrade(&c)));
@@ -345,6 +352,13 @@ impl Connection {
 
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        // HTTP/2 capture path: swallow bytes into per-connection buffer.
+        // See `send_capture` field docs.
+        if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
+            cap.extend_from_slice(buf);
+            self.sent.set(self.sent.get() + buf.len() as u64);
+            return Ok(buf.len());
+        }
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.send(self, buf).await;
         }
@@ -371,6 +385,16 @@ impl Connection {
 
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
+        // HTTP/2 capture path.
+        if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
+            let mut n = 0usize;
+            for s in iov {
+                cap.extend_from_slice(s);
+                n += s.len();
+            }
+            self.sent.set(self.sent.get() + n as u64);
+            return Ok(n);
+        }
         if let Some(ssl) = self.ssl.borrow().clone() {
             // SSL: write the first non-empty slice
             for s in iov {
@@ -407,6 +431,20 @@ impl Connection {
 
     /// sendfile(2) from `file_fd` at `offset` for up to `count` bytes.
     pub async fn sendfile(&self, file_fd: RawFd, offset: i64, count: usize) -> io::Result<usize> {
+        // HTTP/2 capture path: materialize the file range into the buffer.
+        if self.send_capture.borrow().is_some() {
+            let mut buf = vec![0u8; count];
+            let n = unsafe {
+                libc::pread(file_fd, buf.as_mut_ptr() as *mut libc::c_void, count, offset as libc::off_t)
+            };
+            if n < 0 { return Err(io::Error::last_os_error()); }
+            buf.truncate(n as usize);
+            if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
+                cap.extend_from_slice(&buf);
+            }
+            self.sent.set(self.sent.get() + n as u64);
+            return Ok(n as usize);
+        }
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
@@ -526,8 +564,14 @@ impl Connection {
         if self.fd.get() == -1 {
             return;
         }
-        if let Some(ssl) = self.ssl.borrow_mut().take() {
-            ssl.free_on_close(self);
+        // Use try_borrow_mut: on the h2 dispatch path a stale future
+        // may still hold a shared borrow on self.ssl at close time.
+        // In that case, defer the ssl drop to Connection Drop; there's
+        // nothing meaningful for free_on_close to do here anyway.
+        if let Ok(mut slot) = self.ssl.try_borrow_mut() {
+            if let Some(ssl) = slot.take() {
+                ssl.free_on_close(self);
+            }
         }
         // deregister from reactor before closing
         self.afd.borrow_mut().take();

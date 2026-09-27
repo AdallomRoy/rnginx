@@ -70,7 +70,16 @@ impl SslConnection {
                     return Err(e);
                 }
                 _ => {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", ssl_error_string())));
+                    let msg = ssl_error_string();
+                    // OpenSSL 3.x reports "unexpected eof while reading"
+                    // when the peer closes without close_notify. HTTP/2
+                    // clients (curl etc.) do this routinely; treat as
+                    // clean EOF so callers see Ok(0).
+                    if msg.contains("unexpected eof") {
+                        c.read_eof.set(true);
+                        return Ok(0);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg)));
                 }
             }
         }
@@ -105,6 +114,20 @@ impl SslConnection {
 
     pub fn free_on_close(&self, _c: &Connection) {
         // Ssl is dropped when SslConnection is dropped.
+    }
+
+    /// Selected ALPN protocol after handshake (e.g. b"h2", b"http/1.1").
+    /// Returns None if ALPN wasn't negotiated.
+    pub fn alpn_selected(&self) -> Option<Vec<u8>> {
+        if !self.handshaked.get() { return None; }
+        let ssl = self.ssl_ptr();
+        let mut data: *const u8 = std::ptr::null();
+        let mut len: u32 = 0;
+        unsafe {
+            openssl_sys::SSL_get0_alpn_selected(ssl, &mut data, &mut len);
+            if data.is_null() || len == 0 { return None; }
+            Some(std::slice::from_raw_parts(data, len as usize).to_vec())
+        }
     }
 }
 

@@ -17,3 +17,6 @@ md-5.workspace = true
 sha1.workspace = true
 crc32fast.workspace = true
 memchr.workspace = true
+h2.workspace = true
+http.workspace = true
+bytes.workspace = true

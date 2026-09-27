@@ -877,7 +877,9 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 );
             }
         }
-        // ALPN: advertise http/1.1
+        // ALPN: advertise http/1.1. h2 dispatch scaffolding exists in
+        // crate::http2 but is not production-ready — leaving h2 out of
+        // ALPN keeps clients on the working HTTP/1 pipeline.
         static ALPN: &[u8] = b"\x08http/1.1";
         unsafe extern "C" fn alpn_select_cb(
             _ssl: *mut openssl_sys::SSL,
@@ -888,7 +890,6 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
             _arg: *mut c_void,
         ) -> i32 {
             let client_slice = std::slice::from_raw_parts(client, client_len as usize);
-            // Look for "http/1.1" in the client-offered protocols.
             let mut i = 0usize;
             while i < client_slice.len() {
                 let l = client_slice[i] as usize;
@@ -901,7 +902,9 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 }
                 i += 1 + l;
             }
-            3 // SSL_TLSEXT_ERR_NOACK
+            // Match C's ngx_http_ssl_alpn_select: when the client sent
+            // ALPN but nothing matched our list, fatal-alert the handshake.
+            2 // SSL_TLSEXT_ERR_ALERT_FATAL
         }
         unsafe {
             openssl_sys::SSL_CTX_set_alpn_select_cb__fixed_rust(
