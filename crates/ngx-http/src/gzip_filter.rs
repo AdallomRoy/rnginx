@@ -188,15 +188,16 @@ fn should_gzip(r: &R) -> bool {
 
 async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     if !should_gzip(&r) {
-        // Vary: Accept-Encoding when gzip_vary on and gzip disabled/not-applied
-        let conf = r.loc_conf::<GzipConf>(ctx_index());
-        if *conf.borrow().gzip_vary {
+        // Vary: Accept-Encoding when gzip_vary on and gzip disabled/not-applied.
+        // gzip_vary is registered on the core module (CoreLocConf), not our own
+        // GzipConf — so read via clcf() to hit the slot the parser populates.
+        if *r.clcf().borrow().gzip_vary {
             add_vary(&r);
         }
         return next(r).await;
     }
     let level = *r.loc_conf::<GzipConf>(ctx_index()).borrow().level;
-    let vary = *r.loc_conf::<GzipConf>(ctx_index()).borrow().gzip_vary;
+    let vary = *r.clcf().borrow().gzip_vary;
     r.set_ctx(ctx_index(), GzipCtx::new(level));
     // Content-Encoding: gzip
     let ce = TableElt::new(b"Content-Encoding", b"gzip");
