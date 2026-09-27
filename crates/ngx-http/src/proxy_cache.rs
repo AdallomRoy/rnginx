@@ -48,6 +48,7 @@ pub struct ProxyCacheConf {
     pub convert_head: bool,
     pub bypass: Vec<Rc<ComplexValue>>,        // proxy_cache_bypass expressions
     pub no_cache: Vec<Rc<ComplexValue>>,      // proxy_no_cache expressions
+    pub ignore_headers: Vec<Vec<u8>>,         // proxy_ignore_headers: lowercase names to skip
 }
 
 impl ProxyCacheConf {
@@ -62,6 +63,7 @@ impl ProxyCacheConf {
             convert_head: true,
             bypass: Vec::new(),
             no_cache: Vec::new(),
+            ignore_headers: Vec::new(),
         }
     }
 }
@@ -391,12 +393,22 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
     // came off the upstream, so we can add them directly. Special-case the
     // handful that HeadersOut has typed slots for so the header filter
     // renders them.
+    // Default hide list — mirrors PROXY_HIDE_HEADERS in proxy.rs. Cached
+    // responses include everything the upstream sent, but the client only
+    // ever sees the filtered view.
+    const HIT_HIDE: &[&[u8]] = &[
+        b"x-accel-expires", b"x-accel-redirect", b"x-accel-limit-rate",
+        b"x-accel-buffering", b"x-accel-charset",
+        b"date", b"server", b"x-pad", b"x-powered-by", b"connection",
+        b"keep-alive", b"transfer-encoding", b"upgrade",
+    ];
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = resp.status as i64;
         ho.content_length_n = resp.body.len() as i64;
         for (k, v) in &resp.headers {
             let lc = k.to_ascii_lowercase();
+            if HIT_HIDE.iter().any(|h| *h == lc.as_slice()) { continue; }
             match lc.as_slice() {
                 b"content-length" => {
                     // We recompute this from the cached body length above;
@@ -539,13 +551,47 @@ pub fn maybe_save(
         _ => return,
     };
     if is_no_cache(r, conf) { return; }
-    // A Cache-Control response header — max-age / s-maxage / no-cache /
-    // no-store / private — overrides proxy_cache_valid. Matches C's
-    // ngx_http_upstream_process_cache_control.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let ignored = |name: &[u8]| -> bool {
+        let lc = name.to_ascii_lowercase();
+        conf.ignore_headers.iter().any(|h| h == &lc)
+    };
+
+    // X-Accel-Expires overrides both Expires and Cache-Control. Only the
+    // first occurrence counts (duplicates are ignored).
+    let mut xa_expires: Option<u64> = None;   // absolute epoch to expire at, 0 = don't cache
+    let mut xa_seen = false;
+    if !ignored(b"x-accel-expires") {
+        for (k, v) in &headers {
+            if !k.eq_ignore_ascii_case(b"x-accel-expires") { continue; }
+            if xa_seen { continue; } // matches C: first occurrence wins
+            xa_seen = true;
+            let s = trim_ws(v);
+            if s.is_empty() { continue; }
+            if s == b"0" { xa_expires = Some(0); continue; }
+            if let Some(rest) = s.strip_prefix(b"@") {
+                if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() {
+                    xa_expires = Some(n);
+                }
+            } else if let Ok(n) = std::str::from_utf8(s).unwrap_or("").parse::<u64>() {
+                xa_expires = Some(now + n);
+            }
+        }
+    }
+
+    // Cache-Control: max-age / s-maxage / no-cache / no-store / private.
+    // Matches ngx_http_upstream_process_cache_control.
     let mut cc_ttl: Option<u64> = None;
     let mut cc_forbid = false;
-    for (k, v) in &headers {
-        if k.eq_ignore_ascii_case(b"cache-control") {
+    let mut cc_seen = false;
+    if !ignored(b"cache-control") {
+        for (k, v) in &headers {
+            if !k.eq_ignore_ascii_case(b"cache-control") { continue; }
+            cc_seen = true;
             for part in v.split(|&b| b == b',') {
                 let part = trim_ws(part);
                 if part.eq_ignore_ascii_case(b"no-cache")
@@ -567,17 +613,49 @@ pub fn maybe_save(
             }
         }
     }
-    if cc_forbid { return; }
-    let ttl = match cc_ttl {
-        Some(t) => t,
-        None => match ttl_for(conf, status) { Some(t) => t, None => return },
+
+    // Expires: absolute HTTP-date. Overridden by Cache-Control if present.
+    let mut expires_ttl: Option<u64> = None;
+    if !ignored(b"expires") {
+        for (k, v) in &headers {
+            if !k.eq_ignore_ascii_case(b"expires") { continue; }
+            if let Some(when) = parse_http_time(v) {
+                if when <= now { expires_ttl = Some(0); }
+                else { expires_ttl = Some(when - now); }
+            }
+        }
+    }
+
+    // Set-Cookie makes the response uncacheable (unless ignored).
+    if !ignored(b"set-cookie") {
+        for (k, _v) in &headers {
+            if k.eq_ignore_ascii_case(b"set-cookie") { return; }
+        }
+    }
+
+    // Precedence: X-Accel-Expires > Cache-Control > Expires > proxy_cache_valid.
+    let expires_epoch: u64 = if let Some(x) = xa_expires {
+        if x == 0 { return; }
+        x
+    } else if cc_forbid {
+        return;
+    } else if let Some(t) = cc_ttl {
+        now + t
+    } else if cc_seen {
+        // Cache-Control present without max-age/s-maxage and without a
+        // forbidding directive → fall through to Expires, then valid.
+        if let Some(t) = expires_ttl { if t == 0 { return; } now + t }
+        else if let Some(t) = ttl_for(conf, status) { now + t }
+        else { return; }
+    } else if let Some(t) = expires_ttl {
+        if t == 0 { return; } now + t
+    } else if let Some(t) = ttl_for(conf, status) {
+        now + t
+    } else {
+        return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let resp = CachedResponse {
-        expires_epoch: now + ttl,
+        expires_epoch,
         status,
         headers,
         body,
@@ -598,4 +676,8 @@ fn trim_ws(mut s: &[u8]) -> &[u8] {
 fn strip_prefix_ci<'a>(s: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
     if s.len() < p.len() { return None; }
     if s[..p.len()].eq_ignore_ascii_case(p) { Some(&s[p.len()..]) } else { None }
+}
+
+fn parse_http_time(v: &[u8]) -> Option<u64> {
+    ngx_core::parse::parse_http_time(v).and_then(|t| if t >= 0 { Some(t as u64) } else { None })
 }

@@ -342,6 +342,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.cache.valid.is_empty() { c.cache.valid = p.cache.valid.clone(); }
     if c.cache.bypass.is_empty() { c.cache.bypass = p.cache.bypass.clone(); }
     if c.cache.no_cache.is_empty() { c.cache.no_cache = p.cache.no_cache.clone(); }
+    if c.cache.ignore_headers.is_empty() { c.cache.ignore_headers = p.cache.ignore_headers.clone(); }
     Ok(())
 }
 
@@ -786,10 +787,20 @@ async fn proxy_handler(r: R) -> i64 {
 
 
     // Build request line. proxy_method overrides the client method if set.
+    let convert_head_active = conf_borrowed.cache.zone.is_some()
+        && conf_borrowed.cache.convert_head
+        && conf_borrowed.method.is_none()
+        && r.method.get() == NGX_HTTP_HEAD;
     let method_owned: Vec<u8> = if let Some(mcv) = conf_borrowed.method.clone() {
         drop(conf_borrowed);
         let m = crate::script::complex_value(&r, &mcv).unwrap_or_default();
         m
+    } else if convert_head_active {
+        drop(conf_borrowed);
+        // proxy_cache_convert_head: fetch the full body from the upstream
+        // via GET so the cache stores a body a later GET can HIT, then
+        // let head_only trim the body before sending to the client.
+        b"GET".to_vec()
     } else {
         drop(conf_borrowed);
         r.method_name.borrow().clone()
@@ -1716,30 +1727,15 @@ async fn proxy_handler(r: R) -> i64 {
     let cache_snapshot_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = {
         let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
         if lcf_c.borrow().cache.zone.is_some() {
-            let ho = r.headers_out.borrow();
-            let mut hdrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            if let Some(h) = &ho.content_length {
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
-            if !ho.content_type.is_empty() {
-                hdrs.push((b"Content-Type".to_vec(), ho.content_type.clone()));
-            }
-            if let Some(h) = &ho.content_encoding {
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
-            if let Some(h) = &ho.location {
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
-            if let Some(h) = &ho.last_modified {
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
-            if let Some(h) = &ho.etag {
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
-            for h in &ho.headers {
-                if h.hash.get() == 0 { continue; }
-                hdrs.push((h.key.clone(), h.value.borrow().clone()));
-            }
+            // Snapshot the raw upstream headers — including the ones the
+            // proxy_hide list keeps from the client (X-Accel-Expires,
+            // Set-Cookie, ...) — so cache TTL decisions and cache_control
+            // parsing see the same view the C code does. `upstream_headers_in`
+            // is populated before the hide filter runs.
+            let uh = r.upstream_headers_in.borrow();
+            let hdrs: Vec<(Vec<u8>, Vec<u8>)> = uh.iter()
+                .map(|h| (h.key.clone(), h.value.borrow().clone()))
+                .collect();
             Some(hdrs)
         } else {
             None
@@ -1791,6 +1787,22 @@ async fn proxy_handler(r: R) -> i64 {
     // sub_filter, gzip) clear r.headers_out.content_length_n.
     let head_only = r.method.get() == NGX_HTTP_HEAD || r.header_only.get();
     if head_only {
+        // Cache HEAD responses too, so a later request (HEAD or GET) can
+        // HIT. In the convert_head=on path we would have sent GET upstream
+        // and the response body will actually be present in `response`.
+        if let Some(hdrs) = cache_snapshot_headers {
+            let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+            let cache_conf = lcf_s.borrow().cache.clone();
+            let body = if body_start < response.len() {
+                response[body_start..].to_vec()
+            } else {
+                Vec::new()
+            };
+            crate::proxy_cache::maybe_save(
+                &r, &cache_conf, &upstream_uri,
+                status as u16, hdrs, body,
+            );
+        }
         return NGX_OK;
     }
     // proxy_store: if configured, buffer the whole body and write it out
@@ -2164,7 +2176,13 @@ pub fn proxy_module() -> ModuleDef {
             if !list.iter().any(|x| x == &name) { list.push(name); }
             Ok(())
         }),
-        cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            for a in cf.args[1..].to_vec() {
+                cell.borrow_mut().cache.ignore_headers.push(a.to_ascii_lowercase());
+            }
+            Ok(())
+        }),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_store_handler),
@@ -2221,7 +2239,12 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_methods", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_purge", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let v = &cf.args[1];
+            cell.borrow_mut().cache.convert_head = v == b"on";
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
