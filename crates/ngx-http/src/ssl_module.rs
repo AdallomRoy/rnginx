@@ -26,6 +26,139 @@ use crate::request::*;
 use crate::variables::VarDef;
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, HttpModuleDef, http_module_def};
 
+// ---------------------------------------------------------------------
+// SNI cert selection: swap SSL_CTX to the matched server's context in
+// the servername callback. Registry maps a small integer stashed on
+// each SSL as ex_data back to the addr_conf so the callback can walk
+// virtual_names[hostname] without any thread/global synchronization.
+// ---------------------------------------------------------------------
+thread_local! {
+    static SNI_REGISTRY: RefCell<Vec<Option<Rc<AddrConf>>>> = const { RefCell::new(Vec::new()) };
+    static SNI_EX_INDEX: Cell<i32> = const { Cell::new(-1) };
+}
+
+unsafe extern "C" fn sni_free_cb(
+    _parent: *mut c_void,
+    ptr: *mut c_void,
+    _ad: *mut openssl_sys::CRYPTO_EX_DATA,
+    _idx: std::os::raw::c_int,
+    _argl: std::os::raw::c_long,
+    _argp: *mut c_void,
+) {
+    if ptr.is_null() { return; }
+    let idx = ptr as usize;
+    if idx == 0 { return; } // sentinel-shifted, 0 is the "unset" marker
+    SNI_REGISTRY.with(|r| {
+        let mut v = r.borrow_mut();
+        let real = idx - 1;
+        if real < v.len() { v[real] = None; }
+    });
+}
+
+fn sni_ex_index() -> i32 {
+    let cur = SNI_EX_INDEX.with(|c| c.get());
+    if cur >= 0 { return cur; }
+    let idx = unsafe {
+        openssl_sys::SSL_get_ex_new_index(0, std::ptr::null_mut(), None, None, Some(sni_free_cb))
+    };
+    SNI_EX_INDEX.with(|c| c.set(idx));
+    idx
+}
+
+fn sni_register(addr: Rc<AddrConf>) -> usize {
+    SNI_REGISTRY.with(|r| {
+        let mut v = r.borrow_mut();
+        // Reuse a hole left by a freed connection if we have one — this
+        // keeps the vector bounded across a long-running worker's
+        // lifetime instead of leaking a slot per handshake.
+        for (i, slot) in v.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(addr);
+                return i;
+            }
+        }
+        v.push(Some(addr));
+        v.len() - 1
+    })
+}
+
+fn sni_lookup(idx: usize) -> Option<Rc<AddrConf>> {
+    SNI_REGISTRY.with(|r| r.borrow().get(idx).and_then(|o| o.clone()))
+}
+
+unsafe extern "C" fn sni_servername_cb(
+    ssl: *mut openssl_sys::SSL,
+    _ad: *mut std::os::raw::c_int,
+    _arg: *mut c_void,
+) -> std::os::raw::c_int {
+    // SSL_TLSEXT_ERR_OK = 0, SSL_TLSEXT_ERR_ALERT_FATAL = 2, SSL_TLSEXT_ERR_NOACK = 3
+    let ok: std::os::raw::c_int = 0;
+    let fatal: std::os::raw::c_int = 2;
+    let idx_ptr = openssl_sys::SSL_get_ex_data(ssl, sni_ex_index());
+    if idx_ptr.is_null() { return ok; }
+    let idx = idx_ptr as usize - 1; // sentinel-shift so NULL != index 0
+    let addr = match sni_lookup(idx) { Some(a) => a, None => return ok };
+    let name_c = openssl_sys::SSL_get_servername(ssl, 0 /* TLSEXT_NAMETYPE_host_name */);
+    if name_c.is_null() {
+        // No SNI. If reject_handshake is on for the default server, refuse.
+        if reject_handshake_for(&addr.default_server) {
+            return fatal;
+        }
+        return ok;
+    }
+    let name = std::ffi::CStr::from_ptr(name_c).to_bytes();
+    // Lowercase copy so hash lookup matches.
+    let host: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let cscf = find_server_by_name(&addr, &host);
+    let cscf = match cscf {
+        Some(c) => c,
+        None => {
+            // No matching virtual server. If default has reject_handshake
+            // on, refuse; else fall through with the default cert.
+            if reject_handshake_for(&addr.default_server) {
+                return fatal;
+            }
+            return ok;
+        }
+    };
+    // Fetch the target server's SslContext and swap.
+    let sctx = cscf.borrow().ctx.clone();
+    let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => return ok };
+    let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
+    if reject_handshake_for(&cscf) {
+        return fatal;
+    }
+    let target = ssl_conf.borrow().ssl_ctx.borrow().clone();
+    if let Some(target) = target {
+        let raw = target.as_ptr() as *mut openssl_sys::SSL_CTX;
+        if openssl_sys::SSL_set_SSL_CTX(ssl, raw).is_null() {
+            return ok;
+        }
+        // Match C's post-SSL_set_SSL_CTX adjustments so verify from the
+        // target ctx actually takes effect for this handshake.
+        let mode = openssl_sys::SSL_CTX_get_verify_mode(raw);
+        openssl_sys::SSL_set_verify(ssl, mode, None);
+        // SSL_CTRL_OPTIONS=32 — set options via SSL_ctrl since 0.9.117
+        // doesn't expose SSL_set_options as a direct FFI symbol.
+        let opts = openssl_sys::SSL_CTX_get_options(raw);
+        openssl_sys::SSL_ctrl(ssl, 32, opts as std::os::raw::c_long, std::ptr::null_mut());
+    }
+    ok
+}
+
+fn reject_handshake_for(cscf: &Rc<RefCell<CoreSrvConf>>) -> bool {
+    let sctx = cscf.borrow().ctx.clone();
+    let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => return false };
+    let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
+    let v = ssl_conf.borrow().reject_handshake.get_or(false);
+    v
+}
+
+fn find_server_by_name(addr: &AddrConf, host: &[u8]) -> Option<Rc<RefCell<CoreSrvConf>>> {
+    let vn = addr.virtual_names.as_ref()?;
+    vn.names.find(ngx_core::hash::hash_key(host), host).cloned()
+}
+
 crate::http_module_index!("ngx_http_ssl_module");
 
 pub struct HttpSslSrvConf {
@@ -285,12 +418,13 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => continue };
         let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
         let has_cert = ssl_conf.borrow().certificate.is_set();
-        if !has_cert { continue; }
+        let reject_only = !has_cert && ssl_conf.borrow().reject_handshake.get_or(false);
+        if !has_cert && !reject_only { continue; }
         let (cert, key, ciphers, protocols, verify_mode, client_ca, verify_depth,
              prefer_server_ciphers, session_tickets) = {
             let s = ssl_conf.borrow();
-            (s.certificate.get().clone(),
-             s.certificate_key.get().clone(),
+            (s.certificate.as_option().cloned().unwrap_or_default(),
+             s.certificate_key.as_option().cloned().unwrap_or_default(),
              s.ciphers.get_or(b"HIGH:!aNULL:!MD5".to_vec()),
              s.protocols.get_or(0),
              s.verify.get_or(0),
@@ -301,18 +435,20 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         };
         let mut builder = SslContext::builder(SslMethod::tls_server())
             .map_err(|e| cf.emerg(format_args!("SSL_CTX_new() failed: {}", e)))?;
-        let cert_full = cf.cycle.full_name(&cert, true);
-        let key_full = cf.cycle.full_name(&key, true);
-        let cert_str = std::str::from_utf8(&cert_full)
-            .map_err(|_| cf.emerg(format_args!("ssl_certificate path is not UTF-8")))?;
-        let key_str = std::str::from_utf8(&key_full)
-            .map_err(|_| cf.emerg(format_args!("ssl_certificate_key path is not UTF-8")))?;
-        builder.set_certificate_chain_file(cert_str)
-            .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_certificate_chain_file(\"{}\") failed: {}", cert_str, e)))?;
-        builder.set_private_key_file(key_str, SslFiletype::PEM)
-            .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", key_str, e)))?;
-        builder.check_private_key()
-            .map_err(|e| cf.emerg(format_args!("SSL: certificate and key mismatch: {}", e)))?;
+        if has_cert {
+            let cert_full = cf.cycle.full_name(&cert, true);
+            let key_full = cf.cycle.full_name(&key, true);
+            let cert_str = std::str::from_utf8(&cert_full)
+                .map_err(|_| cf.emerg(format_args!("ssl_certificate path is not UTF-8")))?;
+            let key_str = std::str::from_utf8(&key_full)
+                .map_err(|_| cf.emerg(format_args!("ssl_certificate_key path is not UTF-8")))?;
+            builder.set_certificate_chain_file(cert_str)
+                .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_certificate_chain_file(\"{}\") failed: {}", cert_str, e)))?;
+            builder.set_private_key_file(key_str, SslFiletype::PEM)
+                .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", key_str, e)))?;
+            builder.check_private_key()
+                .map_err(|e| cf.emerg(format_args!("SSL: certificate and key mismatch: {}", e)))?;
+        }
         let ciph_str = std::str::from_utf8(&ciphers)
             .map_err(|_| cf.emerg(format_args!("ssl_ciphers is not UTF-8")))?;
         let _ = builder.set_cipher_list(ciph_str);
@@ -376,6 +512,15 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 std::ptr::null_mut(),
             );
             let _ = ALPN;
+            // Install the SNI callback so a hostname-directed handshake
+            // can swap SSL_CTX to another server's cert. The callback
+            // reads addr_conf out of per-SSL ex_data — set from
+            // ssl_handshake — so a single global callback works for all
+            // listens.
+            openssl_sys::SSL_CTX_set_tlsext_servername_callback__fixed_rust(
+                builder.as_ptr() as *mut _,
+                Some(sni_servername_cb),
+            );
         }
         let ctx = builder.build();
         *ssl_conf.borrow_mut().ssl_ctx.borrow_mut() = Some(Rc::new(ctx));
@@ -419,6 +564,11 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
     unsafe {
         SSL_set_fd(ssl.as_ptr(), fd);
         openssl_sys::SSL_set_accept_state(ssl.as_ptr());
+        // Attach addr_conf so the SNI callback can find the matching
+        // virtual server and swap SSL_CTX. Store idx+1 so a NULL
+        // ex_data (unset) is distinguishable from index 0.
+        let idx = sni_register(hc.addr_conf.clone());
+        openssl_sys::SSL_set_ex_data(ssl.as_ptr(), sni_ex_index(), (idx + 1) as *mut c_void);
     }
     // Wrap and stash into the connection so recv/send route through TLS.
     let ssl_conn = Rc::new(SslConnection::new());
