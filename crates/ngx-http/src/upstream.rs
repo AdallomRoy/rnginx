@@ -326,8 +326,14 @@ pub struct PeerState {
     pub accessed: u64,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum BalancerKind { RoundRobin, IpHash }
+#[derive(Clone)]
+pub enum BalancerKind {
+    RoundRobin,
+    IpHash,
+    /// nginx `hash $key` (non-consistent). Key is a ComplexValue evaluated
+    /// per request; the CRC32 of the result picks the peer by weight.
+    Hash(std::rc::Rc<crate::script::ComplexValue>),
+}
 
 pub struct PeerGroup {
     pub peers: Vec<PeerState>,
@@ -423,10 +429,18 @@ pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
         let mut g = cell.borrow_mut();
-        match g.balancer {
+        match &g.balancer {
             BalancerKind::IpHash => {
                 let addr_bytes = client_ip_bytes(r);
                 return pick_ip_hash(&mut g.peers, &addr_bytes)
+                    .or_else(|| pick_wrr(&mut g.backup));
+            }
+            BalancerKind::Hash(cv) => {
+                let key_cv = cv.clone();
+                drop(g);
+                let key = crate::script::complex_value(r, &key_cv).unwrap_or_default();
+                let mut g = cell.borrow_mut();
+                return pick_hash(&mut g.peers, &key)
                     .or_else(|| pick_wrr(&mut g.backup));
             }
             BalancerKind::RoundRobin => {
@@ -454,6 +468,38 @@ fn client_ip_bytes(r: &R) -> Vec<u8> {
         // therefore all hash to the same key.
         SockAddr::Unix(_) => vec![0, 0, 0],
     }
+}
+
+/// nginx `hash $key` non-consistent picker: CRC32 of the key, then
+/// `hash % total_weight` selects a peer.  Mirrors
+/// ngx_http_upstream_get_hash_peer (non-consistent branch).
+fn pick_hash(peers: &mut [PeerState], key: &[u8]) -> Option<(String, u16)> {
+    if peers.is_empty() || key.is_empty() { return pick_wrr(peers); }
+    let total: i32 = peers.iter()
+        .filter(|p| !p.server.down)
+        .map(|p| p.server.weight as i32)
+        .sum();
+    if total <= 0 { return None; }
+
+    let mut hash = crc32fast::hash(key);
+    for _try in 0..20 {
+        let mut w = (hash % total as u32) as i32;
+        for p in peers.iter() {
+            if p.server.down { continue; }
+            let peer_w = p.server.weight as i32;
+            if w < peer_w {
+                return Some((
+                    std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
+                    p.server.port,
+                ));
+            }
+            w -= peer_w;
+        }
+        // Rehash: (prev_hash bytes) CRC32'd again — same as C rehashing the
+        // 4-byte previous hash value.
+        hash = crc32fast::hash(&hash.to_be_bytes());
+    }
+    pick_wrr(peers)
 }
 
 /// nginx ip_hash algorithm: hash = 89; for byte in addr: hash = (hash*113 + byte) % 6271.

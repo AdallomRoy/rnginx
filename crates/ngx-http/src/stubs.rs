@@ -584,9 +584,34 @@ pub fn mp4_module() -> ModuleDef {
 }
 
 pub fn upstream_hash_module() -> ModuleDef {
-    stub("ngx_http_upstream_hash_module", vec![
-        Command::new("hash", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE12, ConfLevel::None, accept),
-    ])
+    use ngx_core::cmd_fn;
+    let def = crate::HttpModuleDef { ..Default::default() };
+    let commands = vec![
+        cmd_fn!("hash", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE12, ConfLevel::None,
+            |cf: &mut ngx_core::conf::Conf, _cmd: &ngx_core::conf::Command,
+             _conf: Option<Rc<dyn std::any::Any>>| {
+                if cf.args.len() < 2 {
+                    return Err(ngx_core::conf::msg("hash requires a key"));
+                }
+                // Optional "consistent" argument turns on ketama-style
+                // consistent hashing in C. Not yet implemented — fall
+                // back to plain non-consistent hash so at least keyed
+                // routing still happens.
+                let key = cf.args[1].clone();
+                let cv = crate::script::compile_complex_value(cf, &key, 0)?;
+                let umcf = crate::get_main_conf::<crate::upstream::UpstreamMainConf>(cf, crate::upstream::ctx_index());
+                let mut m = umcf.borrow_mut();
+                let mut b = m.current_builder.borrow_mut();
+                match b.as_mut() {
+                    Some(bu) => {
+                        bu.balancer = crate::upstream::BalancerKind::Hash(Rc::new(cv));
+                        Ok(())
+                    }
+                    None => Err(ngx_core::conf::msg("hash outside upstream block")),
+                }
+            }),
+    ];
+    crate::http_module_def("ngx_http_upstream_hash_module", def, commands)
 }
 
 pub fn upstream_ip_hash_module() -> ModuleDef {
