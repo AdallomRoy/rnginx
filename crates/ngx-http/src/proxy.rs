@@ -1698,6 +1698,27 @@ async fn proxy_handler(r: R) -> i64 {
     // Suppress duplicate Expires (silently drop the second occurrence).
     let _ = duplicate_expires;
 
+    // X-Accel-Limit-Rate: bytes-per-second cap on the response, matching
+    // ngx_http_upstream_process_limit_rate. Applied to r.limit_rate BEFORE
+    // X-Accel-Redirect so the header survives the internal redirect
+    // (C's upstream_process_headers assigns u->headers_in.x_accel_limit_rate
+    // which propagates via r->limit_rate to the redirected request).
+    {
+        let xal_val = r.upstream_headers_in.borrow().iter()
+            .find(|h| h.lowcase_key.eq_ignore_ascii_case(b"x-accel-limit-rate"))
+            .map(|h| h.value.borrow().clone());
+        if let Some(v) = xal_val {
+            if let Ok(s) = std::str::from_utf8(&v) {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    if n >= 0 {
+                        r.limit_rate.set(n as usize);
+                        r.limit_rate_set.set(true);
+                    }
+                }
+            }
+        }
+    }
+
     // X-Accel-Redirect: if the upstream response carries this header, discard
     // the response body (we've already read it) and internally redirect. Keep
     // only the small allow-list of upstream headers marked `redirect=1` in
