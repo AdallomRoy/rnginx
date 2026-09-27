@@ -52,6 +52,7 @@ pub mod ssi_filter;
 pub mod geo;
 pub mod range_filter;
 pub mod proxy;
+pub mod proxy_cache;
 pub mod upstream;
 pub mod upstream_keepalive;
 pub mod upstream_keepalive_pool;

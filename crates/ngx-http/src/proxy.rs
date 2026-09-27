@@ -136,6 +136,9 @@ pub struct NgxHttpProxyLocConf {
     /// hide_headers. Pass overrides any hide (default or explicit) for the
     /// named header.
     pub pass_headers: Option<Vec<Vec<u8>>>,
+    /// proxy_cache*: nested container so cache directives don't push the
+    /// per-request runtime through the whole conf when caching is off.
+    pub cache: crate::proxy_cache::ProxyCacheConf,
 }
 
 /// Default list of upstream response headers that nginx hides. See
@@ -257,6 +260,7 @@ impl Default for NgxHttpProxyLocConf {
             http_version: Val::unset(),
             hide_headers: None,
             pass_headers: None,
+            cache: crate::proxy_cache::ProxyCacheConf::new(),
         }
     }
 }
@@ -327,6 +331,14 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     // which pulls each list from prev when NGX_CONF_UNSET_PTR.
     if c.hide_headers.is_none() { c.hide_headers = p.hide_headers.clone(); }
     if c.pass_headers.is_none() { c.pass_headers = p.pass_headers.clone(); }
+    // proxy_cache_* inheritance — location-level overrides win, otherwise
+    // pull each field from the parent (matches C's per-field
+    // ngx_conf_merge_ptr_value / merge_str_value pattern).
+    if c.cache.zone.is_none() { c.cache.zone = p.cache.zone.clone(); }
+    if c.cache.key.is_none() { c.cache.key = p.cache.key.clone(); }
+    if c.cache.valid.is_empty() { c.cache.valid = p.cache.valid.clone(); }
+    if c.cache.bypass.is_empty() { c.cache.bypass = p.cache.bypass.clone(); }
+    if c.cache.no_cache.is_empty() { c.cache.no_cache = p.cache.no_cache.clone(); }
     Ok(())
 }
 
@@ -587,6 +599,11 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
 
     crate::variables::add_variables(cf, &vars)?;
 
+    // $upstream_cache_status is defined by the proxy_cache module so it lives
+    // wherever caching does — register it during proxy preconfiguration so
+    // access_log and rewrite scripts can see it.
+    crate::proxy_cache::add_variables(cf)?;
+
     // Register proxy handler in content phase
     crate::core::add_phase_handler(cf, crate::NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(proxy_handler(r))));
 
@@ -647,6 +664,20 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let conf_borrowed = lcf.borrow();
+
+    // proxy_cache lookup — happens *before* we open the upstream. `try_serve`
+    // returns `Some(rc)` for a hit (already sent to client) or a bypass
+    // decision; `None` means MISS/EXPIRED and we continue to upstream.
+    if conf_borrowed.cache.zone.is_some() {
+        let cache_conf = conf_borrowed.cache.clone();
+        let upstream_uri_snap = upstream_uri.clone();
+        drop(conf_borrowed);
+        if let Some(rc) = crate::proxy_cache::try_serve(&r, &cache_conf, &upstream_uri_snap).await {
+            return rc;
+        }
+        let _ = lcf.borrow();
+    }
     let conf_borrowed = lcf.borrow();
 
     // Parse upstream URI
@@ -1649,6 +1680,43 @@ async fn proxy_handler(r: R) -> i64 {
     // proxy_redirect: rewrite Location / Refresh (url=...) headers.
     rewrite_redirect_headers(&r, &upstream_uri);
 
+    // Snapshot cached headers *before* send_header runs — filters
+    // (addition_filter, sub_filter, gzip) rewrite headers_out during the
+    // header pass, and we want the pre-filter view on disk so a later HIT
+    // replays the same response the origin sent.
+    let cache_snapshot_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = {
+        let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+        if lcf_c.borrow().cache.zone.is_some() {
+            let ho = r.headers_out.borrow();
+            let mut hdrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if let Some(h) = &ho.content_length {
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            if !ho.content_type.is_empty() {
+                hdrs.push((b"Content-Type".to_vec(), ho.content_type.clone()));
+            }
+            if let Some(h) = &ho.content_encoding {
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            if let Some(h) = &ho.location {
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            if let Some(h) = &ho.last_modified {
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            if let Some(h) = &ho.etag {
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            for h in &ho.headers {
+                if h.hash.get() == 0 { continue; }
+                hdrs.push((h.key.clone(), h.value.borrow().clone()));
+            }
+            Some(hdrs)
+        } else {
+            None
+        }
+    };
+
     // Send status and headers to client
     let send_hdr_rc = crate::core_rt::send_header(&r).await;
     if send_hdr_rc != NGX_OK {
@@ -1763,10 +1831,26 @@ async fn proxy_handler(r: R) -> i64 {
         }
         if !short_response {
             maybe_store_body(&r, &body_snapshot_for_store);
+            if let Some(hdrs) = cache_snapshot_headers {
+                let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+                let cache_conf = lcf_s.borrow().cache.clone();
+                crate::proxy_cache::maybe_save(
+                    &r, &cache_conf, &upstream_uri,
+                    status as u16, hdrs, body_snapshot_for_store,
+                );
+            }
         }
     } else {
         // Empty 200 response — still honor proxy_store (writes an empty file).
         maybe_store_body(&r, &[]);
+        if let Some(hdrs) = cache_snapshot_headers {
+            let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+            let cache_conf = lcf_s.borrow().cache.clone();
+            crate::proxy_cache::maybe_save(
+                &r, &cache_conf, &upstream_uri,
+                status as u16, hdrs, Vec::new(),
+            );
+        }
     }
 
     NGX_OK
@@ -2060,11 +2144,36 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
         cmd_fn!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_valid", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_bypass", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::None, |cf, _cmd, _conf| crate::proxy_cache::parse_proxy_cache_path(cf)),
+        cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            if cf.args[1] == b"off" {
+                cell.borrow_mut().cache.zone = None;
+            } else {
+                cell.borrow_mut().cache.zone = Some(cf.args[1].clone());
+            }
+            Ok(())
+        }),
+        cmd_fn!("proxy_cache_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let cv = crate::script::compile_complex_value(cf, &cf.args[1].clone(), 0)?;
+            cell.borrow_mut().cache.key = Some(Rc::new(cv));
+            Ok(())
+        }),
+        cmd_fn!("proxy_cache_valid", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let cv = crate::proxy_cache::parse_cache_valid(&cf.args[1..])?;
+            cell.borrow_mut().cache.valid.push(cv);
+            Ok(())
+        }),
+        cmd_fn!("proxy_cache_bypass", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            for a in cf.args[1..].to_vec() {
+                let cv = crate::script::compile_complex_value(cf, &a, 0)?;
+                cell.borrow_mut().cache.bypass.push(Rc::new(cv));
+            }
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_use_stale", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_lock", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_lock_age", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -2076,7 +2185,14 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_cache_purge", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            for a in cf.args[1..].to_vec() {
+                let cv = crate::script::compile_complex_value(cf, &a, 0)?;
+                cell.borrow_mut().cache.no_cache.push(Rc::new(cv));
+            }
+            Ok(())
+        }),
         cmd_fn!("proxy_ssl_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ssl_certificate_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ssl_password_file", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
