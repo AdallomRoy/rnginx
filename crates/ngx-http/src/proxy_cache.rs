@@ -80,10 +80,18 @@ impl ProxyCacheConf {
 // proxy_cache_lock: single-flight upstream fetch per cache key.
 // ---------------------------------------------------------------------
 
+#[derive(Clone)]
+struct LockEntry {
+    notify: Rc<tokio::sync::Notify>,
+    started_ms: u64,
+}
+
 thread_local! {
-    static IN_FLIGHT: RefCell<HashMap<Vec<u8>, Rc<tokio::sync::Notify>>> =
+    static IN_FLIGHT: RefCell<HashMap<Vec<u8>, LockEntry>> =
         RefCell::new(HashMap::new());
 }
+
+fn now_ms() -> u64 { ngx_core::times::current_msec() }
 
 /// Try to acquire the lock for a key. Returns Ok(true) if we became the
 /// leader (caller must call release_lock when done), Ok(false) after
@@ -94,28 +102,59 @@ pub async fn acquire_lock(
     zone_name: &[u8],
     key: &[u8],
     timeout_ms: u64,
+    age_ms: u64,
 ) -> Result<bool, ()> {
     let existing = IN_FLIGHT.with(|m| m.borrow().get(key).cloned());
     match existing {
-        Some(notify) => {
-            let wait = notify.notified();
+        Some(entry) => {
+            // proxy_cache_lock_age: if the current leader has been holding
+            // the lock past its age budget, forcibly take over — C treats
+            // an aged lock as expired and lets a new request become
+            // leader without disturbing the old one's save.
+            let waited = now_ms().saturating_sub(entry.started_ms);
+            let age_left = age_ms.saturating_sub(waited);
+            let time_left = timeout_ms.saturating_sub(waited);
+            if age_left == 0 {
+                // Leader has been holding past its age budget — become new leader.
+                IN_FLIGHT.with(|m| {
+                    m.borrow_mut().insert(key.to_vec(), LockEntry {
+                        notify: Rc::new(tokio::sync::Notify::new()),
+                        started_ms: now_ms(),
+                    });
+                });
+                return Ok(true);
+            }
+            // Wait UP TO min(age_left, time_left). Age fires first → become
+            // new leader; timeout fires first → fall back to upstream
+            // without caching.
+            let wait = entry.notify.notified();
             tokio::pin!(wait);
-            let dur = std::time::Duration::from_millis(timeout_ms);
+            let age_first = age_left <= time_left;
+            let dur = std::time::Duration::from_millis(age_left.min(time_left));
             match tokio::time::timeout(dur, wait).await {
                 Ok(()) => {
-                    // Leader finished — cache should now be populated. Let the
-                    // caller re-lookup; if it's still MISS the caller falls back
-                    // to a direct upstream fetch.
                     let _ = zone_name;
                     Ok(false)
+                }
+                Err(_) if age_first => {
+                    // Aged out — take over as new leader.
+                    IN_FLIGHT.with(|m| {
+                        m.borrow_mut().insert(key.to_vec(), LockEntry {
+                            notify: Rc::new(tokio::sync::Notify::new()),
+                            started_ms: now_ms(),
+                        });
+                    });
+                    Ok(true)
                 }
                 Err(_) => Err(()),
             }
         }
         None => {
             IN_FLIGHT.with(|m| {
-                m.borrow_mut()
-                    .insert(key.to_vec(), Rc::new(tokio::sync::Notify::new()));
+                m.borrow_mut().insert(key.to_vec(), LockEntry {
+                    notify: Rc::new(tokio::sync::Notify::new()),
+                    started_ms: now_ms(),
+                });
             });
             Ok(true)
         }
@@ -125,8 +164,8 @@ pub async fn acquire_lock(
 /// Wake every waiter blocked on `key` and drop the in-flight marker.
 pub fn release_lock(key: &[u8]) {
     let entry = IN_FLIGHT.with(|m| m.borrow_mut().remove(key));
-    if let Some(notify) = entry {
-        notify.notify_waiters();
+    if let Some(entry) = entry {
+        entry.notify.notify_waiters();
     }
 }
 
@@ -688,7 +727,7 @@ async fn try_serve_once(
             // leader, remember the key so the caller releases it after the
             // upstream save completes.
             if conf.lock && !is_retry {
-                match acquire_lock(zone, &key, conf.lock_timeout_ms).await {
+                match acquire_lock(zone, &key, conf.lock_timeout_ms, conf.lock_age_ms).await {
                     Ok(true) => {
                         set_lock_key(r, key.clone());
                     }
