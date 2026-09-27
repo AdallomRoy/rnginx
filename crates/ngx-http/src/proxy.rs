@@ -1788,20 +1788,40 @@ async fn proxy_handler(r: R) -> i64 {
     let head_only = r.method.get() == NGX_HTTP_HEAD || r.header_only.get();
     if head_only {
         // Cache HEAD responses too, so a later request (HEAD or GET) can
-        // HIT. In the convert_head=on path we would have sent GET upstream
-        // and the response body will actually be present in `response`.
+        // HIT. In the convert_head=on path we sent GET upstream, so the
+        // real body is in `response`. Skip caching if the upstream sent
+        // fewer bytes than Content-Length declared — matches the
+        // short_response guard on the GET path.
         if let Some(hdrs) = cache_snapshot_headers {
-            let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-            let cache_conf = lcf_s.borrow().cache.clone();
-            let body = if body_start < response.len() {
-                response[body_start..].to_vec()
-            } else {
-                Vec::new()
-            };
-            crate::proxy_cache::maybe_save(
-                &r, &cache_conf, &upstream_uri,
-                status as u16, hdrs, body,
-            );
+            // If we forwarded HEAD → GET upstream (convert_head=on), a
+            // real GET body should be present; treat a partial body as
+            // "short" and skip caching. If the client sent HEAD and we
+            // stayed HEAD upstream, Content-Length describes the notional
+            // GET body — there's no upstream body to be short.
+            let head_upstream = method == "HEAD";
+            let tail_len = response.len().saturating_sub(body_start);
+            let short_response = !head_upstream
+                && upstream_content_length >= 0
+                && (upstream_content_length as usize) > tail_len;
+            if !short_response {
+                let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+                let cache_conf = lcf_s.borrow().cache.clone();
+                let body = if body_start < response.len() {
+                    let tail = &response[body_start..];
+                    let end = if upstream_content_length >= 0 {
+                        (upstream_content_length as usize).min(tail.len())
+                    } else {
+                        tail.len()
+                    };
+                    tail[..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                crate::proxy_cache::maybe_save(
+                    &r, &cache_conf, &upstream_uri,
+                    status as u16, hdrs, body,
+                );
+            }
         }
         return NGX_OK;
     }
