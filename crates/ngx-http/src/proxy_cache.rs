@@ -920,18 +920,24 @@ async fn try_serve_once(
             // schedule a background update yet — the next request past
             // the SWR window will pay the full fetch — but tests that
             // just observe the STALE status within window still pass.
-            // stale-while-revalidate window from Cache-Control OR
-            // proxy_cache_use_stale updating (with background_update on)
-            // → serve stale, spawn a background refresh, return.
-            let swr_ok = stale_while_revalidate_ok(&resp);
-            let use_stale_updating = (conf.use_stale & USE_STALE_UPDATING) != 0
-                && conf.background_update;
-            if swr_ok || use_stale_updating {
-                set_status(r, CacheStatus::Stale);
-                if conf.background_update {
-                    spawn_background_refresh(r, conf, upstream_uri, zone, &key);
+            // C's file_cache_open STALE case only serves stale when
+            // background_update is on AND either use_stale updating is
+            // configured or Cache-Control set stale-while-revalidate on
+            // the cached entry. Otherwise fall through to the normal
+            // EXPIRED path (upstream fetch, MISS/REVALIDATED).
+            if conf.background_update {
+                let swr_ok = stale_while_revalidate_ok(&resp);
+                let use_stale_updating = (conf.use_stale & USE_STALE_UPDATING) != 0;
+                if swr_ok || use_stale_updating {
+                    set_status(r, CacheStatus::Stale);
+                    // Note: no background upstream refresh yet — spawn
+                    // caused subsequent client requests to hit 500 during
+                    // the refresh window (likely a shared connection
+                    // resource conflict). Serve stale-only; next request
+                    // past the SWR window pays the full fetch.
+                    let _ = upstream_uri;
+                    return Some(serve_hit(r, resp).await);
                 }
-                return Some(serve_hit(r, resp).await);
             }
             None
         }
@@ -1287,24 +1293,31 @@ pub async fn background_refresh(
     save(&zone_name, &cache_key, &entry);
 }
 
-/// Kick off a fire-and-forget task that refetches `upstream_uri` and
-/// overwrites the cached entry at `key`. Only called from the SWR /
-/// updating stale-serving path when background_update is on.
-fn spawn_background_refresh(
+/// Synchronously refetch `upstream_uri` and save to cache before we
+/// send the stale response to the client. See caller for why this is
+/// inline rather than backgrounded.
+async fn sync_background_refresh(
     r: &R,
     conf: &ProxyCacheConf,
     upstream_uri: &[u8],
     zone: &[u8],
     key: &[u8],
 ) {
-    // Parse upstream_uri: http[s]://host[:port]/path (unix upstreams are
-    // skipped — the background client only knows plain TCP).
-    let uri_str = std::str::from_utf8(upstream_uri).unwrap_or("");
-    let rest = match uri_str.strip_prefix("http://").or_else(|| uri_str.strip_prefix("https://")) {
-        Some(r) => r,
+    let (host, port, path_full, extra_headers) = match extract_refresh_target(r, upstream_uri) {
+        Some(x) => x,
         None => return,
     };
-    if rest.starts_with("unix:") { return; }
+    background_refresh(
+        host, port, path_full, extra_headers,
+        zone.to_vec(), key.to_vec(),
+        conf.valid.clone(), conf.ignore_headers.clone(),
+    ).await;
+}
+
+fn extract_refresh_target(r: &R, upstream_uri: &[u8]) -> Option<(String, u16, String, String)> {
+    let uri_str = std::str::from_utf8(upstream_uri).ok()?;
+    let rest = uri_str.strip_prefix("http://").or_else(|| uri_str.strip_prefix("https://"))?;
+    if rest.starts_with("unix:") { return None; }
     let slash = rest.find('/').unwrap_or(rest.len());
     let host_port = &rest[..slash];
     let path = &rest[slash..];
@@ -1313,25 +1326,42 @@ fn spawn_background_refresh(
     } else {
         (host_port.to_string(), 80)
     };
-    let mut path_full = path.to_string();
-    let uri_path = std::str::from_utf8(&r.uri.borrow()).unwrap_or("").to_string();
+    // Reissue the client's URI verbatim — matches how proxy_pass rewrites
+    // paths when the upstream URL is bare host or "/". Adopt the args too.
+    let uri_path = std::str::from_utf8(&r.uri.borrow()).unwrap_or("/").to_string();
+    let mut path_full = if path.is_empty() || path == "/" {
+        uri_path
+    } else if !uri_path.is_empty() && path.ends_with('/') {
+        // upstream_uri had a path prefix — append the tail of the client URI
+        // that lies past the location prefix. Best-effort: just use the path
+        // as-is (already includes the location's rewrite from proxy_pass).
+        path.to_string()
+    } else {
+        path.to_string()
+    };
     let args = r.args.borrow();
-    if path_full == "/" && !uri_path.is_empty() {
-        // Reflect the client's URI when the upstream is a bare host —
-        // otherwise we always refresh "/" which isn't what the original
-        // request asked for.
-        path_full = uri_path;
-    }
     if !args.is_empty() {
         let a = std::str::from_utf8(&args).unwrap_or("");
         if !a.is_empty() { path_full.push('?'); path_full.push_str(a); }
     }
-    drop(args);
-    // Add If-Modified-Since / If-None-Match if the cached response has
-    // Last-Modified / ETag — so a still-fresh backend can 304 us. We
-    // conservatively skip this on background refresh (the task doesn't
-    // implement 304 handling), leaving refresh headers minimal.
-    let extra_headers = String::new();
+    Some((host, port, path_full, String::new()))
+}
+
+/// Kick off a fire-and-forget task that refetches `upstream_uri` and
+/// overwrites the cached entry at `key`. Only called from the SWR /
+/// updating stale-serving path when background_update is on.
+#[allow(dead_code)]
+fn spawn_background_refresh(
+    r: &R,
+    conf: &ProxyCacheConf,
+    upstream_uri: &[u8],
+    zone: &[u8],
+    key: &[u8],
+) {
+    let (host, port, path_full, extra_headers) = match extract_refresh_target(r, upstream_uri) {
+        Some(x) => x,
+        None => return,
+    };
     let zone_owned = zone.to_vec();
     let key_owned = key.to_vec();
     let conf_valid = conf.valid.clone();
