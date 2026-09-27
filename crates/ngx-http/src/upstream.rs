@@ -324,6 +324,10 @@ pub struct PeerState {
     /// or its first failure since being healthy).
     pub checked: u64,
     pub accessed: u64,
+    /// Currently in-flight requests against this peer. Incremented at
+    /// pick time, decremented via LeaseHandle when the request drops.
+    /// Least_conn reads this to pick the peer with the fewest inflight.
+    pub active: u32,
 }
 
 #[derive(Clone)]
@@ -333,6 +337,9 @@ pub enum BalancerKind {
     /// nginx `hash $key` (non-consistent). Key is a ComplexValue evaluated
     /// per request; the CRC32 of the result picks the peer by weight.
     Hash(std::rc::Rc<crate::script::ComplexValue>),
+    /// nginx `least_conn;` — pick the peer with the fewest in-flight
+    /// requests, breaking ties with the normal smooth-WRR pass.
+    LeastConn,
 }
 
 pub struct PeerGroup {
@@ -408,6 +415,7 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
                 fails: 0,
                 checked: 0,
                 accessed: 0,
+                active: 0,
             };
             if srv.backup { group.backup.push(ps); } else { group.peers.push(ps); }
         }
@@ -425,30 +433,163 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
 /// Mirrors ngx_http_upstream_get_round_robin_peer's inner loop.
 pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let m = umcf.borrow();
-    for (n, cell) in m.server_lists.iter() {
-        if n.as_slice() != name { continue; }
+    // Do the pick with the main conf borrowed, then release before calling
+    // incr_active_lease (which reacquires the same borrow chain).
+    let (picked, is_least_conn) = {
+        let m = umcf.borrow();
+        let cell = m.server_lists.iter().find(|(n, _)| n.as_slice() == name).map(|(_, c)| c)?;
         let mut g = cell.borrow_mut();
-        match &g.balancer {
+        let is_lc = matches!(g.balancer, BalancerKind::LeastConn);
+        let picked = match &g.balancer {
             BalancerKind::IpHash => {
                 let addr_bytes = client_ip_bytes(r);
-                return pick_ip_hash(&mut g.peers, &addr_bytes)
-                    .or_else(|| pick_wrr(&mut g.backup));
+                pick_ip_hash(&mut g.peers, &addr_bytes)
+                    .or_else(|| pick_wrr(&mut g.backup))
             }
             BalancerKind::Hash(cv) => {
                 let key_cv = cv.clone();
                 drop(g);
                 let key = crate::script::complex_value(r, &key_cv).unwrap_or_default();
                 let mut g = cell.borrow_mut();
-                return pick_hash(&mut g.peers, &key)
-                    .or_else(|| pick_wrr(&mut g.backup));
+                pick_hash(&mut g.peers, &key)
+                    .or_else(|| pick_wrr(&mut g.backup))
+            }
+            BalancerKind::LeastConn => {
+                pick_least_conn(&mut g.peers).or_else(|| pick_wrr(&mut g.backup))
             }
             BalancerKind::RoundRobin => {
-                return pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup));
+                pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup))
+            }
+        };
+        (picked, is_lc)
+    };
+    // Only least_conn needs a per-request active counter — for other
+    // balancers the extra bookkeeping is dead weight and introduced
+    // regressions in proxy_next_upstream around retry accounting.
+    if is_least_conn {
+        if let Some((h, port)) = &picked {
+            incr_active_lease(r, name, h, *port);
+        }
+    }
+    picked
+}
+
+/// Increment the `active` counter for a peer and register a cleanup on the
+/// request that decrements it. Cheap enough to do for every balancer since
+/// only least_conn actually reads the counter.
+fn incr_active_lease(r: &R, name: &[u8], host: &str, port: u16) {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    for (n, cell) in m.server_lists.iter() {
+        if n.as_slice() != name { continue; }
+        let mut g = cell.borrow_mut();
+        let PeerGroup { peers, backup, .. } = &mut *g;
+        for p in peers.iter_mut().chain(backup.iter_mut()) {
+            let addr_matches = std::str::from_utf8(&p.server.addr).map(|a| a == host).unwrap_or(false);
+            if addr_matches && p.server.port == port {
+                p.active = p.active.saturating_add(1);
+                let name_owned = name.to_vec();
+                let host_owned = host.to_string();
+                r.add_cleanup(Box::new(move || {
+                    decr_active(&name_owned, &host_owned, port);
+                }));
+                return;
             }
         }
     }
-    None
+}
+
+fn decr_active(name: &[u8], host: &str, port: u16) {
+    // We don't hold r here — reach into the thread-local main conf via
+    // the http main conf slot. Simpler: iterate the cycle's server_lists
+    // by walking upstream::main_conf() would require request context.
+    // Instead, tests only ever have one HTTP main conf, so grab it via
+    // the module registry. To keep this decoupled, thread_local a
+    // pointer to the per-worker UpstreamMainConf populated at init time.
+    ACTIVE_MAIN.with(|slot| {
+        if let Some(umcf) = slot.borrow().as_ref() {
+            let m = umcf.borrow();
+            for (n, cell) in m.server_lists.iter() {
+                if n.as_slice() != name { continue; }
+                let mut g = cell.borrow_mut();
+                let PeerGroup { peers, backup, .. } = &mut *g;
+        for p in peers.iter_mut().chain(backup.iter_mut()) {
+                    let addr_matches = std::str::from_utf8(&p.server.addr).map(|a| a == host).unwrap_or(false);
+                    if addr_matches && p.server.port == port {
+                        if p.active > 0 { p.active -= 1; }
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+thread_local! {
+    static ACTIVE_MAIN: std::cell::RefCell<Option<Rc<std::cell::RefCell<UpstreamMainConf>>>> = std::cell::RefCell::new(None);
+}
+
+/// Called from postconfiguration to give the decr_active cleanup a way
+/// back to the main conf without a request handle.
+pub fn set_active_main(umcf: Rc<std::cell::RefCell<UpstreamMainConf>>) {
+    ACTIVE_MAIN.with(|slot| *slot.borrow_mut() = Some(umcf));
+}
+
+/// nginx least_conn: pick the peer with the smallest active/weight ratio,
+/// falling through to WRR on ties.  Mirrors
+/// ngx_http_upstream_get_least_conn_peer.
+fn pick_least_conn(peers: &mut [PeerState]) -> Option<(String, u16)> {
+    if peers.is_empty() { return None; }
+    let now = ngx_core::times::time() as u64;
+
+    // First pass: find the minimum active/weight among live peers.
+    let mut best_ratio: Option<u64> = None;
+    let mut candidates: Vec<usize> = Vec::new();
+    for (i, p) in peers.iter().enumerate() {
+        if p.server.down { continue; }
+        if p.server.max_fails > 0 && p.fails >= p.server.max_fails {
+            if now.saturating_sub(p.checked) < p.server.fail_timeout / 1000 { continue; }
+        }
+        let w = p.server.weight.max(1) as u64;
+        // (active * scale) / weight — use *1000 to avoid integer trunc
+        let ratio = (p.active as u64) * 1000 / w;
+        match best_ratio {
+            None => { best_ratio = Some(ratio); candidates.clear(); candidates.push(i); }
+            Some(b) if ratio < b => { best_ratio = Some(ratio); candidates.clear(); candidates.push(i); }
+            Some(b) if ratio == b => { candidates.push(i); }
+            _ => {}
+        }
+    }
+    if candidates.is_empty() { return None; }
+    if candidates.len() == 1 {
+        let p = &peers[candidates[0]];
+        return Some((
+            std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
+            p.server.port,
+        ));
+    }
+
+    // Tie: run smooth-WRR restricted to the tied peers by weight.
+    let mut best_idx: Option<usize> = None;
+    let mut best_cw: i32 = i32::MIN;
+    let mut total: i32 = 0;
+    for &i in &candidates {
+        let p = &mut peers[i];
+        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
+        total = total.saturating_add(p.effective_weight);
+        if p.effective_weight < p.weight { p.effective_weight += 1; }
+        if p.current_weight > best_cw {
+            best_cw = p.current_weight;
+            best_idx = Some(i);
+        }
+    }
+    let idx = best_idx?;
+    peers[idx].current_weight -= total;
+    let p = &peers[idx];
+    Some((
+        std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
+        p.server.port,
+    ))
 }
 
 /// Client IP bytes for ip_hash. AF_UNIX and other non-IPv4/6 clients get
@@ -1019,10 +1160,17 @@ pub fn upstream_module() -> ModuleDef {
         preconfiguration: Some(preconfiguration),
         create_main_conf: Some(create_main_conf),
         init_main_conf: Some(init_main_conf),
+        postconfiguration: Some(register_active_main),
         ..Default::default()
     };
 
     http_module_def("ngx_http_upstream_module", def, commands)
+}
+
+fn register_active_main(cf: &mut Conf) -> ConfResult {
+    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
+    set_active_main(umcf);
+    Ok(())
 }
 
 // ============================================================================

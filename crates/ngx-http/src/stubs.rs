@@ -634,6 +634,23 @@ pub fn upstream_ip_hash_module() -> ModuleDef {
 }
 
 pub fn upstream_least_conn_module() -> ModuleDef {
+    use ngx_core::cmd_fn;
+    let def = crate::HttpModuleDef { ..Default::default() };
+    let commands = vec![
+        cmd_fn!("least_conn", NGX_HTTP_UPS_CONF | NGX_CONF_NOARGS, ConfLevel::None,
+            |cf: &mut ngx_core::conf::Conf, _cmd: &ngx_core::conf::Command,
+             _conf: Option<Rc<dyn std::any::Any>>| {
+                let umcf = crate::get_main_conf::<crate::upstream::UpstreamMainConf>(cf, crate::upstream::ctx_index());
+                let mut m = umcf.borrow_mut();
+                let mut b = m.current_builder.borrow_mut();
+                match b.as_mut() {
+                    Some(bu) => { bu.balancer = crate::upstream::BalancerKind::LeastConn; Ok(()) }
+                    None => Err(ngx_core::conf::msg("least_conn outside upstream block")),
+                }
+            }),
+    ];
+    return crate::http_module_def("ngx_http_upstream_least_conn_module", def, commands);
+    #[allow(unreachable_code)]
     stub("ngx_http_upstream_least_conn_module", vec![
         Command::new("least_conn", NGX_HTTP_UPS_CONF | NGX_CONF_NOARGS, ConfLevel::None, accept),
     ])
