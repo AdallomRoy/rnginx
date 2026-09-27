@@ -459,6 +459,10 @@ pub struct Request {
     pub subrequest_in_memory: Cell<bool>,
     pub waited: Cell<bool>,
     pub cached: Cell<bool>,
+    /// Set when the upstream response did not reach its framing terminator
+    /// (no 0-chunk for chunked, or Content-Length short). Prevents
+    /// proxy_cache from persisting truncated responses.
+    pub upstream_response_incomplete: Cell<bool>,
     pub gzip_tested: Cell<bool>,
     pub gzip_ok: Cell<bool>,
     pub gzip_vary: Cell<bool>,
@@ -743,6 +747,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         subrequest_in_memory: Cell::new(false),
         waited: Cell::new(false),
         cached: Cell::new(false),
+        upstream_response_incomplete: Cell::new(false),
         gzip_tested: Cell::new(false),
         gzip_ok: Cell::new(false),
         gzip_vary: Cell::new(false),

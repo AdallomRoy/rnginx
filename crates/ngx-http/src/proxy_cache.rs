@@ -1037,6 +1037,10 @@ pub fn maybe_save(
     };
     if is_no_cache(r, conf) { return; }
     if is_no_store(r) { return; }
+    // Don't cache truncated responses (chunked without 0-chunk, or
+    // Content-Length short). Matches C's ngx_http_upstream_process_headers
+    // path where truncated bodies never reach ngx_http_file_cache_update.
+    if r.upstream_response_incomplete.get() { return; }
     // proxy_cache_min_uses: only actually persist once the entry has
     // been requested min_uses times — matches C's node->uses threshold.
     if conf.min_uses > 1 {

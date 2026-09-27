@@ -1290,9 +1290,10 @@ async fn proxy_handler(r: R) -> i64 {
         // path (empty response, retry). On the success path it's simply
         // dropped when the enclosing scope ends — so it's safe to take it
         // out here via std::io before we hit that drop.
-        if want_keepalive && !upstream_wants_close && got_header {
+        // Compute framing completeness for BOTH the keepalive decision
+        // AND the "should this get cached" check below.
+        let (framing_complete, is_head_g, is_bodyless_g) = if got_header {
             let is_head = r.method.get() == crate::NGX_HTTP_HEAD;
-            // Status can be re-parsed briefly to detect 204/304/1xx bodyless.
             let is_bodyless = if let Some(e) = header_end {
                 let sl = &response[..e.min(response.len())];
                 if let Some(nl) = sl.iter().position(|&b| b == b'\n') {
@@ -1306,7 +1307,7 @@ async fn proxy_handler(r: R) -> i64 {
                         .unwrap_or(false)
                 } else { false }
             } else { false };
-            let framing_complete = if is_head || is_bodyless {
+            let fc = if is_head || is_bodyless {
                 true
             } else if let Some(cl) = expected_body_len {
                 header_end.map(|e| response.len() >= e + cl).unwrap_or(false)
@@ -1315,11 +1316,27 @@ async fn proxy_handler(r: R) -> i64 {
             } else {
                 false
             };
-            if framing_complete {
-                if let Some(name) = &named_upstream {
-                    if let Some(UpstreamSock::Tcp(old)) = upstream.take() {
-                        crate::upstream_keepalive::pool_put(name, &addr, old);
-                    }
+            (fc, is_head, is_bodyless)
+        } else {
+            (false, false, false)
+        };
+        // Signal to proxy_cache::maybe_save that we shouldn't persist
+        // a truncated response. C nginx checks u->length via
+        // ngx_http_upstream_process_non_buffered_downstream and skips
+        // ngx_http_file_cache_update when the response is short.
+        if !framing_complete && got_header && !is_head_g && !is_bodyless_g {
+            // Only mark incomplete when the response HAS a framing
+            // mechanism (Content-Length or chunked). EOF-framed (no
+            // CL, no TE:chunked) is inherently "complete-on-close"
+            // so don't taint the cache path for it.
+            if expected_body_len.is_some() || is_chunked {
+                r.upstream_response_incomplete.set(true);
+            }
+        }
+        if want_keepalive && !upstream_wants_close && got_header && framing_complete {
+            if let Some(name) = &named_upstream {
+                if let Some(UpstreamSock::Tcp(old)) = upstream.take() {
+                    crate::upstream_keepalive::pool_put(name, &addr, old);
                 }
             }
         }
