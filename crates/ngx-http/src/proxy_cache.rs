@@ -435,16 +435,32 @@ pub fn variant_key(r: &R, base: &[u8], vary_header: &[u8]) -> Vec<u8> {
         out.push(b':');
         // Look up header value in the incoming request. Missing header → empty.
         let hin = r.headers_in.borrow();
-        // Match against `hin.headers` (the raw header list).
+        // Match against `hin.headers` (the raw header list). Normalize the
+        // value for cache-key purposes: strip whitespace around commas and
+        // drop empty tokens — RFC 7234 §4.1 "Calculating Secondary Keys"
+        // treats "foo, bar" and "foo,bar" as the same secondary key.
         for h in &hin.headers {
             if h.lowcase_key == name {
-                out.extend_from_slice(&h.value.borrow());
+                let val = h.value.borrow();
+                let normalized: Vec<Vec<u8>> = val.split(|&b| b == b',')
+                    .map(trim_ws)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_vec())
+                    .collect();
+                out.extend_from_slice(&normalized.join(&b","[..]));
                 break;
             }
         }
         out.push(b'|');
     }
     out
+}
+
+fn vary_has_wildcard(vary_header: &[u8]) -> bool {
+    for part in vary_header.split(|&b| b == b',') {
+        if trim_ws(part) == b"*" { return true; }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------
@@ -646,12 +662,19 @@ async fn try_serve_once(
     // Follow a "vary marker" once: nginx stores the Vary header string in a
     // primary node and reads variants under a per-request-header key. If the
     // stored response has a Vary header, recompute the key and re-look-up.
+    let ignore_vary = conf.ignore_headers.iter().any(|h| h == b"vary");
     let key = if let Some(marker) = lookup(&zone, &base_key) {
-        if let Some(vh) = marker.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(b"vary")) {
-            // "Vary: *" is a wildcard — always uncacheable.
-            let v = trim_ws(&vh.1);
-            if v == b"*" { set_status(r, CacheStatus::Miss); return None; }
-            variant_key(r, &base_key, &vh.1)
+        if !ignore_vary {
+            if let Some(vh) = marker.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(b"vary")) {
+                // Vary: * (in any comma-separated position) is uncacheable.
+                if vary_has_wildcard(&vh.1) {
+                    set_status(r, CacheStatus::Miss);
+                    return None;
+                }
+                variant_key(r, &base_key, &vh.1)
+            } else {
+                base_key.clone()
+            }
         } else {
             base_key.clone()
         }
@@ -942,8 +965,7 @@ pub fn maybe_save(
     };
     match vary_val {
         Some(vh) => {
-            let vt = trim_ws(&vh);
-            if vt == b"*" {
+            if vary_has_wildcard(&vh) {
                 // Wildcard Vary is uncacheable — matches C's cache->vary=* skip.
                 return;
             }
