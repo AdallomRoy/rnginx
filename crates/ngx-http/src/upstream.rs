@@ -306,6 +306,7 @@ pub struct UpstreamMainConf {
 pub struct UpstreamBuilder {
     pub name: Vec<u8>,
     pub servers: Vec<UpstreamServer>,
+    pub balancer: BalancerKind,
 }
 
 /// Smooth weighted round-robin state for a single upstream {} block.
@@ -325,9 +326,15 @@ pub struct PeerState {
     pub accessed: u64,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum BalancerKind { RoundRobin, IpHash }
+
 pub struct PeerGroup {
     pub peers: Vec<PeerState>,
     pub backup: Vec<PeerState>,
+    /// Load-balancing algorithm chosen by the `ip_hash` / `hash` /
+    /// `least_conn` / `random` directive inside the upstream {} block.
+    pub balancer: BalancerKind,
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
@@ -359,6 +366,7 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
     *umcf.borrow().current_builder.borrow_mut() = Some(UpstreamBuilder {
         name: name.clone(),
         servers: Vec::new(),
+        balancer: BalancerKind::RoundRobin,
     });
 
     let saved_ct = cf.cmd_type;
@@ -370,6 +378,7 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
     let builder = umcf.borrow().current_builder.borrow_mut().take();
     if let Some(b) = builder {
         let servers = b.servers.clone();
+        let balancer = b.balancer;
         let uconf = UpstreamConf {
             name: b.name.clone(),
             servers: b.servers,
@@ -382,7 +391,7 @@ fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -
         };
         let peer_init: Rc<dyn PeerInit> = Rc::new(NoopPeerInit);
         let up = Upstream::new(&uconf, peer_init);
-        let mut group = PeerGroup { peers: Vec::new(), backup: Vec::new() };
+        let mut group = PeerGroup { peers: Vec::new(), backup: Vec::new(), balancer };
         for srv in servers.into_iter() {
             let w = if srv.weight == 0 { 1 } else { srv.weight as i32 };
             let ps = PeerState {
@@ -414,9 +423,74 @@ pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
     for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
         let mut g = cell.borrow_mut();
-        return pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup));
+        match g.balancer {
+            BalancerKind::IpHash => {
+                let addr_bytes = client_ip_bytes(r);
+                return pick_ip_hash(&mut g.peers, &addr_bytes)
+                    .or_else(|| pick_wrr(&mut g.backup));
+            }
+            BalancerKind::RoundRobin => {
+                return pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup));
+            }
+        }
     }
     None
+}
+
+/// Client IP bytes for ip_hash. AF_UNIX and other non-IPv4/6 clients get
+/// four 0xFF bytes so they all hash to the same peer (matches C's
+/// ngx_http_upstream_init_ip_hash_peer default of INADDR_NONE).
+fn client_ip_bytes(r: &R) -> Vec<u8> {
+    use ngx_core::inet::SockAddr;
+    let sa = r.connection.sockaddr.borrow();
+    match &*sa {
+        // C's ngx_http_upstream_init_ip_hash_peer hashes the /24 prefix
+        // of the IPv4 address (first three octets); the last one is
+        // dropped so an entire subnet lands on the same peer.
+        SockAddr::V4(v4) => v4.ip().octets()[..3].to_vec(),
+        SockAddr::V6(v6) => v6.ip().octets().to_vec(),
+        // C uses a static-init "pseudo_addr" buffer of 3 zero bytes for
+        // any address family that isn't inet/inet6 — unix connections
+        // therefore all hash to the same key.
+        SockAddr::Unix(_) => vec![0, 0, 0],
+    }
+}
+
+/// nginx ip_hash algorithm: hash = 89; for byte in addr: hash = (hash*113 + byte) % 6271.
+/// Then pick a peer whose cumulative weight covers `hash % total_weight`.
+fn pick_ip_hash(peers: &mut [PeerState], addr: &[u8]) -> Option<(String, u16)> {
+    if peers.is_empty() { return None; }
+    // Sum of live peer weights.
+    let total: i32 = peers.iter()
+        .filter(|p| !p.server.down)
+        .map(|p| p.server.weight as i32)
+        .sum();
+    if total <= 0 { return None; }
+
+    let mut hash: u32 = 89;
+    for &b in addr {
+        hash = hash.wrapping_mul(113).wrapping_add(b as u32) % 6271;
+    }
+
+    // Try up to 20 rehashes so a downed peer doesn't stall the pick (C caps
+    // at 20 as well before falling back to plain round-robin).
+    for _try in 0..20 {
+        let mut w = (hash % total as u32) as i32;
+        for p in peers.iter() {
+            if p.server.down { continue; }
+            let peer_w = p.server.weight as i32;
+            if w < peer_w {
+                return Some((
+                    std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
+                    p.server.port,
+                ));
+            }
+            w -= peer_w;
+        }
+        hash = (hash.wrapping_mul(113).wrapping_add(113)) % 6271;
+    }
+    // Fall back to round-robin.
+    pick_wrr(peers)
 }
 
 /// Number of non-down peers (main + backup) in the named upstream.
@@ -490,7 +564,7 @@ pub fn mark_bad_server(r: &R, name: &[u8], addr: &str, port: u16) {
     for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
         let mut g = cell.borrow_mut();
-        let PeerGroup { peers, backup } = &mut *g;
+        let PeerGroup { peers, backup, .. } = &mut *g;
         for p in peers.iter_mut().chain(backup.iter_mut()) {
             let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
             if paddr == addr && p.server.port == port {
@@ -519,7 +593,7 @@ pub fn mark_good_server(r: &R, name: &[u8], addr: &str, port: u16) {
     for (n, cell) in m.server_lists.iter() {
         if n.as_slice() != name { continue; }
         let mut g = cell.borrow_mut();
-        let PeerGroup { peers, backup } = &mut *g;
+        let PeerGroup { peers, backup, .. } = &mut *g;
         for p in peers.iter_mut().chain(backup.iter_mut()) {
             let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
             if paddr == addr && p.server.port == port {

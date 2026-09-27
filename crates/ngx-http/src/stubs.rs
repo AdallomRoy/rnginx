@@ -590,9 +590,22 @@ pub fn upstream_hash_module() -> ModuleDef {
 }
 
 pub fn upstream_ip_hash_module() -> ModuleDef {
-    stub("ngx_http_upstream_ip_hash_module", vec![
-        Command::new("ip_hash", NGX_HTTP_UPS_CONF | NGX_CONF_NOARGS, ConfLevel::None, accept),
-    ])
+    use ngx_core::cmd_fn;
+    let def = crate::HttpModuleDef { ..Default::default() };
+    let commands = vec![
+        cmd_fn!("ip_hash", NGX_HTTP_UPS_CONF | NGX_CONF_NOARGS, ConfLevel::None,
+            |cf: &mut ngx_core::conf::Conf, _cmd: &ngx_core::conf::Command,
+             _conf: Option<Rc<dyn std::any::Any>>| {
+                let umcf = crate::get_main_conf::<crate::upstream::UpstreamMainConf>(cf, crate::upstream::ctx_index());
+                let mut m = umcf.borrow_mut();
+                let mut b = m.current_builder.borrow_mut();
+                match b.as_mut() {
+                    Some(bu) => { bu.balancer = crate::upstream::BalancerKind::IpHash; Ok(()) }
+                    None => Err(ngx_core::conf::msg("ip_hash outside upstream block")),
+                }
+            }),
+    ];
+    crate::http_module_def("ngx_http_upstream_ip_hash_module", def, commands)
 }
 
 pub fn upstream_least_conn_module() -> ModuleDef {
