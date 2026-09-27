@@ -80,14 +80,10 @@ fn geo_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
         };
         match parse_ipv4_to_u32(ip_str.as_bytes()) {
             Some(ip) => ip,
-            None => {
-                // No IP → use the geo default (fall through to default_value below).
-                if !ctx.default_value.is_empty() {
-                    v.data = ctx.default_value.clone();
-                    v.valid = true;
-                }
-                return NGX_OK;
-            }
+            // Unparseable → INADDR_NONE (0xFFFFFFFF). Mirrors C which does
+            // the same tree lookup so an explicit `255.255.255.255 none;`
+            // entry captures unix / non-IPv4 clients.
+            None => 0xFFFF_FFFF,
         }
     } else if !ctx.proxies.is_empty() {
         // Get the IP from X-Forwarded-For header if trusted proxy
@@ -221,7 +217,11 @@ fn get_remote_addr_u32(r: &R) -> u32 {
             let octets = v4.ip().octets();
             u32::from_be_bytes(octets)
         }
-        _ => 0,
+        // ngx_http_geo_addr treats AF_UNIX (and unmapped IPv6) as
+        // INADDR_NONE (255.255.255.255) so a geo entry keyed on that
+        // sentinel address is what maps unix / non-IPv4 clients.
+        SockAddr::Unix(_) => 0xFFFF_FFFF,
+        SockAddr::V6(_) => 0xFFFF_FFFF,
     }
 }
 
