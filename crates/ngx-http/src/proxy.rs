@@ -334,7 +334,10 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     // proxy_cache_* inheritance — location-level overrides win, otherwise
     // pull each field from the parent (matches C's per-field
     // ngx_conf_merge_ptr_value / merge_str_value pattern).
-    if c.cache.zone.is_none() { c.cache.zone = p.cache.zone.clone(); }
+    if c.cache.zone.is_none() {
+        c.cache.zone = p.cache.zone.clone();
+        c.cache.zone_cv = p.cache.zone_cv.clone();
+    }
     if c.cache.key.is_none() { c.cache.key = p.cache.key.clone(); }
     if c.cache.valid.is_empty() { c.cache.valid = p.cache.valid.clone(); }
     if c.cache.bypass.is_empty() { c.cache.bypass = p.cache.bypass.clone(); }
@@ -1668,6 +1671,32 @@ async fn proxy_handler(r: R) -> i64 {
                 .map(|pages| pages.iter().any(|p| p.status == status))
                 .unwrap_or(false);
             if has_page {
+                // Cache the upstream error before handing off to error_page,
+                // so subsequent requests hit the cached error status and
+                // trigger the same intercept path — matches C's behavior
+                // where u->cache is populated even on intercept.
+                let cache_conf = lcf2.borrow().cache.clone();
+                if cache_conf.zone.is_some() {
+                    let body = if body_start < response.len() {
+                        response[body_start..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut hdrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let ho = r.headers_out.borrow();
+                    if !ho.content_type.is_empty() {
+                        hdrs.push((b"Content-Type".to_vec(), ho.content_type.clone()));
+                    }
+                    for h in &ho.headers {
+                        if h.hash.get() == 0 { continue; }
+                        hdrs.push((h.key.clone(), h.value.borrow().clone()));
+                    }
+                    drop(ho);
+                    crate::proxy_cache::maybe_save(
+                        &r, &cache_conf, &upstream_uri,
+                        status as u16, hdrs, body,
+                    );
+                }
                 return status;
             }
         }
@@ -2148,9 +2177,18 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
             if cf.args[1] == b"off" {
-                cell.borrow_mut().cache.zone = None;
+                let mut c = cell.borrow_mut();
+                c.cache.zone = None;
+                c.cache.zone_cv = None;
+            } else if cf.args[1].contains(&b'$') {
+                let cv = crate::script::compile_complex_value(cf, &cf.args[1].clone(), 0)?;
+                let mut c = cell.borrow_mut();
+                c.cache.zone = Some(cf.args[1].clone());
+                c.cache.zone_cv = Some(Rc::new(cv));
             } else {
-                cell.borrow_mut().cache.zone = Some(cf.args[1].clone());
+                let mut c = cell.borrow_mut();
+                c.cache.zone = Some(cf.args[1].clone());
+                c.cache.zone_cv = None;
             }
             Ok(())
         }),

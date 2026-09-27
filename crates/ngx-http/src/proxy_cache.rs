@@ -39,7 +39,8 @@ pub struct CacheValid {
 
 #[derive(Clone)]
 pub struct ProxyCacheConf {
-    pub zone: Option<Vec<u8>>,                // proxy_cache <zone>
+    pub zone: Option<Vec<u8>>,                // proxy_cache <zone> (literal or "$var...")
+    pub zone_cv: Option<Rc<ComplexValue>>,    // compiled complex value if zone is dynamic
     pub key: Option<Rc<ComplexValue>>,        // proxy_cache_key <expr>
     pub valid: Vec<CacheValid>,               // proxy_cache_valid ...
     pub min_uses: u32,                        // proxy_cache_min_uses (unused: always cache)
@@ -53,6 +54,7 @@ impl ProxyCacheConf {
     pub fn new() -> Self {
         ProxyCacheConf {
             zone: None,
+            zone_cv: None,
             key: None,
             valid: Vec::new(),
             min_uses: 1,
@@ -141,6 +143,20 @@ pub fn parse_proxy_cache_path(cf: &mut Conf) -> ConfResult {
 
 pub fn zone(name: &[u8]) -> Option<CachePath> {
     ZONES.with(|z| z.borrow().get(name).cloned())
+}
+
+/// Resolve the effective zone name for a request. Returns:
+///   - Some(Ok(name)) — a valid zone name to use for lookup/save
+///   - Some(Err(())) — a dynamic name was set but expanded to something
+///     that doesn't match a configured zone (500 in C)
+///   - None — no caching configured
+pub fn resolve_zone_name(r: &R, conf: &ProxyCacheConf) -> Option<Result<Vec<u8>, ()>> {
+    let name = match &conf.zone_cv {
+        Some(cv) => crate::script::complex_value(r, cv).ok()?,
+        None => conf.zone.as_ref()?.clone(),
+    };
+    if name.is_empty() { return None; }  // empty variable → cache disabled, not an error
+    if zone(&name).is_some() { Some(Ok(name)) } else { Some(Err(())) }
 }
 
 pub fn parse_cache_valid(args: &[Vec<u8>]) -> Result<CacheValid, ConfError> {
@@ -452,7 +468,10 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
 ///   - `Some(rc)` if we handled the request (HIT served, or BYPASS decision recorded)
 ///   - `None` to continue on to upstream (MISS / EXPIRED / not configured)
 pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Option<i64> {
-    let zone = conf.zone.as_ref()?;
+    let zone = match resolve_zone_name(r, conf)? {
+        Ok(z) => z,
+        Err(()) => return Some(crate::NGX_HTTP_INTERNAL_SERVER_ERROR as i64),
+    };
     // Bypass predicates: skip lookup but keep saving allowed.
     if is_bypass(r, conf) {
         set_status(r, CacheStatus::Bypass);
@@ -462,7 +481,7 @@ pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Opt
         Some(cv) => crate::script::complex_value(r, cv).ok()?,
         None => default_cache_key(r, upstream_uri),
     };
-    match lookup(zone, &key) {
+    match lookup(&zone, &key) {
         Some(resp) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -470,6 +489,29 @@ pub async fn try_serve(r: &R, conf: &ProxyCacheConf, upstream_uri: &[u8]) -> Opt
                 .unwrap_or(0);
             if resp.expires_epoch > now {
                 set_status(r, CacheStatus::Hit);
+                // proxy_intercept_errors on a cached error: skip the
+                // regular hit-serve path and hand the status to error_page,
+                // matching C where u->cache serves through
+                // ngx_http_upstream_intercept_errors.
+                let cached_status = resp.status;
+                if cached_status >= crate::NGX_HTTP_SPECIAL_RESPONSE as u16 {
+                    let intercept = r
+                        .loc_conf::<crate::proxy::NgxHttpProxyLocConf>(crate::proxy::ctx_index())
+                        .borrow()
+                        .intercept_errors
+                        .get_or(false);
+                    if intercept {
+                        let has_page = r.clcf()
+                            .borrow()
+                            .error_pages
+                            .as_ref()
+                            .map(|pages| pages.iter().any(|p| p.status == cached_status as i64))
+                            .unwrap_or(false);
+                        if has_page {
+                            return Some(cached_status as i64);
+                        }
+                    }
+                }
                 return Some(serve_hit(r, resp).await);
             }
             set_status(r, CacheStatus::Expired);
@@ -492,9 +534,44 @@ pub fn maybe_save(
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     body: Vec<u8>,
 ) {
-    let zone = match &conf.zone { Some(z) => z, None => return };
+    let zone = match resolve_zone_name(r, conf) {
+        Some(Ok(z)) => z,
+        _ => return,
+    };
     if is_no_cache(r, conf) { return; }
-    let ttl = match ttl_for(conf, status) { Some(t) => t, None => return };
+    // A Cache-Control response header — max-age / s-maxage / no-cache /
+    // no-store / private — overrides proxy_cache_valid. Matches C's
+    // ngx_http_upstream_process_cache_control.
+    let mut cc_ttl: Option<u64> = None;
+    let mut cc_forbid = false;
+    for (k, v) in &headers {
+        if k.eq_ignore_ascii_case(b"cache-control") {
+            for part in v.split(|&b| b == b',') {
+                let part = trim_ws(part);
+                if part.eq_ignore_ascii_case(b"no-cache")
+                    || part.eq_ignore_ascii_case(b"no-store")
+                    || part.eq_ignore_ascii_case(b"private")
+                {
+                    cc_forbid = true;
+                } else if let Some(rest) = strip_prefix_ci(part, b"s-maxage=") {
+                    if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() {
+                        cc_ttl = Some(n);
+                    }
+                } else if cc_ttl.is_none() {
+                    if let Some(rest) = strip_prefix_ci(part, b"max-age=") {
+                        if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() {
+                            cc_ttl = Some(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if cc_forbid { return; }
+    let ttl = match cc_ttl {
+        Some(t) => t,
+        None => match ttl_for(conf, status) { Some(t) => t, None => return },
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -509,6 +586,16 @@ pub fn maybe_save(
         Some(cv) => crate::script::complex_value(r, cv).unwrap_or_else(|_| default_cache_key(r, upstream_uri)),
         None => default_cache_key(r, upstream_uri),
     };
-    save(zone, &key, &resp);
-    let _ = zone; // silence
+    save(&zone, &key, &resp);
+}
+
+fn trim_ws(mut s: &[u8]) -> &[u8] {
+    while let Some(&b) = s.first() { if b == b' ' || b == b'\t' { s = &s[1..]; } else { break; } }
+    while let Some(&b) = s.last() { if b == b' ' || b == b'\t' { s = &s[..s.len()-1]; } else { break; } }
+    s
+}
+
+fn strip_prefix_ci<'a>(s: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
+    if s.len() < p.len() { return None; }
+    if s[..p.len()].eq_ignore_ascii_case(p) { Some(&s[p.len()..]) } else { None }
 }
