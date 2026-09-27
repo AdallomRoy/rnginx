@@ -347,6 +347,8 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.cache.lock_timeout_ms == 5000 { c.cache.lock_timeout_ms = p.cache.lock_timeout_ms; }
     if c.cache.lock_age_ms == 5000 { c.cache.lock_age_ms = p.cache.lock_age_ms; }
     if !c.cache.revalidate { c.cache.revalidate = p.cache.revalidate; }
+    if c.cache.use_stale == 0 { c.cache.use_stale = p.cache.use_stale; }
+    if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
     Ok(())
 }
 
@@ -1429,10 +1431,18 @@ async fn proxy_handler(r: R) -> i64 {
     // expires+N]. Serve the cached body as STALE — matches C's
     // ngx_http_upstream_cache_send returning STALE on ngx_http_upstream_next
     // when u->cache_status is EXPIRED and the entry is stale-if-error-ok.
-    if status >= 500 && status < 600 {
+    if status >= 400 {
         if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
             if let Some(cached) = hints.cached.clone() {
-                if crate::proxy_cache::stale_if_error_ok(&cached) {
+                let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+                let cache_conf = lcf_c.borrow().cache.clone();
+                // For status-based failures (5xx / 4xx from upstream) C's
+                // ngx_http_upstream_test_next only serves stale when
+                // cache_use_stale matches the specific status bit —
+                // stale-if-error from Cache-Control alone does not apply
+                // (that's for connection-level errors only).
+                let bit = crate::proxy_cache::use_stale_status_bit(status as u16);
+                if bit != 0 && cache_conf.use_stale & bit != 0 {
                     crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Stale);
                     return crate::proxy_cache::serve_hit(&r, cached).await;
                 }
@@ -2318,7 +2328,12 @@ pub fn proxy_module() -> ModuleDef {
             }
             Ok(())
         }),
-        cmd_fn!("proxy_cache_use_stale", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_use_stale", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let bits = crate::proxy_cache::parse_use_stale_flags(&cf.args[1..].to_vec())?;
+            cell.borrow_mut().cache.use_stale = bits;
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_lock", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
             cell.borrow_mut().cache.lock = cf.args[1] == b"on";
@@ -2351,7 +2366,11 @@ pub fn proxy_module() -> ModuleDef {
             cell.borrow_mut().cache.convert_head = v == b"on";
             Ok(())
         }),
-        cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            cell.borrow_mut().cache.background_update = cf.args[1] == b"on";
+            Ok(())
+        }),
         cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
             for a in cf.args[1..].to_vec() {

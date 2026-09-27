@@ -53,6 +53,57 @@ pub struct ProxyCacheConf {
     pub lock_timeout_ms: u64,                 // proxy_cache_lock_timeout
     pub lock_age_ms: u64,                     // proxy_cache_lock_age
     pub revalidate: bool,                     // proxy_cache_revalidate
+    pub use_stale: u32,                       // proxy_cache_use_stale bitmask
+    pub background_update: bool,              // proxy_cache_background_update
+}
+
+// proxy_cache_use_stale bitmask values (matches ngx_http_upstream_next_t).
+pub const USE_STALE_ERROR: u32          = 0x0001;
+pub const USE_STALE_TIMEOUT: u32        = 0x0002;
+pub const USE_STALE_INVALID_HEADER: u32 = 0x0004;
+pub const USE_STALE_UPDATING: u32       = 0x0008;
+pub const USE_STALE_HTTP_500: u32       = 0x0010;
+pub const USE_STALE_HTTP_502: u32       = 0x0020;
+pub const USE_STALE_HTTP_503: u32       = 0x0040;
+pub const USE_STALE_HTTP_504: u32       = 0x0080;
+pub const USE_STALE_HTTP_403: u32       = 0x0100;
+pub const USE_STALE_HTTP_404: u32       = 0x0200;
+pub const USE_STALE_HTTP_429: u32       = 0x0400;
+
+pub fn parse_use_stale_flags(args: &[Vec<u8>]) -> Result<u32, ConfError> {
+    let mut bits = 0u32;
+    for a in args {
+        let m = match a.as_slice() {
+            b"off" => return Ok(0),
+            b"error" => USE_STALE_ERROR,
+            b"timeout" => USE_STALE_TIMEOUT,
+            b"invalid_header" => USE_STALE_INVALID_HEADER,
+            b"updating" => USE_STALE_UPDATING,
+            b"http_500" => USE_STALE_HTTP_500,
+            b"http_502" => USE_STALE_HTTP_502,
+            b"http_503" => USE_STALE_HTTP_503,
+            b"http_504" => USE_STALE_HTTP_504,
+            b"http_403" => USE_STALE_HTTP_403,
+            b"http_404" => USE_STALE_HTTP_404,
+            b"http_429" => USE_STALE_HTTP_429,
+            _ => return Err(msg("invalid use_stale flag")),
+        };
+        bits |= m;
+    }
+    Ok(bits)
+}
+
+pub fn use_stale_status_bit(status: u16) -> u32 {
+    match status {
+        500 => USE_STALE_HTTP_500,
+        502 => USE_STALE_HTTP_502,
+        503 => USE_STALE_HTTP_503,
+        504 => USE_STALE_HTTP_504,
+        403 => USE_STALE_HTTP_403,
+        404 => USE_STALE_HTTP_404,
+        429 => USE_STALE_HTTP_429,
+        _ => 0,
+    }
 }
 
 impl ProxyCacheConf {
@@ -72,6 +123,8 @@ impl ProxyCacheConf {
             lock_timeout_ms: 5000,
             lock_age_ms: 5000,
             revalidate: false,
+            use_stale: 0,
+            background_update: false,
         }
     }
 }
