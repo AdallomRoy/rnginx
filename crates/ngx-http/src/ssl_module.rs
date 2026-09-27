@@ -23,6 +23,14 @@ extern "C" {
     // convention), so we bind SSL_get1_peer_certificate directly here — OpenSSL 3
     // exports both names and 1.1.1 exports SSL_get_peer_certificate as an alias.
     fn SSL_get1_peer_certificate(ssl: *const openssl_sys::SSL) -> *mut openssl_sys::X509;
+    fn OBJ_nid2sn(nid: std::os::raw::c_int) -> *const std::os::raw::c_char;
+}
+
+// SSL_get_negotiated_group is a macro in openssl/ssl.h that expands to
+// SSL_ctrl(s, SSL_CTRL_GET_NEGOTIATED_GROUP=134, 0, NULL). Do the same.
+#[allow(non_snake_case)]
+unsafe fn SSL_get_negotiated_group(ssl: *mut openssl_sys::SSL) -> std::os::raw::c_int {
+    openssl_sys::SSL_ctrl(ssl, 134, 0, std::ptr::null_mut()) as std::os::raw::c_int
 }
 
 #[allow(non_snake_case)]
@@ -412,7 +420,7 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         VarDef { name: "ssl_client_v_remain", set: None, get: Some(var_notfound), data: 0, flags: 0 },
         VarDef { name: "ssl_alpn_protocol", set: None, get: Some(var_notfound), data: 0, flags: 0 },
         VarDef { name: "ssl_early_data", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_curve", set: None, get: Some(var_notfound), data: 0, flags: 0 },
+        VarDef { name: "ssl_curve", set: None, get: Some(var_ssl_curve), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
         VarDef { name: "ssl_curves", set: None, get: Some(var_notfound), data: 0, flags: 0 },
     ];
     crate::variables::add_variables(cf, &vars)?;
@@ -451,8 +459,42 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 .map_err(|_| cf.emerg(format_args!("ssl_certificate_key path is not UTF-8")))?;
             builder.set_certificate_chain_file(cert_str)
                 .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_certificate_chain_file(\"{}\") failed: {}", cert_str, e)))?;
-            builder.set_private_key_file(key_str, SslFiletype::PEM)
-                .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", key_str, e)))?;
+            // ssl_password_file: try each password in turn against the
+            // encrypted PEM. Matches ngx_ssl_read_password_file +
+            // per-password decrypt loop in ngx_ssl_certificate_key.
+            let pwd_file = ssl_conf.borrow().password_file.as_option().cloned();
+            let passwords: Vec<Vec<u8>> = if let Some(pf) = pwd_file {
+                let pf_full = cf.cycle.full_name(&pf, true);
+                let pf_str = std::str::from_utf8(&pf_full)
+                    .map_err(|_| cf.emerg(format_args!("ssl_password_file path is not UTF-8")))?;
+                let data = std::fs::read(pf_str)
+                    .map_err(|e| cf.emerg(format_args!("ssl_password_file read failed: {}", e)))?;
+                data.split(|&b| b == b'\n')
+                    .map(|l| {
+                        let mut s = l.to_vec();
+                        // trim trailing \r
+                        if s.last() == Some(&b'\r') { s.pop(); }
+                        s
+                    })
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let key_res = load_private_key(key_str, &passwords);
+            match key_res {
+                Ok(pkey) => {
+                    builder.set_private_key(&pkey)
+                        .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey(\"{}\") failed: {}", key_str, e)))?;
+                }
+                Err(_) if passwords.is_empty() => {
+                    builder.set_private_key_file(key_str, SslFiletype::PEM)
+                        .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", key_str, e)))?;
+                }
+                Err(e) => {
+                    return Err(cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", key_str, e)));
+                }
+            }
             builder.check_private_key()
                 .map_err(|e| cf.emerg(format_args!("SSL: certificate and key mismatch: {}", e)))?;
         }
@@ -461,6 +503,22 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         let _ = builder.set_cipher_list(ciph_str);
         // Protocol version limits
         set_protocols_on_builder(&mut builder, protocols);
+        // ssl_ecdh_curve: SSL_CTX_set1_groups_list (OpenSSL 1.1+) accepts
+        // a colon-separated list of curve names ("prime256v1:x25519").
+        let ecdh_curve = ssl_conf.borrow().ecdh_curve.as_option().cloned();
+        if let Some(curve) = ecdh_curve {
+            if let Ok(cs) = std::ffi::CString::new(curve) {
+                unsafe {
+                    // SSL_CTRL_SET_GROUPS_LIST = 92
+                    openssl_sys::SSL_CTX_ctrl(
+                        builder.as_ptr() as *mut _,
+                        92,
+                        0,
+                        cs.as_ptr() as *mut c_void,
+                    );
+                }
+            }
+        }
         if verify_mode != 0 {
             // NOTE: we deliberately do NOT set FAIL_IF_NO_PEER_CERT
             // even for verify=on. C nginx handles the no-cert case in
@@ -563,6 +621,31 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         *ssl_conf.borrow_mut().ssl_ctx.borrow_mut() = Some(Rc::new(ctx));
     }
     Ok(())
+}
+
+/// Read an encrypted PEM key file and decrypt it using one of the
+/// supplied passwords. Falls back to an unencrypted parse when the
+/// list is empty. Matches nginx's per-password retry loop in
+/// ngx_ssl_certificate_key.
+fn load_private_key(path: &str, passwords: &[Vec<u8>]) -> Result<openssl::pkey::PKey<openssl::pkey::Private>, openssl::error::ErrorStack> {
+    let pem = std::fs::read(path).map_err(|e| {
+        // Wrap the io::Error into openssl::error::ErrorStack via a dummy
+        // stack entry. Simplest is to just return an empty stack; the
+        // caller's error message includes the path anyway.
+        let _ = e;
+        openssl::error::ErrorStack::get()
+    })?;
+    if passwords.is_empty() {
+        return openssl::pkey::PKey::private_key_from_pem(&pem);
+    }
+    let mut last_err = None;
+    for pw in passwords {
+        match openssl::pkey::PKey::private_key_from_pem_passphrase(&pem, pw) {
+            Ok(k) => return Ok(k),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(openssl::error::ErrorStack::get))
 }
 
 fn set_protocols_on_builder(builder: &mut SslContextBuilder, mask: u32) {
@@ -787,6 +870,20 @@ fn var_ssl_server_name(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
         _ => { v.not_found = true; NGX_OK }
     }
 }
+fn var_ssl_curve(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
+    if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
+    let ptr = sc.inner.borrow().as_ref().unwrap().as_ptr();
+    unsafe {
+        let nid = SSL_get_negotiated_group(ptr as *mut _);
+        if nid == 0 { v.not_found = true; return NGX_OK; }
+        let sn = OBJ_nid2sn(nid);
+        if sn.is_null() { v.not_found = true; return NGX_OK; }
+        let bytes = std::ffi::CStr::from_ptr(sn).to_bytes().to_vec();
+        set_var(v, bytes)
+    }
+}
+
 fn var_ssl_client_verify(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     let sc = match ssl_conn(r) { Some(c) => c, None => { v.not_found = true; return NGX_OK; } };
     if !sc.handshaked.get() { v.not_found = true; return NGX_OK; }
