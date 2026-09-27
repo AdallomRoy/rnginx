@@ -463,6 +463,75 @@ fn vary_has_wildcard(vary_header: &[u8]) -> bool {
     false
 }
 
+/// Same TTL precedence as maybe_save (X-Accel-Expires > Cache-Control >
+/// Expires > proxy_cache_valid). Callers use this on a 304 response
+/// to recompute the cached entry's expiry from the ORIGINAL cached
+/// headers (upstream only tells us "still fresh", not a new TTL).
+pub fn compute_expires_from_cached(
+    conf: &ProxyCacheConf,
+    cached: &CachedResponse,
+    now: u64,
+) -> Option<u64> {
+    let ignored = |name: &[u8]| -> bool {
+        let lc = name.to_ascii_lowercase();
+        conf.ignore_headers.iter().any(|h| h == &lc)
+    };
+    let mut xa: Option<u64> = None;
+    let mut xa_seen = false;
+    if !ignored(b"x-accel-expires") {
+        for (k, v) in &cached.headers {
+            if !k.eq_ignore_ascii_case(b"x-accel-expires") { continue; }
+            if xa_seen { continue; }
+            xa_seen = true;
+            let s = trim_ws(v);
+            if s.is_empty() { continue; }
+            if s == b"0" { xa = Some(0); continue; }
+            if let Some(rest) = s.strip_prefix(b"@") {
+                if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() { xa = Some(n); }
+            } else if let Ok(n) = std::str::from_utf8(s).unwrap_or("").parse::<u64>() {
+                xa = Some(now + n);
+            }
+        }
+    }
+    if let Some(x) = xa { return if x == 0 { None } else { Some(x) }; }
+    let mut cc_ttl: Option<u64> = None;
+    let mut cc_seen = false;
+    let mut cc_forbid = false;
+    if !ignored(b"cache-control") {
+        for (k, v) in &cached.headers {
+            if !k.eq_ignore_ascii_case(b"cache-control") { continue; }
+            cc_seen = true;
+            for part in v.split(|&b| b == b',') {
+                let p = trim_ws(part);
+                if p.eq_ignore_ascii_case(b"no-cache") || p.eq_ignore_ascii_case(b"no-store") || p.eq_ignore_ascii_case(b"private") {
+                    cc_forbid = true;
+                } else if let Some(rest) = strip_prefix_ci(p, b"s-maxage=") {
+                    if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() { cc_ttl = Some(n); }
+                } else if cc_ttl.is_none() {
+                    if let Some(rest) = strip_prefix_ci(p, b"max-age=") {
+                        if let Ok(n) = std::str::from_utf8(rest).unwrap_or("").parse::<u64>() { cc_ttl = Some(n); }
+                    }
+                }
+            }
+        }
+    }
+    if cc_forbid { return None; }
+    if let Some(t) = cc_ttl { return Some(now + t); }
+    let mut expires_ttl: Option<u64> = None;
+    if !ignored(b"expires") {
+        for (k, v) in &cached.headers {
+            if !k.eq_ignore_ascii_case(b"expires") { continue; }
+            if let Some(when) = ngx_core::parse::parse_http_time(v) {
+                let w = if when >= 0 { when as u64 } else { 0 };
+                expires_ttl = Some(if w <= now { 0 } else { w - now });
+            }
+        }
+    }
+    if let Some(t) = expires_ttl { return if t == 0 { None } else { Some(now + t) }; }
+    if cc_seen { return None; }  // CC present without max-age and Expires bad → no TTL
+    ttl_for(conf, cached.status).map(|t| now + t)
+}
+
 // ---------------------------------------------------------------------
 // $upstream_cache_status
 // ---------------------------------------------------------------------

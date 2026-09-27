@@ -1407,13 +1407,17 @@ async fn proxy_handler(r: R) -> i64 {
                     let c = lcf_c.borrow();
                     c.cache.clone()
                 };
-                // Compute new expires from the same rules as save.
-                let ttl = crate::proxy_cache::ttl_for(&cache_conf, cached.status).unwrap_or(0);
+                // Compute new expires from the SAME headers already on the
+                // cached entry (upstream only signals freshness; the TTL
+                // comes from the response's Cache-Control / Expires /
+                // X-Accel-Expires / proxy_cache_valid, same precedence
+                // as the initial save).
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                cached.expires_epoch = now + ttl;
+                cached.expires_epoch = crate::proxy_cache::compute_expires_from_cached(&cache_conf, &cached, now)
+                    .unwrap_or(now);
                 crate::proxy_cache::save(&hints.zone, &hints.key, &cached);
                 crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Revalidated);
                 return crate::proxy_cache::serve_hit(&r, cached).await;
