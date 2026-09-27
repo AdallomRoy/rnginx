@@ -131,6 +131,31 @@ impl ProxyCacheConf {
     }
 }
 
+// Per-zone+key hit counter for proxy_cache_min_uses / cache_check_range.
+thread_local! {
+    static HITS: RefCell<HashMap<Vec<u8>, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Increment and return the hit count for a cache key. First call returns 1.
+pub fn bump_hits(zone: &[u8], key: &[u8]) -> u32 {
+    let mut composite = zone.to_vec();
+    composite.push(0);
+    composite.extend_from_slice(key);
+    HITS.with(|m| {
+        let mut b = m.borrow_mut();
+        let v = b.entry(composite).or_insert(0);
+        *v = v.saturating_add(1);
+        *v
+    })
+}
+
+pub fn get_hits(zone: &[u8], key: &[u8]) -> u32 {
+    let mut composite = zone.to_vec();
+    composite.push(0);
+    composite.extend_from_slice(key);
+    HITS.with(|m| m.borrow().get(&composite).copied().unwrap_or(0))
+}
+
 /// Return true when the client's Range header specifies a start byte
 /// at or below `max_range_offset` (or "-N" suffix ranges — always
 /// treated as below since they read from EOF-N). Callers use this to
@@ -837,6 +862,8 @@ async fn try_serve_once(
     } else {
         base_key.clone()
     };
+    // Track use count for proxy_cache_min_uses / cache_check_range.
+    bump_hits(zone, &key);
     match lookup(&zone, &key) {
         Some(resp) => {
             let now = std::time::SystemTime::now()

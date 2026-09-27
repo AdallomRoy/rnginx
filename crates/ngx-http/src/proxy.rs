@@ -350,6 +350,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.cache.use_stale == 0 { c.cache.use_stale = p.cache.use_stale; }
     if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
     if c.cache.max_range_offset.is_none() { c.cache.max_range_offset = p.cache.max_range_offset; }
+    if c.cache.min_uses == 1 { c.cache.min_uses = p.cache.min_uses; }
     Ok(())
 }
 
@@ -900,11 +901,28 @@ async fn proxy_handler(r: R) -> i64 {
         let lcf_mro = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
         let c = lcf_mro.borrow();
         match (c.cache.zone.as_ref(), c.cache.max_range_offset) {
-            (Some(_), Some(off)) => {
+            (Some(_zone), Some(off)) => {
                 let hin = r.headers_in.borrow();
-                hin.range.first()
+                let range_ok = hin.range.first()
                     .map(|h| crate::proxy_cache::range_below_offset(&h.value.borrow(), off))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if range_ok && c.cache.min_uses > 1 {
+                    // Gate on min_uses hits: if this key hasn't been
+                    // requested min_uses times yet, don't do the range-strip
+                    // optimization — matches C's cache_min_uses interaction
+                    // with cache_check_range.
+                    if let Some(Ok(zn)) = crate::proxy_cache::resolve_zone_name(&r, &c.cache) {
+                        let base_key = match &c.cache.key {
+                            Some(cv) => crate::script::complex_value(&r, cv).unwrap_or_default(),
+                            None => crate::proxy_cache::default_cache_key(&r, &upstream_uri),
+                        };
+                        crate::proxy_cache::get_hits(&zn, &base_key) >= c.cache.min_uses
+                    } else {
+                        false
+                    }
+                } else {
+                    range_ok
+                }
             }
             _ => false,
         }
@@ -2375,7 +2393,12 @@ pub fn proxy_module() -> ModuleDef {
             cell.borrow_mut().cache.lock_timeout_ms = t as u64;
             Ok(())
         }),
-        cmd_fn!("proxy_cache_min_uses", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_min_uses", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let n = ngx_core::string::atoi(&cf.args[1]).ok_or_else(|| ngx_core::conf::msg("invalid number"))?;
+            cell.borrow_mut().cache.min_uses = n as u32;
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_revalidate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
             cell.borrow_mut().cache.revalidate = cf.args[1] == b"on";
