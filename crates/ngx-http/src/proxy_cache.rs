@@ -52,6 +52,7 @@ pub struct ProxyCacheConf {
     pub lock: bool,                           // proxy_cache_lock
     pub lock_timeout_ms: u64,                 // proxy_cache_lock_timeout
     pub lock_age_ms: u64,                     // proxy_cache_lock_age
+    pub revalidate: bool,                     // proxy_cache_revalidate
 }
 
 impl ProxyCacheConf {
@@ -70,6 +71,7 @@ impl ProxyCacheConf {
             lock: false,
             lock_timeout_ms: 5000,
             lock_age_ms: 5000,
+            revalidate: false,
         }
     }
 }
@@ -651,6 +653,23 @@ async fn try_serve_once(
                 return Some(serve_hit(r, resp).await);
             }
             set_status(r, CacheStatus::Expired);
+            if conf.revalidate {
+                let ims = resp.headers.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(b"last-modified"))
+                    .map(|(_, v)| v.clone());
+                let inm = resp.headers.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(b"etag"))
+                    .map(|(_, v)| v.clone());
+                if ims.is_some() || inm.is_some() {
+                    set_revalidate(r, RevalidateHints {
+                        if_modified_since: ims,
+                        if_none_match: inm,
+                        cached: Some(resp),
+                        zone: zone.to_vec(),
+                        key: key.clone(),
+                    });
+                }
+            }
             None
         }
         None => {
@@ -683,8 +702,32 @@ async fn try_serve_once(
     }
 }
 
+/// Per-request state carried between try_serve and the upstream fetch to
+/// support proxy_cache_revalidate.
+#[derive(Default, Clone)]
+pub struct RevalidateHints {
+    pub if_modified_since: Option<Vec<u8>>,
+    pub if_none_match: Option<Vec<u8>>,
+    pub cached: Option<CachedResponse>,
+    pub zone: Vec<u8>,
+    pub key: Vec<u8>,
+}
+
 thread_local! {
+    static REVALIDATE: RefCell<HashMap<u64, RevalidateHints>> = RefCell::new(HashMap::new());
     static NO_STORE: RefCell<HashMap<u64, ()>> = RefCell::new(HashMap::new());
+}
+
+pub fn set_revalidate(r: &R, h: RevalidateHints) {
+    let id = Rc::as_ptr(r) as u64;
+    REVALIDATE.with(|m| { m.borrow_mut().insert(id, h); });
+    r.add_cleanup(Box::new(move || {
+        REVALIDATE.with(|m| { m.borrow_mut().remove(&id); });
+    }));
+}
+
+pub fn get_revalidate(r: &R) -> Option<RevalidateHints> {
+    REVALIDATE.with(|m| m.borrow().get(&(Rc::as_ptr(r) as u64)).cloned())
 }
 
 fn set_no_store(r: &R) {

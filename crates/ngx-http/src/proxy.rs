@@ -346,6 +346,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if !c.cache.lock { c.cache.lock = p.cache.lock; }
     if c.cache.lock_timeout_ms == 5000 { c.cache.lock_timeout_ms = p.cache.lock_timeout_ms; }
     if c.cache.lock_age_ms == 5000 { c.cache.lock_age_ms = p.cache.lock_age_ms; }
+    if !c.cache.revalidate { c.cache.revalidate = p.cache.revalidate; }
     Ok(())
 }
 
@@ -952,6 +953,26 @@ async fn proxy_handler(r: R) -> i64 {
             .map(|l| l.max_cached > 0)
             .unwrap_or(false);
     let conn_line = if connection_overridden { "" } else { "Connection: close\r\n" };
+    // proxy_cache_revalidate: if the cached response had Last-Modified /
+    // ETag and the cache has expired, add If-Modified-Since /
+    // If-None-Match so the upstream can 304 us and reuse the entry.
+    let reval_hdrs: String = match crate::proxy_cache::get_revalidate(&r) {
+        Some(h) => {
+            let mut s = String::new();
+            if let Some(ims) = &h.if_modified_since {
+                s.push_str("If-Modified-Since: ");
+                s.push_str(std::str::from_utf8(ims).unwrap_or(""));
+                s.push_str("\r\n");
+            }
+            if let Some(inm) = &h.if_none_match {
+                s.push_str("If-None-Match: ");
+                s.push_str(std::str::from_utf8(inm).unwrap_or(""));
+                s.push_str("\r\n");
+            }
+            s
+        }
+        None => String::new(),
+    };
     // IPv6 literal hostnames need bracket-quoting in the Host header.
     // For unix upstreams C sends "unix:<path>:" — copy that.
     let host_hdr: String = if let Some(path) = host.strip_prefix("unix:") {
@@ -964,8 +985,8 @@ async fn proxy_handler(r: R) -> i64 {
     let request = format!(
         "{} {} {}\r\n\
          Host: {}\r\n\
-         {}{}{}{}\r\n",
-        method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, forward_headers
+         {}{}{}{}{}\r\n",
+        method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, reval_hdrs, forward_headers
     );
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
@@ -1373,6 +1394,31 @@ async fn proxy_handler(r: R) -> i64 {
             }
         }
         break 'retry;
+    }
+    // proxy_cache_revalidate: on 304 the upstream is telling us the cached
+    // entry is still fresh — repush it with a new expiry and serve HIT so
+    // the client sees REVALIDATED. Matches C's ngx_http_upstream_process_headers
+    // 304-branch.
+    if status == 304 {
+        if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
+            if let Some(mut cached) = hints.cached.clone() {
+                let cache_conf = {
+                    let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+                    let c = lcf_c.borrow();
+                    c.cache.clone()
+                };
+                // Compute new expires from the same rules as save.
+                let ttl = crate::proxy_cache::ttl_for(&cache_conf, cached.status).unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                cached.expires_epoch = now + ttl;
+                crate::proxy_cache::save(&hints.zone, &hints.key, &cached);
+                crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Revalidated);
+                return crate::proxy_cache::serve_hit(&r, cached).await;
+            }
+        }
     }
     let headers_section = &response[..status_line_end];
     let status_line_end_nl = headers_section.iter().position(|&b| b == b'\n').unwrap_or(headers_section.len());
@@ -2272,7 +2318,11 @@ pub fn proxy_module() -> ModuleDef {
             Ok(())
         }),
         cmd_fn!("proxy_cache_min_uses", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_revalidate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_revalidate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            cell.borrow_mut().cache.revalidate = cf.args[1] == b"on";
+            Ok(())
+        }),
         cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_methods", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cache_purge", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
