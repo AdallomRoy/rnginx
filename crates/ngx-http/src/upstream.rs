@@ -544,10 +544,12 @@ fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
     if cf.args.len() < 2 {
         return Err(msg("no server address specified"));
     }
-    // Parse host:port from args[1]. IPv6 [::1]:8080 supported.
+    // Parse host:port from args[1]. IPv6 [::1]:8080 and unix:/path supported.
     let addr = cf.args[1].clone();
     let addr_str = std::str::from_utf8(&addr).unwrap_or("");
-    let (host, port) = if addr_str.starts_with('[') {
+    let (host, port) = if let Some(path) = addr_str.strip_prefix("unix:") {
+        (format!("unix:{}", path), 0)
+    } else if addr_str.starts_with('[') {
         // [ipv6]:port
         if let Some(end) = addr_str.find(']') {
             let host_part = &addr_str[..=end];
