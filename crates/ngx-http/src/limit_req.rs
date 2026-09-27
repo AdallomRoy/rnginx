@@ -40,6 +40,9 @@ pub struct LimitReqZone {
     rate_num: u64,   // N requests
     rate_per: u64,   // per N seconds (1 or 60)
     key_expr: Vec<u8>,  // The key expression (e.g., $binary_remote_addr)
+    /// Pre-compiled version of key_expr — evaluated per request. Runtime
+    /// evaluator prefers this over key_expr when set.
+    key_cv: Option<std::rc::Rc<crate::script::ComplexValue>>,
     map: RefCell<HashMap<Vec<u8>, LimitReqNode>>,
 }
 
@@ -184,7 +187,7 @@ async fn limit_req_handler(r: R) -> i64 {
         };
 
         // Evaluate the key expression
-        let key = evaluate_key_expression(&r, &zone.key_expr);
+        let key = evaluate_zone_key(&r, &zone);
         if key.is_empty() {
             // Empty key means variable not set - skip this limit
             continue;
@@ -301,10 +304,18 @@ fn limit_req_zone(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
     }
 
     let zone_name = zone_name.unwrap();
+    // Pre-compile the key so per-request evaluation doesn't need to parse it.
+    // Fast path: $binary_remote_addr short-circuits the ComplexValue plumbing.
+    let key_cv = if key_expr == b"$binary_remote_addr" {
+        None
+    } else {
+        crate::script::compile_complex_value(cf, &key_expr, 0).ok().map(Rc::new)
+    };
     let zone = Rc::new(LimitReqZone {
         rate_num,
         rate_per,
         key_expr,
+        key_cv,
         map: RefCell::new(HashMap::new()),
     });
 
@@ -420,19 +431,20 @@ fn limit_req_dry_run(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
     Ok(())
 }
 
-fn evaluate_key_expression(r: &R, expr: &[u8]) -> Vec<u8> {
-    let expr_str = String::from_utf8_lossy(expr);
-
-    if expr_str == "$binary_remote_addr" {
-        match &*r.connection.sockaddr.borrow() {
+fn evaluate_zone_key(r: &R, zone: &LimitReqZone) -> Vec<u8> {
+    // Fast path: $binary_remote_addr is the overwhelmingly common case.
+    if zone.key_expr == b"$binary_remote_addr" {
+        return match &*r.connection.sockaddr.borrow() {
             ngx_core::inet::SockAddr::V4(sa) => sa.ip().octets().to_vec(),
             ngx_core::inet::SockAddr::V6(sa) => sa.ip().octets().to_vec(),
-            ngx_core::inet::SockAddr::Unix(_) => b"unix".to_vec(),
-        }
-    } else {
-        // For other expressions like $arg_*, return empty (not supported yet)
-        // TODO: implement other key expressions
-        Vec::new()
+            // C uses zeroes for anything that isn't inet(6).
+            ngx_core::inet::SockAddr::Unix(_) => vec![0, 0, 0, 0],
+        };
+    }
+    // General case: evaluate the pre-compiled ComplexValue.
+    match &zone.key_cv {
+        Some(cv) => crate::script::complex_value(r, cv).unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
