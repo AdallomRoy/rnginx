@@ -325,6 +325,11 @@ crate::http_module_index!("ngx_http_ssl_module");
 pub struct HttpSslSrvConf {
     pub certificate: Val<Vec<u8>>,
     pub certificate_key: Val<Vec<u8>>,
+    /// Additional certificate paths beyond the primary one. Populated by
+    /// the second and subsequent `ssl_certificate` directives so multi-
+    /// algorithm certs (RSA + ECDSA) can be served from the same server.
+    pub certificates_more: Val<Vec<Vec<u8>>>,
+    pub certificate_keys_more: Val<Vec<Vec<u8>>>,
     pub ciphers: Val<Vec<u8>>,
     pub client_certificate: Val<Vec<u8>>,
     pub trusted_certificate: Val<Vec<u8>>,
@@ -350,6 +355,8 @@ impl Default for HttpSslSrvConf {
         HttpSslSrvConf {
             certificate: Val::unset(),
             certificate_key: Val::unset(),
+            certificates_more: Val::unset(),
+            certificate_keys_more: Val::unset(),
             ciphers: Val::unset(),
             client_certificate: Val::unset(),
             trusted_certificate: Val::unset(),
@@ -381,6 +388,16 @@ fn merge_srv_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     let mut c = conf_cell::<HttpSslSrvConf>(conf).borrow_mut();
     c.certificate.merge_opt(&p.certificate);
     c.certificate_key.merge_opt(&p.certificate_key);
+    if !c.certificates_more.is_set() {
+        if let Some(v) = p.certificates_more.as_option() {
+            c.certificates_more = Val::set(v.clone());
+        }
+    }
+    if !c.certificate_keys_more.is_set() {
+        if let Some(v) = p.certificate_keys_more.as_option() {
+            c.certificate_keys_more = Val::set(v.clone());
+        }
+    }
     c.ciphers.merge(&p.ciphers, b"HIGH:!aNULL:!MD5".to_vec());
     c.client_certificate.merge_opt(&p.client_certificate);
     c.trusted_certificate.merge_opt(&p.trusted_certificate);
@@ -440,10 +457,30 @@ fn core_srv_ssl_conf(cf: &Conf) -> Rc<RefCell<HttpSslSrvConf>> {
 }
 
 fn set_certificate(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    set_str_slot(cf, |c| &mut c.certificate)
+    let arg = cf.args[1].clone();
+    let conf = core_srv_ssl_conf(cf);
+    let mut c = conf.borrow_mut();
+    if !c.certificate.is_set() {
+        c.certificate = Val::set(arg);
+    } else {
+        let mut more = c.certificates_more.as_option().cloned().unwrap_or_default();
+        more.push(arg);
+        c.certificates_more = Val::set(more);
+    }
+    Ok(())
 }
 fn set_certificate_key(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    set_str_slot(cf, |c| &mut c.certificate_key)
+    let arg = cf.args[1].clone();
+    let conf = core_srv_ssl_conf(cf);
+    let mut c = conf.borrow_mut();
+    if !c.certificate_key.is_set() {
+        c.certificate_key = Val::set(arg);
+    } else {
+        let mut more = c.certificate_keys_more.as_option().cloned().unwrap_or_default();
+        more.push(arg);
+        c.certificate_keys_more = Val::set(more);
+    }
+    Ok(())
 }
 fn set_ciphers(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
     set_str_slot(cf, |c| &mut c.ciphers)
@@ -673,6 +710,40 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
             }
             builder.check_private_key()
                 .map_err(|e| cf.emerg(format_args!("SSL: certificate and key mismatch: {}", e)))?;
+            // Additional ssl_certificate / ssl_certificate_key pairs
+            // (RSA + ECDSA multi-algorithm). Each subsequent call to
+            // SSL_CTX_use_certificate registers the cert against its
+            // key's algorithm slot — modern OpenSSL keeps them side by
+            // side so it can pick the right one per client cipher.
+            let extra_certs = ssl_conf.borrow().certificates_more.as_option().cloned().unwrap_or_default();
+            let extra_keys = ssl_conf.borrow().certificate_keys_more.as_option().cloned().unwrap_or_default();
+            let pair_count = extra_certs.len().min(extra_keys.len());
+            for i in 0..pair_count {
+                let cf2 = cf.cycle.full_name(&extra_certs[i], true);
+                let kf2 = cf.cycle.full_name(&extra_keys[i], true);
+                let cs2 = std::str::from_utf8(&cf2)
+                    .map_err(|_| cf.emerg(format_args!("ssl_certificate path is not UTF-8")))?;
+                let ks2 = std::str::from_utf8(&kf2)
+                    .map_err(|_| cf.emerg(format_args!("ssl_certificate_key path is not UTF-8")))?;
+                builder.set_certificate_chain_file(cs2)
+                    .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_certificate_chain_file(\"{}\") failed: {}", cs2, e)))?;
+                let key_res2 = load_private_key(ks2, &passwords);
+                match key_res2 {
+                    Ok(pkey) => {
+                        builder.set_private_key(&pkey)
+                            .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey(\"{}\") failed: {}", ks2, e)))?;
+                    }
+                    Err(_) if passwords.is_empty() => {
+                        builder.set_private_key_file(ks2, SslFiletype::PEM)
+                            .map_err(|e| cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", ks2, e)))?;
+                    }
+                    Err(e) => {
+                        return Err(cf.emerg(format_args!("SSL_CTX_use_PrivateKey_file(\"{}\") failed: {}", ks2, e)));
+                    }
+                }
+                builder.check_private_key()
+                    .map_err(|e| cf.emerg(format_args!("SSL: certificate and key mismatch: {}", e)))?;
+            }
         }
         let ciph_str = std::str::from_utf8(&ciphers)
             .map_err(|_| cf.emerg(format_args!("ssl_ciphers is not UTF-8")))?;
