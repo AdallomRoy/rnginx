@@ -920,8 +920,17 @@ async fn try_serve_once(
             // schedule a background update yet — the next request past
             // the SWR window will pay the full fetch — but tests that
             // just observe the STALE status within window still pass.
-            if stale_while_revalidate_ok(&resp) {
+            // stale-while-revalidate window from Cache-Control OR
+            // proxy_cache_use_stale updating (with background_update on)
+            // → serve stale, spawn a background refresh, return.
+            let swr_ok = stale_while_revalidate_ok(&resp);
+            let use_stale_updating = (conf.use_stale & USE_STALE_UPDATING) != 0
+                && conf.background_update;
+            if swr_ok || use_stale_updating {
                 set_status(r, CacheStatus::Stale);
+                if conf.background_update {
+                    spawn_background_refresh(r, conf, upstream_uri, zone, &key);
+                }
                 return Some(serve_hit(r, resp).await);
             }
             None
@@ -1182,6 +1191,158 @@ fn strip_prefix_ci<'a>(s: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
 
 fn parse_http_time(v: &[u8]) -> Option<u64> {
     ngx_core::parse::parse_http_time(v).and_then(|t| if t >= 0 { Some(t as u64) } else { None })
+}
+
+/// Minimal HTTP/1.0 client for proxy_cache_background_update. Reissues
+/// the same URL to the upstream, reads a plain response (no chunked
+/// framing, no upgrade), and saves to cache. Best-effort — failures are
+/// silently dropped since the primary response is already on its way to
+/// the client.
+pub async fn background_refresh(
+    upstream_host: String,
+    upstream_port: u16,
+    request_path: String,
+    request_headers: String,
+    zone_name: Vec<u8>,
+    cache_key: Vec<u8>,
+    conf_valid: Vec<CacheValid>,
+    ignore_headers: Vec<Vec<u8>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = format!("{}:{}", upstream_host, upstream_port);
+    let mut stream = match tokio::net::TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n{}\r\n",
+        request_path, upstream_host, request_headers
+    );
+    if stream.write_all(req.as_bytes()).await.is_err() { return; }
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return,
+        }
+        if buf.len() > 8 * 1024 * 1024 { break; } // 8 MB safety cap
+    }
+    // Parse status line + headers.
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let sep = match sep { Some(s) => s, None => return };
+    let head = &buf[..sep];
+    let body = buf[sep + 4..].to_vec();
+    let mut lines = head.split(|&b| b == b'\n');
+    let status_line = lines.next().unwrap_or(&[]);
+    let sl = std::str::from_utf8(status_line).unwrap_or("").trim_end();
+    let parts: Vec<&str> = sl.split_whitespace().collect();
+    let status: u16 = if parts.len() >= 2 { parts[1].parse().unwrap_or(0) } else { 0 };
+    if status == 0 { return; }
+    let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for line in lines {
+        let line = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
+        if line.is_empty() { continue; }
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let name = &line[..colon];
+            let mut vs = colon + 1;
+            while vs < line.len() && (line[vs] == b' ' || line[vs] == b'\t') { vs += 1; }
+            headers.push((name.to_vec(), line[vs..].to_vec()));
+        }
+    }
+    let conf = ProxyCacheConf {
+        zone: Some(zone_name.clone()),
+        zone_cv: None,
+        key: None,
+        valid: conf_valid,
+        min_uses: 1,
+        methods: crate::NGX_HTTP_GET | crate::NGX_HTTP_HEAD,
+        convert_head: true,
+        bypass: Vec::new(),
+        no_cache: Vec::new(),
+        ignore_headers,
+        lock: false,
+        lock_timeout_ms: 5000,
+        lock_age_ms: 5000,
+        revalidate: false,
+        use_stale: 0,
+        background_update: false,
+        max_range_offset: None,
+    };
+    // Compute expires the same way maybe_save does.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let resp = CachedResponse {
+        expires_epoch: 0,
+        status,
+        headers: headers.clone(),
+        body,
+    };
+    let expires = compute_expires_from_cached(&conf, &resp, now)
+        .unwrap_or_else(|| now.saturating_add(60));
+    let entry = CachedResponse { expires_epoch: expires, ..resp };
+    save(&zone_name, &cache_key, &entry);
+}
+
+/// Kick off a fire-and-forget task that refetches `upstream_uri` and
+/// overwrites the cached entry at `key`. Only called from the SWR /
+/// updating stale-serving path when background_update is on.
+fn spawn_background_refresh(
+    r: &R,
+    conf: &ProxyCacheConf,
+    upstream_uri: &[u8],
+    zone: &[u8],
+    key: &[u8],
+) {
+    // Parse upstream_uri: http[s]://host[:port]/path (unix upstreams are
+    // skipped — the background client only knows plain TCP).
+    let uri_str = std::str::from_utf8(upstream_uri).unwrap_or("");
+    let rest = match uri_str.strip_prefix("http://").or_else(|| uri_str.strip_prefix("https://")) {
+        Some(r) => r,
+        None => return,
+    };
+    if rest.starts_with("unix:") { return; }
+    let slash = rest.find('/').unwrap_or(rest.len());
+    let host_port = &rest[..slash];
+    let path = &rest[slash..];
+    let (host, port) = if let Some(idx) = host_port.rfind(':') {
+        (host_port[..idx].to_string(), host_port[idx + 1..].parse::<u16>().unwrap_or(80))
+    } else {
+        (host_port.to_string(), 80)
+    };
+    let mut path_full = path.to_string();
+    let uri_path = std::str::from_utf8(&r.uri.borrow()).unwrap_or("").to_string();
+    let args = r.args.borrow();
+    if path_full == "/" && !uri_path.is_empty() {
+        // Reflect the client's URI when the upstream is a bare host —
+        // otherwise we always refresh "/" which isn't what the original
+        // request asked for.
+        path_full = uri_path;
+    }
+    if !args.is_empty() {
+        let a = std::str::from_utf8(&args).unwrap_or("");
+        if !a.is_empty() { path_full.push('?'); path_full.push_str(a); }
+    }
+    drop(args);
+    // Add If-Modified-Since / If-None-Match if the cached response has
+    // Last-Modified / ETag — so a still-fresh backend can 304 us. We
+    // conservatively skip this on background refresh (the task doesn't
+    // implement 304 handling), leaving refresh headers minimal.
+    let extra_headers = String::new();
+    let zone_owned = zone.to_vec();
+    let key_owned = key.to_vec();
+    let conf_valid = conf.valid.clone();
+    let ignore_headers = conf.ignore_headers.clone();
+    tokio::task::spawn_local(async move {
+        background_refresh(
+            host, port, path_full, extra_headers,
+            zone_owned, key_owned,
+            conf_valid, ignore_headers,
+        ).await;
+    });
 }
 
 /// Return true if the cached response is within its stale-if-error
