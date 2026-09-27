@@ -147,8 +147,16 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
 
                 // Set Content-Range header
                 let content_range_str = format!("bytes {}-{}/{}", range.start, range.end - 1, content_length);
-                if let Some(h) = r.headers_out.borrow_mut().content_range.take() {
-                    h.hash.set(0);
+                {
+                    let mut ho = r.headers_out.borrow_mut();
+                    if let Some(h) = ho.content_range.take() {
+                        h.hash.set(0);
+                    }
+                    // Drop any Content-Range that the upstream response
+                    // carried through into ho.headers so we don't emit
+                    // both our fresh one and the stale one. Matches
+                    // range_clearing.t.
+                    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
                 }
                 let cr_header = TableElt::new(b"Content-Range", content_range_str.as_bytes());
                 r.headers_out.borrow_mut().content_range = Some(cr_header);
@@ -176,11 +184,18 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
 
                 // Set Content-Type to multipart
                 let content_type = format!("multipart/byteranges; boundary={:x}", boundary);
-                r.headers_out.borrow_mut().content_type = content_type.into_bytes();
-
-                // Remove individual content type from headers
-                if let Some(h) = r.headers_out.borrow_mut().content_length.take() {
-                    h.hash.set(0);
+                {
+                    let mut ho = r.headers_out.borrow_mut();
+                    ho.content_type = content_type.into_bytes();
+                    // Strip any Content-Range the upstream carried
+                    // through — each body part now carries its own.
+                    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
+                    if let Some(h) = ho.content_range.take() {
+                        h.hash.set(0);
+                    }
+                    if let Some(h) = ho.content_length.take() {
+                        h.hash.set(0);
+                    }
                 }
             }
 
@@ -224,6 +239,7 @@ async fn range_not_satisfiable(r: R, next: HeaderFilter) -> i64 {
     if let Some(h) = ho.content_range.take() {
         h.hash.set(0);
     }
+    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
     ho.content_range = Some(cr_header);
     drop(ho);
 

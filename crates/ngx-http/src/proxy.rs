@@ -1839,6 +1839,12 @@ async fn proxy_handler(r: R) -> i64 {
             r.allow_ranges.set(true);
             r.single_range.set(true);
         }
+        // Cached/cacheable responses go through range_filter regardless
+        // of the upstream's Accept-Ranges — C's ngx_http_upstream_send_response
+        // sets r->allow_ranges = 1 when u->cacheable is set.
+        if lcf_fr.borrow().cache.zone.is_some() {
+            r.allow_ranges.set(true);
+        }
     }
 
     // Reject 101 Switching Protocols the client didn't ask for BEFORE we
