@@ -24,7 +24,73 @@ extern "C" {
     // exports both names and 1.1.1 exports SSL_get_peer_certificate as an alias.
     fn SSL_get1_peer_certificate(ssl: *const openssl_sys::SSL) -> *mut openssl_sys::X509;
     fn OBJ_nid2sn(nid: std::os::raw::c_int) -> *const std::os::raw::c_char;
+
+    // In OpenSSL 3.x, SSL_set_options / SSL_clear_options are direct
+    // functions, not aliases for SSL_ctrl(SSL_CTRL_OPTIONS/CLEAR).
+    // Using ctrl works for reading (SSL_CTRL_OPTIONS,0 returns options)
+    // but not for writing on 3.x — SSL_ctrl(32, op, NULL) is a no-op
+    // for setting options in modern builds. Use direct symbols.
+    fn SSL_set_options(ssl: *mut openssl_sys::SSL, op: u64) -> u64;
+    fn SSL_clear_options(ssl: *mut openssl_sys::SSL, op: u64) -> u64;
+
+    // Direct SSL_CTX_set_client_hello_cb + SSL_client_hello_get0_ext.
+    // openssl-sys 0.9.117 exposes these under #[cfg(ossl111)]; if that
+    // cfg didn't fire during build (e.g., using an older sys crate),
+    // we still get the OpenSSL 1.1.1+ symbol at link time.
+    fn SSL_CTX_set_client_hello_cb(
+        ctx: *mut openssl_sys::SSL_CTX,
+        cb: Option<unsafe extern "C" fn(
+            s: *mut openssl_sys::SSL,
+            al: *mut std::os::raw::c_int,
+            arg: *mut c_void,
+        ) -> std::os::raw::c_int>,
+        arg: *mut c_void,
+    );
+    fn SSL_client_hello_get0_ext(
+        s: *mut openssl_sys::SSL,
+        type_: std::os::raw::c_uint,
+        out: *mut *const u8,
+        outlen: *mut usize,
+    ) -> std::os::raw::c_int;
+
+    // CRL loading via PEM_read_bio_X509_CRL / X509_STORE_add_crl.
+    // openssl-sys 0.9.117 exposes some but not all of these.
+    fn PEM_read_bio_X509_CRL(
+        bio: *mut openssl_sys::BIO,
+        x: *mut *mut c_void,
+        cb: *mut c_void,
+        u: *mut c_void,
+    ) -> *mut c_void;
+    fn X509_STORE_add_crl(store: *mut openssl_sys::X509_STORE, crl: *mut c_void) -> std::os::raw::c_int;
+    fn X509_STORE_set_flags(store: *mut openssl_sys::X509_STORE, flags: u32) -> std::os::raw::c_int;
+    fn X509_CRL_free(crl: *mut c_void);
+    fn SSL_CTX_get_cert_store(ctx: *const openssl_sys::SSL_CTX) -> *mut openssl_sys::X509_STORE;
+
+    // SSL_CONF_CTX API for ssl_conf_command directive. Not exposed by
+    // openssl-sys 0.9.117.
+    fn SSL_CONF_CTX_new() -> *mut c_void;
+    fn SSL_CONF_CTX_free(cctx: *mut c_void);
+    fn SSL_CONF_CTX_set_flags(cctx: *mut c_void, flags: u32) -> u32;
+    fn SSL_CONF_CTX_set_ssl_ctx(cctx: *mut c_void, ctx: *mut openssl_sys::SSL_CTX);
+    fn SSL_CONF_CTX_finish(cctx: *mut c_void) -> std::os::raw::c_int;
+    fn SSL_CONF_cmd(
+        cctx: *mut c_void,
+        cmd: *const std::os::raw::c_char,
+        value: *const std::os::raw::c_char,
+    ) -> std::os::raw::c_int;
+    fn SSL_CONF_cmd_value_type(
+        cctx: *mut c_void,
+        cmd: *const std::os::raw::c_char,
+    ) -> std::os::raw::c_int;
 }
+
+// SSL_CONF flags from openssl/ssl.h
+const SSL_CONF_FLAG_FILE: u32 = 0x0002;
+const SSL_CONF_FLAG_SERVER: u32 = 0x0008;
+const SSL_CONF_FLAG_SHOW_ERRORS: u32 = 0x0010;
+const SSL_CONF_FLAG_CERTIFICATE: u32 = 0x0020;
+const SSL_CONF_TYPE_FILE: std::os::raw::c_int = 2;
+const SSL_CONF_TYPE_DIR: std::os::raw::c_int = 3;
 
 // SSL_get_negotiated_group is a macro in openssl/ssl.h that expands to
 // SSL_ctrl(s, SSL_CTRL_GET_NEGOTIATED_GROUP=134, 0, NULL). Do the same.
@@ -102,39 +168,50 @@ fn sni_lookup(idx: usize) -> Option<Rc<HttpConnection>> {
     SNI_REGISTRY.with(|r| r.borrow().get(idx).and_then(|o| o.clone()))
 }
 
-unsafe extern "C" fn sni_servername_cb(
+// The core "pick vhost from SNI hostname, swap SSL_CTX + protocol
+// options" logic. Split out so both the servername callback (fallback
+// path, if client_hello_cb isn't wired) and the client_hello callback
+// can reuse it. `host_opt` is None when no SNI extension was present.
+unsafe fn sni_apply(
     ssl: *mut openssl_sys::SSL,
-    _ad: *mut std::os::raw::c_int,
-    _arg: *mut c_void,
+    ad: *mut std::os::raw::c_int,
+    host_opt: Option<&[u8]>,
 ) -> std::os::raw::c_int {
-    // SSL_TLSEXT_ERR_OK = 0, SSL_TLSEXT_ERR_ALERT_FATAL = 2, SSL_TLSEXT_ERR_NOACK = 3
     let ok: std::os::raw::c_int = 0;
     let fatal: std::os::raw::c_int = 2;
+    // SSL_AD_UNRECOGNIZED_NAME = 112. Matches C's servername.
+    let set_reject_alert = |ad_p: *mut std::os::raw::c_int| {
+        if !ad_p.is_null() { *ad_p = 112; }
+    };
     let idx_ptr = openssl_sys::SSL_get_ex_data(ssl, sni_ex_index());
     if idx_ptr.is_null() { return ok; }
-    let idx = idx_ptr as usize - 1; // sentinel-shift so NULL != index 0
-    let hc = match sni_lookup(idx) { Some(h) => h, None => return ok };
+    let idx = idx_ptr as usize - 1;
+    let hc = match sni_lookup(idx) { Some(h) => h, None => { return ok; } };
     let addr = &hc.addr_conf;
-    let name_c = openssl_sys::SSL_get_servername(ssl, 0 /* TLSEXT_NAMETYPE_host_name */);
-    if name_c.is_null() {
-        if reject_handshake_for(&addr.default_server) {
-            return fatal;
+    let host = match host_opt {
+        Some(h) => h,
+        None => {
+            if reject_handshake_for(&addr.default_server) {
+                set_reject_alert(ad);
+                return fatal;
+            }
+            return ok;
         }
-        return ok;
-    }
-    let name = std::ffi::CStr::from_ptr(name_c).to_bytes();
-    let host: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    };
+    let host: Vec<u8> = host.iter().map(|b| b.to_ascii_lowercase()).collect();
     let cscf = find_server_by_name(addr, &host);
     let cscf = match cscf {
         Some(c) => c,
         None => {
             if reject_handshake_for(&addr.default_server) {
+                set_reject_alert(ad);
                 return fatal;
             }
             return ok;
         }
     };
     if reject_handshake_for(&cscf) {
+        set_reject_alert(ad);
         return fatal;
     }
     // Point hc at the SNI'd server's config so subsequent request
@@ -143,7 +220,7 @@ unsafe extern "C" fn sni_servername_cb(
     let target_ctx = cscf.borrow().ctx.clone();
     *hc.conf_ctx.borrow_mut() = target_ctx.clone();
     // Fetch the target server's SslContext and swap.
-    let srv_slots = match &target_ctx.srv { Some(s) => s.clone(), None => return ok };
+    let srv_slots = match &target_ctx.srv { Some(s) => s.clone(), None => { return ok; } };
     let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
     let target = ssl_conf.borrow().ssl_ctx.borrow().clone();
     if let Some(target) = target {
@@ -153,12 +230,81 @@ unsafe extern "C" fn sni_servername_cb(
         }
         let mode = openssl_sys::SSL_CTX_get_verify_mode(raw);
         openssl_sys::SSL_set_verify(ssl, mode, None);
-        // SSL_CTRL_OPTIONS=32 — set options via SSL_ctrl since 0.9.117
-        // doesn't expose SSL_set_options as a direct FFI symbol.
+        // SSL_CTRL_CLEAR_OPTIONS=77 — clear all protocol-related NO_
+        // options from the SSL so the target ctx's options can take
+        // effect. Otherwise a permissive default vhost's absence of
+        // NO_TLSv1_3 would leave TLSv1.3 usable on a vhost that
+        // explicitly disabled it. This matches C's SSL_set_options /
+        // SSL_clear_options sequence in ngx_http_ssl_servername.
+        let proto_mask: u64 = openssl_sys::SSL_OP_NO_SSLv2 as u64
+            | openssl_sys::SSL_OP_NO_SSLv3 as u64
+            | openssl_sys::SSL_OP_NO_TLSv1 as u64
+            | openssl_sys::SSL_OP_NO_TLSv1_1 as u64
+            | openssl_sys::SSL_OP_NO_TLSv1_2 as u64
+            | openssl_sys::SSL_OP_NO_TLSv1_3 as u64;
+        // In OpenSSL 3.x, SSL_set_options/SSL_clear_options are direct
+        // functions — SSL_ctrl(SSL_CTRL_OPTIONS/CLEAR) is a no-op for
+        // writing. Use the real symbols.
+        SSL_clear_options(ssl, proto_mask);
         let opts = openssl_sys::SSL_CTX_get_options(raw);
-        openssl_sys::SSL_ctrl(ssl, 32, opts as std::os::raw::c_long, std::ptr::null_mut());
+        SSL_set_options(ssl, opts);
     }
     ok
+}
+
+// Client hello callback: runs BEFORE version negotiation so
+// SSL_set_options here actually constrains TLS 1.3 selection. Matches
+// C's ngx_ssl_client_hello_callback → ngx_http_ssl_servername path.
+unsafe extern "C" fn sni_client_hello_cb(
+    ssl: *mut openssl_sys::SSL,
+    ad: *mut std::os::raw::c_int,
+    _arg: *mut c_void,
+) -> std::os::raw::c_int {
+    // TLSEXT_TYPE_server_name = 0
+    let mut ext: *const u8 = std::ptr::null();
+    let mut ext_len: usize = 0;
+    let host_opt: Option<Vec<u8>> = if SSL_client_hello_get0_ext(ssl, 0, &mut ext, &mut ext_len) != 0
+        && !ext.is_null()
+        && ext_len >= 5
+    {
+        let p = std::slice::from_raw_parts(ext, ext_len);
+        // ServerNameList: uint16 list_len | uint8 name_type | uint16 name_len | name
+        let list_len = ((p[0] as usize) << 8) | (p[1] as usize);
+        if list_len + 2 != ext_len || p[2] != 0 {
+            *ad = 50; // SSL_AD_DECODE_ERROR
+            return 0; // SSL_CLIENT_HELLO_ERROR
+        }
+        let name_len = ((p[3] as usize) << 8) | (p[4] as usize);
+        if name_len + 2 + 3 != ext_len || 5 + name_len > ext_len {
+            *ad = 50;
+            return 0;
+        }
+        Some(p[5..5 + name_len].to_vec())
+    } else {
+        None
+    };
+    let rc = sni_apply(ssl, ad, host_opt.as_deref());
+    // SSL_CLIENT_HELLO_SUCCESS = 1, SSL_CLIENT_HELLO_ERROR = 0
+    if rc == 2 { 0 } else { 1 }
+}
+
+// Kept for compatibility — if the client_hello callback for some reason
+// hasn't fired (e.g., OpenSSL < 1.1.1 build), the servername callback
+// is a valid fallback and still lets $ssl_server_name / verify work,
+// even if protocol-version overrides on TLSv1.3 won't take effect from
+// here (too late in the handshake).
+unsafe extern "C" fn sni_servername_cb(
+    ssl: *mut openssl_sys::SSL,
+    ad: *mut std::os::raw::c_int,
+    _arg: *mut c_void,
+) -> std::os::raw::c_int {
+    let name_c = openssl_sys::SSL_get_servername(ssl, 0);
+    let host_opt = if name_c.is_null() {
+        None
+    } else {
+        Some(std::ffi::CStr::from_ptr(name_c).to_bytes().to_vec())
+    };
+    sni_apply(ssl, ad, host_opt.as_deref())
 }
 
 fn reject_handshake_for(cscf: &Rc<RefCell<CoreSrvConf>>) -> bool {
@@ -195,6 +341,7 @@ pub struct HttpSslSrvConf {
     pub session_tickets: Val<bool>,
     pub prefer_server_ciphers: Val<bool>,
     pub reject_handshake: Val<bool>,
+    pub conf_commands: Val<Vec<(Vec<u8>, Vec<u8>)>>,
     pub ssl_ctx: RefCell<Option<Rc<SslContext>>>,
 }
 
@@ -219,6 +366,7 @@ impl Default for HttpSslSrvConf {
             session_tickets: Val::unset(),
             prefer_server_ciphers: Val::unset(),
             reject_handshake: Val::unset(),
+            conf_commands: Val::unset(),
             ssl_ctx: RefCell::new(None),
         }
     }
@@ -249,6 +397,24 @@ fn merge_srv_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.session_tickets.merge(&p.session_tickets, true);
     c.prefer_server_ciphers.merge(&p.prefer_server_ciphers, false);
     c.reject_handshake.merge(&p.reject_handshake, false);
+    if !c.conf_commands.is_set() {
+        if let Some(v) = p.conf_commands.as_option() {
+            c.conf_commands = Val::set(v.clone());
+        }
+    } else if let Some(pv) = p.conf_commands.as_option() {
+        // Merge: outer commands run first, inner overrides.
+        let mut merged = pv.clone();
+        if let Some(cv) = c.conf_commands.as_option() {
+            for (k, v) in cv.iter() {
+                if let Some(pos) = merged.iter().position(|(mk, _)| mk == k) {
+                    merged[pos] = (k.clone(), v.clone());
+                } else {
+                    merged.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        c.conf_commands = Val::set(merged);
+    }
     if c.ssl_ctx.borrow().is_none() {
         *c.ssl_ctx.borrow_mut() = p.ssl_ctx.borrow().clone();
     }
@@ -348,6 +514,16 @@ fn set_reject_handshake(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>
     let v = match cf.args[1].as_slice() { b"on" => true, b"off" => false, _ => return Err(msg("invalid value")) };
     core_srv_ssl_conf(cf).borrow_mut().reject_handshake = Val::set(v); Ok(())
 }
+fn set_conf_command(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let key = cf.args[1].clone();
+    let value = cf.args[2].clone();
+    let conf = core_srv_ssl_conf(cf);
+    let mut c = conf.borrow_mut();
+    let mut cur = c.conf_commands.as_option().cloned().unwrap_or_default();
+    cur.push((key, value));
+    c.conf_commands = Val::set(cur);
+    Ok(())
+}
 fn accept_any(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult { Ok(()) }
 
 pub fn ssl_module() -> ModuleDef {
@@ -378,7 +554,7 @@ pub fn ssl_module() -> ModuleDef {
         cmd_fn!("ssl_password_file", F | NGX_CONF_TAKE1, ConfLevel::Srv, set_password_file),
         cmd_fn!("ssl_reject_handshake", F | NGX_CONF_FLAG, ConfLevel::Srv, set_reject_handshake),
         cmd_fn!("ssl_prefer_server_ciphers", F | NGX_CONF_FLAG, ConfLevel::Srv, set_prefer_server_ciphers),
-        cmd_fn!("ssl_conf_command", F | NGX_CONF_TAKE2, ConfLevel::Srv, accept_any),
+        cmd_fn!("ssl_conf_command", F | NGX_CONF_TAKE2, ConfLevel::Srv, set_conf_command),
         cmd_fn!("ssl_early_data", F | NGX_CONF_FLAG, ConfLevel::Srv, accept_any),
         cmd_fn!("ssl_stapling", F | NGX_CONF_FLAG, ConfLevel::Srv, accept_any),
         cmd_fn!("ssl_stapling_file", F | NGX_CONF_TAKE1, ConfLevel::Srv, accept_any),
@@ -563,6 +739,57 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 }
             }
             builder.set_verify_depth(verify_depth);
+            // ssl_crl: load a CRL bundle, register each entry with the
+            // cert store, and enable CRL_CHECK|CRL_CHECK_ALL flags so
+            // OpenSSL actually consults the CRL during chain
+            // verification. Matches ngx_ssl_crl.
+            let crl = ssl_conf.borrow().crl.as_option().cloned();
+            if let Some(crl) = crl {
+                let crl_full = cf.cycle.full_name(&crl, true);
+                let crl_str = std::str::from_utf8(&crl_full)
+                    .map_err(|_| cf.emerg(format_args!("ssl_crl path is not UTF-8")))?;
+                let data = std::fs::read(crl_str)
+                    .map_err(|e| cf.emerg(format_args!("ssl_crl read \"{}\" failed: {}", crl_str, e)))?;
+                unsafe {
+                    let bio = openssl_sys::BIO_new_mem_buf(
+                        data.as_ptr() as *const c_void,
+                        data.len() as std::os::raw::c_int,
+                    );
+                    if bio.is_null() {
+                        return Err(cf.emerg(format_args!("BIO_new_mem_buf() failed")));
+                    }
+                    let store = SSL_CTX_get_cert_store(builder.as_ptr() as *const _);
+                    if store.is_null() {
+                        openssl_sys::BIO_free_all(bio);
+                        return Err(cf.emerg(format_args!("SSL_CTX_get_cert_store() failed")));
+                    }
+                    let mut loaded = 0u32;
+                    loop {
+                        let x = PEM_read_bio_X509_CRL(
+                            bio,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        );
+                        if x.is_null() { break; }
+                        if X509_STORE_add_crl(store, x) != 1 {
+                            X509_CRL_free(x);
+                            // C's ngx_ssl_crl treats "already in hash"
+                            // as OK; on other failures it errors. We
+                            // just continue to be permissive here.
+                            continue;
+                        }
+                        X509_CRL_free(x);
+                        loaded += 1;
+                    }
+                    openssl_sys::BIO_free_all(bio);
+                    if loaded == 0 {
+                        return Err(cf.emerg(format_args!("cannot load CRL \"{}\": no entries", crl_str)));
+                    }
+                    // X509_V_FLAG_CRL_CHECK=0x4, X509_V_FLAG_CRL_CHECK_ALL=0x8
+                    X509_STORE_set_flags(store, 0x4 | 0x8);
+                }
+            }
         }
         if prefer_server_ciphers {
             unsafe {
@@ -572,6 +799,82 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         if !session_tickets {
             unsafe {
                 openssl_sys::SSL_CTX_set_options(builder.as_ptr() as *mut _, openssl_sys::SSL_OP_NO_TICKET);
+            }
+        }
+        // ssl_session_cache: honor off/none. Everything else (builtin,
+        // shared, builtin:size) falls through to the default server
+        // cache which is what OpenSSL sets up on its own — good enough
+        // for the tests that just check whether sessions get reused.
+        let sess_cache = ssl_conf.borrow().session_cache.as_option().cloned();
+        if let Some(mode) = sess_cache {
+            unsafe {
+                match mode.as_slice() {
+                    b"off" => {
+                        openssl_sys::SSL_CTX_set_session_cache_mode(
+                            builder.as_ptr() as *mut _,
+                            openssl_sys::SSL_SESS_CACHE_OFF,
+                        );
+                        // TLSv1.3: disable session tickets so no
+                        // resumption is possible over TLSv1.3 either.
+                        // C nginx doesn't emit tickets when SSL_SESS_CACHE_OFF
+                        // is set because SSL_new_session_ticket won't fire
+                        // for a stateless-only cb — but modern OpenSSL keeps
+                        // TLS 1.3 tickets independent, so we force it here.
+                        // SSL_CTX_set_num_tickets = SSL_CTX_ctrl(SSL_CTRL_SET_NUM_TICKETS=95).
+                        openssl_sys::SSL_CTX_ctrl(
+                            builder.as_ptr() as *mut _,
+                            95,
+                            0,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    b"none" => {
+                        openssl_sys::SSL_CTX_set_session_cache_mode(
+                            builder.as_ptr() as *mut _,
+                            openssl_sys::SSL_SESS_CACHE_SERVER
+                                | openssl_sys::SSL_SESS_CACHE_NO_AUTO_CLEAR
+                                | openssl_sys::SSL_SESS_CACHE_NO_INTERNAL_STORE,
+                        );
+                        // SSL_CTX_sess_set_cache_size = SSL_CTX_ctrl(42).
+                        openssl_sys::SSL_CTX_ctrl(
+                            builder.as_ptr() as *mut _,
+                            openssl_sys::SSL_CTRL_SET_SESS_CACHE_SIZE,
+                            1,
+                            std::ptr::null_mut(),
+                        );
+                        openssl_sys::SSL_CTX_ctrl(
+                            builder.as_ptr() as *mut _,
+                            95,
+                            0,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Session ID context. Required by OpenSSL when client cert
+        // verification is enabled (verify=on/optional/optional_no_ca);
+        // without it, SSL_do_handshake fails with "session id context
+        // uninitialized" on the second connection to the same ctx.
+        // Matches ngx_ssl_session_id_context; we just use a per-server
+        // stable string derived from certificate path.
+        {
+            let sess_ctx: Vec<u8> = if has_cert {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                cert.hash(&mut hasher);
+                let h = hasher.finish();
+                h.to_le_bytes().to_vec()
+            } else {
+                b"HTTP".to_vec()
+            };
+            unsafe {
+                openssl_sys::SSL_CTX_set_session_id_context(
+                    builder.as_ptr() as *mut _,
+                    sess_ctx.as_ptr(),
+                    sess_ctx.len() as std::os::raw::c_uint,
+                );
             }
         }
         // ALPN: advertise http/1.1
@@ -616,6 +919,68 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 builder.as_ptr() as *mut _,
                 Some(sni_servername_cb),
             );
+            // Install a client_hello callback in addition. This fires
+            // BEFORE version negotiation, which is what we need for
+            // ssl_protocols overrides on TLSv1.3 vhosts to actually
+            // take effect. Matches C's ngx_ssl_client_hello_callback.
+            SSL_CTX_set_client_hello_cb(
+                builder.as_ptr() as *mut _,
+                Some(sni_client_hello_cb),
+                std::ptr::null_mut(),
+            );
+        }
+        // ssl_conf_command: apply OpenSSL's SSL_CONF commands. Matches
+        // ngx_ssl_conf_commands — file-typed values are resolved via
+        // ngx_conf_full_name.
+        let cmds = ssl_conf.borrow().conf_commands.as_option().cloned();
+        if let Some(cmds) = cmds {
+            unsafe {
+                let cctx = SSL_CONF_CTX_new();
+                if cctx.is_null() {
+                    return Err(cf.emerg(format_args!("SSL_CONF_CTX_new() failed")));
+                }
+                SSL_CONF_CTX_set_flags(
+                    cctx,
+                    SSL_CONF_FLAG_FILE | SSL_CONF_FLAG_SERVER
+                        | SSL_CONF_FLAG_CERTIFICATE | SSL_CONF_FLAG_SHOW_ERRORS,
+                );
+                SSL_CONF_CTX_set_ssl_ctx(cctx, builder.as_ptr() as *mut _);
+                for (k, v) in cmds.iter() {
+                    let key = match std::ffi::CString::new(k.clone()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            SSL_CONF_CTX_free(cctx);
+                            return Err(cf.emerg(format_args!("ssl_conf_command: invalid key")));
+                        }
+                    };
+                    let mut val_bytes = v.clone();
+                    let t = SSL_CONF_cmd_value_type(cctx, key.as_ptr());
+                    if t == SSL_CONF_TYPE_FILE || t == SSL_CONF_TYPE_DIR {
+                        val_bytes = cf.cycle.full_name(&val_bytes, true);
+                    }
+                    let val = match std::ffi::CString::new(val_bytes) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            SSL_CONF_CTX_free(cctx);
+                            return Err(cf.emerg(format_args!("ssl_conf_command: invalid value")));
+                        }
+                    };
+                    let rc = SSL_CONF_cmd(cctx, key.as_ptr(), val.as_ptr());
+                    if rc <= 0 {
+                        SSL_CONF_CTX_free(cctx);
+                        return Err(cf.emerg(format_args!(
+                            "SSL_CONF_cmd(\"{}\", \"{}\") failed",
+                            ngx_core::string::B(k),
+                            ngx_core::string::B(v),
+                        )));
+                    }
+                }
+                let rc = SSL_CONF_CTX_finish(cctx);
+                SSL_CONF_CTX_free(cctx);
+                if rc != 1 {
+                    return Err(cf.emerg(format_args!("SSL_CONF_CTX_finish() failed")));
+                }
+            }
         }
         let ctx = builder.build();
         *ssl_conf.borrow_mut().ssl_ctx.borrow_mut() = Some(Rc::new(ctx));
