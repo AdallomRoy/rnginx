@@ -96,6 +96,8 @@ pub struct NgxHttpProxyLocConf {
     /// the upstream of a proxy_pass URL without variables
     /// (ngx_http_upstream_add)
     pub upstream: Option<Rc<crate::upstream::UpstreamSrvConf>>,
+    /// plcf->vars.uri: the URI part of a proxy_pass URL without variables
+    pub vars_uri: Vec<u8>,
     /// proxy_redirect entries. Reuses CookieRewrite because the substitution
     /// machinery is the same (literal, complex or regex pattern → replacement).
     pub redirects: Vec<CookieRewrite>,
@@ -245,6 +247,7 @@ impl Default for NgxHttpProxyLocConf {
             next_upstream_tries: Val::unset(),
             next_upstream_timeout: Val::unset(),
             upstream: None,
+            vars_uri: Vec::new(),
             redirects: Vec::new(),
             redirect_off: false,
             redirect_default: false,
@@ -268,6 +271,7 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     if c.upstream_uri.is_none() {
         c.upstream_uri = p.upstream_uri.clone();
         c.upstream = p.upstream.clone();
+        c.vars_uri = p.vars_uri.clone();
     }
     if c.upstream_uri_cv.is_none() {
         c.upstream_uri_cv = p.upstream_uri_cv.clone();
@@ -465,6 +469,7 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
             u.no_resolve = true;
             let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
             conf.borrow_mut().upstream = Some(uscf);
+            conf.borrow_mut().vars_uri = u.uri.clone();
         }
         conf.borrow_mut().upstream_uri = Some(uri);
     }
@@ -790,18 +795,12 @@ async fn proxy_handler(r: R) -> i64 {
     let is_variable_pass = conf_borrowed.upstream_uri_cv.is_some();
     let forwarded_uri: Vec<u8> = if is_variable_pass {
         upstream_path.as_bytes().to_vec()
-    } else if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[scheme_len(upstream_uri_str)..].contains('/') {
-        let mut u = upstream_path.as_bytes().to_vec();
-        // Strip trailing slash if adding suffix that starts with /
-        let tail = if request_uri.starts_with(loc_name.as_slice()) {
-            &request_uri[loc_name.len()..]
-        } else {
-            &request_uri[..]
-        };
-        if u.last() == Some(&b'/') && tail.first() == Some(&b'/') {
-            u.pop();
-        }
-        u.extend_from_slice(tail);
+    } else if !conf_borrowed.vars_uri.is_empty() {
+        // ngx_http_proxy_create_request: vars.uri, then the request URI
+        // past the location
+        let mut u = conf_borrowed.vars_uri.clone();
+        let loc_len = if r.valid_location.get() && request_uri.starts_with(loc_name.as_slice()) { loc_name.len() } else { 0 };
+        u.extend_from_slice(&request_uri[loc_len..]);
         u
     } else {
         request_uri.clone()
@@ -1160,6 +1159,10 @@ async fn proxy_handler(r: R) -> i64 {
         // ngx_http_upstream_connect
         let rc = g.u.connect(&r);
 
+        if rc == NGX_ERROR {
+            return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR).await;
+        }
+
         if rc == NGX_BUSY {
             match g.u.next(&r, crate::upstream::NGX_HTTP_UPSTREAM_FT_NOLIVE) {
                 Ok(()) => continue 'retry,
@@ -1181,8 +1184,13 @@ async fn proxy_handler(r: R) -> i64 {
                 Some(sa) => sa,
                 None => return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR).await,
             };
-            match connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), connect_timeout).await {
+            let session = match &ssl_setup {
+                Some(ssl) if ssl.session_reuse => g.u.set_session(),
+                _ => None,
+            };
+            match connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), session, connect_timeout).await {
                 Ok(s) => {
+                    g.u.save_session(&s);
                     upstream_requests = 0;
                     upstream_start_time = ngx_core::times::current_msec();
                     s
@@ -1271,19 +1279,15 @@ async fn proxy_handler(r: R) -> i64 {
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
                     if !got_header {
-                        let crlf = response.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
-                        let lf = response.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
-                        let end = match (crlf, lf) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b),
-                            (None, None) => None,
-                        };
+                        let end = find_header_end(&response).map(|(_, bs)| bs);
                         if let Some(e) = end {
                             let header_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
                             if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
                                 st.header_time = header_ms;
                             }
+                            // u->headers_in of this response, for the
+                            // balancer's notify ($upstream_cookie_*)
+                            set_upstream_headers_in(&r, &response[..e]);
                             g.u.notify(&r, crate::upstream::NGX_HTTP_UPSTREAM_NOTIFY_HEADER);
                             got_header = true;
                             header_end = Some(e);
@@ -1391,6 +1395,11 @@ async fn proxy_handler(r: R) -> i64 {
                 Err(_) => break,
             }
         }
+        // a session ticket read with the response goes to the peer
+        // (ngx_ssl_new_client_session, c->ssl->save_session)
+        if let Some(u) = upstream.as_ref() {
+            g.u.save_session(u);
+        }
         let read_ok = true;
         // If we finished this read cleanly (framing terminated: known
         // Content-Length reached, or chunked-complete saw the 0-chunk),
@@ -1463,14 +1472,9 @@ async fn proxy_handler(r: R) -> i64 {
         bytes_received_from_upstream = response.len() as i64;
 
         // Parse status line. Pick the earliest header/body separator.
-        let sep_crlf = response.windows(4).position(|w| w == b"\r\n\r\n");
-        let sep_lf = response.windows(2).position(|w| w == b"\n\n");
-        let (sle, bs) = match (sep_crlf, sep_lf) {
-            (Some(a), Some(b)) if a <= b => (a, a + 4),
-            (Some(_), Some(b)) => (b, b + 2),
-            (Some(a), None) => (a, a + 4),
-            (None, Some(b)) => (b, b + 2),
-            (None, None) => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
+        let (sle, bs) = match find_header_end(&response) {
+            Some(e) => e,
+            None => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
         };
         status_line_end = sle;
         body_start = bs;
@@ -2886,6 +2890,44 @@ pub(crate) struct SslSetup {
     verify: bool,
 }
 
+/// The end of a response header: the empty line after it, as
+/// ngx_http_parse_header_line sees lines ending in LF or CRLF. Returns the
+/// end of the last header line (before its line terminator) and the start
+/// of the body.
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n').map(|p| p + i) {
+        let line_end = if p > 0 && buf[p - 1] == b'\r' { p - 1 } else { p };
+        match buf.get(p + 1) {
+            Some(b'\n') => return Some((line_end, p + 2)),
+            Some(b'\r') if buf.get(p + 2) == Some(&b'\n') => return Some((line_end, p + 3)),
+            _ => {}
+        }
+        i = p + 1;
+    }
+    None
+}
+
+/// u->headers_in: the header lines of an upstream response header block
+/// (after the status line).
+fn set_upstream_headers_in(r: &R, block: &[u8]) {
+    let mut h = r.upstream_headers_in.borrow_mut();
+    h.clear();
+    for line in block.split(|&b| b == b'\n').skip(1) {
+        let line = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let mut vstart = colon + 1;
+            while vstart < line.len() && (line[vstart] == b' ' || line[vstart] == b'\t') {
+                vstart += 1;
+            }
+            h.push(crate::request::TableElt::new(&line[..colon], &line[vstart..]));
+        }
+    }
+}
+
 /// Connect to the upstream and, for https, run the TLS handshake
 /// (ngx_http_upstream_ssl_init_connection), both within
 /// proxy_connect_timeout.
@@ -2894,12 +2936,12 @@ pub(crate) async fn connect_upstream(
     sockaddr: &ngx_core::inet::SockAddr,
     bind: Option<std::net::SocketAddr>,
     ssl: Option<&SslSetup>,
+    session: Option<openssl::ssl::SslSession>,
     timeout: u64,
 ) -> Result<UpstreamSock, ConnectError> {
     let log = r.connection.log.clone();
     let action = log.action();
     let handshaking = std::cell::Cell::new(false);
-    let peer_name = String::from_utf8_lossy(&sockaddr.to_text(true)).into_owned();
 
     let connect = async {
         let sock = connect_with_optional_bind(sockaddr, bind).await.map_err(|e| {
@@ -2926,7 +2968,8 @@ pub(crate) async fn connect_upstream(
 
         let params = crate::upstream_ssl::Params {
             ctx: &ssl.ctx,
-            session_peer: if ssl.session_reuse { Some(peer_name.as_str()) } else { None },
+            session_reuse: ssl.session_reuse,
+            session,
             name: ssl.name.as_ref().map(|(n, sni)| (n.as_slice(), *sni)),
             verify: ssl.verify,
         };

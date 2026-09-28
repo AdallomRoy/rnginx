@@ -64,6 +64,8 @@ impl Write for SockIo {
 /// An upstream connection over TLS.
 pub struct UpstreamSsl {
     stream: SslStream<SockIo>,
+    /// the connection's key for sessions OpenSSL hands over
+    session_key: u64,
     /// Application data read while waiting for the upstream to answer.
     peeked: Vec<u8>,
     eof: bool,
@@ -132,13 +134,14 @@ pub fn create_ctx(
     if session_reuse {
         builder.set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
         builder.set_new_session_callback(|ssl, session| {
-            // ngx_ssl_new_client_session: the peer keeps the latest session
-            let peer = match ssl.ex_data(peer_index()) {
-                Some(p) => p.clone(),
+            // ngx_ssl_new_client_session: kept for c->ssl->save_session,
+            // the peer's save_session of the request using the connection
+            let key = match ssl.ex_data(session_key_index()) {
+                Some(k) => *k,
                 None => return,
             };
-            SESSIONS.with(|s| {
-                s.borrow_mut().insert(peer, session);
+            NEW_SESSIONS.with(|s| {
+                s.borrow_mut().insert(key, session);
             });
         });
     }
@@ -147,14 +150,15 @@ pub fn create_ctx(
 }
 
 thread_local! {
-    /// The saved session of each upstream peer
-    /// (ngx_http_upstream_save_round_robin_peer_session).
-    static SESSIONS: RefCell<HashMap<String, SslSession>> = RefCell::new(HashMap::new());
+    /// Sessions of connections not yet given to their peers, by
+    /// connection key.
+    static NEW_SESSIONS: RefCell<HashMap<u64, SslSession>> = RefCell::new(HashMap::new());
+    static SESSION_KEY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-fn peer_index() -> openssl::ex_data::Index<Ssl, String> {
+fn session_key_index() -> openssl::ex_data::Index<Ssl, u64> {
     use std::sync::OnceLock;
-    static INDEX: OnceLock<openssl::ex_data::Index<Ssl, String>> = OnceLock::new();
+    static INDEX: OnceLock<openssl::ex_data::Index<Ssl, u64>> = OnceLock::new();
     *INDEX.get_or_init(|| Ssl::new_ex_index().expect("SSL_get_ex_new_index() failed"))
 }
 
@@ -169,8 +173,10 @@ pub enum HandshakeError {
 /// What ngx_http_upstream_ssl_init_connection needs of the location.
 pub struct Params<'a> {
     pub ctx: &'a SslContext,
-    /// The peer, for the saved session: None when sessions are not reused.
-    pub session_peer: Option<&'a str>,
+    /// Sessions are reused: the peer's session (peer.set_session), and new
+    /// ones are kept for peer.save_session.
+    pub session_reuse: bool,
+    pub session: Option<SslSession>,
     /// ngx_http_upstream_ssl_name, when proxy_ssl_server_name or
     /// proxy_ssl_verify is on: the name, and whether to send it (SNI).
     pub name: Option<(&'a [u8], bool)>,
@@ -209,20 +215,24 @@ pub async fn handshake(sock: SockIo, p: Params<'_>) -> Result<UpstreamSsl, Hands
         check_name = Some(name.to_vec());
     }
 
-    if let Some(peer) = p.session_peer {
-        let session = SESSIONS.with(|s| s.borrow().get(peer).cloned());
-        if let Some(session) = session {
+    let session_key = SESSION_KEY.with(|k| {
+        k.set(k.get() + 1);
+        k.get()
+    });
+
+    if p.session_reuse {
+        if let Some(session) = &p.session {
             // a session of another context is refused by the server, as in C
             unsafe {
-                let _ = ssl.set_session(&session);
+                let _ = ssl.set_session(session);
             }
         }
-        ssl.set_ex_data(peer_index(), peer.to_string());
+        ssl.set_ex_data(session_key_index(), session_key);
     }
 
     let stream = SslStream::new(ssl, sock).map_err(|e| HandshakeError::Internal(format!("SSL_new() failed ({})", e)))?;
 
-    let mut s = UpstreamSsl { stream, peeked: Vec::new(), eof: false, error: None };
+    let mut s = UpstreamSsl { stream, session_key, peeked: Vec::new(), eof: false, error: None };
 
     match std::future::poll_fn(|cx| s.poll_io(cx, |st| st.connect())).await {
         Ok(Ok(())) => {}
@@ -347,9 +357,19 @@ impl UpstreamSsl {
 /// (no_wait_shutdown). SSL_free after an unfinished shutdown would also
 /// mark the session as not resumable (ssl_clear_bad_session), and it is
 /// shared with the saved one.
+impl UpstreamSsl {
+    /// The session OpenSSL handed over since the last call, for the peer's
+    /// save_session (ngx_http_upstream_ssl_save_session).
+    pub fn take_session(&self) -> Option<SslSession> {
+        NEW_SESSIONS.with(|s| s.borrow_mut().remove(&self.session_key))
+    }
+}
+
 impl Drop for UpstreamSsl {
     fn drop(&mut self) {
         use foreign_types::ForeignTypeRef;
+
+        NEW_SESSIONS.with(|s| s.borrow_mut().remove(&self.session_key));
 
         let ssl = self.stream.ssl().as_ptr();
 

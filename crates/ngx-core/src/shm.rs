@@ -9,9 +9,11 @@ use crate::ngx_log_error;
 
 pub struct Shm {
     pub addr: Cell<*mut u8>,
-    pub size: usize,
+    pub size: Cell<usize>,
     pub name: Vec<u8>,
     pub exists: Cell<bool>,
+    /// the cycle's log, set when the zone is created or reused
+    pub log: RefCell<Option<Log>>,
 }
 
 impl Shm {
@@ -19,7 +21,7 @@ impl Shm {
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                self.size,
+                self.size.get(),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANON | libc::MAP_SHARED,
                 -1,
@@ -27,7 +29,7 @@ impl Shm {
             )
         };
         if p == libc::MAP_FAILED {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "mmap(MAP_ANON|MAP_SHARED, {}) failed", self.size);
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "mmap(MAP_ANON|MAP_SHARED, {}) failed", self.size.get());
             return Err(());
         }
         self.addr.set(p as *mut u8);
@@ -39,8 +41,8 @@ impl Shm {
         if p.is_null() {
             return;
         }
-        if unsafe { libc::munmap(p as *mut libc::c_void, self.size) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "munmap({:p}, {}) failed", p, self.size);
+        if unsafe { libc::munmap(p as *mut libc::c_void, self.size.get()) } == -1 {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "munmap({:p}, {}) failed", p, self.size.get());
         }
         self.addr.set(std::ptr::null_mut());
     }
@@ -65,7 +67,7 @@ pub struct ShmZone {
 impl ShmZone {
     pub fn new(name: Vec<u8>, size: usize, tag: &'static str) -> Rc<ShmZone> {
         Rc::new(ShmZone {
-            shm: Shm { addr: Cell::new(std::ptr::null_mut()), size, name, exists: Cell::new(false) },
+            shm: Shm { addr: Cell::new(std::ptr::null_mut()), size: Cell::new(size), name, exists: Cell::new(false), log: RefCell::new(None) },
             init: RefCell::new(None),
             data: RefCell::new(None),
             tag,

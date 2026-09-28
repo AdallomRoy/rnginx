@@ -39,8 +39,7 @@ enum MapEntry {
 }
 
 struct MapRegex {
-    regex: Rc<Regex>,
-    case_sensitive: bool,
+    regex: Rc<crate::variables::HttpRegex>,
     value: MapEntry,
 }
 
@@ -194,10 +193,15 @@ fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
                 return NGX_OK;
             }
 
-            // Try regexes
+            // Try regexes: ngx_http_regex_exec() sets the captures and
+            // the named capture variables the value may use
             let regexes = ctx.regexes.borrow();
-            for regex_entry in regexes.iter() {
-                if regex_entry.regex.is_match(&lookup_key) {
+            for regex_entry in regexes.iter().filter(|_| !lookup_key.is_empty()) {
+                let n = crate::variables::regex_exec(r, &regex_entry.regex, &lookup_key);
+                if n == NGX_DECLINED {
+                    continue;
+                }
+                if n == NGX_OK {
                     match &regex_entry.value {
                         MapEntry::Static(val) => {
                             v.data.clone_from(val);
@@ -210,6 +214,8 @@ fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
                     }
                     return NGX_OK;
                 }
+                // NGX_ERROR
+                break;
             }
 
             // Try default
@@ -293,16 +299,8 @@ fn map_include_file(cf: &mut Conf, filename: &[u8], ctx: &MapCtx) -> ConfResult 
             let pattern = &key[pattern_start..];
 
             let flags = if is_case_sensitive { 0 } else { ngx_core::regex::NGX_REGEX_CASELESS };
-            match Regex::compile(pattern, flags) {
-                Ok(regex) => {
-                    ctx.regexes.borrow_mut().push(MapRegex {
-                        regex,
-                        case_sensitive: is_case_sensitive,
-                        value,
-                    });
-                }
-                Err(e) => return Err(cf.emerg(format_args!("regex error: {}", e))),
-            }
+            let regex = crate::variables::regex_compile(cf, pattern, flags)?;
+            ctx.regexes.borrow_mut().push(MapRegex { regex, value });
         } else {
             // Regular entry
             ctx.entries.borrow_mut().push((key.to_vec(), value));
@@ -379,17 +377,10 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
         let pattern = &key[pattern_start..];
 
         let flags = if is_case_sensitive { 0 } else { ngx_core::regex::NGX_REGEX_CASELESS };
-        match Regex::compile(pattern, flags) {
-            Ok(regex) => {
-                ctx.regexes.borrow_mut().push(MapRegex {
-                    regex,
-                    case_sensitive: is_case_sensitive,
-                    value,
-                });
-                Ok(())
-            }
-            Err(e) => Err(cf.emerg(format_args!("regex error: {}", e))),
-        }
+        let pattern = pattern.to_vec();
+        let regex = crate::variables::regex_compile(cf, &pattern, flags)?;
+        ctx.regexes.borrow_mut().push(MapRegex { regex, value });
+        Ok(())
     } else {
         ctx.entries.borrow_mut().push((key.clone(), value));
         Ok(())

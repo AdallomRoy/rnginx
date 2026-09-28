@@ -394,6 +394,7 @@ pub fn regex_exec(r: &R, re: &Rc<HttpRegex>, s: &[u8]) -> i64 {
                 r.ncaptures.set(caps.len() * 2);
                 *r.captures.borrow_mut() = flat;
                 *r.captures_data.borrow_mut() = s.to_vec();
+                let nvars = cmcf.borrow().variables.len();
                 for (cap, vi) in re.variables.iter() {
                     let mut vv = VariableValue::default();
                     if let Some((a, b)) = caps.get(*cap) {
@@ -403,6 +404,9 @@ pub fn regex_exec(r: &R, re: &Rc<HttpRegex>, s: &[u8]) -> i64 {
                     }
                     vv.valid = true;
                     let mut vars = r.variables.borrow_mut();
+                    if vars.len() < nvars {
+                        vars.resize(nvars, VariableValue::default());
+                    }
                     if *vi < vars.len() {
                         vars[*vi] = vv;
                     }

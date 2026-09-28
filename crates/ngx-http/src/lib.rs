@@ -64,6 +64,7 @@ pub mod upstream_least_conn;
 pub mod upstream_least_time;
 pub mod upstream_random;
 pub mod upstream_zone;
+pub mod upstream_sticky;
 pub mod upstream_round_robin;
 pub mod upstream_ssl;
 pub mod fastcgi;
@@ -618,7 +619,7 @@ pub fn modules() -> Vec<ModuleDef> {
         upstream_random::upstream_random_module(),
         upstream_keepalive::upstream_keepalive_module(),
         upstream_zone::upstream_zone_module(),
-        stubs::upstream_sticky_module(),
+        upstream_sticky::upstream_sticky_module(),
         stub_status::stub_status_module(),
         write_filter::write_filter_module(),
         header_filter::header_filter_module(),

@@ -857,6 +857,10 @@ async fn fastcgi_handler(r: R) -> i64 {
         // ngx_http_upstream_connect
         let rc = g.u.connect(&r);
 
+        if rc == NGX_ERROR {
+            return crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
         if rc == NGX_BUSY {
             match g.u.next(&r, crate::upstream::NGX_HTTP_UPSTREAM_FT_NOLIVE) {
                 Ok(()) => continue,
@@ -874,7 +878,7 @@ async fn fastcgi_handler(r: R) -> i64 {
                 Some(sa) => sa,
                 None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
             };
-            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, connect_timeout).await {
+            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, None, connect_timeout).await {
                 Ok(s) => (s, 0, ngx_core::times::current_msec()),
                 Err(e) => {
                     let ft = match e {

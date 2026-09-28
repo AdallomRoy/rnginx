@@ -507,12 +507,6 @@ pub fn mp4_module() -> ModuleDef {
     ])
 }
 
-pub fn upstream_sticky_module() -> ModuleDef {
-    stub("ngx_http_upstream_sticky_module", vec![
-        Command::new("sticky", NGX_HTTP_UPS_CONF | NGX_CONF_2MORE, ConfLevel::None, accept),
-    ])
-}
-
 pub fn v3_filter_module() -> ModuleDef {
     stub("ngx_http_v3_filter_module", vec![
     ])

@@ -151,6 +151,14 @@ impl AsyncWrite for UpstreamSock {
     }
 }
 impl UpstreamSock {
+    /// A new TLS session of the connection, for peer.save_session.
+    pub fn take_ssl_session(&self) -> Option<openssl::ssl::SslSession> {
+        match self {
+            UpstreamSock::Ssl(s) => s.take_session(),
+            _ => None,
+        }
+    }
+
     /// Wait until the upstream has sent data or closed. The readiness is
     /// checked with a peek, so a stale one (a keepalive connection whose
     /// last response ended without EAGAIN) is cleared instead of reported.
@@ -811,6 +819,19 @@ impl UpstreamPeer {
         rc
     }
 
+    /// peer.set_session: the session to resume with the peer
+    pub fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
+        self.balancer.set_session()
+    }
+
+    /// ngx_http_upstream_ssl_save_session: a new session of the peer's
+    /// connection goes to peer.save_session.
+    pub fn save_session(&mut self, sock: &UpstreamSock) {
+        if let Some(session) = sock.take_ssl_session() {
+            self.balancer.save_session(session);
+        }
+    }
+
     /// peer.notify
     pub fn notify(&mut self, r: &R, typ: u32) {
         let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
@@ -893,6 +914,10 @@ impl UpstreamPeer {
             return;
         }
 
+        if let Some(c) = &conn {
+            self.save_session(&c.sock);
+        }
+
         self.pc.connection = conn;
         self.pc.keepalive = keepalive;
         self.pc.request_body_sent = request_body_sent;
@@ -901,6 +926,7 @@ impl UpstreamPeer {
         self.balancer.free(&mut self.pc, 0, &us);
 
         self.pc.sockaddr = None;
+        self.pc.sid = None;
 
         // a connection the cache did not take is closed
         self.pc.connection = None;

@@ -1,184 +1,144 @@
-//! Red-black tree (ngx_rbtree.c) — intrusive tree usable in shared memory.
+//! Red-black tree (ngx_rbtree.c): an intrusive tree, usable in shared
+//! memory.
+//!
+//! The red-black tree code is based on the algorithm described in
+//! the "Introduction to Algorithms" by Cormen, Leiserson and Rivest.
 
 use std::ptr;
 
-/// Red-black tree node. Uses color in lower bits and contains user data.
+/// ngx_rbtree_node_t
 #[repr(C)]
-#[derive(PartialEq)]
 pub struct RbtreeNode {
     pub key: usize,
     pub left: *mut RbtreeNode,
     pub right: *mut RbtreeNode,
     pub parent: *mut RbtreeNode,
-    pub color: u8,  // 0=black, 1=red
-    pub data: u8,   // padding/user data
+    pub color: u8,
+    pub data: u8,
 }
 
-/// Red-black tree with custom insert function.
+pub type RbtreeInsertPt = unsafe fn(root: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode);
+
+/// ngx_rbtree_t
 #[repr(C)]
 pub struct Rbtree {
     pub root: *mut RbtreeNode,
     pub sentinel: *mut RbtreeNode,
-    pub insert: Option<unsafe fn(temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode)>,
+    pub insert: Option<RbtreeInsertPt>,
 }
 
 impl RbtreeNode {
-    /// Create a new node (uninitialized parent/children).
     pub fn new(key: usize) -> Self {
-        RbtreeNode {
-            key,
-            left: ptr::null_mut(),
-            right: ptr::null_mut(),
-            parent: ptr::null_mut(),
-            color: 1,  // red by default
-            data: 0,
-        }
+        RbtreeNode { key, left: ptr::null_mut(), right: ptr::null_mut(), parent: ptr::null_mut(), color: 0, data: 0 }
     }
 }
 
 impl Rbtree {
-    /// Initialize a tree with a sentinel node.
-    pub unsafe fn init(&mut self, sentinel: *mut RbtreeNode, insert_fn: unsafe fn(*mut RbtreeNode, *mut RbtreeNode, *mut RbtreeNode)) {
-        (*sentinel).color = 0;  // black
+    /// ngx_rbtree_init: a sentinel must be black
+    pub unsafe fn init(&mut self, sentinel: *mut RbtreeNode, insert: RbtreeInsertPt) {
+        rbt_black(sentinel);
         self.root = sentinel;
         self.sentinel = sentinel;
-        self.insert = Some(insert_fn);
+        self.insert = Some(insert);
     }
 
-    /// Insert a node with the tree's insert function.
+    /// ngx_rbtree_insert
     pub unsafe fn insert(&mut self, node: *mut RbtreeNode) {
+        let mut node = node;
+
+        // a binary tree insert
+
+        let root: *mut *mut RbtreeNode = &mut self.root;
         let sentinel = self.sentinel;
 
-        if self.root == sentinel {
+        if *root == sentinel {
             (*node).parent = ptr::null_mut();
             (*node).left = sentinel;
             (*node).right = sentinel;
-            (*node).color = 0;  // black
-            self.root = node;
+            rbt_black(node);
+            *root = node;
+
             return;
         }
 
-        if let Some(insert_fn) = self.insert {
-            insert_fn(self.root, node, sentinel);
-        }
+        (self.insert.expect("rbtree insert"))(*root, node, sentinel);
 
-        // Re-balance
-        self._rebalance_after_insert(node);
+        // re-balance tree
 
-        rbt_black(self.root);
-    }
+        while node != *root && rbt_is_red((*node).parent) {
+            if (*node).parent == (*(*(*node).parent).parent).left {
+                let temp = (*(*(*node).parent).parent).right;
 
-    unsafe fn _rebalance_after_insert(&mut self, mut node: *mut RbtreeNode) {
-        while node != self.root && rbt_is_red(node) && !(*node).parent.is_null() {
-            let parent = (*node).parent;
-            if parent.is_null() {
-                break;
-            }
-            let grandparent = (*parent).parent;
-
-            if parent == (*grandparent).left {
-                let uncle = (*grandparent).right;
-
-                if rbt_is_red(uncle) {
-                    rbt_black(parent);
-                    rbt_black(uncle);
-                    rbt_red(grandparent);
-                    node = grandparent;
+                if rbt_is_red(temp) {
+                    rbt_black((*node).parent);
+                    rbt_black(temp);
+                    rbt_red((*(*node).parent).parent);
+                    node = (*(*node).parent).parent;
                 } else {
-                    if node == (*parent).right {
-                        node = parent;
-                        self._left_rotate(node);
+                    if node == (*(*node).parent).right {
+                        node = (*node).parent;
+                        left_rotate(root, sentinel, node);
                     }
 
                     rbt_black((*node).parent);
                     rbt_red((*(*node).parent).parent);
-                    self._right_rotate((*(*node).parent).parent);
+                    right_rotate(root, sentinel, (*(*node).parent).parent);
                 }
             } else {
-                let uncle = (*grandparent).left;
+                let temp = (*(*(*node).parent).parent).left;
 
-                if rbt_is_red(uncle) {
-                    rbt_black(parent);
-                    rbt_black(uncle);
-                    rbt_red(grandparent);
-                    node = grandparent;
+                if rbt_is_red(temp) {
+                    rbt_black((*node).parent);
+                    rbt_black(temp);
+                    rbt_red((*(*node).parent).parent);
+                    node = (*(*node).parent).parent;
                 } else {
-                    if node == (*parent).left {
-                        node = parent;
-                        self._right_rotate(node);
+                    if node == (*(*node).parent).left {
+                        node = (*node).parent;
+                        right_rotate(root, sentinel, node);
                     }
 
                     rbt_black((*node).parent);
                     rbt_red((*(*node).parent).parent);
-                    self._left_rotate((*(*node).parent).parent);
+                    left_rotate(root, sentinel, (*(*node).parent).parent);
                 }
             }
         }
+
+        rbt_black(*root);
     }
 
-    unsafe fn _left_rotate(&mut self, node: *mut RbtreeNode) {
-        let temp = (*node).right;
-        (*node).right = (*temp).left;
-
-        if (*temp).left != self.sentinel {
-            (*(*temp).left).parent = node;
-        }
-
-        (*temp).parent = (*node).parent;
-
-        if node == self.root {
-            self.root = temp;
-        } else if node == (*(*node).parent).left {
-            (*(*node).parent).left = temp;
-        } else {
-            (*(*node).parent).right = temp;
-        }
-
-        (*temp).left = node;
-        (*node).parent = temp;
-    }
-
-    unsafe fn _right_rotate(&mut self, node: *mut RbtreeNode) {
-        let temp = (*node).left;
-        (*node).left = (*temp).right;
-
-        if (*temp).right != self.sentinel {
-            (*(*temp).right).parent = node;
-        }
-
-        (*temp).parent = (*node).parent;
-
-        if node == self.root {
-            self.root = temp;
-        } else if node == (*(*node).parent).left {
-            (*(*node).parent).left = temp;
-        } else {
-            (*(*node).parent).right = temp;
-        }
-
-        (*temp).right = node;
-        (*node).parent = temp;
-    }
-
-    /// Delete a node from the tree.
+    /// ngx_rbtree_delete
     pub unsafe fn delete(&mut self, node: *mut RbtreeNode) {
-        let mut subst: *mut RbtreeNode;
-        let mut temp: *mut RbtreeNode;
+        // a binary tree delete
 
-        if (*node).left == self.sentinel {
+        let root: *mut *mut RbtreeNode = &mut self.root;
+        let sentinel = self.sentinel;
+
+        let subst;
+        let mut temp;
+
+        if (*node).left == sentinel {
             temp = (*node).right;
             subst = node;
-        } else if (*node).right == self.sentinel {
+        } else if (*node).right == sentinel {
             temp = (*node).left;
             subst = node;
         } else {
-            subst = rbtree_min((*node).right, self.sentinel);
+            subst = rbtree_min((*node).right, sentinel);
             temp = (*subst).right;
         }
 
-        if subst == self.root {
-            self.root = temp;
+        if subst == *root {
+            *root = temp;
             rbt_black(temp);
+
+            // DEBUG stuff
+            (*node).left = ptr::null_mut();
+            (*node).right = ptr::null_mut();
+            (*node).parent = ptr::null_mut();
+            (*node).key = 0;
+
             return;
         }
 
@@ -190,75 +150,160 @@ impl Rbtree {
             (*(*subst).parent).right = temp;
         }
 
-        if !red {
-            self._rebalance_after_delete(temp);
+        if subst == node {
+            (*temp).parent = (*subst).parent;
+        } else {
+            if (*subst).parent == node {
+                (*temp).parent = subst;
+            } else {
+                (*temp).parent = (*subst).parent;
+            }
+
+            (*subst).left = (*node).left;
+            (*subst).right = (*node).right;
+            (*subst).parent = (*node).parent;
+            rbt_copy_color(subst, node);
+
+            if node == *root {
+                *root = subst;
+            } else if node == (*(*node).parent).left {
+                (*(*node).parent).left = subst;
+            } else {
+                (*(*node).parent).right = subst;
+            }
+
+            if (*subst).left != sentinel {
+                (*(*subst).left).parent = subst;
+            }
+
+            if (*subst).right != sentinel {
+                (*(*subst).right).parent = subst;
+            }
         }
-    }
 
-    unsafe fn _rebalance_after_delete(&mut self, mut node: *mut RbtreeNode) {
-        while node != self.root && !rbt_is_red(node) {
-            if node == (*(*node).parent).left {
-                let mut sibling = (*(*node).parent).right;
+        // DEBUG stuff
+        (*node).left = ptr::null_mut();
+        (*node).right = ptr::null_mut();
+        (*node).parent = ptr::null_mut();
+        (*node).key = 0;
 
-                if rbt_is_red(sibling) {
-                    rbt_black(sibling);
-                    rbt_red((*node).parent);
-                    self._left_rotate((*node).parent);
-                    sibling = (*(*node).parent).right;
+        if red {
+            return;
+        }
+
+        // a delete fixup
+
+        while temp != *root && rbt_is_black(temp) {
+            if temp == (*(*temp).parent).left {
+                let mut w = (*(*temp).parent).right;
+
+                if rbt_is_red(w) {
+                    rbt_black(w);
+                    rbt_red((*temp).parent);
+                    left_rotate(root, sentinel, (*temp).parent);
+                    w = (*(*temp).parent).right;
                 }
 
-                if !rbt_is_red((*sibling).left) && !rbt_is_red((*sibling).right) {
-                    rbt_red(sibling);
-                    node = (*node).parent;
+                if rbt_is_black((*w).left) && rbt_is_black((*w).right) {
+                    rbt_red(w);
+                    temp = (*temp).parent;
                 } else {
-                    if !rbt_is_red((*sibling).right) {
-                        rbt_black((*sibling).left);
-                        rbt_red(sibling);
-                        self._right_rotate(sibling);
-                        sibling = (*(*node).parent).right;
+                    if rbt_is_black((*w).right) {
+                        rbt_black((*w).left);
+                        rbt_red(w);
+                        right_rotate(root, sentinel, w);
+                        w = (*(*temp).parent).right;
                     }
 
-                    rbt_copy_color(sibling, (*node).parent);
-                    rbt_black((*node).parent);
-                    rbt_black((*sibling).right);
-                    self._left_rotate((*node).parent);
-                    node = self.root;
+                    rbt_copy_color(w, (*temp).parent);
+                    rbt_black((*temp).parent);
+                    rbt_black((*w).right);
+                    left_rotate(root, sentinel, (*temp).parent);
+                    temp = *root;
                 }
             } else {
-                let mut sibling = (*(*node).parent).left;
+                let mut w = (*(*temp).parent).left;
 
-                if rbt_is_red(sibling) {
-                    rbt_black(sibling);
-                    rbt_red((*node).parent);
-                    self._right_rotate((*node).parent);
-                    sibling = (*(*node).parent).left;
+                if rbt_is_red(w) {
+                    rbt_black(w);
+                    rbt_red((*temp).parent);
+                    right_rotate(root, sentinel, (*temp).parent);
+                    w = (*(*temp).parent).left;
                 }
 
-                if !rbt_is_red((*sibling).right) && !rbt_is_red((*sibling).left) {
-                    rbt_red(sibling);
-                    node = (*node).parent;
+                if rbt_is_black((*w).left) && rbt_is_black((*w).right) {
+                    rbt_red(w);
+                    temp = (*temp).parent;
                 } else {
-                    if !rbt_is_red((*sibling).left) {
-                        rbt_black((*sibling).right);
-                        rbt_red(sibling);
-                        self._left_rotate(sibling);
-                        sibling = (*(*node).parent).left;
+                    if rbt_is_black((*w).left) {
+                        rbt_black((*w).right);
+                        rbt_red(w);
+                        left_rotate(root, sentinel, w);
+                        w = (*(*temp).parent).left;
                     }
 
-                    rbt_copy_color(sibling, (*node).parent);
-                    rbt_black((*node).parent);
-                    rbt_black((*sibling).left);
-                    self._right_rotate((*node).parent);
-                    node = self.root;
+                    rbt_copy_color(w, (*temp).parent);
+                    rbt_black((*temp).parent);
+                    rbt_black((*w).left);
+                    right_rotate(root, sentinel, (*temp).parent);
+                    temp = *root;
                 }
             }
         }
 
-        rbt_black(node);
+        rbt_black(temp);
     }
 }
 
-/// Find the minimum node in a subtree.
+/// ngx_rbtree_left_rotate
+#[inline]
+unsafe fn left_rotate(root: *mut *mut RbtreeNode, sentinel: *mut RbtreeNode, node: *mut RbtreeNode) {
+    let temp = (*node).right;
+    (*node).right = (*temp).left;
+
+    if (*temp).left != sentinel {
+        (*(*temp).left).parent = node;
+    }
+
+    (*temp).parent = (*node).parent;
+
+    if node == *root {
+        *root = temp;
+    } else if node == (*(*node).parent).left {
+        (*(*node).parent).left = temp;
+    } else {
+        (*(*node).parent).right = temp;
+    }
+
+    (*temp).left = node;
+    (*node).parent = temp;
+}
+
+/// ngx_rbtree_right_rotate
+#[inline]
+unsafe fn right_rotate(root: *mut *mut RbtreeNode, sentinel: *mut RbtreeNode, node: *mut RbtreeNode) {
+    let temp = (*node).left;
+    (*node).left = (*temp).right;
+
+    if (*temp).right != sentinel {
+        (*(*temp).right).parent = node;
+    }
+
+    (*temp).parent = (*node).parent;
+
+    if node == *root {
+        *root = temp;
+    } else if node == (*(*node).parent).right {
+        (*(*node).parent).right = temp;
+    } else {
+        (*(*node).parent).left = temp;
+    }
+
+    (*temp).right = node;
+    (*node).parent = temp;
+}
+
+/// ngx_rbtree_min
 pub unsafe fn rbtree_min(mut node: *mut RbtreeNode, sentinel: *mut RbtreeNode) -> *mut RbtreeNode {
     while (*node).left != sentinel {
         node = (*node).left;
@@ -266,7 +311,7 @@ pub unsafe fn rbtree_min(mut node: *mut RbtreeNode, sentinel: *mut RbtreeNode) -
     node
 }
 
-/// Find the next node in order.
+/// ngx_rbtree_next: the next node in order, or null after the last one.
 pub unsafe fn rbtree_next(tree: &Rbtree, node: *mut RbtreeNode) -> *mut RbtreeNode {
     let sentinel = tree.sentinel;
 
@@ -274,28 +319,28 @@ pub unsafe fn rbtree_next(tree: &Rbtree, node: *mut RbtreeNode) -> *mut RbtreeNo
         return rbtree_min((*node).right, sentinel);
     }
 
-    let mut parent = (*node).parent;
-    let mut n = node;
+    let root = tree.root;
+    let mut node = node;
 
-    while n == (*parent).right {
-        n = parent;
-        parent = (*parent).parent;
+    loop {
+        let parent = (*node).parent;
+
+        if node == root {
+            return ptr::null_mut();
+        }
+
+        if node == (*parent).left {
+            return parent;
+        }
+
+        node = parent;
     }
-
-    if n != (*parent).right {
-        return parent;
-    }
-
-    sentinel
 }
 
-/// Default insert function: by key value.
-pub unsafe fn rbtree_insert_value(
-    mut temp: *mut RbtreeNode,
-    node: *mut RbtreeNode,
-    sentinel: *mut RbtreeNode,
-) {
+/// ngx_rbtree_insert_value
+pub unsafe fn rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
     let mut p: *mut *mut RbtreeNode;
+
     loop {
         p = if (*node).key < (*temp).key { &mut (*temp).left } else { &mut (*temp).right };
 
@@ -313,17 +358,19 @@ pub unsafe fn rbtree_insert_value(
     rbt_red(node);
 }
 
-/// Insert function for timer values (handles overflow).
-pub unsafe fn rbtree_insert_timer_value(
-    mut temp: *mut RbtreeNode,
-    node: *mut RbtreeNode,
-    sentinel: *mut RbtreeNode,
-) {
+/// ngx_rbtree_insert_timer_value
+pub unsafe fn rbtree_insert_timer_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
     let mut p: *mut *mut RbtreeNode;
+
     loop {
-        // Handle timer overflow (49 days for ms in 32 bits)
-        let cmp = ((*node).key as i64) - ((*temp).key as i64);
-        p = if cmp < 0 { &mut (*temp).left } else { &mut (*temp).right };
+        // Timer values
+        // 1) are spread in small range, usually several minutes,
+        // 2) and overflow each 49 days, if milliseconds are stored in 32 bits.
+        // The comparison takes into account that overflow.
+
+        // node->key < temp->key
+
+        p = if ((*node).key.wrapping_sub((*temp).key) as isize) < 0 { &mut (*temp).left } else { &mut (*temp).right };
 
         if *p == sentinel {
             break;
@@ -339,29 +386,28 @@ pub unsafe fn rbtree_insert_timer_value(
     rbt_red(node);
 }
 
-// Color helpers
 #[inline]
-unsafe fn rbt_red(node: *mut RbtreeNode) {
+pub unsafe fn rbt_red(node: *mut RbtreeNode) {
     (*node).color = 1;
 }
 
 #[inline]
-unsafe fn rbt_black(node: *mut RbtreeNode) {
+pub unsafe fn rbt_black(node: *mut RbtreeNode) {
     (*node).color = 0;
 }
 
 #[inline]
-unsafe fn rbt_is_red(node: *mut RbtreeNode) -> bool {
+pub unsafe fn rbt_is_red(node: *mut RbtreeNode) -> bool {
     (*node).color != 0
 }
 
 #[inline]
-unsafe fn rbt_is_black(node: *mut RbtreeNode) -> bool {
-    (*node).color == 0
+pub unsafe fn rbt_is_black(node: *mut RbtreeNode) -> bool {
+    !rbt_is_red(node)
 }
 
 #[inline]
-unsafe fn rbt_copy_color(n1: *mut RbtreeNode, n2: *mut RbtreeNode) {
+pub unsafe fn rbt_copy_color(n1: *mut RbtreeNode, n2: *mut RbtreeNode) {
     (*n1).color = (*n2).color;
 }
 
@@ -369,55 +415,67 @@ unsafe fn rbt_copy_color(n1: *mut RbtreeNode, n2: *mut RbtreeNode) {
 mod tests {
     use super::*;
 
+    unsafe fn keys(tree: &Rbtree) -> Vec<usize> {
+        let mut out = vec![];
+        if tree.root == tree.sentinel {
+            return out;
+        }
+        let mut n = rbtree_min(tree.root, tree.sentinel);
+        while !n.is_null() {
+            out.push((*n).key);
+            n = rbtree_next(tree, n);
+        }
+        out
+    }
+
+    // every path from a node down has the same number of black nodes, and
+    // a red node has no red child
+    unsafe fn black_height(n: *mut RbtreeNode, sentinel: *mut RbtreeNode) -> usize {
+        if n == sentinel {
+            return 1;
+        }
+        if rbt_is_red(n) {
+            assert!(rbt_is_black((*n).left) && rbt_is_black((*n).right));
+        }
+        let l = black_height((*n).left, sentinel);
+        let r = black_height((*n).right, sentinel);
+        assert_eq!(l, r);
+        l + if rbt_is_black(n) { 1 } else { 0 }
+    }
+
     #[test]
-    #[ignore]
-    fn test_rbtree_basic() {
+    fn insert_delete() {
         unsafe {
-            // Create sentinel
             let mut sentinel = Box::new(RbtreeNode::new(0));
-            sentinel.color = 0; // black
-            let sentinel_ptr = &mut *sentinel as *mut RbtreeNode;
+            let mut tree = Rbtree { root: ptr::null_mut(), sentinel: ptr::null_mut(), insert: None };
+            tree.init(&mut *sentinel, rbtree_insert_value);
 
-            // Create tree
-            let mut tree = Rbtree {
-                root: sentinel_ptr,
-                sentinel: sentinel_ptr,
-                insert: Some(rbtree_insert_value),
+            let mut nodes: Vec<Box<RbtreeNode>> = (0..200).map(|i| Box::new(RbtreeNode::new((i * 7919) % 200))).collect();
+            for n in nodes.iter_mut() {
+                tree.insert(&mut **n);
+                black_height(tree.root, tree.sentinel);
+            }
+            assert_eq!(keys(&tree), (0..200).collect::<Vec<_>>());
+
+            for (i, n) in nodes.iter_mut().enumerate() {
+                if i % 3 == 0 {
+                    tree.delete(&mut **n);
+                    black_height(tree.root, tree.sentinel);
+                }
+            }
+            let expected: Vec<usize> = {
+                let mut v: Vec<usize> = (0..200).filter(|i| i % 3 != 0).map(|i| (i * 7919) % 200).collect();
+                v.sort();
+                v
             };
+            assert_eq!(keys(&tree), expected);
 
-            // Insert nodes
-            let mut nodes = vec![];
-            for i in (0..10).rev() {
-                nodes.push(Box::new(RbtreeNode::new(i)));
+            for (i, n) in nodes.iter_mut().enumerate() {
+                if i % 3 != 0 {
+                    tree.delete(&mut **n);
+                }
             }
-
-            let node_ptrs: Vec<_> = nodes.iter_mut().map(|n| &mut **n as *mut RbtreeNode).collect();
-
-            for &ptr in &node_ptrs {
-                tree.insert(ptr);
-            }
-
-            // Verify order by traversing
-            let mut keys = vec![];
-            let mut current = rbtree_min(tree.root, tree.sentinel);
-            while current != tree.sentinel {
-                keys.push((*current).key);
-                current = rbtree_next(&tree, current);
-            }
-
-            assert_eq!(keys, (0..10).collect::<Vec<_>>());
-
-            // Test delete
-            tree.delete(node_ptrs[3]);
-            keys.clear();
-            current = rbtree_min(tree.root, tree.sentinel);
-            while current != tree.sentinel {
-                keys.push((*current).key);
-                current = rbtree_next(&tree, current);
-            }
-
-            let expected: Vec<_> = (0..10).filter(|&i| i != 3).collect();
-            assert_eq!(keys, expected);
+            assert!(tree.root == tree.sentinel);
         }
     }
 }

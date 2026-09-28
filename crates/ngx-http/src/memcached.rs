@@ -163,6 +163,10 @@ async fn handler(r: R) -> i64 {
         // ngx_http_upstream_connect
         let rc = u.connect(&r);
 
+        if rc == NGX_ERROR {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
         if rc == NGX_BUSY {
             match u.next(&r, NGX_HTTP_UPSTREAM_FT_NOLIVE) {
                 Ok(()) => continue,
@@ -180,7 +184,7 @@ async fn handler(r: R) -> i64 {
                 Some(sa) => sa,
                 None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
             };
-            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, 60000).await {
+            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, None, 60000).await {
                 Ok(s) => (s, 0, ngx_core::times::current_msec()),
                 Err(_) => match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
                     Ok(()) => continue,

@@ -284,46 +284,6 @@ impl Cycle {
         Ok(p)
     }
 
-    /// ngx_shared_memory_add
-    pub fn shared_memory_add(&mut self, cf: &Conf, name: &[u8], size: usize, tag: &'static str) -> Result<Rc<ShmZone>, ConfError> {
-        for z in &self.shared_memory {
-            if z.shm.name.as_slice() != name {
-                continue;
-            }
-            if z.tag != tag {
-                cf.log_error(
-                    NGX_LOG_EMERG,
-                    None,
-                    format_args!("the shared memory zone \"{}\" is already declared for a different use", B(name)),
-                );
-                return Err(ConfError::Logged);
-            }
-            if z.shm.size == 0 {
-                // size set later by the owning directive
-                let nz = ShmZone::new(name.to_vec(), size, tag);
-                *nz.init.borrow_mut() = z.init.borrow().clone();
-                *nz.conf.borrow_mut() = z.conf.borrow().clone();
-                nz.noreuse.set(z.noreuse.get());
-                // replace in place to keep identity semantics simple
-                let idx = self.shared_memory.iter().position(|x| Rc::ptr_eq(x, z)).unwrap();
-                self.shared_memory[idx] = nz.clone();
-                return Ok(nz);
-            }
-            if size != 0 && size != z.shm.size {
-                cf.log_error(
-                    NGX_LOG_EMERG,
-                    None,
-                    format_args!("the size {} of shared memory zone \"{}\" conflicts with already declared size {}", size, B(name), z.shm.size),
-                );
-                return Err(ConfError::Logged);
-            }
-            return Ok(z.clone());
-        }
-        let z = ShmZone::new(name.to_vec(), size, tag);
-        self.shared_memory.push(z.clone());
-        Ok(z)
-    }
-
     /// ngx_create_paths
     pub fn create_paths(&self, user: Option<u32>) -> Result<(), ()> {
         for p in &self.paths {
@@ -584,10 +544,11 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
     // shared memory
     let zones = cycle.shared_memory.clone();
     for z in zones.iter() {
-        if z.shm.size == 0 {
+        if z.shm.size.get() == 0 {
             ngx_log_error!(NGX_LOG_EMERG, cycle.log, None, "zero size shared memory zone \"{}\"", B(&z.shm.name));
             return Err(());
         }
+        *z.shm.log.borrow_mut() = Some(cycle.log.clone());
         let mut data: Option<Rc<dyn Any>> = None;
         let mut found = false;
         for oz in old.shared_memory.iter() {
@@ -598,7 +559,7 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
                 data = oz.data.borrow().clone();
                 break;
             }
-            if z.tag == oz.tag && z.shm.size == oz.shm.size {
+            if z.tag == oz.tag && z.shm.size.get() == oz.shm.size.get() {
                 z.shm.addr.set(oz.shm.addr.get());
                 let init = z.init.borrow().clone().expect("zone init");
                 if init(z, oz.data.borrow().clone()).is_err() {
@@ -715,7 +676,7 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
     // free old shared memory not reused
     for oz in old.shared_memory.iter() {
         let live = cycle.shared_memory.iter().any(|z| {
-            z.shm.name == oz.shm.name && z.tag == oz.tag && z.shm.size == oz.shm.size && !oz.noreuse.get()
+            z.shm.name == oz.shm.name && z.tag == oz.tag && z.shm.size.get() == oz.shm.size.get() && !oz.noreuse.get()
         });
         if !live {
             oz.shm.free(&cycle.log);
@@ -744,4 +705,44 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
 
     cycle.old_cycle = None;
     Ok(Rc::from(cycle))
+}
+
+/// ngx_shared_memory_add
+pub fn shared_memory_add(cf: &mut Conf, name: &[u8], size: usize, tag: &'static str) -> Result<Rc<ShmZone>, ConfError> {
+    let found = cf.cycle.shared_memory.iter().find(|z| z.shm.name.as_slice() == name).cloned();
+
+    if let Some(z) = found {
+        if z.tag != tag {
+            cf.log_error(
+                NGX_LOG_EMERG,
+                None,
+                format_args!("the shared memory zone \"{}\" is already declared for a different use", B(name)),
+            );
+            return Err(ConfError::Logged);
+        }
+
+        if z.shm.size.get() == 0 {
+            z.shm.size.set(size);
+        }
+
+        if size != 0 && size != z.shm.size.get() {
+            cf.log_error(
+                NGX_LOG_EMERG,
+                None,
+                format_args!(
+                    "the size {} of shared memory zone \"{}\" conflicts with already declared size {}",
+                    size,
+                    B(name),
+                    z.shm.size.get()
+                ),
+            );
+            return Err(ConfError::Logged);
+        }
+
+        return Ok(z);
+    }
+
+    let z = ShmZone::new(name.to_vec(), size, tag);
+    cf.cycle.shared_memory.push(z.clone());
+    Ok(z)
 }

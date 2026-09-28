@@ -269,6 +269,28 @@ pub fn spawn<F: std::future::Future<Output = ()> + 'static>(f: F) -> tokio::task
     tokio::task::spawn_local(f)
 }
 
+thread_local! {
+    static POSTED_TASKS: RefCell<Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// spawn(), or, before the event loop runs, once it starts: init_process
+/// handlers add timers, as ngx_add_timer() works before
+/// ngx_process_events_and_timers() in C.
+pub fn spawn_posted<F: std::future::Future<Output = ()> + 'static>(f: F) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        spawn(f);
+        return;
+    }
+    POSTED_TASKS.with(|p| p.borrow_mut().push(Box::pin(f)));
+}
+
+fn spawn_posted_tasks() {
+    let tasks = POSTED_TASKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for f in tasks {
+        spawn(f);
+    }
+}
+
 fn flags_notify() -> Rc<tokio::sync::Notify> {
     FLAGS_NOTIFY.with(|n| n.clone())
 }
@@ -661,6 +683,7 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
     local.block_on(&rt, async move {
         let mut cycle = c2;
         spawn(control_task(cycle.clone(), single));
+        spawn_posted_tasks();
         start_accepting(&cycle);
         let notify = flags_notify();
         let close_notify = close_notify();
