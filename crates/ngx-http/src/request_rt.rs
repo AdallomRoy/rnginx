@@ -1187,6 +1187,9 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         b.cap = *cscf.borrow().client_header_buffer_size;
         b.data.clear();
     }
+    if c.ssl.borrow().is_some() {
+        ngx_core::event_openssl::ngx_ssl_free_buffer(&c);
+    }
     c.log.set_action(Some("keepalive"));
     if c.tcp_nopush.get() == TcpNopush::Set {
         if let Err(e) = c.tcp_push_off() {
