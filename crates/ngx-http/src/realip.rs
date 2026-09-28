@@ -307,15 +307,10 @@ async fn realip_handler(r: R) -> i64 {
             };
             (headers, None)
         }
-        NGX_HTTP_REALIP_PROXY => {
-            // proxy_protocol is handled via r.connection.proxy_protocol
-            let pp = r.connection.proxy_protocol.borrow();
-            if pp.is_none() {
-                return NGX_DECLINED;
-            }
-            // For now, we'll just decline proxy_protocol since we need to understand the data structure
-            return NGX_DECLINED;
-        }
+        NGX_HTTP_REALIP_PROXY => match proxy_protocol(&r) {
+            Some(pp) => (Vec::new(), Some(pp.src_addr.clone())),
+            None => return NGX_DECLINED,
+        },
         NGX_HTTP_REALIP_HEADER => {
             // Custom header name lookup
             let (header_name, header_hash) = {
@@ -353,14 +348,26 @@ async fn realip_handler(r: R) -> i64 {
     let proxies = c.from.clone();
     drop(c);
 
-    let (rc, new_addr) = get_forwarded_addr(&r, &current_addr, &headers_vec, value_opt.as_deref().unwrap_or(&[]), &proxies, recursive);
+    let (rc, mut new_addr) = get_forwarded_addr(&r, &current_addr, &headers_vec, value_opt.as_deref().unwrap_or(&[]), &proxies, recursive);
 
     if rc == NGX_DECLINED {
         return NGX_DECLINED;
     }
 
+    if header_type == NGX_HTTP_REALIP_PROXY {
+        if let Some(pp) = proxy_protocol(&r) {
+            new_addr.set_port(pp.src_port);
+        }
+    }
+
     // Set the new address
     set_real_addr(&r, new_addr).await
+}
+
+/// The PROXY protocol header read for this connection (c->proxy_protocol).
+fn proxy_protocol(r: &R) -> Option<Rc<ngx_core::proxy_protocol::ProxyProtocol>> {
+    let pp = r.connection.proxy_protocol.borrow().clone()?;
+    pp.downcast::<ngx_core::proxy_protocol::ProxyProtocol>().ok()
 }
 
 async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
