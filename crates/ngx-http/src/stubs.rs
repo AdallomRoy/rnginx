@@ -49,26 +49,6 @@ pub fn upstream_module() -> ModuleDef {
     ])
 }
 
-pub fn v2_module() -> ModuleDef {
-    stub("ngx_http_v2_module", vec![
-        Command::new("http2", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("http2_recv_buffer_size", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_pool_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_max_concurrent_streams", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_max_concurrent_pushes", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_max_requests", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_max_field_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_max_header_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_body_preread_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_streams_index_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_recv_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_idle_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_chunk_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("http2_push_preload", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("http2_push", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-    ])
-}
-
 pub fn v3_module() -> ModuleDef {
     stub("ngx_http_v3_module", vec![
         Command::new("http3", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),

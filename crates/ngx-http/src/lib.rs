@@ -24,6 +24,7 @@ pub mod script;
 pub mod header_filter;
 pub mod write_filter;
 pub mod http2;
+pub mod v2;
 pub mod memcached;
 pub mod special_response;
 pub mod static_module;
@@ -563,7 +564,7 @@ pub fn modules() -> Vec<ModuleDef> {
         core::core_module(),
         log::log_module(),
         upstream::upstream_module(),
-        stubs::v2_module(),
+        v2::module::v2_module(),
         stubs::v3_module(),
         static_module::static_module(),
         gzip_static::gzip_static_module(),
