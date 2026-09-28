@@ -950,35 +950,42 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 );
             }
         }
-        // ALPN: advertise http/1.1. h2 dispatch scaffolding exists in
-        // crate::http2 but is not production-ready — leaving h2 out of
-        // ALPN keeps clients on the working HTTP/1 pipeline.
-        static ALPN: &[u8] = b"\x08http/1.1";
+        // ngx_http_ssl_alpn_select: h2 is offered when the SNI-selected
+        // (or default) server has "http2 on" or the listen has "http2";
+        // the server's order wins, and no common protocol is fatal.
         unsafe extern "C" fn alpn_select_cb(
-            _ssl: *mut openssl_sys::SSL,
+            ssl: *mut openssl_sys::SSL,
             out: *mut *const u8,
             outlen: *mut u8,
             client: *const u8,
             client_len: u32,
             _arg: *mut c_void,
         ) -> i32 {
-            let client_slice = std::slice::from_raw_parts(client, client_len as usize);
-            let mut i = 0usize;
-            while i < client_slice.len() {
-                let l = client_slice[i] as usize;
-                if i + 1 + l > client_slice.len() { break; }
-                let proto = &client_slice[i+1..i+1+l];
-                if proto == b"http/1.1" {
-                    *out = client_slice[i+1..].as_ptr();
-                    *outlen = l as u8;
-                    return 0; // SSL_TLSEXT_ERR_OK
+            // NGX_HTTP_V2_ALPN_PROTO NGX_HTTP_ALPN_PROTOS
+            static H2_PROTOS: &[u8] = b"\x02h2\x08http/1.1\x08http/1.0\x08http/0.9";
+            // NGX_HTTP_ALPN_PROTOS
+            static PROTOS: &[u8] = b"\x08http/1.1\x08http/1.0\x08http/0.9";
+            let mut srv = PROTOS;
+            let idx_ptr = openssl_sys::SSL_get_ex_data(ssl, sni_ex_index());
+            if !idx_ptr.is_null() && idx_ptr as usize != 0 {
+                if let Some(hc) = sni_lookup(idx_ptr as usize - 1) {
+                    if crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2 {
+                        srv = H2_PROTOS;
+                    }
                 }
-                i += 1 + l;
             }
-            // Match C's ngx_http_ssl_alpn_select: when the client sent
-            // ALPN but nothing matched our list, fatal-alert the handshake.
-            // h2_ssl.t "alpn rejected" depends on this.
-            2 // SSL_TLSEXT_ERR_ALERT_FATAL
+            let rc = openssl_sys::SSL_select_next_proto(
+                out as *mut *mut u8,
+                outlen,
+                srv.as_ptr(),
+                srv.len() as u32,
+                client,
+                client_len,
+            );
+            if rc != openssl_sys::OPENSSL_NPN_NEGOTIATED {
+                return 2; // SSL_TLSEXT_ERR_ALERT_FATAL
+            }
+            0 // SSL_TLSEXT_ERR_OK
         }
         unsafe {
             openssl_sys::SSL_CTX_set_alpn_select_cb__fixed_rust(
@@ -986,7 +993,6 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
                 Some(alpn_select_cb),
                 std::ptr::null_mut(),
             );
-            let _ = ALPN;
             // Install the SNI callback so a hostname-directed handshake
             // can swap SSL_CTX to another server's cert. The callback
             // reads addr_conf out of per-SSL ex_data — set from
@@ -1195,6 +1201,10 @@ pub fn ssl_verify_enabled(cscf: &Rc<RefCell<CoreSrvConf>>) -> bool {
 ///   SNI hostname doesn't match Host — 421 Misdirected Request when
 ///   verify_client is on (avoids credential-mismatch)
 pub fn ssl_process_request_checks(r: &R) -> Option<i64> {
+    if r.connection.ssl.borrow().is_none() {
+        ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent plain HTTP request to HTTPS port");
+        return Some(crate::NGX_HTTP_TO_HTTPS);
+    }
     let cscf = r.cscf();
     let sctx = cscf.borrow().ctx.clone();
     let srv_slots = &sctx.srv.as_ref()?.clone();

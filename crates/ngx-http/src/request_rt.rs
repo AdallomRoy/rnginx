@@ -89,17 +89,47 @@ async fn connection_task(c: Rc<Connection>) {
     let hc_any: Rc<dyn std::any::Any> = hc.clone();
     *c.data.borrow_mut() = Some(hc_any);
 
-    if addr_conf.ssl {
-        hc.ssl.set(true);
-        c.log.set_action(Some("SSL handshaking"));
-        if !crate::stubs::ssl_handshake(&c, &hc).await {
-            close_connection(&c);
-            return;
-        }
-    }
     if addr_conf.proxy_protocol {
         hc.proxy_protocol.set(true);
         c.log.set_action(Some("reading PROXY protocol"));
+    }
+    if addr_conf.ssl {
+        hc.ssl.set(true);
+        match ssl_handshake_peek(&c, &hc).await {
+            Err(()) => {
+                close_connection(&c);
+                return;
+            }
+            Ok(false) => {
+                http_debug_c(&c, "plain http");
+                c.log.set_action(Some("waiting for request"));
+            }
+            Ok(true) => {
+                c.log.set_action(Some("SSL handshaking"));
+                let timeout = *cscf.borrow().client_header_timeout;
+                match tokio::time::timeout(Duration::from_millis(timeout), crate::stubs::ssl_handshake(&c, &hc)).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        close_connection(&c);
+                        return;
+                    }
+                    Err(_) => {
+                        ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
+                        close_connection(&c);
+                        return;
+                    }
+                }
+                // ngx_http_ssl_handshake_handler: HTTP/2 negotiated by ALPN
+                if crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2 {
+                    let alpn = c.ssl.borrow().clone().and_then(|s| s.alpn_selected());
+                    if alpn.as_deref() == Some(&b"h2"[..]) {
+                        crate::v2::connection::init(c.clone(), hc.clone(), Vec::new()).await;
+                        return;
+                    }
+                }
+                c.log.set_action(Some("waiting for request"));
+            }
+        }
     }
 
     let mut first = true;
@@ -149,6 +179,72 @@ async fn connection_task(c: Rc<Connection>) {
                 return;
             }
         }
+    }
+}
+
+/// The start of ngx_http_ssl_handshake: read the PROXY protocol header, if
+/// the listen has one (it precedes TLS), then peek at the first byte: a TLS
+/// (or SSLv2) handshake (true), or plain HTTP sent to the SSL port (false).
+async fn ssl_handshake_peek(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<bool, ()> {
+    let timeout = {
+        let cscf = srv_conf_from_ctx(&hc.conf_ctx.borrow());
+        let t = *cscf.borrow().client_header_timeout;
+        t
+    };
+
+    loop {
+        let size = if hc.proxy_protocol.get() { ngx_core::proxy_protocol::NGX_PROXY_PROTOCOL_MAX_HEADER + 1 } else { 1 };
+        let mut buf = vec![0u8; size];
+
+        let res = tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(timeout), c.peek(&mut buf)) => r,
+            _ = c.close_notify.notified() => return Err(()),
+        };
+
+        let n = match res {
+            Err(_) => {
+                ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
+                return Err(());
+            }
+            Ok(Err(e)) => {
+                ngx_log_error!(NGX_LOG_INFO, c.log, e.raw_os_error(), "recv() failed");
+                return Err(());
+            }
+            Ok(Ok(n)) => n,
+        };
+
+        if n == 0 {
+            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client closed connection");
+            return Err(());
+        }
+
+        let mut first = buf[0];
+
+        if hc.proxy_protocol.get() {
+            hc.proxy_protocol.set(false);
+
+            let (pp, size) = ngx_core::proxy_protocol::read(&c.log, &buf[..n])?;
+            if let Some(pp) = pp {
+                *c.proxy_protocol.borrow_mut() = Some(Rc::new(pp));
+            }
+
+            // consume the header, which is in the socket buffer already
+            let mut hdr = vec![0u8; size];
+            match c.recv(&mut hdr).await {
+                Ok(m) if m == size => {}
+                _ => return Err(()),
+            }
+
+            c.log.set_action(Some("SSL handshaking"));
+
+            if n == size {
+                continue;
+            }
+
+            first = buf[size];
+        }
+
+        return Ok(first & 0x80 != 0 || first == 0x16);
     }
 }
 
