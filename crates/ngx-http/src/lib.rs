@@ -395,11 +395,13 @@ pub fn get_loc_conf<T: 'static>(cf: &Conf, idx: usize) -> Rc<RefCell<T>> {
 }
 
 /// Fetch a module's main conf from the cycle (runtime).
-pub fn cycle_main_conf<T: 'static>(cycle: &ngx_core::cycle::Cycle, idx: usize) -> Option<Rc<RefCell<T>>> {
+/// The module's ctx_index is taken only when the block exists: the module
+/// indices are set up by the block.
+pub fn cycle_main_conf<T: 'static>(cycle: &ngx_core::cycle::Cycle, idx: fn() -> usize) -> Option<Rc<RefCell<T>>> {
     let m = find_module(&cycle.modules, "ngx_http_module")?;
     let holder = cycle.conf_ctx[m.index].as_ref()?;
     let ctx = holder.downcast_ref::<ConfCtx>()?;
-    Some(get_conf::<T>(ctx, ConfLevel::Main, idx))
+    Some(get_conf::<T>(ctx, ConfLevel::Main, idx()))
 }
 
 // --- the http {} block (ngx_http_block) ---

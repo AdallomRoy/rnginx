@@ -961,7 +961,7 @@ fn init_worker(cycle: &Rc<ngx_core::cycle::Cycle>) -> Result<(), ()> {
         return Ok(());
     }
 
-    let umcf = match crate::cycle_main_conf::<UpstreamMainConf>(cycle, crate::upstream::ctx_index()) {
+    let umcf = match crate::cycle_main_conf::<UpstreamMainConf>(cycle, crate::upstream::ctx_index) {
         Some(umcf) => umcf,
         None => return Ok(()),
     };

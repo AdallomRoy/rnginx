@@ -398,10 +398,16 @@ impl Url {
     }
 }
 
+/// ngx_inet_add_addr: an address for each port of a listen port range
 fn add_addr(u: &mut Url, sa: SockAddr) {
-    let name = sa.to_text(true);
     u.sockaddr = Some(sa.clone());
-    u.addrs.push(Addr { sockaddr: sa, name });
+    let nports = if u.last_port != 0 { u.last_port - u.port + 1 } else { 1 };
+    for i in 0..nports {
+        let mut sa = sa.clone();
+        sa.set_port(u.port + i);
+        let name = sa.to_text(true);
+        u.addrs.push(Addr { sockaddr: sa, name });
+    }
 }
 
 /// ngx_parse_url. On error, returns Err and sets u.err (may be None for resolve errors already set).

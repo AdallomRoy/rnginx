@@ -19,6 +19,14 @@ use crate::{ngx_log_debug, ngx_log_error, os};
 
 pub type ListenHandler = Rc<dyn Fn(Rc<Connection>)>;
 
+/// ngx_connection_log_error_e
+pub const NGX_ERROR_ALERT: u32 = 0;
+pub const NGX_ERROR_ERR: u32 = 1;
+pub const NGX_ERROR_INFO: u32 = 2;
+pub const NGX_ERROR_IGNORE_ECONNRESET: u32 = 3;
+pub const NGX_ERROR_IGNORE_EINVAL: u32 = 4;
+pub const NGX_ERROR_IGNORE_EMSGSIZE: u32 = 5;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TcpNodelay {
     Unset,
@@ -187,6 +195,8 @@ pub struct Connection {
     pub write_ready: Cell<bool>,
     pub read_eof: Cell<bool>,
     pub read_pending_eof: Cell<bool>,
+    /// c->log_error: the level of ngx_connection_error() messages
+    pub log_error: Cell<u32>,
     /// A per-stream copy of an HTTP/2 connection (C's fake connection, see
     /// Connection::new_fake). It never owns the socket or the SSL object,
     /// is not counted as a connection, and refuses socket I/O.
@@ -249,6 +259,7 @@ impl Connection {
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
+            log_error: Cell::new(NGX_ERROR_ALERT),
             fake: false,
         });
         ACTIVE.with(|a| a.set(a.get() + 1));
@@ -315,6 +326,7 @@ impl Connection {
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
+            log_error: Cell::new(c.log_error.get()),
             fake: true,
         })
     }
@@ -518,6 +530,35 @@ impl Connection {
         }
     }
 
+    /// recv(MSG_PEEK) of the stream preread phase (ngx_stream_preread_peek):
+    /// waits until more than `have` bytes can be peeked, the peer closes its
+    /// side, or an error. Returns the number of bytes peeked and whether the
+    /// peer has closed its side (c->read->pending_eof, from EPOLLRDHUP).
+    /// Readiness is cleared when there is nothing new, so the next wait
+    /// blocks for a new event, as the edge-triggered epoll does in C.
+    pub async fn peek_more(&self, buf: &mut [u8], have: usize) -> io::Result<(usize, bool)> {
+        self.fake_io_error()?;
+        let afd = self.afd()?;
+        loop {
+            let mut guard = afd.readable().await?;
+            let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_PEEK) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Err(e);
+            }
+            let n = n as usize;
+            let eof = guard.ready().is_read_closed();
+            if n == 0 || n > have || eof {
+                return Ok((n, eof || n == 0));
+            }
+            guard.clear_ready();
+        }
+    }
+
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.fake_io_error()?;
@@ -622,6 +663,33 @@ impl Connection {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// ngx_connection_error: log a socket error with the level of
+    /// c->log_error; returns false for the ignored errors
+    pub fn connection_error(&self, err: i32, text: &str) -> bool {
+        let log_error = self.log_error.get();
+
+        if err == libc::ECONNRESET && log_error == NGX_ERROR_IGNORE_ECONNRESET {
+            return false;
+        }
+
+        if err == libc::EMSGSIZE && log_error == NGX_ERROR_IGNORE_EMSGSIZE {
+            return false;
+        }
+
+        let level = if [0, libc::ECONNRESET, libc::EPIPE, libc::ENOTCONN, libc::ETIMEDOUT, libc::ECONNREFUSED, libc::ENETDOWN, libc::ENETUNREACH, libc::EHOSTDOWN, libc::EHOSTUNREACH].contains(&err) {
+            match log_error {
+                NGX_ERROR_IGNORE_EMSGSIZE | NGX_ERROR_IGNORE_EINVAL | NGX_ERROR_IGNORE_ECONNRESET | NGX_ERROR_INFO => NGX_LOG_INFO,
+                _ => NGX_LOG_ERR,
+            }
+        } else {
+            NGX_LOG_ALERT
+        };
+
+        ngx_log_error!(level, self.log, Some(err), "{}", text);
+
+        true
     }
 
     /// ngx_tcp_nodelay
