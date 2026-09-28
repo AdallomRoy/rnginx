@@ -238,6 +238,8 @@ pub struct H2Stream {
     pub fc: Rc<Connection>,
 
     pub queued: Cell<usize>,
+    /// Payload bytes of the stream's DATA frames queued and not yet written.
+    pub queued_bytes: Cell<usize>,
 
     /// Signed: a SETTINGS_INITIAL_WINDOW_SIZE change can make it negative.
     pub send_window: Cell<isize>,

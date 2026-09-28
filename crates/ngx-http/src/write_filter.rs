@@ -121,6 +121,31 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     let sendfile_max_chunk = *clcf.borrow().sendfile_max_chunk;
     let send_timeout = *clcf.borrow().send_timeout;
 
+    // HTTP/2: queue what the flow control windows allow and let the body
+    // producer go on while the output in flight stays below the output
+    // buffers, as C does when ngx_http_v2_send_chain returns the rest to
+    // r->out and the copy filter reads its next buffer. The remainder joins
+    // later output in the same DATA frame. The last buffer, flushes and
+    // rate limited output are sent in full below.
+    if r.stream.borrow().is_some() && !last && !flush && !sync && limit_rate == 0 {
+        match crate::v2::filter::send_nowait(&r).await {
+            Err(()) => {
+                c.error.set(true);
+                return NGX_ERROR;
+            }
+            Ok(unsent) => {
+                if unsent < crate::copy_filter::output_buffers_size(&r) {
+                    if r.out.borrow().is_empty() {
+                        r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
+                    } else {
+                        r.buffered.set(r.buffered.get() | NGX_HTTP_WRITE_BUFFERED);
+                    }
+                    return NGX_OK;
+                }
+            }
+        }
+    }
+
     loop {
         let mut limit: i64;
         if limit_rate > 0 {

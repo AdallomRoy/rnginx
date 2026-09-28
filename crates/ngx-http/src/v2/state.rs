@@ -228,7 +228,8 @@ fn state_read_data(h2c: &Rc<H2Connection>, buf: &mut [u8], mut pos: usize) -> Op
     let end = buf.len();
     let st = &h2c.state;
 
-    let stream = match st.stream.borrow().clone() {
+    let stream = st.stream.borrow().clone();
+    let stream = match stream {
         Some(s) => s,
         None => return state_skip_padded(h2c, buf, pos),
     };
@@ -238,7 +239,8 @@ fn state_read_data(h2c: &Rc<H2Connection>, buf: &mut [u8], mut pos: usize) -> Op
         return state_skip_padded(h2c, buf, pos);
     }
 
-    let r = match stream.request.borrow().clone() {
+    let r = stream.request.borrow().clone();
+    let r = match r {
         Some(r) => r,
         None => return state_skip_padded(h2c, buf, pos),
     };
@@ -780,7 +782,8 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
         st.index.set(false);
     }
 
-    let stream = match st.stream.borrow().clone() {
+    let stream = st.stream.borrow().clone();
+    let stream = match stream {
         None => return state_header_complete(h2c, buf, pos),
         Some(s) => s,
     };

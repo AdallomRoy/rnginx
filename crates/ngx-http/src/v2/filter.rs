@@ -520,6 +520,32 @@ pub async fn send_chain(r: &R, chain: &mut Chain, limit: i64) -> io::Result<i64>
     }
 }
 
+/// ngx_http_v2_send_chain without waiting for the windows: frame what they
+/// allow now, leaving the rest in r.out (C returns it to the write filter,
+/// which keeps it in r->out), and let the connection write the frames out
+/// (ngx_http_v2_filter_send). Returns the output still in flight, the
+/// remainder plus queued DATA, which the write filter bounds as C's busy
+/// output buffers do.
+pub async fn send_nowait(r: &R) -> Result<usize, ()> {
+    let stream = request_stream(r).ok_or(())?;
+
+    let mut out = std::mem::take(&mut *r.out.borrow_mut());
+    let res = send_chain_once(r, &stream, &mut out, 0);
+    *r.out.borrow_mut() = out;
+    res?;
+
+    stream.connection.out_notify.notify_one();
+    tokio::task::yield_now().await;
+
+    if stream.fc.error.get() {
+        return Err(());
+    }
+
+    let rest: usize = r.out.borrow().iter().map(buf_size).sum();
+
+    Ok(rest + stream.queued_bytes.get())
+}
+
 fn chain_empty(chain: &Chain) -> bool {
     chain.iter().all(|b| buf_size(b) == 0 && !b.last_buf)
 }
@@ -685,6 +711,7 @@ fn send_chain_once(r: &R, stream: &Rc<H2Stream>, chain: &mut Chain, limit: i64) 
 
             stream.send_window.set(stream.send_window.get() - frame_size as isize);
             stream.queued.set(stream.queued.get() + 1);
+            stream.queued_bytes.set(stream.queued_bytes.get() + frame_size);
 
             queued_total += frame_size as i64;
         }
@@ -885,6 +912,10 @@ fn handle_frame(stream: &Rc<H2Stream>, frame: &OutFrame) {
         stream.out_closed.set(true);
     }
 
+    if frame.handler == FrameHandler::Data {
+        stream.queued_bytes.set(stream.queued_bytes.get().saturating_sub(frame.length));
+    }
+
     stream.queued.set(stream.queued.get().saturating_sub(1));
 }
 
@@ -926,6 +957,7 @@ pub fn filter_cleanup(stream: &Rc<H2Stream>) {
                 let f = out.remove(i);
                 if f.handler == FrameHandler::Data {
                     window += f.length;
+                    stream.queued_bytes.set(stream.queued_bytes.get().saturating_sub(f.length));
                 }
                 stream.queued.set(stream.queued.get() - 1);
                 if stream.queued.get() == 0 {

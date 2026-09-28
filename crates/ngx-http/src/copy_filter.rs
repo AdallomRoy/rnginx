@@ -39,6 +39,14 @@ fn init(_cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
+/// The output_buffers total: how much output may be in flight before the
+/// copy filter has to wait (its busy buffers in C).
+pub fn output_buffers_size(r: &R) -> usize {
+    let conf = r.loc_conf::<CopyConf>(ctx_index());
+    let b = conf.borrow();
+    b.bufs.num.max(1) * b.bufs.size.max(1)
+}
+
 async fn copy_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     let need_in_memory = r.main_filter_need_in_memory.get() || r.filter_need_in_memory.get() || !r.connection.sendfile.get();
     let has_file = input.iter().any(|b| b.in_file && !b.in_memory());

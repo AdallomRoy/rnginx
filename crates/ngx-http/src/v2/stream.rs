@@ -341,6 +341,7 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         node: RefCell::new(node.clone()),
         fc: fc.clone(),
         queued: Cell::new(0),
+        queued_bytes: Cell::new(0),
         send_window: Cell::new(h2c.init_window.get() as isize),
         recv_window: Cell::new(h2scf.preread_size),
         preread: RefCell::new(None),
@@ -1053,7 +1054,8 @@ pub fn close_stream(stream: &Rc<H2Stream>, rc: i64) {
 
     h2c.frames.set(h2c.frames.get().saturating_sub(stream.frames.get()));
 
-    if let Some(r) = stream.request.borrow_mut().take() {
+    let r = stream.request.borrow_mut().take();
+    if let Some(r) = r {
         request_rt::free_request(&r, rc);
         super::filter::filter_cleanup(stream);
         *r.stream.borrow_mut() = None;

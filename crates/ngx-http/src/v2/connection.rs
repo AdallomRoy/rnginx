@@ -752,7 +752,14 @@ async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut 
 
         let res = tokio::select! {
             r = tokio::time::timeout(Duration::from_millis(t), c.recv(&mut rbuf[..NGX_HTTP_LINGERING_BUFFER_SIZE])) => r,
-            _ = c.close_notify.notified() => return,
+            _ = c.close_notify.notified() => {
+                // ngx_http_v2_lingering_close_handler closes on c->close,
+                // which lingering reset: ignore an earlier shutdown wakeup
+                if c.close.get() {
+                    return;
+                }
+                continue;
+            }
         };
 
         match res {
