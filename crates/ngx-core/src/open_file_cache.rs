@@ -190,22 +190,37 @@ impl OpenFileCache {
     }
 }
 
-/// Guard that decrements cache file count on drop.
-pub struct CachedFileHandle {
-    cache: Rc<OpenFileCache>,
-    name: Vec<u8>,
+/// Guard for a file opened via `open_cached_file`.
+///
+/// When cached (`Cached`), drop decrements the reference count in the cache and
+/// closes the fd only if the cache marked it for close and no other users remain.
+/// When uncached (`Owned` — no `open_file_cache` configured), drop closes the fd
+/// unconditionally, since nothing else owns it.
+pub enum CachedFileHandle {
+    Cached { cache: Rc<OpenFileCache>, name: Vec<u8> },
+    Owned { fd: i32 },
 }
 
 impl Drop for CachedFileHandle {
     fn drop(&mut self) {
-        if let Some(file_rc) = self.cache.files.borrow().get(&self.name) {
-            let mut file = file_rc.borrow_mut();
-            if file.count > 0 {
-                file.count -= 1;
+        match self {
+            CachedFileHandle::Cached { cache, name } => {
+                if let Some(file_rc) = cache.files.borrow().get(name) {
+                    let mut file = file_rc.borrow_mut();
+                    if file.count > 0 {
+                        file.count -= 1;
+                    }
+                    if file.close && file.count == 0 && file.fd >= 0 {
+                        os::close(file.fd);
+                        file.fd = NGX_INVALID_FILE;
+                    }
+                }
             }
-            if file.close && file.count == 0 && file.fd >= 0 {
-                os::close(file.fd);
-                file.fd = NGX_INVALID_FILE;
+            CachedFileHandle::Owned { fd } => {
+                if *fd >= 0 {
+                    os::close(*fd);
+                    *fd = NGX_INVALID_FILE;
+                }
             }
         }
     }
@@ -222,7 +237,11 @@ pub fn open_cached_file(
     of.err = 0;
 
     if cache.is_none() {
-        return open_and_stat_file(name, of, log).map(|_| None);
+        open_and_stat_file(name, of, log)?;
+        if of.is_dir || of.fd == NGX_INVALID_FILE {
+            return Ok(None);
+        }
+        return Ok(Some(Rc::new(CachedFileHandle::Owned { fd: of.fd })));
     }
 
     let cache = cache.unwrap();
@@ -279,7 +298,7 @@ pub fn open_cached_file(
 
         if should_return_cached {
             if of.err == 0 && !of.is_dir {
-                return Ok(Some(Rc::new(CachedFileHandle {
+                return Ok(Some(Rc::new(CachedFileHandle::Cached {
                     cache: cache.clone(),
                     name: name.to_vec(),
                 })));
@@ -351,7 +370,7 @@ pub fn open_cached_file(
         );
 
         if of.err == 0 && !of.is_dir {
-            return Ok(Some(Rc::new(CachedFileHandle {
+            return Ok(Some(Rc::new(CachedFileHandle::Cached {
                 cache: cache.clone(),
                 name: name.to_vec(),
             })));
