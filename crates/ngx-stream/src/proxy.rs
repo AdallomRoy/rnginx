@@ -1432,7 +1432,7 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
                 let limit = limit_rate as i64 * (ngx_core::times::time() - u.start_sec.get() + 1) - received(0);
 
                 if limit <= 0 {
-                    r.delayed(from_upstream).set(true);
+                    set_delayed(r, from_upstream, src, true);
                     let delay = (-limit * 1000 / limit_rate as i64 + 1) as u64;
                     delay_until = Some(Instant::now() + Duration::from_millis(delay));
                     break;
@@ -1470,7 +1470,7 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
                 let delay = (n as u64) * 1000 / limit_rate as u64;
 
                 if delay > 0 {
-                    r.delayed(from_upstream).set(true);
+                    set_delayed(r, from_upstream, src, true);
                     delay_until = Some(Instant::now() + Duration::from_millis(delay));
                 }
             }
@@ -1532,7 +1532,7 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
         if let Some(t) = delay_until.take() {
             tokio::time::sleep_until(t).await;
 
-            r.delayed(from_upstream).set(false);
+            set_delayed(r, from_upstream, src, false);
 
             // the delayed event: the proxy timer is back if nothing is
             // delayed
@@ -1546,6 +1546,23 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
         }
 
         src_ready = true;
+    }
+}
+
+/// src->read->delayed of limit_rate: while it is set, a datagram for a
+/// client connection of a UDP listening socket is not read, and
+/// ngx_event_recvmsg drops it (the read handler returns at once); those
+/// already waiting to be read arrived after the read which started the
+/// delay, and are dropped too.
+fn set_delayed(r: &Relay, from_upstream: bool, src: &Connection, delayed: bool) {
+    r.delayed(from_upstream).set(delayed);
+
+    src.read_delayed.set(delayed);
+
+    if delayed {
+        if let Some(udp) = src.udp_conn() {
+            udp.drop_unread(src);
+        }
     }
 }
 

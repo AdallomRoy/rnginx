@@ -28,7 +28,10 @@
 //!   connection was gone, so they start a new connection;
 //! - a connection keeps at most NGX_UDP_MAX_UNREAD datagrams it does not
 //!   read; more are dropped, as C drops a datagram the session does not
-//!   read.
+//!   read;
+//! - a datagram for a connection whose read is delayed (c->read->delayed:
+//!   the stream proxy's limit rate) is dropped, as the read handler
+//!   returns without reading it in C.
 //!
 //! The listening socket is registered in the reactor as a dup() of the
 //! listening descriptor owned by the listening's UDP state: the pseudo
@@ -589,6 +592,12 @@ impl UdpConnection {
     /// A datagram for the connection (ngx_event_recvmsg: c->udp->buffer
     /// and the read handler).
     fn add_datagram(&self, c: &Connection, data: &[u8]) {
+        if c.read_delayed.get() {
+            // the read handler is called with the read event delayed: it
+            // returns at once, and the datagram is lost
+            return;
+        }
+
         let mut buffer = self.buffer.borrow_mut();
 
         if buffer.len() >= NGX_UDP_MAX_UNREAD {
@@ -601,6 +610,20 @@ impl UdpConnection {
         drop(buffer);
 
         self.notify.notify_one();
+    }
+
+    /// Drop the datagrams not read yet (a delayed read event).
+    pub fn drop_unread(&self, c: &Connection) {
+        let n = {
+            let mut buffer = self.buffer.borrow_mut();
+            let n = buffer.len();
+            buffer.clear();
+            n
+        };
+
+        if n > 0 {
+            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "recvmsg: {} datagrams dropped, the read is delayed", n);
+        }
     }
 
     /// There is a datagram to read (c->read->ready).
@@ -1170,6 +1193,48 @@ mod tests {
             let mut buf = [0u8; 16];
             let n = recv(&c, &mut buf).await;
             assert_eq!(&buf[..n], b"0");
+
+            stop_recvmsg(&ls);
+            os::close(ls.fd.get());
+        });
+    }
+
+    #[test]
+    fn delayed_read_drops_datagrams() {
+        run(async {
+            let (ls, addr, conns) = udp_listening("127.0.0.1:0");
+            crate::event::spawn(recvmsg_loop(ls.clone()));
+
+            let a = client("127.0.0.1:0").await;
+
+            a.send_to(b"first", addr).await.unwrap();
+            wait_for(|| conns.borrow().len() == 1).await;
+            let c = conns.borrow()[0].clone();
+            let udp = c.udp_conn().unwrap();
+
+            // queued, then dropped when the read gets delayed
+
+            a.send_to(b"q", addr).await.unwrap();
+            wait_for(|| udp.unread() == 1).await;
+            c.read_delayed.set(true);
+            udp.drop_unread(&c);
+            assert_eq!(udp.unread(), 0);
+
+            // lost while the read is delayed (the read handler returns)
+
+            a.send_to(b"lost", addr).await.unwrap();
+            a.send_to(b"lost2", addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(udp.unread(), 0);
+            assert_eq!(conns.borrow().len(), 1);
+
+            // read again once the delay is over
+
+            c.read_delayed.set(false);
+            a.send_to(b"next", addr).await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = recv(&c, &mut buf).await;
+            assert_eq!(&buf[..n], b"next");
 
             stop_recvmsg(&ls);
             os::close(ls.fd.get());
