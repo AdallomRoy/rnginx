@@ -407,6 +407,51 @@ impl Connection {
         }
     }
 
+    /// One non-blocking recv attempt (plain or TLS), without waiting:
+    /// WouldBlock when no data can be read now. OpenSSL may hold decrypted
+    /// data the socket no longer shows, so TLS is always tried first. A
+    /// drained socket clears the retained readiness, as in drive_io, so a
+    /// later readable() waits for a new event.
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.fake_io_error()?;
+        let afd = self.afd()?;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let Some(ssl) = self.ssl.borrow().clone() {
+            match ssl.try_recv(self, buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => return r,
+            }
+            if let std::task::Poll::Ready(Ok(mut guard)) = afd.poll_read_ready(&mut cx) {
+                match ssl.try_recv(self, buf) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => guard.clear_ready(),
+                    r => return r,
+                }
+            }
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        match afd.poll_read_ready(&mut cx) {
+            std::task::Poll::Ready(Ok(mut guard)) => match guard.try_io(|inner| {
+                let n = unsafe { libc::recv(inner.get_ref().0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(r) => {
+                    let n = r?;
+                    if n == 0 {
+                        self.read_eof.set(true);
+                    }
+                    Ok(n)
+                }
+                Err(_) => Err(io::ErrorKind::WouldBlock.into()),
+            },
+            std::task::Poll::Ready(Err(e)) => Err(e),
+            std::task::Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.
     pub fn try_recv_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
         let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };

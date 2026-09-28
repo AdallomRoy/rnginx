@@ -7,7 +7,9 @@
 //! task then runs ngx_http_v2_read_request_body and, on each read event,
 //! ngx_http_v2_read_client_request_body_handler: the data goes through
 //! rb->buf (ngx_http_v2_process_request_body) and into the request body
-//! filters (ngx_http_v2_filter_request_body).
+//! filters (ngx_http_v2_filter_request_body). An unbuffered body is set up
+//! the same way; then the upstream calls read_unbuffered_request_body()
+//! whenever it can take more data.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -39,7 +41,8 @@ fn post_read(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
 }
 
 /// ngx_http_v2_read_request_body, then the read event handler until the
-/// body is complete (NGX_OK) or failed (an HTTP status).
+/// body is complete (NGX_OK) or failed (an HTTP status). An unbuffered body
+/// returns NGX_AGAIN once set up.
 pub async fn read_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     let stream = match request_stream(r) {
         Some(s) => s,
@@ -86,6 +89,7 @@ pub async fn read_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     // rb->buf
     stream.body_cap.set(len);
     stream.body_buf.borrow_mut().clear();
+    stream.body_last.set(0);
 
     let preread = stream.preread.borrow_mut().take();
 
@@ -133,6 +137,11 @@ pub async fn read_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
         let _ = had_preread;
     }
 
+    if r.request_body_no_buffering.get() {
+        // the upstream reads the rest: ngx_http_read_unbuffered_request_body
+        return NGX_AGAIN;
+    }
+
     // ngx_http_v2_read_client_request_body_handler on each read event
     loop {
         let pending = std::mem::take(&mut *stream.body_pending.borrow_mut());
@@ -173,16 +182,16 @@ pub async fn read_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     }
 }
 
-/// The end of ngx_http_v2_process_request_body for a complete body:
-/// $request_body needs the in-memory copy, as the HTTP/1 path makes it.
-fn finish(r: &R, rb: &Rc<RefCell<RequestBody>>, rc: i64) -> i64 {
+/// A complete body (NGX_OK) is read as buffered: the caller gets all of
+/// it in rb->bufs (ngx_http_read_client_request_body at done).
+fn finish(r: &R, _rb: &Rc<RefCell<RequestBody>>, rc: i64) -> i64 {
     if rc != NGX_OK {
         return rc;
     }
 
     r.request_body_no_buffering.set(false);
 
-    crate::request_body::finish_body(r, rb)
+    NGX_OK
 }
 
 /// ngx_http_v2_process_request_body: copy `data` into rb->buf, passing the
@@ -203,7 +212,7 @@ async fn process(r: &R, stream: &Rc<H2Stream>, rb: &Rc<RefCell<RequestBody>>, da
 
     loop {
         loop {
-            if stream.body_buf.borrow().len() == cap && size > 0 {
+            if stream.body_last.get() == cap && size > 0 {
                 if r.request_body_no_buffering.get() {
                     // should never happen due to flow control
                     ngx_log_error!(NGX_LOG_ALERT, fc.log, None, "no space in http2 body buffer");
@@ -219,21 +228,20 @@ async fn process(r: &R, stream: &Rc<H2Stream>, rb: &Rc<RefCell<RequestBody>>, da
                     return rc;
                 }
 
-                stream.body_buf.borrow_mut().clear();
+                stream.body_last.set(0);
             }
 
             // copy body data to the buffer
-            let n = {
-                let mut buf = stream.body_buf.borrow_mut();
-                let n = (cap - buf.len()).min(size);
-                buf.extend_from_slice(&data[pos..pos + n]);
-                n
-            };
+            let n = (cap - stream.body_last.get()).min(size);
 
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 request body recv {}", n);
 
-            pos += n;
-            size -= n;
+            if n > 0 {
+                stream.body_buf.borrow_mut().extend_from_slice(&data[pos..pos + n]);
+                stream.body_last.set(stream.body_last.get() + n);
+                pos += n;
+                size -= n;
+            }
 
             if size == 0 && last {
                 rb.borrow_mut().rest = 0;
@@ -276,6 +284,84 @@ async fn process(r: &R, stream: &Rc<H2Stream>, rb: &Rc<RefCell<RequestBody>>, da
     }
 
     NGX_OK
+}
+
+/// ngx_http_v2_read_unbuffered_request_body: pass on the DATA received so
+/// far and, once the upstream has written out everything passed before (the
+/// caller sends rb->bufs before it calls again: rb->busy is what this call
+/// passed on), rewind rb->buf and open the stream window to its size.
+/// NGX_OK when the body is complete, NGX_AGAIN for more.
+pub async fn read_unbuffered_request_body(r: &R) -> i64 {
+    let stream = match request_stream(r) {
+        Some(s) => s,
+        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+    };
+    let rb = match r.request_body.borrow().clone() {
+        Some(rb) => rb,
+        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+    };
+    let fc = stream.fc.clone();
+
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 read unbuffered request body");
+
+    if fc.error.get() {
+        stream.skip_data.set(true);
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    let pending = std::mem::take(&mut *stream.body_pending.borrow_mut());
+
+    let rc = process(r, &stream, &rb, &pending, stream.in_closed.get(), true).await;
+
+    if rc != NGX_OK && rc != NGX_AGAIN {
+        stream.skip_data.set(true);
+        return rc;
+    }
+
+    if rc == NGX_OK {
+        return NGX_OK;
+    }
+
+    if rb.borrow().rest == 0 {
+        return NGX_AGAIN;
+    }
+
+    if !rb.borrow().bufs.is_empty() {
+        return NGX_AGAIN;
+    }
+
+    stream.body_last.set(0);
+
+    let h2c = stream.connection.clone();
+
+    let mut window = stream.body_cap.get();
+
+    let current = h2c.state.stream.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &stream));
+    if current {
+        window -= h2c.state.length.get();
+    }
+
+    let recv_window = stream.recv_window.get();
+
+    if window <= recv_window {
+        if window < recv_window {
+            ngx_log_error!(NGX_LOG_ALERT, fc.log, None, "http2 negative window update");
+            stream.skip_data.set(true);
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        return NGX_AGAIN;
+    }
+
+    // queued for the driver, which sends it (ngx_http_v2_send_output_queue)
+    if send_window_update(&h2c, stream.node.borrow().id.get(), window - recv_window).is_err() {
+        stream.skip_data.set(true);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    stream.recv_window.set(window);
+
+    NGX_AGAIN
 }
 
 /// ngx_http_v2_filter_request_body: pass rb->buf to the request body

@@ -212,8 +212,10 @@ pub struct RequestBody {
     pub filter_need_buffering: bool,
     pub last_sent: bool,
     pub last_saved: bool,
-    /// Raw in-memory body (for $request_body when fits in buffers).
-    pub in_memory: Vec<u8>,
+    /// rb->buf of an unbuffered HTTP/1 body as its size and fill level
+    /// (buf->last - buf->start); the data read is passed on at once.
+    pub buf_size: usize,
+    pub buf_last: usize,
 }
 
 /// Variable value cache entry (ngx_http_variable_value_t).

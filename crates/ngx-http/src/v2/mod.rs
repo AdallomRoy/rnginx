@@ -249,9 +249,12 @@ pub struct H2Stream {
     pub preread: RefCell<Option<Vec<u8>>>,
     /// DATA received while the request reads the body, not yet processed.
     pub body_pending: RefCell<Vec<u8>>,
-    /// rb->buf: the body buffer and its size.
+    /// rb->buf: the data not passed on yet (buf->pos..buf->last), the
+    /// buffer size, and its fill level since the last rewind
+    /// (buf->last - buf->start).
     pub body_buf: RefCell<Vec<u8>>,
     pub body_cap: Cell<usize>,
+    pub body_last: Cell<usize>,
 
     /// DATA frame structures allocated by this stream (counted in
     /// H2Connection.frames) and how many of them are free for reuse.

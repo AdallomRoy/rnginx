@@ -62,6 +62,37 @@ impl AsyncWrite for UpstreamSock {
         }
     }
 }
+impl UpstreamSock {
+    /// Wait until the upstream has sent data or closed. The readiness is
+    /// checked with a peek, so a stale one (a keepalive connection whose
+    /// last response ended without EAGAIN) is cleared instead of reported.
+    async fn wait_readable(&self) {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let (ready, peek) = match self {
+                UpstreamSock::Tcp(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
+                UpstreamSock::Unix(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
+            };
+            if ready.is_err() {
+                return;
+            }
+            match peek {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                _ => return,
+            }
+        }
+    }
+}
+
+fn peek_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<usize> {
+    let mut b = [0u8; 1];
+    let n = unsafe { libc::recv(fd, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::cell::RefCell;
 
@@ -93,6 +124,8 @@ pub struct NgxHttpProxyLocConf {
     pub pass_request_headers: Val<bool>,
     /// proxy_pass_request_body: forward client body to upstream (default on).
     pub pass_request_body: Val<bool>,
+    /// proxy_request_buffering (default on).
+    pub request_buffering: Val<bool>,
     /// proxy_set_body: overrides the request body sent upstream (complex value).
     pub set_body: Option<crate::script::ComplexValue>,
     /// proxy_set_header entries: (name, complex value). Empty value drops the
@@ -244,6 +277,7 @@ impl Default for NgxHttpProxyLocConf {
             intercept_errors: Val::unset(),
             pass_request_headers: Val::unset(),
             pass_request_body: Val::unset(),
+            request_buffering: Val::unset(),
             set_body: None,
             set_headers: Vec::new(),
             force_ranges: Val::unset(),
@@ -284,6 +318,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.intercept_errors.merge(&p.intercept_errors, false);
     c.pass_request_headers.merge(&p.pass_request_headers, true);
     c.pass_request_body.merge(&p.pass_request_body, true);
+    c.request_buffering.merge(&p.request_buffering, true);
     if c.set_body.is_none() {
         c.set_body = p.set_body.clone();
     }
@@ -455,13 +490,6 @@ fn proxy_buffering_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn A
     Ok(())
 }
 
-fn proxy_request_buffering_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("invalid number of arguments"));
-    }
-    Ok(())
-}
-
 fn proxy_bind_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
     let args = cf.args.clone();
@@ -626,18 +654,20 @@ async fn proxy_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let conf_borrowed = lcf.borrow();
 
-    // Read the client request body first (or discard if none) — nginx does this before
-    // opening the upstream connection so we can either forward it or drop it cleanly.
+    // ngx_http_proxy_handler: read the client request body before the
+    // upstream is set up; unbuffered, only what is there now, and the rest
+    // is sent on as it arrives (send_request_body).
+    if !conf_borrowed.request_buffering.get_or(true)
+        && conf_borrowed.set_body.is_none()
+        && conf_borrowed.pass_request_body.get_or(true)
+        && (!r.headers_in.borrow().chunked || *conf_borrowed.http_version == 1)
+    {
+        r.request_body_no_buffering.set(true);
+    }
     drop(conf_borrowed);
-    let has_body = r.headers_in.borrow().content_length_n > 0 || r.headers_in.borrow().chunked;
-    if has_body {
-        let rc = crate::request_body::read_client_request_body(&r).await;
-        if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
-            return rc;
-        }
-    } else {
-        let rc = crate::request_body::discard_request_body(&r).await;
-        if rc != NGX_OK { return rc; }
+    let rc = crate::request_body::read_client_request_body(&r).await;
+    if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+        return rc;
     }
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let conf_borrowed = lcf.borrow();
@@ -849,9 +879,19 @@ async fn proxy_handler(r: R) -> i64 {
         .map(|(n, _)| n.to_ascii_lowercase())
         .collect();
 
+    // An unbuffered body still being read goes as it arrives: what was read
+    // so far follows the header, with Content-Length, or chunked when the
+    // client's body is (ngx_http_proxy_create_request, internal_chunked).
+    let unbuffered = r.request_body_no_buffering.get();
+    let internal_chunked = unbuffered && r.headers_in.borrow().chunked && r.reading_body.get();
     // Collect request body (if any) into a Vec. proxy_set_body wins over the
     // client body when configured; otherwise honour proxy_pass_request_body.
-    let body_bytes: Vec<u8> = if let Some(cv) = set_body_cv {
+    let body_bytes: Vec<u8> = if unbuffered {
+        let bufs = take_request_body_bufs(&r);
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &bufs, internal_chunked);
+        out
+    } else if let Some(cv) = set_body_cv {
         crate::script::complex_value(&r, &cv).unwrap_or_default()
     } else if !pass_body_flag { Vec::new() } else {
         let rb = r.request_body.borrow();
@@ -880,7 +920,18 @@ async fn proxy_handler(r: R) -> i64 {
         }
         out
     };
-    let content_length_hdr = if !body_bytes.is_empty() {
+    // "Content-Length: $proxy_internal_body_length" and "Transfer-Encoding:
+    // $proxy_internal_chunked" are default headers: proxy_set_header of the
+    // same name replaces them (an empty value drops them).
+    let cl_overridden = overridden_names.iter().any(|n| n.as_slice() == b"content-length");
+    let te_overridden = overridden_names.iter().any(|n| n.as_slice() == b"transfer-encoding");
+    let content_length_hdr = if internal_chunked {
+        if te_overridden { String::new() } else { "Transfer-Encoding: chunked\r\n".to_string() }
+    } else if cl_overridden {
+        String::new()
+    } else if unbuffered {
+        format!("Content-Length: {}\r\n", r.headers_in.borrow().content_length_n)
+    } else if !body_bytes.is_empty() {
         format!("Content-Length: {}\r\n", body_bytes.len())
     } else if r.headers_in.borrow().content_length_n > 0 || r.headers_in.borrow().chunked {
         format!("Content-Length: 0\r\n")
@@ -1136,6 +1187,15 @@ async fn proxy_handler(r: R) -> i64 {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
         bytes_sent_to_upstream = wire.len() as i64;
+        if r.reading_body.get() {
+            match send_request_body(&r, upstream.as_mut().unwrap(), internal_chunked).await {
+                Ok(n) => bytes_sent_to_upstream += n,
+                Err(rc) => {
+                    upstream = None;
+                    return return_error(&r, rc).await;
+                }
+            }
+        }
 
         response = Vec::new();
         // Read headers first so header_time is separate from response_time.
@@ -1333,7 +1393,9 @@ async fn proxy_handler(r: R) -> i64 {
                 r.upstream_response_incomplete.set(true);
             }
         }
-        if want_keepalive && !upstream_wants_close && got_header && framing_complete {
+        // ngx_http_upstream_free_keepalive_peer: not if the request body
+        // was not sent in full (u->request_body_sent)
+        if want_keepalive && !upstream_wants_close && got_header && framing_complete && !r.reading_body.get() {
             if let Some(name) = &named_upstream {
                 if let Some(UpstreamSock::Tcp(old)) = upstream.take() {
                     crate::upstream_keepalive::pool_put(name, &addr, old);
@@ -1370,8 +1432,10 @@ async fn proxy_handler(r: R) -> i64 {
             }
             if next_upstream_mask & FT_ERROR != 0 && allow_by_idem {
                 if let Some(name) = &named_upstream {
+                    // an unbuffered body that was sent can't be sent again
                     let can_try = attempts < peer_limit
-                        && (next_upstream_tries == 0 || attempts < next_upstream_tries);
+                        && (next_upstream_tries == 0 || attempts < next_upstream_tries)
+                        && !r.request_body_no_buffering.get();
                     if can_try {
                         if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
                             host = h; port = p;
@@ -1448,7 +1512,8 @@ async fn proxy_handler(r: R) -> i64 {
             if allow_by_idem {
                 if let Some(name) = &named_upstream {
                     let can_try = attempts < peer_limit
-                        && (next_upstream_tries == 0 || attempts < next_upstream_tries);
+                        && (next_upstream_tries == 0 || attempts < next_upstream_tries)
+                        && !r.request_body_no_buffering.get();
                     if can_try {
                         if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
                             r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
@@ -2124,6 +2189,86 @@ async fn proxy_handler(r: R) -> i64 {
     NGX_OK
 }
 
+/// The request body buffers read so far (rb->bufs), taken to be sent.
+fn take_request_body_bufs(r: &R) -> ngx_core::buf::Chain {
+    match r.request_body.borrow().as_ref() {
+        Some(rb) => std::mem::take(&mut rb.borrow_mut().bufs),
+        None => ngx_core::buf::Chain::new(),
+    }
+}
+
+/// The data of unbuffered request body buffers as sent to the upstream:
+/// as is, or, when chunked, ngx_http_proxy_body_output_filter: one chunk
+/// for all the buffers ("%xO" CRLF ... CRLF), and the last chunk after the
+/// last buffer.
+fn body_output_filter(out: &mut Vec<u8>, bufs: &ngx_core::buf::Chain, chunked: bool) {
+    let size: usize = bufs.iter().map(|b| b.buf_size() as usize).sum();
+    if chunked && size > 0 {
+        out.extend_from_slice(format!("{:x}\r\n", size).as_bytes());
+    }
+    for b in bufs.iter() {
+        if let ngx_core::buf::BufData::Memory(m) = &b.data {
+            let end = b.last.min(m.len());
+            if b.pos < end {
+                out.extend_from_slice(&m[b.pos..end]);
+            }
+        }
+    }
+    if !chunked {
+        return;
+    }
+    if bufs.back().is_some_and(|b| b.last_buf) {
+        out.extend_from_slice(if size == 0 { b"0\r\n\r\n" } else { b"\r\n0\r\n\r\n" });
+    } else if size > 0 {
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
+/// ngx_http_upstream_send_request_body for an unbuffered body, once the
+/// header and the body read so far are sent: read the rest of the body as
+/// the client sends it (ngx_http_read_unbuffered_request_body) and send it
+/// on, until it is complete. Returns the bytes sent, or the status to
+/// finalize with: a client body error, 408 when the client times out
+/// (ngx_http_upstream_read_request_handler), 502 when the upstream write
+/// fails. Returns early if the upstream responds (or closes) first.
+async fn send_request_body(r: &R, upstream: &mut UpstreamSock, chunked: bool) -> Result<i64, i64> {
+    let timeout = *r.clcf().borrow().client_body_timeout;
+    let mut sent = 0i64;
+    loop {
+        let rc = crate::request_body::read_unbuffered_request_body(r).await;
+        if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+            return Err(rc);
+        }
+        let bufs = take_request_body_bufs(r);
+        if !bufs.is_empty() {
+            let mut out = Vec::new();
+            body_output_filter(&mut out, &bufs, chunked);
+            if !out.is_empty() {
+                if upstream.write_all(&out).await.is_err() {
+                    return Err(NGX_HTTP_BAD_GATEWAY as i64);
+                }
+                sent += out.len() as i64;
+            }
+            if !r.reading_body.get() {
+                return Ok(sent);
+            }
+            continue;
+        }
+        if !r.reading_body.get() {
+            return Ok(sent);
+        }
+        tokio::select! {
+            res = tokio::time::timeout(std::time::Duration::from_millis(timeout), crate::request_body::wait_request_body(r)) => {
+                if res.is_err() {
+                    r.connection.timedout.set(true);
+                    return Err(crate::NGX_HTTP_REQUEST_TIME_OUT);
+                }
+            }
+            _ = upstream.wait_readable() => return Ok(sent),
+        }
+    }
+}
+
 async fn return_error(r: &R, status: i64) -> i64 {
     // Populate a synthetic upstream state so $upstream_addr / $upstream_status
     // in add_header 'always' show the failed peer(s) — otherwise the client's
@@ -2373,7 +2518,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_pass_handler),
         cmd_fn!("proxy_redirect", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_redirect_handler),
         cmd_fn!("proxy_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_buffering_handler),
-        cmd_fn!("proxy_request_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_request_buffering_handler),
+        ngx_core::cmd!("proxy_request_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, request_buffering, set_flag),
         cmd_fn!("proxy_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_bind_handler),
         cmd_fn!("proxy_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_connect_timeout_handler),
         cmd_fn!("proxy_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_send_timeout_handler),

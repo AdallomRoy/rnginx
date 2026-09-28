@@ -348,6 +348,7 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         body_pending: RefCell::new(Vec::new()),
         body_buf: RefCell::new(Vec::new()),
         body_cap: Cell::new(0),
+        body_last: Cell::new(0),
         frames: Cell::new(0),
         free_frames: Cell::new(0),
         cookies: RefCell::new(Vec::new()),

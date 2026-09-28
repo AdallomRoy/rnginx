@@ -45,45 +45,55 @@ impl SslConnection {
         b.as_ref().expect("SSL not initialized").as_ptr()
     }
 
-    pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
-        c.drive_io(|| {
-            let rc = unsafe {
-                openssl_sys::SSL_read(self.ssl_ptr(), buf.as_mut_ptr() as *mut c_void, buf.len() as i32)
-            };
-            if rc > 0 {
-                return IoStep::Done(Ok(rc as usize));
+    /// One SSL_read attempt (the body of ngx_ssl_recv).
+    fn read_step(&self, c: &Connection, buf: &mut [u8]) -> IoStep<io::Result<usize>> {
+        let rc = unsafe {
+            openssl_sys::SSL_read(self.ssl_ptr(), buf.as_mut_ptr() as *mut c_void, buf.len() as i32)
+        };
+        if rc > 0 {
+            return IoStep::Done(Ok(rc as usize));
+        }
+        let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
+        match err {
+            openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+            openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+            openssl_sys::SSL_ERROR_ZERO_RETURN => {
+                c.read_eof.set(true);
+                IoStep::Done(Ok(0))
             }
-            let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
-            match err {
-                openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
-                openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
-                openssl_sys::SSL_ERROR_ZERO_RETURN => {
+            openssl_sys::SSL_ERROR_SYSCALL => {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(0) {
                     c.read_eof.set(true);
-                    IoStep::Done(Ok(0))
+                    return IoStep::Done(Ok(0));
                 }
-                openssl_sys::SSL_ERROR_SYSCALL => {
-                    let e = io::Error::last_os_error();
-                    if e.raw_os_error() == Some(0) {
-                        c.read_eof.set(true);
-                        return IoStep::Done(Ok(0));
-                    }
-                    IoStep::Done(Err(e))
-                }
-                _ => {
-                    let msg = ssl_error_string();
-                    // OpenSSL 3.x reports "unexpected eof while reading"
-                    // when the peer closes without close_notify. HTTP/2
-                    // clients (curl etc.) do this routinely; treat as
-                    // clean EOF so callers see Ok(0).
-                    if msg.contains("unexpected eof") {
-                        c.read_eof.set(true);
-                        return IoStep::Done(Ok(0));
-                    }
-                    IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg))))
-                }
+                IoStep::Done(Err(e))
             }
-        })
-        .await?
+            _ => {
+                let msg = ssl_error_string();
+                // OpenSSL 3.x reports "unexpected eof while reading"
+                // when the peer closes without close_notify. HTTP/2
+                // clients (curl etc.) do this routinely; treat as
+                // clean EOF so callers see Ok(0).
+                if msg.contains("unexpected eof") {
+                    c.read_eof.set(true);
+                    return IoStep::Done(Ok(0));
+                }
+                IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg))))
+            }
+        }
+    }
+
+    pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
+        c.drive_io(|| self.read_step(c, buf)).await?
+    }
+
+    /// A single SSL_read attempt; WANT_READ / WANT_WRITE map to WouldBlock.
+    pub fn try_recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
+        match self.read_step(c, buf) {
+            IoStep::Done(r) => r,
+            IoStep::WantRead | IoStep::WantWrite => Err(io::ErrorKind::WouldBlock.into()),
+        }
     }
 
     pub async fn send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {

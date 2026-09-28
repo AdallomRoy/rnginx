@@ -655,21 +655,26 @@ fn var_request_completion(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_request_body(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let rb = r.request_body.borrow().clone();
-    match rb {
+    let rb = match rb {
+        Some(rb) => rb,
         None => {
             v.not_found = true;
-            NGX_OK
+            return NGX_OK;
         }
-        Some(rb) => {
-            let b = rb.borrow();
-            if b.temp_file.is_some() {
-                v.not_found = true;
-                return NGX_OK;
-            }
-            set_str(v, &b.in_memory);
-            NGX_OK
+    };
+    let b = rb.borrow();
+    if b.bufs.is_empty() || b.temp_file.is_some() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    let mut data = Vec::new();
+    for buf in b.bufs.iter() {
+        if let ngx_core::buf::BufData::Memory(m) = &buf.data {
+            data.extend_from_slice(&m[buf.pos..buf.last]);
         }
     }
+    set_str(v, &data);
+    NGX_OK
 }
 
 fn var_request_body_file(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
