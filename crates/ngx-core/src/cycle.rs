@@ -624,6 +624,27 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
         }
     }
 
+    // SO_REUSEPORT fanout: duplicate each reuseport listening (worker==0) once
+    // per additional worker so each worker gets its own kernel socket. Ported
+    // from ngx_clone_listening; must happen before inheritance so both fresh
+    // startup and reload see the same set of listening entries in both cycles.
+    {
+        let n = *crate::core_module::core_conf(&cycle).borrow().worker_processes;
+        if n > 1 {
+            let originals: Vec<Rc<Listening>> = cycle
+                .listening
+                .iter()
+                .filter(|ls| ls.reuseport.get() && ls.worker.get() == 0)
+                .cloned()
+                .collect();
+            for ls in &originals {
+                for w in 1..(n as usize) {
+                    cycle.listening.push(Rc::new(ls.clone_for_worker(w)));
+                }
+            }
+        }
+    }
+
     // listening sockets: inherit fds from old cycle where addresses match
     if !old.listening.is_empty() {
         for ls in old.listening.iter() {

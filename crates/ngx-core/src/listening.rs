@@ -101,4 +101,50 @@ impl Listening {
     pub fn is_unix(&self) -> bool {
         matches!(self.sockaddr, SockAddr::Unix(_))
     }
+
+    /// Create a per-worker copy of this listening for SO_REUSEPORT fanout.
+    /// Ported from ngx_clone_listening: same address + options, fresh fd/state,
+    /// bound to the given `worker` index.
+    pub fn clone_for_worker(&self, worker: usize) -> Listening {
+        Listening {
+            fd: Cell::new(-1),
+            sockaddr: self.sockaddr.clone(),
+            addr_text: self.addr_text.clone(),
+            ty: self.ty,
+            backlog: Cell::new(self.backlog.get()),
+            rcvbuf: Cell::new(self.rcvbuf.get()),
+            sndbuf: Cell::new(self.sndbuf.get()),
+            keepidle: Cell::new(self.keepidle.get()),
+            keepintvl: Cell::new(self.keepintvl.get()),
+            keepcnt: Cell::new(self.keepcnt.get()),
+            handler: RefCell::new(self.handler.borrow().clone()),
+            servers: RefCell::new(self.servers.borrow().clone()),
+            log: RefCell::new(self.log.borrow().clone()),
+            pool_size: Cell::new(self.pool_size.get()),
+            previous: RefCell::new(None),
+            worker: Cell::new(worker),
+            open: Cell::new(false),
+            remain: Cell::new(false),
+            ignore: Cell::new(false),
+            bound: Cell::new(false),
+            inherited: Cell::new(false),
+            nonblocking_accept: Cell::new(self.nonblocking_accept.get()),
+            listen: Cell::new(false),
+            nonblocking: Cell::new(self.nonblocking.get()),
+            shared: Cell::new(self.shared.get()),
+            addr_ntop: Cell::new(self.addr_ntop.get()),
+            wildcard: Cell::new(self.wildcard.get()),
+            ipv6only: Cell::new(self.ipv6only.get()),
+            reuseport: Cell::new(true),
+            add_reuseport: Cell::new(false),
+            keepalive: Cell::new(self.keepalive.get()),
+            quic: Cell::new(self.quic.get()),
+            deferred_accept: Cell::new(self.deferred_accept.get()),
+            delete_deferred: Cell::new(false),
+            add_deferred: Cell::new(false),
+            fastopen: Cell::new(self.fastopen.get()),
+            protocol: RefCell::new(*self.protocol.borrow()),
+            change_protocol: Cell::new(false),
+        }
+    }
 }
