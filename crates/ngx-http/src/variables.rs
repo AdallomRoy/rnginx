@@ -1030,7 +1030,7 @@ fn var_proxy_protocol_addr(r: &R, v: &mut VariableValue, d: usize) -> i64 {
             2 => set_str(v, p.src_port.to_string().as_bytes()),
             _ => set_str(v, p.dst_port.to_string().as_bytes()),
         },
-        None => set_str(v, b""),
+        None => v.not_found = true,
     }
     NGX_OK
 }

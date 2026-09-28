@@ -11,14 +11,16 @@ pub const NGX_PROXY_PROTOCOL_MAX_HEADER: usize = 4096;
 pub const NGX_PROXY_PROTOCOL_V2_MAX_HEADER: usize = 52;
 
 // V2 constants
+#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_CMD_LOCAL: u8 = 0;
 const NGX_PROXY_PROTOCOL_CMD_PROXY: u8 = 1;
 
+#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_AF_UNSPEC: u8 = 0;
 const NGX_PROXY_PROTOCOL_AF_INET: u8 = 1;
 const NGX_PROXY_PROTOCOL_AF_INET6: u8 = 2;
-const NGX_PROXY_PROTOCOL_AF_UNIX: u8 = 3;
 
+#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_TYPE_UNSPEC: u8 = 0;
 const NGX_PROXY_PROTOCOL_TYPE_STREAM: u8 = 1;
 const NGX_PROXY_PROTOCOL_TYPE_DGRAM: u8 = 2;
@@ -47,8 +49,11 @@ pub struct ProxyProtocol {
 }
 
 /// Read and parse a PROXY protocol header from a buffer.
-/// Returns (ProxyProtocol, bytes_consumed) on success, Err(()) on error.
-pub fn read(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
+/// Returns (header, bytes_consumed) on success, Err(()) on error. The header
+/// is None when it carries no addresses (v1 UNKNOWN; v2 commands other than
+/// PROXY, transports other than STREAM, families other than INET/INET6),
+/// where C leaves c->proxy_protocol NULL.
+pub fn read(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> {
     let len = buf.len();
 
     // Check for v2 signature (12 bytes minimum): \r\n\r\n\0\r\nQUIT\n
@@ -70,7 +75,7 @@ pub fn read(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
 }
 
 /// Read v1 PROXY protocol (text format).
-fn read_v1(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
+fn read_v1(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> {
     let mut p = 6; // Skip "PROXY "
     let end = buf.len();
 
@@ -81,10 +86,7 @@ fn read_v1(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
         // Skip to CRLF
         while p + 1 < end {
             if buf[p] == b'\r' && buf[p + 1] == b'\n' {
-                return Ok((
-                    ProxyProtocol { src_addr: vec![], dst_addr: vec![], src_port: 0, dst_port: 0, tlvs: vec![] },
-                    p + 2,
-                ));
+                return Ok((None, p + 2));
             }
             p += 1;
         }
@@ -130,10 +132,7 @@ fn read_v1(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
                    "PROXY protocol src: {} {}, dst: {} {}",
                    B(&src_addr), src_port, B(&dst_addr), dst_port);
 
-    Ok((
-        ProxyProtocol { src_addr, dst_addr, src_port, dst_port, tlvs: vec![] },
-        p,
-    ))
+    Ok((Some(ProxyProtocol { src_addr, dst_addr, src_port, dst_port, tlvs: vec![] }), p))
 }
 
 /// Read a v1 address field (ends with space)
@@ -182,7 +181,7 @@ fn read_port(buf: &[u8], start: usize, sep: u8) -> Result<(u16, usize), ()> {
 }
 
 /// Read v2 PROXY protocol (binary format).
-fn read_v2(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
+fn read_v2(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> {
     let len = buf.len();
 
     // V2 header minimum: 16 bytes (sig 12 + version/command 1 + family/transport 1 + length 2)
@@ -210,75 +209,47 @@ fn read_v2(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
     let data_start = 16;
     let command = buf[12] & 0x0f;
 
-    // Only PROXY command is fully supported
-    if command != NGX_PROXY_PROTOCOL_CMD_PROXY && command != NGX_PROXY_PROTOCOL_CMD_LOCAL {
+    // only PROXY is supported
+    if command != NGX_PROXY_PROTOCOL_CMD_PROXY {
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, log,
                        "PROXY protocol v2 unsupported command {}", command);
-        return Ok((
-            ProxyProtocol { src_addr: vec![], dst_addr: vec![], src_port: 0, dst_port: 0, tlvs: vec![] },
-            end,
-        ));
+        return Ok((None, end));
     }
 
     let transport = buf[13] & 0x0f;
-    if transport != NGX_PROXY_PROTOCOL_TYPE_STREAM && transport != NGX_PROXY_PROTOCOL_TYPE_UNSPEC {
+    // only STREAM is supported
+    if transport != NGX_PROXY_PROTOCOL_TYPE_STREAM {
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, log,
                        "PROXY protocol v2 unsupported transport {}", transport);
-        return Ok((
-            ProxyProtocol { src_addr: vec![], dst_addr: vec![], src_port: 0, dst_port: 0, tlvs: vec![] },
-            end,
-        ));
+        return Ok((None, end));
     }
 
     let family = buf[13] >> 4;
     let mut addr_start = data_start;
-    let mut src_addr = Vec::new();
-    let mut dst_addr = Vec::new();
-    let mut src_port = 0u16;
-    let mut dst_port = 0u16;
 
-    match family {
+    let (src_addr, dst_addr, src_port, dst_port) = match family {
         NGX_PROXY_PROTOCOL_AF_INET => {
             if end - addr_start < 12 {
                 return Err(());
             }
             let data = &buf[addr_start..addr_start + 12];
-            src_addr = format_ipv4(&data[0..4]);
-            dst_addr = format_ipv4(&data[4..8]);
-            src_port = parse_uint16(&data[8..10]);
-            dst_port = parse_uint16(&data[10..12]);
             addr_start += 12;
+            (format_ipv4(&data[0..4]), format_ipv4(&data[4..8]), parse_uint16(&data[8..10]), parse_uint16(&data[10..12]))
         }
         NGX_PROXY_PROTOCOL_AF_INET6 => {
             if end - addr_start < 36 {
                 return Err(());
             }
             let data = &buf[addr_start..addr_start + 36];
-            src_addr = format_ipv6(&data[0..16]);
-            dst_addr = format_ipv6(&data[16..32]);
-            src_port = parse_uint16(&data[32..34]);
-            dst_port = parse_uint16(&data[34..36]);
             addr_start += 36;
-        }
-        NGX_PROXY_PROTOCOL_AF_UNIX => {
-            if end - addr_start < 216 {
-                return Err(());
-            }
-            // Unix socket addresses (108 bytes each)
-            addr_start += 216;
-        }
-        NGX_PROXY_PROTOCOL_AF_UNSPEC => {
-            // No address data
+            (format_ipv6(&data[0..16]), format_ipv6(&data[16..32]), parse_uint16(&data[32..34]), parse_uint16(&data[34..36]))
         }
         _ => {
             ngx_log_debug!(NGX_LOG_DEBUG_CORE, log,
                            "PROXY protocol v2 unsupported address family {}", family);
-            return Ok((
-                ProxyProtocol { src_addr: vec![], dst_addr: vec![], src_port: 0, dst_port: 0, tlvs: vec![] },
-                end,
-            ));
+            return Ok((None, end));
         }
-    }
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_CORE, log,
                    "PROXY protocol v2 src: {} {}, dst: {} {}",
@@ -291,10 +262,7 @@ fn read_v2(log: &Log, buf: &[u8]) -> Result<(ProxyProtocol, usize), ()> {
         vec![]
     };
 
-    Ok((
-        ProxyProtocol { src_addr, dst_addr, src_port, dst_port, tlvs },
-        end,
-    ))
+    Ok((Some(ProxyProtocol { src_addr, dst_addr, src_port, dst_port, tlvs }), end))
 }
 
 /// Format IPv4 address from 4 bytes
@@ -452,6 +420,7 @@ mod tests {
         let log = Log::stderr(NGX_LOG_ERR);
         let header = b"PROXY TCP4 192.0.2.1 198.51.100.2 54321 443\r\n";
         let (pp, consumed) = read(&log, header).unwrap();
+        let pp = pp.unwrap();
         assert_eq!(pp.src_addr, b"192.0.2.1");
         assert_eq!(pp.dst_addr, b"198.51.100.2");
         assert_eq!(pp.src_port, 54321);
@@ -464,6 +433,7 @@ mod tests {
         let log = Log::stderr(NGX_LOG_ERR);
         let header = b"PROXY TCP6 2001:db8::1 2001:db8::2 54321 443\r\n";
         let (pp, consumed) = read(&log, header).unwrap();
+        let pp = pp.unwrap();
         assert_eq!(pp.src_addr, b"2001:db8::1");
         assert_eq!(pp.dst_addr, b"2001:db8::2");
         assert_eq!(pp.src_port, 54321);
@@ -476,8 +446,7 @@ mod tests {
         let log = Log::stderr(NGX_LOG_ERR);
         let header = b"PROXY UNKNOWN\r\n";
         let (pp, consumed) = read(&log, header).unwrap();
-        assert_eq!(pp.src_addr, b"");
-        assert_eq!(pp.dst_addr, b"");
+        assert!(pp.is_none());
         assert_eq!(consumed, header.len());
     }
 
@@ -510,6 +479,7 @@ mod tests {
         header[26..28].copy_from_slice(&443u16.to_be_bytes());
 
         let (pp, consumed) = read(&log, &header).unwrap();
+        let pp = pp.unwrap();
         assert_eq!(pp.src_addr, b"192.0.2.1");
         assert_eq!(pp.dst_addr, b"198.51.100.2");
         assert_eq!(pp.src_port, 54321);

@@ -214,7 +214,9 @@ async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<(),
             match ngx_core::proxy_protocol::read(&c.log, &data) {
                 Err(()) => return Err(()),
                 Ok((pp, consumed)) => {
-                    *c.proxy_protocol.borrow_mut() = Some(Rc::new(pp));
+                    if let Some(pp) = pp {
+                        *c.proxy_protocol.borrow_mut() = Some(Rc::new(pp));
+                    }
                     let mut b = hc.buffer.borrow_mut();
                     b.pos += consumed;
                     if b.pos == b.last {
