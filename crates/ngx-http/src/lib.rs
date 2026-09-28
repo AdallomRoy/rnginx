@@ -61,6 +61,7 @@ pub mod upstream_keepalive;
 pub mod upstream_keepalive_pool;
 pub mod upstream_round_robin;
 pub mod upstream_ssl;
+pub mod fastcgi;
 pub mod event_pipe;
 pub mod ssl_module;
 pub mod gzip_filter;
@@ -591,7 +592,7 @@ pub fn modules() -> Vec<ModuleDef> {
         rewrite::rewrite_module(),
         ssl_module::ssl_module(),
         proxy::proxy_module(),
-        stubs::fastcgi_module(),
+        fastcgi::fastcgi_module(),
         stubs::uwsgi_module(),
         stubs::scgi_module(),
         stubs::grpc_module(),

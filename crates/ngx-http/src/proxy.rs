@@ -1326,7 +1326,8 @@ async fn proxy_handler(r: R) -> i64 {
         }
         bytes_sent_to_upstream = wire.len() as i64;
         if r.reading_body.get() {
-            match send_request_body(&r, upstream.as_mut().unwrap(), internal_chunked).await {
+            let output = |out: &mut Vec<u8>, bufs: &ngx_core::buf::Chain| body_output_filter(out, bufs, internal_chunked);
+            match send_request_body(&r, upstream.as_mut().unwrap(), &output).await {
                 Ok(n) => bytes_sent_to_upstream += n,
                 Err(rc) => {
                     upstream = None;
@@ -2245,11 +2246,11 @@ fn body_output_filter(out: &mut Vec<u8>, bufs: &ngx_core::buf::Chain, chunked: b
 /// ngx_http_upstream_send_request_body for an unbuffered body, once the
 /// header and the body read so far are sent: read the rest of the body as
 /// the client sends it (ngx_http_read_unbuffered_request_body) and send it
-/// on, until it is complete. Returns the bytes sent, or the status to
+/// on, framed by the module's `output` filter, until it is complete. Returns the bytes sent, or the status to
 /// finalize with: a client body error, 408 when the client times out
 /// (ngx_http_upstream_read_request_handler), 502 when the upstream write
 /// fails. Returns early if the upstream responds (or closes) first.
-async fn send_request_body(r: &R, upstream: &mut UpstreamSock, chunked: bool) -> Result<i64, i64> {
+pub(crate) async fn send_request_body(r: &R, upstream: &mut UpstreamSock, output: &dyn Fn(&mut Vec<u8>, &ngx_core::buf::Chain)) -> Result<i64, i64> {
     let timeout = *r.clcf().borrow().client_body_timeout;
     let mut sent = 0i64;
     loop {
@@ -2260,7 +2261,7 @@ async fn send_request_body(r: &R, upstream: &mut UpstreamSock, chunked: bool) ->
         let bufs = take_request_body_bufs(r);
         if !bufs.is_empty() {
             let mut out = Vec::new();
-            body_output_filter(&mut out, &bufs, chunked);
+            output(&mut out, &bufs);
             if !out.is_empty() {
                 if upstream.write_all(&out).await.is_err() {
                     return Err(NGX_HTTP_BAD_GATEWAY as i64);
@@ -3000,7 +3001,7 @@ fn parse_bind_addr(s: &str) -> Option<std::net::SocketAddr> {
 /// (from `proxy_bind 127.0.0.1:$remote_port` style) will be used verbatim,
 /// with SO_REUSEADDR to allow rebinding TIME_WAIT sockets.
 /// How connecting to the upstream failed (ngx_http_upstream_next).
-enum ConnectError {
+pub(crate) enum ConnectError {
     /// NGX_HTTP_UPSTREAM_FT_ERROR: 502, unless another upstream is tried.
     Error,
     /// NGX_HTTP_UPSTREAM_FT_TIMEOUT: 504, unless another upstream is tried.
@@ -3010,7 +3011,7 @@ enum ConnectError {
 }
 
 /// The TLS side of an https upstream.
-struct SslSetup {
+pub(crate) struct SslSetup {
     ctx: openssl::ssl::SslContext,
     session_reuse: bool,
     name: Option<(Vec<u8>, bool)>,
@@ -3020,7 +3021,7 @@ struct SslSetup {
 /// Connect to the upstream and, for https, run the TLS handshake
 /// (ngx_http_upstream_ssl_init_connection), both within
 /// proxy_connect_timeout.
-async fn connect_upstream(
+pub(crate) async fn connect_upstream(
     r: &R,
     addr: &str,
     bind: Option<std::net::SocketAddr>,
