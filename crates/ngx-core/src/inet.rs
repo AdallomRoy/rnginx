@@ -201,6 +201,12 @@ pub fn inet_addr(text: &[u8]) -> Option<Ipv4Addr> {
     }
     if n == 3 {
         addr = (addr << 8) + octet;
+
+        // INADDR_NONE: "255.255.255.255" is an error for the callers
+        if addr == 0xffffffff {
+            return None;
+        }
+
         return Some(Ipv4Addr::from(addr));
     }
     None
@@ -716,6 +722,8 @@ mod tests {
         assert_eq!(inet_addr(b"127.0.0.1"), Some(Ipv4Addr::new(127, 0, 0, 1)));
         assert_eq!(inet_addr(b"256.0.0.1"), None);
         assert_eq!(inet_addr(b"1.2.3"), None);
+        assert_eq!(inet_addr(b"255.255.255.255"), None);
+        assert_eq!(inet_addr(b"255.255.255.254"), Some(Ipv4Addr::new(255, 255, 255, 254)));
         assert!(matches!(ptocidr(b"10.0.0.0/8"), CidrParse::Ok(Cidr::V4 { addr: 0x0a000000, mask: 0xff000000 })));
         assert!(matches!(ptocidr(b"10.0.0.1/8"), CidrParse::Done(_)));
         assert!(matches!(ptocidr(b"10.0.0.1/33"), CidrParse::Error));

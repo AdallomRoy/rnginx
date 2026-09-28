@@ -551,16 +551,14 @@ fn geo_range(cf: &mut Conf, ctx: &mut GeoConfCtx, value: &[Vec<u8>]) -> ConfResu
         None => return Err(invalid(cf)),
     };
 
-    // ngx_inet_addr() returns INADDR_NONE for "255.255.255.255"
-
     let start = match inet_addr(&net[..p]).map(u32::from) {
-        Some(a) if a != INADDR_NONE => a,
-        _ => return Err(invalid(cf)),
+        Some(a) => a,
+        None => return Err(invalid(cf)),
     };
 
     let end = match inet_addr(&net[p + 1..]).map(u32::from) {
-        Some(a) if a != INADDR_NONE => a,
-        _ => return Err(invalid(cf)),
+        Some(a) => a,
+        None => return Err(invalid(cf)),
     };
 
     if start > end {
@@ -898,12 +896,7 @@ fn geo_cidr_value(cf: &mut Conf, net: &[u8]) -> Result<Cidr, ConfError> {
         return Ok(Cidr::V4 { addr: 0xffffffff, mask: 0xffffffff });
     }
 
-    // ngx_inet_addr() in ngx_ptocidr() returns INADDR_NONE for
-    // "255.255.255.255", which is not an IPv6 address either
-
-    let addr_len = net.iter().position(|&c| c == b'/').unwrap_or(net.len());
-
-    let rc = if inet_addr(&net[..addr_len]).map(u32::from) == Some(INADDR_NONE) { CidrParse::Error } else { ptocidr(net) };
+    let rc = ptocidr(net);
 
     match rc {
         CidrParse::Error => Err(cf.emerg(format_args!("invalid network \"{}\"", B(net)))),
