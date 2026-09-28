@@ -23,7 +23,6 @@ pub mod variables;
 pub mod script;
 pub mod header_filter;
 pub mod write_filter;
-pub mod http2;
 pub mod huff_decode;
 pub mod huff_encode;
 pub mod v2;

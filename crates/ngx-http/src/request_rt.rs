@@ -96,17 +96,6 @@ async fn connection_task(c: Rc<Connection>) {
             close_connection(&c);
             return;
         }
-        // HTTP/2 via ALPN: hand off to the h2 dispatcher and return.
-        // We advertise h2 in ALPN for every ssl listen, so any client
-        // that negotiated it wants h2 — dispatch regardless of the
-        // srv-level `http2 on/off` directive.
-        if let Some(alpn) = c.ssl.borrow().clone().and_then(|s| s.alpn_selected()) {
-            if alpn == b"h2" {
-                crate::http2::h2_run(c.clone(), hc.clone()).await;
-                close_connection(&c);
-                return;
-            }
-        }
     }
     if addr_conf.proxy_protocol {
         hc.proxy_protocol.set(true);

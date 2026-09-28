@@ -187,12 +187,10 @@ pub struct Connection {
     pub write_ready: Cell<bool>,
     pub read_eof: Cell<bool>,
     pub read_pending_eof: Cell<bool>,
-    /// When set, all send/writev/sendfile calls append into this buffer
-    /// instead of writing to the socket. Used by the HTTP/2 dispatcher
-    /// to capture the pipeline's HTTP/1 wire output, re-parse it, and
-    /// emit it as h2 frames. `sendfile` is materialized (read from disk)
-    /// so the h2 side sees a plain byte stream.
-    pub send_capture: RefCell<Option<Vec<u8>>>,
+    /// A per-stream copy of an HTTP/2 connection (C's fake connection, see
+    /// Connection::new_fake). It never owns the socket or the SSL object,
+    /// is not counted as a connection, and refuses socket I/O.
+    pub fake: bool,
 }
 
 impl Connection {
@@ -251,7 +249,7 @@ impl Connection {
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
-            send_capture: RefCell::new(None),
+            fake: false,
         });
         ACTIVE.with(|a| a.set(a.get() + 1));
         CONNECTIONS.with(|m| m.borrow_mut().insert(number, Rc::downgrade(&c)));
@@ -265,6 +263,67 @@ impl Connection {
             *c.local_sockaddr.borrow_mut() = Some(ls.sockaddr.clone());
         }
         Some(c)
+    }
+
+    /// The per-stream "fake" connection of ngx_http_v2_create_stream: a copy
+    /// of the HTTP/2 connection (addresses, SSL state, PROXY header, log
+    /// chain and number) with its own request-level state (sent, error,
+    /// timedout, requests, ...). Output goes through the HTTP/2 layer; socket
+    /// I/O on it fails with EBADF, and dropping it never touches the real
+    /// socket, the SSL object or the connection counters.
+    pub fn new_fake(c: &Rc<Connection>) -> Rc<Connection> {
+        let log = c.log.fork();
+        log.set_connection(c.number);
+        Rc::new(Connection {
+            fd: Cell::new(-1),
+            afd: RefCell::new(None),
+            number: c.number,
+            log,
+            listening: c.listening.clone(),
+            ty: c.ty,
+            sockaddr: RefCell::new(c.sockaddr.borrow().clone()),
+            addr_text: RefCell::new(c.addr_text.borrow().clone()),
+            original_sockaddr: RefCell::new(c.original_sockaddr.borrow().clone()),
+            original_addr_text: RefCell::new(c.original_addr_text.borrow().clone()),
+            local_sockaddr: RefCell::new(c.local_sockaddr()),
+            proxy_protocol: RefCell::new(c.proxy_protocol.borrow().clone()),
+            ssl: RefCell::new(c.ssl.borrow().clone()),
+            buffer: RefCell::new(Vec::new()),
+            sent: Cell::new(0),
+            requests: Cell::new(c.requests.get()),
+            start_time: Cell::new(c.start_time.get()),
+            start_msec: Cell::new(c.start_msec.get()),
+            timedout: Cell::new(false),
+            error: Cell::new(false),
+            destroyed: Cell::new(false),
+            idle: Cell::new(false),
+            close: Cell::new(false),
+            shared: Cell::new(true),
+            tcp_nodelay: Cell::new(TcpNodelay::Disabled),
+            tcp_nopush: Cell::new(c.tcp_nopush.get()),
+            need_last_buf: Cell::new(false),
+            need_flush_buf: Cell::new(false),
+            sendfile: Cell::new(c.sendfile.get()),
+            udp: Cell::new(false),
+            close_notify: tokio::sync::Notify::new(),
+            data: RefCell::new(c.data.borrow().clone()),
+            reusable: Cell::new(false),
+            pipeline: Cell::new(false),
+            read_delayed: Cell::new(false),
+            write_delayed: Cell::new(false),
+            unexpected_eof: Cell::new(false),
+            write_ready: Cell::new(false),
+            read_eof: Cell::new(false),
+            read_pending_eof: Cell::new(false),
+            fake: true,
+        })
+    }
+
+    fn fake_io_error(&self) -> io::Result<()> {
+        if self.fake {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Ok(())
     }
 
     fn afd(&self) -> io::Result<Rc<AsyncFd<Fd>>> {
@@ -346,6 +405,7 @@ impl Connection {
 
     /// ngx_unix_recv equivalent: read some bytes, awaiting readiness. Ok(0) is EOF.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.fake_io_error()?;
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.recv(self, buf).await;
         }
@@ -374,6 +434,7 @@ impl Connection {
 
     /// Peek without consuming.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.fake_io_error()?;
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
@@ -393,13 +454,7 @@ impl Connection {
 
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        // HTTP/2 capture path: swallow bytes into per-connection buffer.
-        // See `send_capture` field docs.
-        if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
-            cap.extend_from_slice(buf);
-            self.sent.set(self.sent.get() + buf.len() as u64);
-            return Ok(buf.len());
-        }
+        self.fake_io_error()?;
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.send(self, buf).await;
         }
@@ -426,16 +481,7 @@ impl Connection {
 
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
-        // HTTP/2 capture path.
-        if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
-            let mut n = 0usize;
-            for s in iov {
-                cap.extend_from_slice(s);
-                n += s.len();
-            }
-            self.sent.set(self.sent.get() + n as u64);
-            return Ok(n);
-        }
+        self.fake_io_error()?;
         if let Some(ssl) = self.ssl.borrow().clone() {
             // SSL: write the first non-empty slice
             for s in iov {
@@ -472,20 +518,7 @@ impl Connection {
 
     /// sendfile(2) from `file_fd` at `offset` for up to `count` bytes.
     pub async fn sendfile(&self, file_fd: RawFd, offset: i64, count: usize) -> io::Result<usize> {
-        // HTTP/2 capture path: materialize the file range into the buffer.
-        if self.send_capture.borrow().is_some() {
-            let mut buf = vec![0u8; count];
-            let n = unsafe {
-                libc::pread(file_fd, buf.as_mut_ptr() as *mut libc::c_void, count, offset as libc::off_t)
-            };
-            if n < 0 { return Err(io::Error::last_os_error()); }
-            buf.truncate(n as usize);
-            if let Some(cap) = self.send_capture.borrow_mut().as_mut() {
-                cap.extend_from_slice(&buf);
-            }
-            self.sent.set(self.sent.get() + n as u64);
-            return Ok(n as usize);
-        }
+        self.fake_io_error()?;
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
@@ -644,6 +677,9 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        if self.fake {
+            return;
+        }
         if self.fd.get() != -1 {
             self.close();
         }
