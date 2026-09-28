@@ -747,10 +747,12 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
     let st = &h2c.state;
     let log = &h2c.connection.log;
 
+    // field_start..field_end stays on the last field read: a skipped field
+    // (a refused stream's literal that is not indexed) leaves it as it was
     if st.parse_name.get() {
         st.parse_name.set(false);
 
-        let name = std::mem::take(&mut *st.field.borrow_mut());
+        let name = st.field.borrow().clone();
 
         if name.is_empty() {
             ngx_log_error!(NGX_LOG_INFO, log, None, "client sent zero header name length");
@@ -765,7 +767,7 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
     if st.parse_value.get() {
         st.parse_value.set(false);
 
-        *st.header_value.borrow_mut() = std::mem::take(&mut *st.field.borrow_mut());
+        *st.header_value.borrow_mut() = st.field.borrow().clone();
     }
 
     let len = st.header_name.borrow().len() + st.header_value.borrow().len();
