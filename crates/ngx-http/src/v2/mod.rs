@@ -5,7 +5,9 @@
 //! docs/HTTP2_PLAN.md); until it lands, TLS clients are not offered `h2` via
 //! ALPN and plaintext connections are served as HTTP/1.
 
+pub mod encode;
 pub mod module;
+pub mod table;
 
 // ngx_http_v2.h
 pub const NGX_HTTP_V2_STATE_BUFFER_SIZE: usize = 16;
