@@ -1076,3 +1076,31 @@ pub fn core_module() -> ModuleDef {
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_host_names() {
+        assert_eq!(validate_host(b"example.com").unwrap(), b"example.com");
+        // lowercased, the trailing dot and the port removed
+        assert_eq!(validate_host(b"Example.COM.").unwrap(), b"example.com");
+        assert_eq!(validate_host(b"example.com:8080").unwrap(), b"example.com");
+        assert_eq!(validate_host(b"[::1]:443").unwrap(), b"[::1]");
+        assert_eq!(validate_host(b"[::1]").unwrap(), b"[::1]");
+    }
+
+    #[test]
+    fn validate_host_invalid() {
+        assert_eq!(validate_host(b""), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"."), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"a..b"), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"a/b"), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"[::1"), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"[::1]x"), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"host:65536"), Err(NGX_DECLINED));
+        assert_eq!(validate_host(b"host:65535").unwrap(), b"host");
+        assert_eq!(validate_host(b"host:x"), Err(NGX_DECLINED));
+    }
+}

@@ -732,3 +732,79 @@ pub fn proxy_protocol_v2_write(sockaddr: &SockAddr, local: &SockAddr, ty: i32, t
 
     buf
 }
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn crc32c_check_value() {
+        // the check value of CRC-32C (Castagnoli)
+        assert_eq!(crc32c_long(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c_long(b""), 0);
+    }
+
+    #[test]
+    fn v1_header() {
+        let src = SockAddr::v4(Ipv4Addr::new(127, 0, 0, 1), 5000);
+        let dst = SockAddr::v4(Ipv4Addr::new(127, 0, 0, 2), 8080);
+        assert_eq!(proxy_protocol_write(&src, &dst), b"PROXY TCP4 127.0.0.1 127.0.0.2 5000 8080\r\n");
+
+        let src6 = SockAddr::v6(Ipv6Addr::LOCALHOST, 1);
+        assert_eq!(proxy_protocol_write(&src6, &dst), b"PROXY TCP6 ::1 127.0.0.2 1 8080\r\n");
+
+        let unix = SockAddr::Unix(b"/tmp/s".to_vec());
+        assert_eq!(proxy_protocol_write(&unix, &dst), b"PROXY UNKNOWN\r\n");
+    }
+
+    #[test]
+    fn v2_header_inet() {
+        let src = SockAddr::v4(Ipv4Addr::new(10, 0, 0, 1), 0x1234);
+        let dst = SockAddr::v4(Ipv4Addr::new(10, 0, 0, 2), 0x5678);
+
+        let h = proxy_protocol_v2_write(&src, &dst, libc::SOCK_STREAM, &[], None);
+
+        // signature, PROXY command, INET/STREAM, 12 bytes of addresses and
+        // the 7 bytes of the CRC32c TLV
+        assert_eq!(&h[..12], NGX_PROXY_PROTOCOL_SIGNATURE);
+        assert_eq!(h[12], 0x21);
+        assert_eq!(h[13], 0x11);
+        assert_eq!(u16::from_be_bytes([h[14], h[15]]) as usize, 12 + 7);
+        assert_eq!(&h[16..20], &[10, 0, 0, 1]);
+        assert_eq!(&h[20..24], &[10, 0, 0, 2]);
+        assert_eq!(&h[24..26], &[0x12, 0x34]);
+        assert_eq!(&h[26..28], &[0x56, 0x78]);
+        assert_eq!(&h[28..31], &[NGX_PROXY_PROTOCOL_TLV_CRC32C, 0, 4]);
+
+        // the checksum is of the header with the zeroed value
+        let mut zeroed = h.clone();
+        zeroed[31..35].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(u32::from_be_bytes([h[31], h[32], h[33], h[34]]), crc32c_long(&zeroed));
+
+        // the header reads back
+        let (pp, size) = read(&Log::stderr(0), &h).expect("valid header");
+        let pp = pp.expect("addresses");
+        assert_eq!(size, h.len());
+        assert_eq!(pp.src_addr, b"10.0.0.1");
+        assert_eq!(pp.dst_port, 0x5678);
+    }
+
+    #[test]
+    fn v2_header_mapped_and_unix() {
+        let src = SockAddr::v6("::ffff:1.2.3.4".parse().unwrap(), 1);
+        let dst = SockAddr::v6("::ffff:5.6.7.8".parse().unwrap(), 2);
+
+        // both v4-mapped: demoted to AF_INET
+        let h = proxy_protocol_v2_write(&src, &dst, libc::SOCK_DGRAM, &[], None);
+        assert_eq!(h[13], 0x12);
+        assert_eq!(&h[16..20], &[1, 2, 3, 4]);
+
+        // a unix client: LOCAL with no addresses
+        let unix = SockAddr::Unix(b"/tmp/s".to_vec());
+        let h = proxy_protocol_v2_write(&unix, &dst, libc::SOCK_STREAM, &[], None);
+        assert_eq!(h[12], 0x20);
+        assert_eq!(h[13], 0x00);
+        assert_eq!(u16::from_be_bytes([h[14], h[15]]), 7);
+    }
+}
