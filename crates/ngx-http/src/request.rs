@@ -316,7 +316,7 @@ impl LogContext for HttpLogCtx {
                 log_error_handler(&r, &sr, buf);
             }
             None => {
-                if let Some(ls) = &c.listening {
+                if let Some(ls) = c.listening() {
                     buf.extend_from_slice(b", server: ");
                     buf.extend_from_slice(&ls.addr_text);
                 }

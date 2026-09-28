@@ -19,6 +19,15 @@ use crate::{ngx_log_debug, ngx_log_error, os};
 
 pub type ListenHandler = Rc<dyn Fn(Rc<Connection>)>;
 
+/// ngx_pool_cleanup_t of a connection's pool
+pub struct PoolCleanup {
+    /// the module that added it (the cleanup handler compared in C)
+    pub tag: &'static str,
+    /// cln->data
+    pub data: Option<Rc<dyn Any>>,
+    pub handler: Option<Box<dyn FnOnce()>>,
+}
+
 /// ngx_connection_log_error_e
 pub const NGX_ERROR_ALERT: u32 = 0;
 pub const NGX_ERROR_ERR: u32 = 1;
@@ -197,6 +206,12 @@ pub struct Connection {
     pub read_pending_eof: Cell<bool>,
     /// c->log_error: the level of ngx_connection_error() messages
     pub log_error: Cell<u32>,
+    /// the cleanups of the connection's pool (ngx_pool_cleanup_add), run
+    /// when the connection is closed, the last added first
+    pub cleanups: RefCell<Vec<PoolCleanup>>,
+    /// a connection passed to another listening socket (the stream pass
+    /// module sets c->listening)
+    pub passed_listening: RefCell<Option<Rc<Listening>>>,
     /// A per-stream copy of an HTTP/2 connection (C's fake connection, see
     /// Connection::new_fake). It never owns the socket or the SSL object,
     /// is not counted as a connection, and refuses socket I/O.
@@ -276,6 +291,8 @@ impl Connection {
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
             log_error: Cell::new(NGX_ERROR_ALERT),
+            cleanups: RefCell::new(Vec::new()),
+            passed_listening: RefCell::new(None),
             fake: false,
         });
         ACTIVE.with(|a| a.set(a.get() + 1));
@@ -285,7 +302,13 @@ impl Connection {
 
     /// Build a connection for an accepted socket.
     pub fn accepted(fd: RawFd, ls: &Rc<Listening>, sockaddr: SockAddr, log: &Log) -> Option<Rc<Connection>> {
+        let unix = sockaddr.is_unix();
         let c = Connection::create(fd, log, Some(ls.clone()), ls.ty, sockaddr)?;
+        // ngx_event_accept
+        if unix {
+            c.tcp_nopush.set(TcpNopush::Disabled);
+            c.tcp_nodelay.set(TcpNodelay::Disabled);
+        }
         if !ls.wildcard.get() {
             *c.local_sockaddr.borrow_mut() = Some(ls.sockaddr.clone());
         }
@@ -343,6 +366,8 @@ impl Connection {
             read_eof: Cell::new(false),
             read_pending_eof: Cell::new(false),
             log_error: Cell::new(c.log_error.get()),
+            cleanups: RefCell::new(Vec::new()),
+            passed_listening: RefCell::new(None),
             fake: true,
         })
     }
@@ -783,6 +808,36 @@ impl Connection {
         }
     }
 
+    /// c->listening: the listening socket the connection was accepted on,
+    /// or passed to
+    pub fn listening(&self) -> Option<Rc<Listening>> {
+        if let Some(ls) = self.passed_listening.borrow().as_ref() {
+            return Some(ls.clone());
+        }
+        self.listening.clone()
+    }
+
+    /// ngx_pool_cleanup_add on the connection's pool
+    pub fn add_cleanup(&self, cln: PoolCleanup) {
+        self.cleanups.borrow_mut().push(cln);
+    }
+
+    /// The pool's cleanups, the last added first (ngx_destroy_pool).
+    pub fn run_cleanups(&self) {
+        loop {
+            let cln = self.cleanups.borrow_mut().pop();
+
+            match cln {
+                Some(cln) => {
+                    if let Some(h) = cln.handler {
+                        h();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     /// ngx_close_connection
     pub fn close(&self) {
         if self.fd.get() == -1 {
@@ -826,6 +881,8 @@ impl Connection {
         if self.listening.is_some() {
             self.log.set_context(None);
         }
+        // ngx_destroy_pool
+        self.run_cleanups();
     }
 
     pub fn is_closed(&self) -> bool {

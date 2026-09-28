@@ -28,6 +28,10 @@ pub mod write_filter;
 pub mod proxy;
 pub mod upstream;
 pub mod upstream_round_robin;
+pub mod access;
+pub mod limit_conn;
+pub mod pass;
+pub mod realip;
 pub mod return_module;
 pub mod set;
 pub mod upstream_hash;
@@ -876,7 +880,11 @@ pub fn modules() -> Vec<ModuleDef> {
         proxy::proxy_module(),
         upstream::upstream_module(),
         write_filter::write_filter_module(),
+        realip::realip_module(),
+        limit_conn::limit_conn_module(),
+        access::access_module(),
         return_module::return_module(),
+        pass::pass_module(),
         set::set_module(),
         upstream_hash::upstream_hash_module(),
         upstream_least_conn::upstream_least_conn_module(),

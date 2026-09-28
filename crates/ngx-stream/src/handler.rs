@@ -15,7 +15,7 @@ use crate::*;
 /// The address configuration of a listening socket for the connection's
 /// local address.
 fn find_addr_conf(c: &Rc<Connection>) -> Option<Rc<AddrConf>> {
-    let ls = c.listening.clone()?;
+    let ls = c.listening()?;
     let servers = ls.servers.borrow().clone()?;
     let port = servers.downcast::<StreamPort>().ok()?;
 
@@ -84,7 +84,7 @@ pub fn init_connection(c: Rc<Connection>) {
     c.log.set_connection(0);
 
     let text = c.sockaddr.borrow().to_text(true);
-    let ls_text = c.listening.as_ref().map(|ls| ls.addr_text.clone()).unwrap_or_default();
+    let ls_text = c.listening().map(|ls| ls.addr_text.clone()).unwrap_or_default();
 
     ngx_log_error!(NGX_LOG_INFO, c.log, None, "*{} {}client {} connected to {}", c.number, if c.ty == libc::SOCK_DGRAM { "udp " } else { "" }, B(&text), B(&ls_text));
 
@@ -244,7 +244,7 @@ impl LogContext for StreamLogCtx {
         buf.extend_from_slice(&c.addr_text.borrow());
         buf.extend_from_slice(b", server: ");
 
-        if let Some(ls) = c.listening.as_ref() {
+        if let Some(ls) = c.listening() {
             buf.extend_from_slice(&ls.addr_text);
         }
 

@@ -45,7 +45,7 @@ pub fn init_connection(c: Rc<Connection>) {
 }
 
 fn addr_conf_for(c: &Rc<Connection>) -> Option<Rc<AddrConf>> {
-    let ls = c.listening.clone()?;
+    let ls = c.listening()?;
     let servers = ls.servers.borrow().clone()?;
     let port = servers.downcast::<HttpPort>().ok()?;
     if port.naddrs > 1 {

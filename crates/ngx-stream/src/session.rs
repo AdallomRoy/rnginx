@@ -50,9 +50,6 @@ pub struct Session {
     /// ngx_stream_finalize_session() was called
     pub finalized: Cell<bool>,
 
-    /// the preread phase timer (c->read->timer_set / timedout)
-    pub preread_deadline: Cell<Option<tokio::time::Instant>>,
-    pub preread_timedout: Cell<bool>,
 }
 
 pub type S = Rc<Session>;
@@ -82,8 +79,6 @@ impl Session {
             health_check: Cell::new(false),
             limit_conn_status: Cell::new(0),
             finalized: Cell::new(false),
-            preread_deadline: Cell::new(None),
-            preread_timedout: Cell::new(false),
         })
     }
 
