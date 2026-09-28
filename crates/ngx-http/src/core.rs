@@ -1641,6 +1641,15 @@ fn keepalive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
     Ok(())
 }
 
+/// The resolver and resolver_timeout of the http{} level, as the
+/// upstreams inherit them (ngx_http_conf_get_module_loc_conf(cf,
+/// ngx_http_core_module) at init time): unmerged there.
+pub fn resolver_of(cf: &Conf) -> (Option<Rc<Resolver>>, Option<u64>) {
+    let clcf = crate::get_loc_conf::<CoreLocConf>(cf, ctx_index());
+    let c = clcf.borrow();
+    (c.resolver.clone(), c.resolver_timeout.as_option().copied())
+}
+
 fn resolver(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let clcf = clcf_of(&conf);
     if clcf.borrow().resolver.is_some() {

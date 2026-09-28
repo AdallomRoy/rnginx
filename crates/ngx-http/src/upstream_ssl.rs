@@ -315,6 +315,15 @@ impl UpstreamSsl {
         }
     }
 
+    /// The socket descriptor, for the keepalive cache's close handler.
+    pub fn raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match self.stream.get_ref() {
+            SockIo::Tcp(s) => Some(s.as_raw_fd()),
+            SockIo::Unix(s) => Some(s.as_raw_fd()),
+        }
+    }
+
     /// Wait until the upstream has sent application data or closed. TLS
     /// records without data, like TLS 1.3 session tickets, are processed
     /// on the way; the data read is returned by the next read.

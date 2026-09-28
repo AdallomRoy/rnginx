@@ -58,7 +58,12 @@ pub mod proxy;
 pub mod proxy_cache;
 pub mod upstream;
 pub mod upstream_keepalive;
-pub mod upstream_keepalive_pool;
+pub mod upstream_hash;
+pub mod upstream_ip_hash;
+pub mod upstream_least_conn;
+pub mod upstream_least_time;
+pub mod upstream_random;
+pub mod upstream_zone;
 pub mod upstream_round_robin;
 pub mod upstream_ssl;
 pub mod fastcgi;
@@ -606,13 +611,13 @@ pub fn modules() -> Vec<ModuleDef> {
         degradation::degradation_module(),
         flv::flv_module(),
         mp4::mp4_module(),
-        stubs::upstream_hash_module(),
-        stubs::upstream_ip_hash_module(),
-        stubs::upstream_least_conn_module(),
-        stubs::upstream_least_time_module(),
-        stubs::upstream_random_module(),
+        upstream_hash::upstream_hash_module(),
+        upstream_ip_hash::upstream_ip_hash_module(),
+        upstream_least_conn::upstream_least_conn_module(),
+        upstream_least_time::upstream_least_time_module(),
+        upstream_random::upstream_random_module(),
         upstream_keepalive::upstream_keepalive_module(),
-        stubs::upstream_zone_module(),
+        upstream_zone::upstream_zone_module(),
         stubs::upstream_sticky_module(),
         stub_status::stub_status_module(),
         write_filter::write_filter_module(),

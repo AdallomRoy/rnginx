@@ -64,6 +64,8 @@ pub struct NgxHttpFastcgiLocConf {
     /// fastcgi_pass without variables, and with them.
     pub pass: Option<Vec<u8>>,
     pub pass_cv: Option<ComplexValue>,
+    /// the upstream of fastcgi_pass without variables (ngx_http_upstream_add)
+    pub upstream: Option<Rc<crate::upstream::UpstreamSrvConf>>,
     /// fastcgi_param (params_source): inherited as a whole.
     pub params: Option<Rc<Vec<Param>>>,
     pub index: Val<Vec<u8>>,
@@ -89,6 +91,7 @@ impl Default for NgxHttpFastcgiLocConf {
         NgxHttpFastcgiLocConf {
             pass: None,
             pass_cv: None,
+            upstream: None,
             params: None,
             index: Val::unset(),
             split_regex: None,
@@ -122,6 +125,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.pass.is_none() && c.pass_cv.is_none() {
         c.pass = p.pass.clone();
         c.pass_cv = p.pass_cv.clone();
+        c.upstream = p.upstream.clone();
     }
     if c.params.is_none() {
         c.params = p.params.clone();
@@ -170,6 +174,10 @@ fn fastcgi_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>
         let cv = crate::script::compile_complex_value(cf, &url, 0)?;
         cell.borrow_mut().pass_cv = Some(cv);
     } else {
+        let mut u = ngx_core::inet::Url::new(&url);
+        u.no_resolve = true;
+        let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
+        cell.borrow_mut().upstream = Some(uscf);
         cell.borrow_mut().pass = Some(url);
     }
 
@@ -538,44 +546,6 @@ fn read_file_range(fd: i32, from: i64, to: i64) -> Vec<u8> {
     buf
 }
 
-/// The upstream to connect to: an upstream{} block, a unix socket, or an
-/// address (ngx_http_fastcgi_pass / ngx_http_fastcgi_eval).
-enum Target {
-    Named(Vec<u8>),
-    Addr(String, u16),
-}
-
-fn parse_target(r: &R, url: &[u8]) -> Option<Target> {
-    let url = std::str::from_utf8(url).ok()?;
-
-    if crate::upstream::get_upstream_by_name(r, url.as_bytes()).is_some() {
-        return Some(Target::Named(url.as_bytes().to_vec()));
-    }
-
-    if url.starts_with("unix:") {
-        return Some(Target::Addr(url.to_string(), 0));
-    }
-
-    if let Some(rest) = url.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some(Target::Addr(rest[..end].to_string(), port));
-    }
-
-    let (host, port) = url.rsplit_once(':')?;
-    Some(Target::Addr(host.to_string(), port.parse().ok()?))
-}
-
-fn addr_string(host: &str, port: u16) -> String {
-    if host.starts_with("unix:") {
-        format!("{}:{}", host, port)
-    } else if host.contains(':') {
-        format!("[{}]:{}", host, port)
-    } else {
-        format!("{}:{}", host, port)
-    }
-}
-
 /// What reading the response needs of the location, taken before awaiting.
 struct ReadConf {
     read_timeout: u64,
@@ -824,14 +794,6 @@ async fn fastcgi_handler(r: R) -> i64 {
         }
     };
 
-    let target = match parse_target(&r, &url) {
-        Some(t) => t,
-        None => {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "invalid upstream \"{}\"", B(&url));
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-    };
-
     let request = {
         let c = lcf.borrow();
         match create_request(&r, &c) {
@@ -853,196 +815,189 @@ async fn fastcgi_handler(r: R) -> i64 {
         Vec::new()
     };
 
-    let (named, mut host, mut port) = match target {
-        Target::Named(name) => match crate::upstream::first_server_for(&r, &name) {
-            Some((h, p)) => (Some(name), h, p),
-            None => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no live upstreams while connecting to upstream");
-                r.upstream_states.borrow_mut().push(UpstreamState { status: 502, peer: name.clone(), ..Default::default() });
-                return NGX_HTTP_BAD_GATEWAY;
-            }
-        },
-        Target::Addr(h, p) => (None, h, p),
-    };
-
-    let (next_upstream, next_tries, connect_timeout, keep_conn) = {
+    let (next_upstream, next_tries, next_timeout, connect_timeout, keep_conn, static_upstream) = {
         let c = lcf.borrow();
-        (*c.next_upstream.get(), *c.next_upstream_tries.get() as u32, *c.connect_timeout.get(), *c.keep_conn.get())
-    };
-    let peer_limit = named.as_ref().map(|n| crate::upstream::peer_count_for(&r, n) as u32).unwrap_or(0);
-    let mut attempts: u32 = if named.is_some() { 1 } else { 0 };
-
-    let want_keepalive = keep_conn
-        && named.as_ref().and_then(|n| crate::upstream_keepalive::limits_for(n)).map(|l| l.max_cached > 0).unwrap_or(false);
-
-    let can_retry = |attempts: u32| {
-        named.is_some() && attempts < peer_limit && (next_tries == 0 || attempts < next_tries) && !r.request_body_no_buffering.get()
+        (
+            *c.next_upstream.get(),
+            *c.next_upstream_tries.get() as u32,
+            0u64,
+            *c.connect_timeout.get(),
+            *c.keep_conn.get(),
+            c.upstream.clone(),
+        )
     };
 
-    let idempotent = matches!(r.method.get(), NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_PUT | NGX_HTTP_DELETE);
+    let tag = Rc::as_ptr(&lcf) as *const () as usize;
+
+    // ngx_http_upstream_init_request
+    let peer = match static_upstream {
+        Some(uscf) => crate::upstream::UpstreamPeer::init(&r, &uscf, next_upstream, next_tries, next_timeout, tag),
+        None => {
+            // ngx_http_fastcgi_eval
+            let mut u = ngx_core::inet::Url::new(&url);
+            u.no_resolve = true;
+            if ngx_core::inet::parse_url(&mut u).is_err() {
+                if let Some(err) = u.err {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "{} in upstream \"{}\"", err, B(&url));
+                }
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            crate::upstream::UpstreamPeer::resolve(&r, &u, next_upstream, next_tries, next_timeout, tag).await
+        }
+    };
+
+    let peer = match peer {
+        Ok(p) => p,
+        Err(rc) => return rc,
+    };
+
+    let mut g = crate::upstream::PeerGuard::new(&r, peer);
 
     loop {
-        let started = ngx_core::times::current_msec();
-        let addr = addr_string(&host, port);
+        // ngx_http_upstream_connect
+        let rc = g.u.connect(&r);
 
-        let pooled = if want_keepalive && !addr.starts_with("unix:") {
-            named.as_ref().and_then(|n| crate::upstream_keepalive::pool_take(n, &addr))
+        if rc == NGX_BUSY {
+            match g.u.next(&r, crate::upstream::NGX_HTTP_UPSTREAM_FT_NOLIVE) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            }
+        }
+
+        let started = g.u.start_time;
+
+        let (mut upstream, requests, start_time) = if rc == NGX_DONE {
+            let c = g.u.pc.connection.take().unwrap();
+            (c.sock, c.requests, c.start_time)
         } else {
-            None
-        };
-
-        let mut upstream = match pooled {
-            Some(s) => UpstreamSock::Tcp(s),
-            None => match crate::proxy::connect_upstream(&r, &addr, None, None, connect_timeout).await {
-                Ok(s) => s,
+            let sockaddr = match g.u.pc.sockaddr.clone() {
+                Some(sa) => sa,
+                None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+            };
+            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, connect_timeout).await {
+                Ok(s) => (s, 0, ngx_core::times::current_msec()),
                 Err(e) => {
-                    let (status, ft) = match e {
-                        crate::proxy::ConnectError::Error => (NGX_HTTP_BAD_GATEWAY, FT_ERROR),
-                        crate::proxy::ConnectError::Timeout => (NGX_HTTP_GATEWAY_TIME_OUT, FT_TIMEOUT),
+                    let ft = match e {
+                        crate::proxy::ConnectError::Error => FT_ERROR,
+                        crate::proxy::ConnectError::Timeout => FT_TIMEOUT,
                         crate::proxy::ConnectError::Internal => return NGX_HTTP_INTERNAL_SERVER_ERROR,
                     };
-                    r.upstream_states.borrow_mut().push(UpstreamState {
-                        status,
-                        peer: addr.clone().into_bytes(),
-                        connect_time: ngx_core::times::current_msec().saturating_sub(started),
-                        header_time: u64::MAX,
-                        response_time: u64::MAX,
-                        ..Default::default()
-                    });
-                    if let Some(name) = &named {
-                        crate::upstream::mark_bad_server(&r, name, &host, port);
-                        if next_upstream & ft != 0 && can_retry(attempts) {
-                            if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
-                                host = h;
-                                port = p;
-                                attempts += 1;
-                                continue;
-                            }
-                        }
+                    match g.u.next(&r, ft) {
+                        Ok(()) => continue,
+                        Err(st) => return st,
                     }
-                    return status;
                 }
-            },
+            }
         };
 
-        let connect_time = ngx_core::times::current_msec().saturating_sub(started);
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.connect_time = ngx_core::times::current_msec().saturating_sub(started);
+        }
 
         let mut wire = request.clone();
         wire.extend_from_slice(&initial_body);
 
         let mut sent = wire.len() as i64;
 
+        g.u.request_sent = true;
+
         let send_timeout = *lcf.borrow().send_timeout.get();
         let written = tokio::time::timeout(Duration::from_millis(send_timeout), upstream.write_all(&wire)).await;
 
-        let mut failure: Option<(i64, u32)> = match written {
+        let failure: Option<u32> = match written {
             Ok(Ok(())) => None,
-            Ok(Err(_)) => Some((NGX_HTTP_BAD_GATEWAY, FT_ERROR)),
+            Ok(Err(_)) => Some(FT_ERROR),
             Err(_) => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out while sending request to upstream");
-                Some((NGX_HTTP_GATEWAY_TIME_OUT, FT_TIMEOUT))
+                let action = r.connection.log.action();
+                r.connection.log.set_action(Some("sending request to upstream"));
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
+                r.connection.log.set_action(action);
+                Some(FT_TIMEOUT)
             }
         };
 
-        if failure.is_none() && r.reading_body.get() {
+        if let Some(ft) = failure {
+            match g.u.next(&r, ft) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            }
+        }
+
+        if r.reading_body.get() {
             match crate::proxy::send_request_body(&r, &mut upstream, &body_output_filter).await {
                 Ok(n) => sent += n,
                 Err(rc) => {
                     drop(upstream);
-                    r.upstream_states.borrow_mut().push(UpstreamState {
-                        status: rc,
-                        peer: addr.clone().into_bytes(),
-                        connect_time,
-                        header_time: u64::MAX,
-                        response_time: ngx_core::times::current_msec().saturating_sub(started),
-                        bytes_sent: sent,
-                        ..Default::default()
-                    });
+                    if rc == NGX_HTTP_BAD_GATEWAY {
+                        // the upstream write failed
+                        match g.u.next(&r, FT_ERROR) {
+                            Ok(()) => continue,
+                            Err(st) => return st,
+                        }
+                    }
                     return rc;
                 }
             }
         }
 
-        let mut received = 0i64;
-
-        let records = if failure.is_none() {
-            let conf = {
-                let c = lcf.borrow();
-                ReadConf {
-                    read_timeout: *c.read_timeout.get(),
-                    keep_conn: *c.keep_conn.get(),
-                    catch_stderr: c.catch_stderr.clone(),
-                    header_only: r.method.get() == NGX_HTTP_HEAD,
-                }
-            };
-            match read_response(&r, &conf, &mut upstream, &mut received).await {
-                Ok(st) => Some(st),
-                Err(ReadError::Invalid) => {
-                    failure = Some((NGX_HTTP_BAD_GATEWAY, FT_INVALID_HEADER));
-                    None
-                }
-                Err(ReadError::Closed) => {
-                    failure = Some((NGX_HTTP_BAD_GATEWAY, FT_ERROR));
-                    None
-                }
-                Err(ReadError::Timeout) => {
-                    failure = Some((NGX_HTTP_GATEWAY_TIME_OUT, FT_TIMEOUT));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let response_time = ngx_core::times::current_msec().saturating_sub(started);
-
-        if let Some((status, ft)) = failure {
-            r.upstream_states.borrow_mut().push(UpstreamState {
-                status,
-                peer: addr.clone().into_bytes(),
-                connect_time,
-                header_time: u64::MAX,
-                response_time,
-                bytes_sent: sent,
-                bytes_received: received,
-                ..Default::default()
-            });
-            if let Some(name) = &named {
-                crate::upstream::mark_bad_server(&r, name, &host, port);
-                if next_upstream & ft != 0 && (idempotent || next_upstream & FT_NON_IDEMPOTENT != 0) && can_retry(attempts) {
-                    if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
-                        host = h;
-                        port = p;
-                        attempts += 1;
-                        continue;
-                    }
-                }
-            }
-            return status;
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.bytes_sent = sent;
         }
 
-        let records = records.unwrap();
+        let mut received = 0i64;
+
+        let conf = {
+            let c = lcf.borrow();
+            ReadConf {
+                read_timeout: *c.read_timeout.get(),
+                keep_conn: *c.keep_conn.get(),
+                catch_stderr: c.catch_stderr.clone(),
+                header_only: r.method.get() == NGX_HTTP_HEAD,
+            }
+        };
+
+        let records = match read_response(&r, &conf, &mut upstream, &mut received).await {
+            Ok(st) => st,
+            Err(e) => {
+                let ft = match e {
+                    ReadError::Invalid => FT_INVALID_HEADER,
+                    ReadError::Closed => FT_ERROR,
+                    ReadError::Timeout => FT_TIMEOUT,
+                };
+                if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+                    st.bytes_received = received;
+                }
+                match g.u.next(&r, ft) {
+                    Ok(()) => continue,
+                    Err(st) => return st,
+                }
+            }
+        };
+
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.header_time = ngx_core::times::current_msec().saturating_sub(started);
+            st.bytes_received = received;
+        }
+        g.u.notify(&r, crate::upstream::NGX_HTTP_UPSTREAM_NOTIFY_HEADER);
 
         let hend = header_end(&records.stdout).unwrap_or(records.stdout.len());
 
         let (status, status_line, headers) = match process_header(&r, &records.stdout[..hend]) {
             Ok(v) => v,
-            Err(()) => {
-                r.upstream_states.borrow_mut().push(UpstreamState {
-                    status: 502,
-                    peer: addr.clone().into_bytes(),
-                    connect_time,
-                    header_time: response_time,
-                    response_time,
-                    bytes_sent: sent,
-                    bytes_received: received,
-                    ..Default::default()
-                });
-                return NGX_HTTP_BAD_GATEWAY;
-            }
+            Err(()) => match g.u.next(&r, FT_INVALID_HEADER) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            },
         };
 
-        // ngx_http_upstream_test_next for the status
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            if st.status == 0 {
+                st.status = status;
+            }
+            st.response_length = (records.stdout.len() - hend) as i64;
+        }
+
+        // ngx_http_upstream_test_next
         let ft = match status {
             500 => FT_HTTP_500,
             502 => FT_HTTP_502,
@@ -1054,40 +1009,24 @@ async fn fastcgi_handler(r: R) -> i64 {
             _ => 0,
         };
 
-        r.upstream_states.borrow_mut().push(UpstreamState {
-            status,
-            peer: addr.clone().into_bytes(),
-            connect_time,
-            header_time: response_time,
-            response_time,
-            bytes_sent: sent,
-            bytes_received: received,
-            response_length: (records.stdout.len() - hend) as i64,
-            ..Default::default()
-        });
-
-        if ft != 0 && next_upstream & ft != 0 && (idempotent || next_upstream & FT_NON_IDEMPOTENT != 0) {
-            if let Some(name) = &named {
-                if !matches!(status, 403 | 404) {
-                    crate::upstream::mark_bad_server(&r, name, &host, port);
-                }
-                if can_retry(attempts) {
-                    if let Some((h, p)) = crate::upstream::next_server_for(&r, name) {
-                        host = h;
-                        port = p;
-                        attempts += 1;
-                        continue;
-                    }
+        if ft != 0 {
+            let mut mask = ft;
+            if g.u.request_sent && matches!(r.method.get(), NGX_HTTP_POST | NGX_HTTP_LOCK | NGX_HTTP_PATCH) {
+                mask |= FT_NON_IDEMPOTENT;
+            }
+            if g.u.pc.tries > 1 && next_upstream & mask == mask && !(g.u.request_sent && r.request_body_no_buffering.get()) {
+                drop(upstream);
+                match g.u.next(&r, ft) {
+                    Ok(()) => continue,
+                    Err(st) => return st,
                 }
             }
         }
 
-        // the connection can be kept only after END_REQUEST, with the
-        // request body sent in full
-        if want_keepalive && records.end_request && !r.reading_body.get() {
-            if let (Some(name), UpstreamSock::Tcp(s)) = (&named, upstream) {
-                crate::upstream_keepalive::pool_put(name, &addr, s);
-            }
+        // u->keepalive: END_REQUEST was read on a kept connection
+        if keep_conn && records.end_request {
+            g.conn = Some(crate::upstream::UpstreamConn { sock: upstream, requests: requests + 1, start_time });
+            g.keepalive = true;
         }
 
         return send_response(&r, &lcf, status, status_line, headers, &records.stdout[hend..]).await;

@@ -20,6 +20,8 @@ crate::http_module_index!("ngx_http_memcached_module");
 
 pub struct MemcachedLocConf {
     pub upstream: Option<Vec<u8>>,  // host:port
+    /// the upstream of memcached_pass (ngx_http_upstream_add)
+    pub upstream_conf: Option<Rc<crate::upstream::UpstreamSrvConf>>,
     pub gzip_flag: Val<u32>,
     pub next_upstream_not_found: Val<bool>,
 }
@@ -28,6 +30,7 @@ impl Default for MemcachedLocConf {
     fn default() -> Self {
         MemcachedLocConf {
             upstream: None,
+            upstream_conf: None,
             gzip_flag: Val::unset(),
             next_upstream_not_found: Val::unset(),
         }
@@ -39,7 +42,10 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> { make_slot(MemcachedLocConf::
 fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let p = conf_cell::<MemcachedLocConf>(prev).borrow();
     let mut c = conf_cell::<MemcachedLocConf>(conf).borrow_mut();
-    if c.upstream.is_none() { c.upstream = p.upstream.clone(); }
+    if c.upstream.is_none() {
+        c.upstream = p.upstream.clone();
+        c.upstream_conf = p.upstream_conf.clone();
+    }
     c.gzip_flag.merge(&p.gzip_flag, 0);
     c.next_upstream_not_found.merge(&p.next_upstream_not_found, false);
     Ok(())
@@ -70,6 +76,13 @@ pub fn memcached_module() -> ModuleDef {
 
 fn set_memcached_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<MemcachedLocConf>(conf.as_ref().unwrap());
+    if cell.borrow().upstream.is_some() {
+        return Err(msg("is duplicate"));
+    }
+    let mut u = ngx_core::inet::Url::new(&cf.args[1]);
+    u.no_resolve = true;
+    let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
+    cell.borrow_mut().upstream_conf = Some(uscf);
     cell.borrow_mut().upstream = Some(cf.args[1].clone());
     let loc = crate::get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
     loc.borrow_mut().handler = Some(Rc::new(|r| Box::pin(handler(r))));
@@ -124,92 +137,122 @@ async fn handler(r: R) -> i64 {
             }
         }
     };
-    let (host, port, next_not_found, gzip_flag, ups_name) = {
+    let (uscf, next_not_found, gzip_flag, tag) = {
         let conf = r.loc_conf::<MemcachedLocConf>(ctx_index());
         let c = conf.borrow();
-        let uri = match &c.upstream {
+        let uscf = match &c.upstream_conf {
             Some(u) => u.clone(),
             None => return NGX_DECLINED,
         };
-        let s = std::str::from_utf8(&uri).unwrap_or("").to_string();
-        // First try to resolve as a named upstream {} block. That path picks
-        // the first server via smooth WRR — same as ngx_http_memcached_module
-        // going through ngx_http_upstream's ngx_http_upstream_init.
-        let (h, p, name) = if crate::upstream::get_upstream_by_name(&r, s.as_bytes()).is_some() {
-            let (h, p) = crate::upstream::first_server_for(&r, s.as_bytes())
-                .unwrap_or((s.clone(), 11211));
-            (h, p, Some(s.as_bytes().to_vec()))
-        } else if let Some(colon) = s.rfind(':') {
-            let host = &s[..colon];
-            let port = s[colon+1..].parse::<u16>().unwrap_or(11211);
-            (host.to_string(), port, None)
-        } else {
-            (s, 11211u16, None)
-        };
-        (h, p, c.next_upstream_not_found.get_or(false), *c.gzip_flag, name)
+        (uscf, c.next_upstream_not_found.get_or(false), *c.gzip_flag, Rc::as_ptr(&conf) as *const () as usize)
     };
     // Discard body — we don't proxy any body to memcached.
     let rc = crate::request_body::discard_request_body(&r).await;
     if rc != NGX_OK { return rc; }
 
-    let addr = format!("{}:{}", host, port);
-    // Reuse a pooled connection first if this upstream has `keepalive N;`.
-    let want_pool = ups_name.as_ref()
-        .and_then(|n| crate::upstream_keepalive::limits_for(n))
-        .map(|l| l.max_cached > 0)
-        .unwrap_or(false);
-    let pooled = if want_pool {
-        ups_name.as_ref().and_then(|n| crate::upstream_keepalive::pool_take(n, &addr))
-    } else { None };
-    let mut stream = match pooled {
-        Some(s) => s,
-        None => match tokio::net::TcpStream::connect(&addr).await {
-            Ok(s) => s,
-            Err(_) => return NGX_HTTP_BAD_GATEWAY,
-        },
-    };
-    let cmd = format!("get {}\r\n", std::str::from_utf8(&key).unwrap_or(""));
-    if stream.write_all(cmd.as_bytes()).await.is_err() {
-        return NGX_HTTP_BAD_GATEWAY;
-    }
-    let mut buf = Vec::new();
-    // Read enough to see the framing. memcached responses start with either
-    // `VALUE …\r\n<data>\r\nEND\r\n` or `END\r\n` (or an error string). We
-    // read until we see the closing END or the connection closes.
-    let mut tmp = [0u8; 4096];
-    loop {
-        match stream.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                // Look for terminating END\r\n or an error line.
-                if let Some(end) = find_seq(&buf, b"\r\nEND\r\n") {
-                    buf.truncate(end + 7);
-                    break;
-                }
-                if buf.starts_with(b"END\r\n") {
-                    buf.truncate(5);
-                    break;
-                }
-                if buf.starts_with(b"ERROR") || buf.starts_with(b"CLIENT_ERROR") || buf.starts_with(b"SERVER_ERROR") {
-                    // Read until \r\n
-                    if let Some(_p) = find_seq(&buf, b"\r\n") { break; }
-                }
-                if buf.len() > 1 << 20 { break; }
-            }
-            Err(_) => return NGX_HTTP_BAD_GATEWAY,
-        }
-    }
+    use crate::upstream::{UpstreamConn, UpstreamPeer, NGX_HTTP_UPSTREAM_FT_ERROR, NGX_HTTP_UPSTREAM_FT_NOLIVE, NGX_HTTP_UPSTREAM_FT_TIMEOUT};
 
-    // Response is fully consumed by the read loop above (either the
-    // terminating "END\r\n" or an error line). Hand the socket back to
-    // the keepalive pool before we return to the filter chain so a
-    // subsequent memcached_pass reuses it.
-    if want_pool {
-        if let Some(name) = &ups_name {
-            crate::upstream_keepalive::pool_put(name, &addr, stream);
+    let mut u = match UpstreamPeer::init(&r, &uscf, NGX_HTTP_UPSTREAM_FT_ERROR | NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0, 0, tag) {
+        Ok(u) => u,
+        Err(rc) => return rc,
+    };
+
+    let cmd = format!("get {}\r\n", std::str::from_utf8(&key).unwrap_or(""));
+
+    let (conn, buf) = loop {
+        // ngx_http_upstream_connect
+        let rc = u.connect(&r);
+
+        if rc == NGX_BUSY {
+            match u.next(&r, NGX_HTTP_UPSTREAM_FT_NOLIVE) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            }
         }
-    }
+
+        let start = u.start_time;
+
+        let (mut stream, requests, start_time) = if rc == NGX_DONE {
+            let c = u.pc.connection.take().unwrap();
+            (c.sock, c.requests, c.start_time)
+        } else {
+            let sockaddr = match u.pc.sockaddr.clone() {
+                Some(sa) => sa,
+                None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+            };
+            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, 60000).await {
+                Ok(s) => (s, 0, ngx_core::times::current_msec()),
+                Err(_) => match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
+                    Ok(()) => continue,
+                    Err(st) => return st,
+                },
+            }
+        };
+
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.connect_time = ngx_core::times::current_msec().saturating_sub(start);
+        }
+
+        u.request_sent = true;
+
+        if stream.write_all(cmd.as_bytes()).await.is_err() {
+            match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            }
+        }
+
+        let mut buf = Vec::new();
+        // Read enough to see the framing. memcached responses start with either
+        // `VALUE …\r\n<data>\r\nEND\r\n` or `END\r\n` (or an error string). We
+        // read until we see the closing END or the connection closes.
+        let mut tmp = [0u8; 4096];
+        let mut failed = false;
+        loop {
+            match stream.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    // Look for terminating END\r\n or an error line.
+                    if let Some(end) = find_seq(&buf, b"\r\nEND\r\n") {
+                        buf.truncate(end + 7);
+                        break;
+                    }
+                    if buf.starts_with(b"END\r\n") {
+                        buf.truncate(5);
+                        break;
+                    }
+                    if buf.starts_with(b"ERROR") || buf.starts_with(b"CLIENT_ERROR") || buf.starts_with(b"SERVER_ERROR") {
+                        // Read until \r\n
+                        if let Some(_p) = find_seq(&buf, b"\r\n") { break; }
+                    }
+                    if buf.len() > 1 << 20 { break; }
+                }
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+
+        if failed || buf.is_empty() {
+            match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
+                Ok(()) => continue,
+                Err(st) => return st,
+            }
+        }
+
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.header_time = ngx_core::times::current_msec().saturating_sub(start);
+            st.bytes_received = buf.len() as i64;
+        }
+
+        break (UpstreamConn { sock: stream, requests: requests + 1, start_time }, buf);
+    };
+
+    // the response was read in full: u->keepalive
+    let complete = buf.ends_with(b"END\r\n");
+    u.finalize(&r, Some(conn), complete, true);
 
     if buf.starts_with(b"END\r\n") {
         // not found

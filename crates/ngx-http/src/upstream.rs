@@ -1,23 +1,28 @@
-//! HTTP Upstream Framework (ngx_http_upstream.{c,h})
-//!
-//! Implements peer selection, connection pooling, request forwarding, and response
-//! processing for reverse proxy, fastcgi, uwsgi, scgi, grpc, memcached, etc.
+//! ngx_http_upstream.c: the upstream{} configuration and the implicit
+//! upstreams of proxy_pass and friends (ngx_http_upstream_add), the peer
+//! interface balancers implement (ngx_peer_connection_t get/free), and
+//! the peer side of a request's upstream: tries, next upstream
+//! (ngx_http_upstream_next) and the free on finalization. The request path
+//! itself lives in proxy.rs, fastcgi.rs and memcached.rs, which are not
+//! ports of ngx_http_upstream.c.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use ngx_core::buf::Chain;
 use ngx_core::conf::*;
-use ngx_core::connection::Connection;
+use ngx_core::conf::{NGX_CONF_BLOCK, NGX_CONF_TAKE1, NGX_CONF_1MORE};
+use ngx_core::inet::{Addr, SockAddr, Url};
+use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
+use ngx_core::resolver::Resolver;
 use ngx_core::string::B;
-use ngx_core::cmd_fn;
-use ngx_core::conf::{NGX_CONF_BLOCK, NGX_CONF_TAKE1, NGX_CONF_1MORE};
+use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
-use crate::core::*;
 use crate::request::*;
-use crate::variables::{GetHandler, SetHandler, VarDef, NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_NOCACHEABLE, prefix_var_name};
+use crate::upstream_round_robin::RrPeers;
+use crate::variables::{VarDef, NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_NOCACHEABLE, prefix_var_name};
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_UPS_CONF, HttpModuleDef, http_module_def};
 
 // ============================================================================
@@ -71,823 +76,923 @@ pub const NGX_HTTP_UPSTREAM_BACKUP: u32 = 0x0020;
 pub const NGX_HTTP_UPSTREAM_MODIFY: u32 = 0x0040;
 pub const NGX_HTTP_UPSTREAM_MAX_CONNS: u32 = 0x0100;
 
-// ============================================================================
-// PEER SELECTION TRAITS
-// ============================================================================
+// ngx_event_connect.h: peer free states
+pub const NGX_PEER_KEEPALIVE: u32 = 1;
+pub const NGX_PEER_NEXT: u32 = 2;
+pub const NGX_PEER_FAILED: u32 = 4;
 
-/// Peer statistics for variables.
-#[derive(Clone, Debug, Default)]
-pub struct PeerStats {
-    pub conns: u32,
-    pub fails: u32,
-    pub effective_weight: u32,
-    pub current_weight: u32,
-    pub total_weight: u32,
-}
-
-/// Trait for a peer (backend server) in an upstream.
-/// Implementors handle connection pooling and load-balancer state per-peer.
-pub trait Peer: Send {
-    /// Return a connection to the pool after use.
-    fn free(&self, r: &R, pc: &Rc<Connection>, state: u32);
-
-    /// Number of tries remaining for this peer.
-    fn tries(&self) -> u32;
-
-    /// Peer name/address for logging.
-    fn name(&self) -> Vec<u8>;
-
-    /// Mark peer as down (failed).
-    fn mark_down(&self);
-
-    /// Get peer stats (for variables).
-    fn stats(&self) -> PeerStats;
-}
-
-/// Trait for initializing load-balancer peers per-request.
-/// Handles peer selection logic (round-robin, least_conn, ip_hash, etc).
-pub trait PeerInit: Send {
-    /// Initialize peer selection for this request.
-    /// Returns a Peer to attempt connection to.
-    fn init(&self, r: &R, upstream: &Upstream) -> Rc<dyn Peer>;
-}
-
-// ============================================================================
-// UPSTREAM CONFIGURATION AND STATE
-// ============================================================================
+// peer.notify types
+pub const NGX_HTTP_UPSTREAM_NOTIFY_CONNECT: u32 = 0x1;
+pub const NGX_HTTP_UPSTREAM_NOTIFY_HEADER: u32 = 0x2;
 
 crate::http_module_index!("ngx_http_upstream_module");
 
-/// Server entry in upstream { ... } block
-#[derive(Clone)]
-pub struct UpstreamServer {
-    pub name: Vec<u8>,           // name as written
-    pub addr: Vec<u8>,            // resolved address
-    pub port: u16,
-    pub weight: u32,
-    pub max_conns: u32,
-    pub max_fails: u32,
-    pub fail_timeout: u64,        // milliseconds
-    pub slow_start: u64,           // milliseconds
-    pub backup: bool,
-    pub down: bool,
-    pub resolve: bool,
-    pub service: Vec<u8>,
+
+// ============================================================================
+// UPSTREAM CONNECTIONS
+// ============================================================================
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+
+/// Upstream connection — either TCP or UNIX so proxy_pass to
+/// http://unix:/path.sock:/uri works.
+pub enum UpstreamSock {
+    Tcp(TcpStream),
+    Unix(tokio::net::UnixStream),
+    Ssl(Box<crate::upstream_ssl::UpstreamSsl>),
 }
 
-/// Per-upstream configuration: `upstream NAME { ... }`
-pub struct UpstreamConf {
-    pub name: Vec<u8>,
-    pub servers: Vec<UpstreamServer>,
-    pub backup_servers: Vec<UpstreamServer>,
-    pub peer_init: Option<Rc<dyn PeerInit>>,
-    pub keepalive: u32,           // # conns in keepalive pool
-    pub keepalive_time: u64,      // milliseconds
-    pub keepalive_timeout: u64,   // milliseconds
-    pub keepalive_requests: u32,
+
+impl AsyncRead for UpstreamSock {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_read(cx, buf),
+            }
+        }
+    }
 }
-
-/// Per-request upstream context: module-specific callbacks
-pub struct UpstreamCtx {
-    pub schema: Vec<u8>,          // "http", "https"
-    pub uri: Vec<u8>,             // rewritten request URI
-    pub host: Vec<u8>,            // rewritten Host header
-    pub port: u16,
-
-    /// Create upstream request from client request
-    pub create_request: Box<dyn Fn(&R) -> Result<Chain, i64>>,
-
-    /// Reinit request before retry
-    pub reinit_request: Option<Box<dyn Fn(&R) -> i64>>,
-
-    /// Process upstream response headers (returns NGX_OK or status code)
-    pub process_header: Box<dyn Fn(&R, &[u8]) -> i64>,
-
-    pub abort_request: Option<Box<dyn Fn(&R)>>,
-    pub finalize_request: Option<Box<dyn Fn(&R, i64)>>,
-
-    pub input_filter_init: Option<Box<dyn Fn(&R) -> i64>>,
-    pub input_filter: Option<Box<dyn Fn(&R, usize) -> i64>>,
-
-    pub buffering: bool,
-    pub buffer_size: usize,
-    pub bufs: (usize, usize),     // (count, size)
-
-    pub read_timeout: u64,
-    pub connect_timeout: u64,
-    pub send_timeout: u64,
-    pub next_upstream_timeout: u64,
-
-    pub next_upstream_tries: u32,
-    pub next_upstream: u32,       // bitmask of NGX_HTTP_UPSTREAM_FT_*
-
-    pub temp_path: Option<Vec<u8>>,
-    pub max_temp_file_size: usize,
-    pub temp_file_write_size: usize,
-
-    pub pass_headers: Vec<Vec<u8>>,
-    pub hide_headers: Vec<Vec<u8>>,
-    pub pass_request_headers: bool,
-    pub pass_request_body: bool,
-
-    pub intercept_errors: bool,
-    pub ignore_client_abort: bool,
-    pub cyclic_temp_file: bool,
-
-    pub store: bool,
-    pub store_access: u32,        // unix perms
-
-    pub cookie_domains: Vec<Vec<u8>>,
-    pub cookie_paths: Vec<Vec<u8>>,
-    pub cookie_flags: Vec<Vec<u8>>,
-    pub redirects: Vec<(Vec<u8>, Vec<u8>)>, // (from, to)
+impl AsyncWrite for UpstreamSock {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, b),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_write(cx, b),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_write(cx, b),
+            }
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_flush(cx),
+            }
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            let this = self.get_unchecked_mut();
+            match this {
+                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_shutdown(cx),
+            }
+        }
+    }
 }
-
-impl Default for UpstreamCtx {
-    fn default() -> Self {
-        UpstreamCtx {
-            schema: b"http".to_vec(),
-            uri: Vec::new(),
-            host: Vec::new(),
-            port: 80,
-            create_request: Box::new(|_r| Err(NGX_ERROR)),
-            reinit_request: None,
-            process_header: Box::new(|_r, _h| NGX_ERROR),
-            abort_request: None,
-            finalize_request: None,
-            input_filter_init: None,
-            input_filter: None,
-            buffering: true,
-            buffer_size: 4096,
-            bufs: (8, 4096),
-            read_timeout: 60000,
-            connect_timeout: 60000,
-            send_timeout: 60000,
-            next_upstream_timeout: 0,
-            next_upstream_tries: 0,
-            next_upstream: NGX_HTTP_UPSTREAM_FT_ERROR | NGX_HTTP_UPSTREAM_FT_TIMEOUT,
-            temp_path: None,
-            max_temp_file_size: 1024 * 1024 * 1024,
-            temp_file_write_size: 16384,
-            pass_headers: Vec::new(),
-            hide_headers: Vec::new(),
-            pass_request_headers: true,
-            pass_request_body: true,
-            intercept_errors: false,
-            ignore_client_abort: false,
-            cyclic_temp_file: false,
-            store: false,
-            store_access: 0o644,
-            cookie_domains: Vec::new(),
-            cookie_paths: Vec::new(),
-            cookie_flags: Vec::new(),
-            redirects: Vec::new(),
+impl UpstreamSock {
+    /// Wait until the upstream has sent data or closed. The readiness is
+    /// checked with a peek, so a stale one (a keepalive connection whose
+    /// last response ended without EAGAIN) is cleared instead of reported.
+    pub(crate) async fn wait_readable(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let (ready, peek) = match self {
+                UpstreamSock::Tcp(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
+                UpstreamSock::Unix(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
+                UpstreamSock::Ssl(s) => return s.wait_readable().await,
+            };
+            if ready.is_err() {
+                return;
+            }
+            match peek {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                _ => return,
+            }
         }
     }
 }
 
-// Per-request upstream state (already declared in request.rs)
-// pub struct UpstreamState {
-//     pub bl_time: u64,
-//     pub bl_state: u32,
-//     pub status: i64,
-//     pub response_time: u64,
-//     pub connect_time: u64,
-//     pub header_time: u64,
-//     pub queue_time: u64,
-//     pub response_length: i64,
-//     pub bytes_received: i64,
-//     pub bytes_sent: i64,
-//     pub peer: Vec<u8>,
-// }
-
-/// Upstream structure: a group of backend servers
-pub struct Upstream {
-    pub name: Vec<u8>,
-    pub peers: Vec<Rc<dyn Peer>>,
-    pub backup_peers: Vec<Rc<dyn Peer>>,
-    pub peer_init: Rc<dyn PeerInit>,
-    pub keepalive: u32,
-    pub keepalive_time: u64,
-    pub keepalive_timeout: u64,
-    pub keepalive_requests: u32,
+fn peek_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<usize> {
+    let mut b = [0u8; 1];
+    let n = unsafe { libc::recv(fd, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
 }
 
-impl Upstream {
-    pub fn new(conf: &UpstreamConf, peer_init: Rc<dyn PeerInit>) -> Rc<Self> {
-        Rc::new(Upstream {
-            name: conf.name.clone(),
-            peers: Vec::new(),
-            backup_peers: Vec::new(),
-            peer_init,
-            keepalive: conf.keepalive,
-            keepalive_time: conf.keepalive_time,
-            keepalive_timeout: conf.keepalive_timeout,
-            keepalive_requests: conf.keepalive_requests,
-        })
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+/// ngx_http_upstream_server_t: a server of an upstream{} block (or the
+/// single address of an implicit upstream).
+#[derive(Clone, Default)]
+pub struct UpstreamServer {
+    pub name: Vec<u8>,
+    pub addrs: Vec<Addr>,
+    pub weight: u32,
+    pub max_conns: u32,
+    pub max_fails: u32,
+    /// seconds
+    pub fail_timeout: i64,
+    pub slow_start: u64,
+    /// 0, NGX_HTTP_UPSTREAM_FAILED ("down") or NGX_HTTP_UPSTREAM_DRAINING
+    pub down: u32,
+    pub backup: bool,
+    /// resolve at run time (zone)
+    pub host: Vec<u8>,
+    pub service: Vec<u8>,
+    /// route=
+    pub sid: Vec<u8>,
+}
+
+/// Initializes the peers of an upstream at configuration time
+/// (peer.init_upstream).
+pub type InitUpstream = fn(&mut Conf, &Rc<UpstreamSrvConf>) -> ConfResult;
+
+/// Initializes the balancer for a request (peer.init).
+pub type InitPeer = Rc<dyn Fn(&R, &Rc<UpstreamSrvConf>) -> Result<Box<dyn PeerBalancer>, ()>>;
+
+/// ngx_http_upstream_srv_conf_t
+pub struct UpstreamSrvConf {
+    pub host: Vec<u8>,
+    pub file_name: Vec<u8>,
+    pub line: usize,
+    pub port: Cell<u16>,
+    pub no_port: bool,
+    pub flags: Cell<u32>,
+    /// None for an implicit upstream of a name (resolved at init)
+    pub servers: RefCell<Option<Vec<UpstreamServer>>>,
+    /// defined by upstream{} (C: srv_conf != NULL)
+    pub block: Cell<bool>,
+
+    pub init_upstream: Cell<Option<InitUpstream>>,
+    pub init: RefCell<Option<InitPeer>>,
+    /// us->peer.data of the round-robin based balancers
+    pub peers: RefCell<Option<Rc<RrPeers>>>,
+
+    /// zone name and size (shm_zone)
+    pub zone: RefCell<Option<(Vec<u8>, usize)>>,
+    pub resolver: RefCell<Option<Rc<Resolver>>>,
+    /// msec; None until merged (NGX_CONF_UNSET_MSEC)
+    pub resolver_timeout: Cell<Option<u64>>,
+
+    /// the srv confs of the balancer modules, by type
+    modules: RefCell<Vec<(TypeId, Rc<dyn Any>)>>,
+}
+
+impl UpstreamSrvConf {
+    fn new(host: &[u8], port: u16, no_port: bool, flags: u32, file_name: Vec<u8>, line: usize) -> UpstreamSrvConf {
+        UpstreamSrvConf {
+            host: host.to_vec(),
+            file_name,
+            line,
+            port: Cell::new(port),
+            no_port,
+            flags: Cell::new(flags),
+            servers: RefCell::new(None),
+            block: Cell::new(false),
+            init_upstream: Cell::new(None),
+            init: RefCell::new(None),
+            peers: RefCell::new(None),
+            zone: RefCell::new(None),
+            resolver: RefCell::new(None),
+            resolver_timeout: Cell::new(None),
+            modules: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The srv conf of a balancer module (ngx_http_conf_upstream_srv_conf).
+    pub fn module_conf<T: 'static>(&self) -> Option<Rc<T>> {
+        let id = TypeId::of::<T>();
+        let m = self.modules.borrow();
+        let c = m.iter().find(|(t, _)| *t == id)?.1.clone();
+        c.downcast::<T>().ok()
+    }
+
+    pub fn set_module_conf<T: 'static>(&self, conf: Rc<T>) {
+        let id = TypeId::of::<T>();
+        let mut m = self.modules.borrow_mut();
+        m.retain(|(t, _)| *t != id);
+        m.push((id, conf));
+    }
+
+    /// The per-request balancer (uscf->peer.init).
+    pub fn init_peer(self: &Rc<Self>, r: &R) -> Result<Box<dyn PeerBalancer>, ()> {
+        let init = match self.init.borrow().clone() {
+            Some(f) => f,
+            None => return Err(()),
+        };
+        init(r, self)
     }
 }
 
-// ============================================================================
-// MAIN CONFIGURATION STRUCT
-// ============================================================================
-
+/// ngx_http_upstream_main_conf_t
 pub struct UpstreamMainConf {
-    pub upstreams: Vec<(Vec<u8>, Rc<Upstream>)>,
-    /// Servers per upstream name, kept alongside the Rc<Upstream> so
-    /// proxy_pass to a named upstream can pick a peer without going through
-    /// the peer_init dance yet.
-    pub server_lists: Vec<(Vec<u8>, std::cell::RefCell<PeerGroup>)>,
-    /// While an `upstream NAME { ... }` block is being parsed, hold the pending
-    /// server list here so server_handler knows where to append.
-    pub current_builder: std::cell::RefCell<Option<UpstreamBuilder>>,
-}
-
-pub struct UpstreamBuilder {
-    pub name: Vec<u8>,
-    pub servers: Vec<UpstreamServer>,
-    pub balancer: BalancerKind,
-}
-
-/// Smooth weighted round-robin state for a single upstream {} block.
-/// Matches ngx_http_upstream_get_round_robin_peer.
-pub struct PeerState {
-    pub server: UpstreamServer,
-    pub effective_weight: i32,
-    pub current_weight: i32,
-    pub weight: i32,
-    /// Consecutive failure count. When >= max_fails, peer is considered
-    /// down until `checked + fail_timeout` (see ngx_http_upstream_free_
-    /// round_robin_peer / ngx_peer_get_round_robin).
-    pub fails: u32,
-    /// Wall-clock seconds when the peer was last "checked" (either used
-    /// or its first failure since being healthy).
-    pub checked: u64,
-    pub accessed: u64,
-    /// Currently in-flight requests against this peer. Incremented at
-    /// pick time, decremented via LeaseHandle when the request drops.
-    /// Least_conn reads this to pick the peer with the fewest inflight.
-    pub active: u32,
-}
-
-#[derive(Clone)]
-pub enum BalancerKind {
-    RoundRobin,
-    IpHash,
-    /// nginx `hash $key` (non-consistent). Key is a ComplexValue evaluated
-    /// per request; the CRC32 of the result picks the peer by weight.
-    Hash(std::rc::Rc<crate::script::ComplexValue>),
-    /// nginx `least_conn;` — pick the peer with the fewest in-flight
-    /// requests, breaking ties with the normal smooth-WRR pass.
-    LeastConn,
-}
-
-pub struct PeerGroup {
-    pub peers: Vec<PeerState>,
-    pub backup: Vec<PeerState>,
-    /// Load-balancing algorithm chosen by the `ip_hash` / `hash` /
-    /// `least_conn` / `random` directive inside the upstream {} block.
-    pub balancer: BalancerKind,
+    pub upstreams: RefCell<Vec<Rc<UpstreamSrvConf>>>,
+    /// the upstream{} being parsed (C: the block's srv_conf)
+    pub current: RefCell<Option<Rc<UpstreamSrvConf>>>,
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(UpstreamMainConf {
-        upstreams: Vec::new(),
-        server_lists: Vec::new(),
-        current_builder: std::cell::RefCell::new(None),
-    })
+    make_slot(UpstreamMainConf { upstreams: RefCell::new(Vec::new()), current: RefCell::new(None) })
 }
 
-fn init_main_conf(_cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult {
+fn main_conf(cf: &Conf) -> Rc<RefCell<UpstreamMainConf>> {
+    crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index())
+}
+
+/// The upstream{} block whose directives are being parsed
+/// (ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module)).
+pub fn current_upstream(cf: &Conf) -> Option<Rc<UpstreamSrvConf>> {
+    let umcf = main_conf(cf);
+    let m = umcf.borrow();
+    let c = m.current.borrow().clone();
+    c
+}
+
+/// Warn about a second load balancing method in the block
+/// ("load balancing method redefined"), and set it.
+pub fn set_balancer(cf: &Conf, uscf: &UpstreamSrvConf, init: InitUpstream, flags: u32) {
+    if uscf.init_upstream.get().is_some() {
+        cf.warn(format_args!("load balancing method redefined"));
+    }
+
+    uscf.init_upstream.set(Some(init));
+    uscf.flags.set(flags);
+}
+
+/// ngx_http_upstream_init_main_conf: initialize the peers of every upstream.
+fn init_main_conf(cf: &mut Conf, _conf: &Rc<dyn Any>) -> ConfResult {
+    let upstreams = main_conf(cf).borrow().upstreams.borrow().clone();
+
+    for uscf in upstreams.iter() {
+        let init = uscf.init_upstream.get().unwrap_or(crate::upstream_round_robin::init_round_robin);
+        init(cf, uscf)?;
+    }
+
     Ok(())
 }
 
-// ============================================================================
-// DIRECTIVE HANDLERS
-// ============================================================================
-
+/// ngx_http_upstream: the upstream{} block.
 fn upstream_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    // upstream name { ... } block handler
-    if cf.args.len() < 2 {
-        return Err(msg("no upstream name specified"));
-    }
+    let mut u = Url::default();
+    u.host = cf.args[1].clone();
+    u.no_resolve = true;
+    u.no_port = true;
 
-    let name = cf.args[1].clone();
-    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
+    let uscf = upstream_add(
+        cf,
+        &mut u,
+        NGX_HTTP_UPSTREAM_CREATE
+            | NGX_HTTP_UPSTREAM_MODIFY
+            | NGX_HTTP_UPSTREAM_WEIGHT
+            | NGX_HTTP_UPSTREAM_MAX_CONNS
+            | NGX_HTTP_UPSTREAM_MAX_FAILS
+            | NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
+            | NGX_HTTP_UPSTREAM_DOWN
+            | NGX_HTTP_UPSTREAM_BACKUP,
+    )?;
 
-    // Set up a builder that server_handler will push into.
-    *umcf.borrow().current_builder.borrow_mut() = Some(UpstreamBuilder {
-        name: name.clone(),
-        servers: Vec::new(),
-        balancer: BalancerKind::RoundRobin,
-    });
+    uscf.block.set(true);
+    *uscf.servers.borrow_mut() = Some(Vec::new());
+
+    let umcf = main_conf(cf);
+    let prev = umcf.borrow().current.borrow_mut().replace(uscf.clone());
 
     let saved_ct = cf.cmd_type;
     cf.cmd_type = NGX_HTTP_UPS_CONF;
     let rv = cf.parse_block();
     cf.cmd_type = saved_ct;
 
-    // Take the builder back and finalize into an Upstream entry.
-    let builder = umcf.borrow().current_builder.borrow_mut().take();
-    if let Some(b) = builder {
-        let servers = b.servers.clone();
-        let balancer = b.balancer;
-        let uconf = UpstreamConf {
-            name: b.name.clone(),
-            servers: b.servers,
-            backup_servers: Vec::new(),
-            peer_init: None,
-            keepalive: 0,
-            keepalive_time: 0,
-            keepalive_timeout: 0,
-            keepalive_requests: 0,
-        };
-        let peer_init: Rc<dyn PeerInit> = Rc::new(NoopPeerInit);
-        let up = Upstream::new(&uconf, peer_init);
-        let mut group = PeerGroup { peers: Vec::new(), backup: Vec::new(), balancer };
-        for srv in servers.into_iter() {
-            let w = if srv.weight == 0 { 1 } else { srv.weight as i32 };
-            let ps = PeerState {
-                server: srv.clone(),
-                effective_weight: w,
-                current_weight: 0,
-                weight: w,
-                fails: 0,
-                checked: 0,
-                accessed: 0,
-                active: 0,
-            };
-            if srv.backup { group.backup.push(ps); } else { group.peers.push(ps); }
-        }
-        let mut m = umcf.borrow_mut();
-        m.upstreams.push((name.clone(), up));
-        m.server_lists.push((name, std::cell::RefCell::new(group)));
-    }
-    rv
-}
+    *umcf.borrow().current.borrow_mut() = prev;
 
-/// Return (host, port) of the first usable server in the named upstream.
-/// Currently just picks the first non-down, non-backup entry; TODO: real
-/// round-robin with weights.
-/// Pick a peer for the given named upstream using smooth weighted round-robin.
-/// Mirrors ngx_http_upstream_get_round_robin_peer's inner loop.
-pub fn first_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    // Do the pick with the main conf borrowed, then release before calling
-    // incr_active_lease (which reacquires the same borrow chain).
-    let (picked, is_least_conn) = {
-        let m = umcf.borrow();
-        let cell = m.server_lists.iter().find(|(n, _)| n.as_slice() == name).map(|(_, c)| c)?;
-        let mut g = cell.borrow_mut();
-        let is_lc = matches!(g.balancer, BalancerKind::LeastConn);
-        let picked = match &g.balancer {
-            BalancerKind::IpHash => {
-                let addr_bytes = client_ip_bytes(r);
-                pick_ip_hash(&mut g.peers, &addr_bytes)
-                    .or_else(|| pick_wrr(&mut g.backup))
-            }
-            BalancerKind::Hash(cv) => {
-                let key_cv = cv.clone();
-                drop(g);
-                let key = crate::script::complex_value(r, &key_cv).unwrap_or_default();
-                let mut g = cell.borrow_mut();
-                pick_hash(&mut g.peers, &key)
-                    .or_else(|| pick_wrr(&mut g.backup))
-            }
-            BalancerKind::LeastConn => {
-                pick_least_conn(&mut g.peers).or_else(|| pick_wrr(&mut g.backup))
-            }
-            BalancerKind::RoundRobin => {
-                pick_wrr(&mut g.peers).or_else(|| pick_wrr(&mut g.backup))
-            }
-        };
-        (picked, is_lc)
-    };
-    // Only least_conn needs a per-request active counter — for other
-    // balancers the extra bookkeeping is dead weight and introduced
-    // regressions in proxy_next_upstream around retry accounting.
-    if is_least_conn {
-        if let Some((h, port)) = &picked {
-            incr_active_lease(r, name, h, *port);
-        }
-    }
-    picked
-}
+    rv?;
 
-/// Increment the `active` counter for a peer and register a cleanup on the
-/// request that decrements it. Cheap enough to do for every balancer since
-/// only least_conn actually reads the counter.
-fn incr_active_lease(r: &R, name: &[u8], host: &str, port: u16) {
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let m = umcf.borrow();
-    for (n, cell) in m.server_lists.iter() {
-        if n.as_slice() != name { continue; }
-        let mut g = cell.borrow_mut();
-        let PeerGroup { peers, backup, .. } = &mut *g;
-        for p in peers.iter_mut().chain(backup.iter_mut()) {
-            let addr_matches = std::str::from_utf8(&p.server.addr).map(|a| a == host).unwrap_or(false);
-            if addr_matches && p.server.port == port {
-                p.active = p.active.saturating_add(1);
-                let name_owned = name.to_vec();
-                let host_owned = host.to_string();
-                r.add_cleanup(Box::new(move || {
-                    decr_active(&name_owned, &host_owned, port);
-                }));
-                return;
-            }
-        }
-    }
-}
-
-fn decr_active(name: &[u8], host: &str, port: u16) {
-    // We don't hold r here — reach into the thread-local main conf via
-    // the http main conf slot. Simpler: iterate the cycle's server_lists
-    // by walking upstream::main_conf() would require request context.
-    // Instead, tests only ever have one HTTP main conf, so grab it via
-    // the module registry. To keep this decoupled, thread_local a
-    // pointer to the per-worker UpstreamMainConf populated at init time.
-    ACTIVE_MAIN.with(|slot| {
-        if let Some(umcf) = slot.borrow().as_ref() {
-            let m = umcf.borrow();
-            for (n, cell) in m.server_lists.iter() {
-                if n.as_slice() != name { continue; }
-                let mut g = cell.borrow_mut();
-                let PeerGroup { peers, backup, .. } = &mut *g;
-        for p in peers.iter_mut().chain(backup.iter_mut()) {
-                    let addr_matches = std::str::from_utf8(&p.server.addr).map(|a| a == host).unwrap_or(false);
-                    if addr_matches && p.server.port == port {
-                        if p.active > 0 { p.active -= 1; }
-                        return;
-                    }
-                }
-            }
-        }
-    });
-}
-
-thread_local! {
-    static ACTIVE_MAIN: std::cell::RefCell<Option<Rc<std::cell::RefCell<UpstreamMainConf>>>> = std::cell::RefCell::new(None);
-}
-
-/// Called from postconfiguration to give the decr_active cleanup a way
-/// back to the main conf without a request handle.
-pub fn set_active_main(umcf: Rc<std::cell::RefCell<UpstreamMainConf>>) {
-    ACTIVE_MAIN.with(|slot| *slot.borrow_mut() = Some(umcf));
-}
-
-/// nginx least_conn: pick the peer with the smallest active/weight ratio,
-/// falling through to WRR on ties.  Mirrors
-/// ngx_http_upstream_get_least_conn_peer.
-fn pick_least_conn(peers: &mut [PeerState]) -> Option<(String, u16)> {
-    if peers.is_empty() { return None; }
-    let now = ngx_core::times::time() as u64;
-
-    // First pass: find the minimum active/weight among live peers.
-    let mut best_ratio: Option<u64> = None;
-    let mut candidates: Vec<usize> = Vec::new();
-    for (i, p) in peers.iter().enumerate() {
-        if p.server.down { continue; }
-        if p.server.max_fails > 0 && p.fails >= p.server.max_fails {
-            if now.saturating_sub(p.checked) < p.server.fail_timeout / 1000 { continue; }
-        }
-        let w = p.server.weight.max(1) as u64;
-        // (active * scale) / weight — use *1000 to avoid integer trunc
-        let ratio = (p.active as u64) * 1000 / w;
-        match best_ratio {
-            None => { best_ratio = Some(ratio); candidates.clear(); candidates.push(i); }
-            Some(b) if ratio < b => { best_ratio = Some(ratio); candidates.clear(); candidates.push(i); }
-            Some(b) if ratio == b => { candidates.push(i); }
-            _ => {}
-        }
-    }
-    if candidates.is_empty() { return None; }
-    if candidates.len() == 1 {
-        let p = &peers[candidates[0]];
-        return Some((
-            std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
-            p.server.port,
-        ));
+    if uscf.servers.borrow().as_ref().is_none_or(|s| s.is_empty()) {
+        return Err(cf.emerg(format_args!("no servers are inside upstream")));
     }
 
-    // Tie: run smooth-WRR restricted to the tied peers by weight.
-    let mut best_idx: Option<usize> = None;
-    let mut best_cw: i32 = i32::MIN;
-    let mut total: i32 = 0;
-    for &i in &candidates {
-        let p = &mut peers[i];
-        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
-        total = total.saturating_add(p.effective_weight);
-        if p.effective_weight < p.weight { p.effective_weight += 1; }
-        if p.current_weight > best_cw {
-            best_cw = p.current_weight;
-            best_idx = Some(i);
-        }
-    }
-    let idx = best_idx?;
-    peers[idx].current_weight -= total;
-    let p = &peers[idx];
-    Some((
-        std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
-        p.server.port,
-    ))
+    Ok(())
 }
 
-/// Client IP bytes for ip_hash. AF_UNIX and other non-IPv4/6 clients get
-/// four 0xFF bytes so they all hash to the same peer (matches C's
-/// ngx_http_upstream_init_ip_hash_peer default of INADDR_NONE).
-fn client_ip_bytes(r: &R) -> Vec<u8> {
-    use ngx_core::inet::SockAddr;
-    let sa = r.connection.sockaddr.borrow();
-    match &*sa {
-        // C's ngx_http_upstream_init_ip_hash_peer hashes the /24 prefix
-        // of the IPv4 address (first three octets); the last one is
-        // dropped so an entire subnet lands on the same peer.
-        SockAddr::V4(v4) => v4.ip().octets()[..3].to_vec(),
-        SockAddr::V6(v6) => v6.ip().octets().to_vec(),
-        // C uses a static-init "pseudo_addr" buffer of 3 zero bytes for
-        // any address family that isn't inet/inet6 — unix connections
-        // therefore all hash to the same key.
-        SockAddr::Unix(_) => vec![0, 0, 0],
-    }
-}
-
-/// nginx `hash $key` non-consistent picker: CRC32 of the key, then
-/// `hash % total_weight` selects a peer.  Mirrors
-/// ngx_http_upstream_get_hash_peer (non-consistent branch).
-fn pick_hash(peers: &mut [PeerState], key: &[u8]) -> Option<(String, u16)> {
-    if peers.is_empty() || key.is_empty() { return pick_wrr(peers); }
-    let total: i32 = peers.iter()
-        .filter(|p| !p.server.down)
-        .map(|p| p.server.weight as i32)
-        .sum();
-    if total <= 0 { return None; }
-
-    let mut hash = crc32fast::hash(key);
-    for _try in 0..20 {
-        let mut w = (hash % total as u32) as i32;
-        for p in peers.iter() {
-            if p.server.down { continue; }
-            let peer_w = p.server.weight as i32;
-            if w < peer_w {
-                return Some((
-                    std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
-                    p.server.port,
-                ));
-            }
-            w -= peer_w;
-        }
-        // Rehash: (prev_hash bytes) CRC32'd again — same as C rehashing the
-        // 4-byte previous hash value.
-        hash = crc32fast::hash(&hash.to_be_bytes());
-    }
-    pick_wrr(peers)
-}
-
-/// nginx ip_hash algorithm: hash = 89; for byte in addr: hash = (hash*113 + byte) % 6271.
-/// Then pick a peer whose cumulative weight covers `hash % total_weight`.
-fn pick_ip_hash(peers: &mut [PeerState], addr: &[u8]) -> Option<(String, u16)> {
-    if peers.is_empty() { return None; }
-    // Sum of live peer weights.
-    let total: i32 = peers.iter()
-        .filter(|p| !p.server.down)
-        .map(|p| p.server.weight as i32)
-        .sum();
-    if total <= 0 { return None; }
-
-    let mut hash: u32 = 89;
-    for &b in addr {
-        hash = hash.wrapping_mul(113).wrapping_add(b as u32) % 6271;
-    }
-
-    // Try up to 20 rehashes so a downed peer doesn't stall the pick (C caps
-    // at 20 as well before falling back to plain round-robin).
-    for _try in 0..20 {
-        let mut w = (hash % total as u32) as i32;
-        for p in peers.iter() {
-            if p.server.down { continue; }
-            let peer_w = p.server.weight as i32;
-            if w < peer_w {
-                return Some((
-                    std::str::from_utf8(&p.server.addr).unwrap_or("").to_string(),
-                    p.server.port,
-                ));
-            }
-            w -= peer_w;
-        }
-        hash = (hash.wrapping_mul(113).wrapping_add(113)) % 6271;
-    }
-    // Fall back to round-robin.
-    pick_wrr(peers)
-}
-
-/// Number of non-down peers (main + backup) in the named upstream.
-/// proxy_next_upstream uses this as its per-request retry ceiling: after
-/// `peer_count` attempts we've cycled through every distinct peer entry
-/// (even if two entries happen to share a host:port).
-pub fn peer_count_for(r: &R, name: &[u8]) -> usize {
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let m = umcf.borrow();
-    for (n, cell) in m.server_lists.iter() {
-        if n.as_slice() != name { continue; }
-        let g = cell.borrow();
-        return g.peers.iter().filter(|p| !p.server.down).count()
-             + g.backup.iter().filter(|p| !p.server.down).count();
-    }
-    0
-}
-
-/// Pick the next peer for a retry — just runs one more round of smooth WRR
-/// (which naturally rotates among peers). The caller must enforce an
-/// attempt ceiling via [`peer_count_for`] so we don't loop forever when
-/// only one peer exists.
-pub fn next_server_for(r: &R, name: &[u8]) -> Option<(String, u16)> {
-    first_server_for(r, name)
-}
-
-fn pick_wrr(peers: &mut [PeerState]) -> Option<(String, u16)> {
-    let now = ngx_core::times::time() as u64;
-    let mut total: i32 = 0;
-    let mut best_idx: Option<usize> = None;
-    let mut best_cw: i32 = i32::MIN;
-    for (i, p) in peers.iter_mut().enumerate() {
-        if p.server.down { continue; }
-        // max_fails / fail_timeout: skip peers whose consecutive-fail
-        // count reached the ceiling until fail_timeout has elapsed since
-        // the first failure of the current window. Matches ngx_http_
-        // upstream_get_round_robin_peer's `if (peer->max_fails && …)`.
-        if p.server.max_fails > 0 && p.fails >= p.server.max_fails {
-            if now.saturating_sub(p.checked) < p.server.fail_timeout / 1000 {
-                continue;
-            }
-            // Fail window elapsed — give the peer another chance.
-            p.fails = 0;
-            p.checked = now;
-        }
-        p.current_weight = p.current_weight.saturating_add(p.effective_weight);
-        total = total.saturating_add(p.effective_weight);
-        if p.effective_weight < p.weight {
-            p.effective_weight += 1;
-        }
-        if p.current_weight > best_cw {
-            best_cw = p.current_weight;
-            best_idx = Some(i);
-        }
-    }
-    let idx = best_idx?;
-    peers[idx].current_weight -= total;
-    peers[idx].checked = now;
-    let s = &peers[idx].server;
-    Some((String::from_utf8_lossy(&s.addr).into_owned(), s.port))
-}
-
-/// Record a connect/read failure against the peer identified by (addr,
-/// port). Increments fails; on transition to failed, records `accessed`
-/// timestamp so pick_wrr can respect fail_timeout. Mirrors
-/// ngx_http_upstream_free_round_robin_peer(state=NGX_PEER_FAILED).
-pub fn mark_bad_server(r: &R, name: &[u8], addr: &str, port: u16) {
-    let now = ngx_core::times::time() as u64;
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let m = umcf.borrow();
-    for (n, cell) in m.server_lists.iter() {
-        if n.as_slice() != name { continue; }
-        let mut g = cell.borrow_mut();
-        let PeerGroup { peers, backup, .. } = &mut *g;
-        for p in peers.iter_mut().chain(backup.iter_mut()) {
-            let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
-            if paddr == addr && p.server.port == port {
-                p.fails = p.fails.saturating_add(1);
-                p.accessed = now;
-                if p.fails == 1 {
-                    p.checked = now;
-                }
-                // Penalise via effective_weight (matches C: peer->
-                // effective_weight -= peer->weight / peer->max_fails).
-                let per = if p.server.max_fails > 0 {
-                    p.weight / p.server.max_fails as i32
-                } else { p.weight };
-                p.effective_weight = (p.effective_weight - per).max(0);
-                return;
-            }
-        }
-    }
-}
-
-/// Reset a peer's failure counter after a successful use. Called on the
-/// happy path so a stray failure doesn't linger.
-pub fn mark_good_server(r: &R, name: &[u8], addr: &str, port: u16) {
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let m = umcf.borrow();
-    for (n, cell) in m.server_lists.iter() {
-        if n.as_slice() != name { continue; }
-        let mut g = cell.borrow_mut();
-        let PeerGroup { peers, backup, .. } = &mut *g;
-        for p in peers.iter_mut().chain(backup.iter_mut()) {
-            let paddr = std::str::from_utf8(&p.server.addr).unwrap_or("");
-            if paddr == addr && p.server.port == port {
-                p.fails = 0;
-                if p.effective_weight < p.weight {
-                    p.effective_weight = p.weight;
-                }
-                return;
-            }
-        }
-    }
-}
-
-struct NoopPeerInit;
-impl PeerInit for NoopPeerInit {
-    fn init(&self, _r: &R, _upstream: &Upstream) -> Rc<dyn Peer> {
-        Rc::new(DummyPeer)
-    }
-}
-
+/// ngx_http_upstream_server
 fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("no server address specified"));
-    }
-    // Parse host:port from args[1]. IPv6 [::1]:8080 and unix:/path supported.
-    let addr = cf.args[1].clone();
-    let addr_str = std::str::from_utf8(&addr).unwrap_or("");
-    let (host, port) = if let Some(path) = addr_str.strip_prefix("unix:") {
-        (format!("unix:{}", path), 0)
-    } else if addr_str.starts_with('[') {
-        // [ipv6]:port
-        if let Some(end) = addr_str.find(']') {
-            let host_part = &addr_str[..=end];
-            let rest = &addr_str[end + 1..];
-            let port = rest.strip_prefix(':').and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
-            (host_part.to_string(), port)
-        } else {
-            (addr_str.to_string(), 80)
+    let uscf = match current_upstream(cf) {
+        Some(u) => u,
+        None => return Err(msg("\"server\" directive is not allowed here")),
+    };
+
+    let value = cf.args.clone();
+    let flags = uscf.flags.get();
+
+    let mut us = UpstreamServer::default();
+
+    let mut weight: u32 = 1;
+    let mut max_conns: u32 = 0;
+    let mut max_fails: u32 = 1;
+    let mut fail_timeout: i64 = 10;
+    let mut resolve = false;
+
+    let invalid = |cf: &Conf, v: &[u8]| cf.emerg(format_args!("invalid parameter \"{}\"", B(v)));
+    let not_supported = |cf: &Conf, v: &[u8]| cf.emerg(format_args!("balancing method does not support parameter \"{}\"", B(v)));
+
+    for v in value.iter().skip(2) {
+        if let Some(n) = v.strip_prefix(b"weight=") {
+            if flags & NGX_HTTP_UPSTREAM_WEIGHT == 0 {
+                return Err(not_supported(cf, v));
+            }
+            weight = match ngx_core::string::atoi(n) {
+                Some(w) if w > 0 => w as u32,
+                _ => return Err(invalid(cf, v)),
+            };
+            continue;
         }
-    } else if let Some(colon) = addr_str.rfind(':') {
-        let host_part = &addr_str[..colon];
-        let port = addr_str[colon + 1..].parse::<u16>().unwrap_or(80);
-        (host_part.to_string(), port)
+
+        if let Some(n) = v.strip_prefix(b"max_conns=") {
+            if flags & NGX_HTTP_UPSTREAM_MAX_CONNS == 0 {
+                return Err(not_supported(cf, v));
+            }
+            max_conns = match ngx_core::string::atoi(n) {
+                Some(m) => m as u32,
+                None => return Err(invalid(cf, v)),
+            };
+            continue;
+        }
+
+        if let Some(n) = v.strip_prefix(b"max_fails=") {
+            if flags & NGX_HTTP_UPSTREAM_MAX_FAILS == 0 {
+                return Err(not_supported(cf, v));
+            }
+            max_fails = match ngx_core::string::atoi(n) {
+                Some(m) => m as u32,
+                None => return Err(invalid(cf, v)),
+            };
+            continue;
+        }
+
+        if let Some(s) = v.strip_prefix(b"fail_timeout=") {
+            if flags & NGX_HTTP_UPSTREAM_FAIL_TIMEOUT == 0 {
+                return Err(not_supported(cf, v));
+            }
+            fail_timeout = match ngx_core::parse::parse_time(s, true) {
+                Some(t) => t,
+                None => return Err(invalid(cf, v)),
+            };
+            continue;
+        }
+
+        if v.as_slice() == b"backup" {
+            if flags & NGX_HTTP_UPSTREAM_BACKUP == 0 {
+                return Err(not_supported(cf, v));
+            }
+            us.backup = true;
+            continue;
+        }
+
+        if v.as_slice() == b"down" {
+            if flags & NGX_HTTP_UPSTREAM_DOWN == 0 {
+                return Err(not_supported(cf, v));
+            }
+            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_FAILED;
+            continue;
+        }
+
+        if v.as_slice() == b"drain" {
+            if flags & NGX_HTTP_UPSTREAM_DOWN == 0 {
+                return Err(not_supported(cf, v));
+            }
+            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_DRAINING;
+            continue;
+        }
+
+        if let Some(route) = v.strip_prefix(b"route=") {
+            if route.is_empty() {
+                return Err(cf.emerg(format_args!("route is empty")));
+            }
+            if route.len() > crate::upstream_round_robin::NGX_HTTP_UPSTREAM_SID_LEN {
+                return Err(cf.emerg(format_args!("route is longer than {}", crate::upstream_round_robin::NGX_HTTP_UPSTREAM_SID_LEN)));
+            }
+            us.sid = route.to_vec();
+            continue;
+        }
+
+        if v.as_slice() == b"resolve" {
+            resolve = true;
+            continue;
+        }
+
+        if let Some(service) = v.strip_prefix(b"service=") {
+            if service.is_empty() {
+                return Err(cf.emerg(format_args!("service is empty")));
+            }
+            us.service = service.to_vec();
+            continue;
+        }
+
+        return Err(invalid(cf, v));
+    }
+
+    let mut u = Url::new(&value[1]);
+    u.default_port = 80;
+
+    if resolve {
+        // resolve at run time
+        u.no_resolve = true;
+    }
+
+    if !us.service.is_empty() && !resolve {
+        return Err(cf.emerg(format_args!("service upstream \"{}\" requires \"resolve\" parameter", B(&u.url))));
+    }
+
+    if ngx_core::inet::parse_url(&mut u).is_err() {
+        if let Some(err) = u.err {
+            return Err(cf.emerg(format_args!("{} in upstream \"{}\"", err, B(&u.url))));
+        }
+        return Err(ConfError::Logged);
+    }
+
+    us.name = u.url.clone();
+
+    if !us.service.is_empty() && !u.no_port {
+        return Err(cf.emerg(format_args!("service upstream \"{}\" may not have port", B(&us.name))));
+    }
+
+    if !us.service.is_empty() && !u.addrs.is_empty() {
+        return Err(cf.emerg(format_args!("service upstream \"{}\" requires domain name", B(&us.name))));
+    }
+
+    if resolve && u.addrs.is_empty() {
+        // save port
+        let mut sa = SockAddr::v4(std::net::Ipv4Addr::UNSPECIFIED, u.port);
+        sa.set_port(u.port);
+        us.addrs = vec![Addr { sockaddr: sa, name: Vec::new() }];
+        us.host = u.host.clone();
     } else {
-        (addr_str.to_string(), 80)
-    };
+        us.addrs = u.addrs.clone();
+    }
 
-    let mut server = UpstreamServer {
-        name: addr.clone(),
-        addr: host.as_bytes().to_vec(),
-        port,
-        weight: 1,
-        max_conns: 0,
-        max_fails: 1,
-        fail_timeout: 10_000,
-        slow_start: 0,
-        backup: false,
-        down: false,
-        resolve: false,
-        service: Vec::new(),
-    };
-    for arg in cf.args.iter().skip(2) {
-        let s = std::str::from_utf8(arg).unwrap_or("");
-        if s == "backup" { server.backup = true; }
-        else if s == "down" { server.down = true; }
-        else if s == "resolve" { server.resolve = true; }
-        else if let Some(rest) = s.strip_prefix("weight=") {
-            if let Ok(n) = rest.parse::<u32>() { server.weight = n; }
-        } else if let Some(rest) = s.strip_prefix("max_conns=") {
-            if let Ok(n) = rest.parse::<u32>() { server.max_conns = n; }
-        } else if let Some(rest) = s.strip_prefix("max_fails=") {
-            if let Ok(n) = rest.parse::<u32>() { server.max_fails = n; }
-        } else if let Some(rest) = s.strip_prefix("fail_timeout=") {
-            if let Some(ms) = ngx_core::parse::parse_time(rest.as_bytes(), false) {
-                server.fail_timeout = ms as u64;
-            }
-        } else if let Some(rest) = s.strip_prefix("slow_start=") {
-            if let Some(ms) = ngx_core::parse::parse_time(rest.as_bytes(), false) {
-                server.slow_start = ms as u64;
-            }
-        } else if let Some(rest) = s.strip_prefix("service=") {
-            server.service = rest.as_bytes().to_vec();
+    us.weight = weight;
+    us.max_conns = max_conns;
+    us.max_fails = max_fails;
+    us.fail_timeout = fail_timeout;
+
+    uscf.servers.borrow_mut().get_or_insert_with(Vec::new).push(us);
+
+    Ok(())
+}
+
+/// ngx_http_upstream_resolver (in upstream{})
+fn resolver_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let uscf = current_upstream(cf).ok_or_else(|| msg("\"resolver\" directive is not allowed here"))?;
+
+    if uscf.resolver.borrow().is_some() {
+        return Err(msg("is duplicate"));
+    }
+
+    let args = cf.args[1..].to_vec();
+    let r = Resolver::create(cf, &args)?;
+    *uscf.resolver.borrow_mut() = Some(r);
+    Ok(())
+}
+
+/// resolver_timeout in upstream{} (ngx_conf_set_msec_slot)
+fn resolver_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let uscf = current_upstream(cf).ok_or_else(|| msg("\"resolver_timeout\" directive is not allowed here"))?;
+
+    if uscf.resolver_timeout.get().is_some() {
+        return Err(msg("is duplicate"));
+    }
+
+    match ngx_core::parse::parse_time(&cf.args[1], false) {
+        Some(t) => uscf.resolver_timeout.set(Some(t as u64)),
+        None => return Err(msg("invalid value")),
+    }
+    Ok(())
+}
+
+/// ngx_http_upstream_add: the upstream of a proxy_pass-like URL (found by
+/// host and port, or created: implicit), or of an upstream{} block
+/// (NGX_HTTP_UPSTREAM_CREATE), which may complete one created earlier.
+pub fn upstream_add(cf: &mut Conf, u: &mut Url, flags: u32) -> Result<Rc<UpstreamSrvConf>, ConfError> {
+    if flags & NGX_HTTP_UPSTREAM_CREATE == 0 && ngx_core::inet::parse_url(u).is_err() {
+        if let Some(err) = u.err {
+            return Err(cf.emerg(format_args!("{} in upstream \"{}\"", err, B(&u.url))));
+        }
+        return Err(ConfError::Logged);
+    }
+
+    let umcf = main_conf(cf);
+    let upstreams = umcf.borrow().upstreams.borrow().clone();
+
+    for uscf in upstreams.iter() {
+        if !uscf.host.eq_ignore_ascii_case(&u.host) {
+            continue;
+        }
+
+        if flags & NGX_HTTP_UPSTREAM_CREATE != 0 && uscf.flags.get() & NGX_HTTP_UPSTREAM_CREATE != 0 {
+            return Err(cf.emerg(format_args!("duplicate upstream \"{}\"", B(&u.host))));
+        }
+
+        if uscf.flags.get() & NGX_HTTP_UPSTREAM_CREATE != 0 && !u.no_port {
+            return Err(cf.emerg(format_args!("upstream \"{}\" may not have port {}", B(&u.host), u.port)));
+        }
+
+        if flags & NGX_HTTP_UPSTREAM_CREATE != 0 && !uscf.no_port {
+            ngx_log_error!(
+                NGX_LOG_EMERG,
+                cf.log,
+                None,
+                "upstream \"{}\" may not have port {} in {}:{}",
+                B(&u.host),
+                uscf.port.get(),
+                B(&uscf.file_name),
+                uscf.line
+            );
+            return Err(ConfError::Logged);
+        }
+
+        if uscf.port.get() != 0 && u.port != 0 && uscf.port.get() != u.port {
+            continue;
+        }
+
+        if flags & NGX_HTTP_UPSTREAM_CREATE != 0 {
+            uscf.flags.set(flags);
+            uscf.port.set(0);
+        }
+
+        return Ok(uscf.clone());
+    }
+
+    let uscf = Rc::new(UpstreamSrvConf::new(&u.host, u.port, u.no_port, flags, cf.conf_file_name(), cf.conf_line()));
+
+    if u.addrs.len() == 1 && (u.port != 0 || u.family == libc::AF_UNIX) {
+        let us = UpstreamServer { addrs: vec![u.addrs[0].clone()], ..Default::default() };
+        *uscf.servers.borrow_mut() = Some(vec![us]);
+    }
+
+    umcf.borrow().upstreams.borrow_mut().push(uscf.clone());
+
+    Ok(uscf)
+}
+
+/// The upstream a host resolved per request names
+/// (ngx_http_upstream_init_request: umcf->upstreams by host and port).
+pub fn find_upstream(r: &R, host: &[u8], port: u16, no_port: bool) -> Option<Rc<UpstreamSrvConf>> {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    let upstreams = m.upstreams.borrow();
+    upstreams
+        .iter()
+        .find(|u| u.host.eq_ignore_ascii_case(host) && ((u.port.get() == 0 && no_port) || u.port.get() == port))
+        .cloned()
+}
+
+/// The upstream{} block of a name.
+pub fn get_upstream_by_name(r: &R, name: &[u8]) -> Option<Rc<UpstreamSrvConf>> {
+    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
+    let m = umcf.borrow();
+    let upstreams = m.upstreams.borrow();
+    upstreams.iter().find(|u| u.block.get() && u.host.eq_ignore_ascii_case(name)).cloned()
+}
+
+// ============================================================================
+// PEERS
+// ============================================================================
+
+/// An upstream connection with what the keepalive cache checks.
+pub struct UpstreamConn {
+    pub sock: UpstreamSock,
+    /// requests served on the connection (c->requests)
+    pub requests: u64,
+    /// ngx_current_msec at connect (c->start_time)
+    pub start_time: u64,
+}
+
+/// ngx_peer_connection_t: the balancer's view of an upstream connection.
+pub struct PeerConnection {
+    pub sockaddr: Option<SockAddr>,
+    pub name: Vec<u8>,
+    pub tries: u32,
+    pub start_time: u64,
+    pub cached: bool,
+    /// a cached keepalive connection (get), or the one to keep (free)
+    pub connection: Option<UpstreamConn>,
+    /// sticky: the session id the client wants, and the chosen peer's
+    pub hint: Option<Vec<u8>>,
+    pub sid: Option<Vec<u8>>,
+    pub log: Log,
+    /// u->keepalive and u->request_body_sent, for the keepalive cache
+    pub keepalive: bool,
+    pub request_body_sent: bool,
+    /// u->conf: the location, for "keepalive ... local"
+    pub tag: usize,
+}
+
+/// A balancer's per-request state (peer.data with peer.get / peer.free).
+pub trait PeerBalancer {
+    /// peer.tries after peer.init
+    fn tries(&self) -> u32;
+    /// NGX_OK with pc.sockaddr set, NGX_DONE with a cached connection,
+    /// NGX_BUSY when no peer is available (pc.name is the upstream's).
+    fn get(&mut self, pc: &mut PeerConnection) -> i64;
+    fn free(&mut self, pc: &mut PeerConnection, state: u32, us: &UpstreamState);
+    fn notify(&mut self, _pc: &mut PeerConnection, _typ: u32, _us: &UpstreamState) {}
+    fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
+        None
+    }
+    fn save_session(&mut self, _session: openssl::ssl::SslSession) {}
+    /// the round robin data under the balancer
+    fn rr(&mut self) -> Option<&mut crate::upstream_round_robin::RrPeerData> {
+        None
+    }
+}
+
+/// The peer side of a request's upstream (ngx_http_upstream_t: peer,
+/// the next upstream settings, request_sent).
+pub struct UpstreamPeer {
+    pub pc: PeerConnection,
+    pub balancer: Box<dyn PeerBalancer>,
+    pub next_upstream: u32,
+    pub next_upstream_timeout: u64,
+    pub request_sent: bool,
+    /// ngx_current_msec at the start of the current try (u->start_time)
+    pub start_time: u64,
+}
+
+impl UpstreamPeer {
+    fn new(r: &R, balancer: Box<dyn PeerBalancer>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+        let mut tries = balancer.tries();
+
+        // ngx_http_upstream_init_request
+        if next_upstream_tries != 0 && tries > next_upstream_tries {
+            tries = next_upstream_tries;
+        }
+
+        let now = ngx_core::times::current_msec();
+
+        UpstreamPeer {
+            pc: PeerConnection {
+                sockaddr: None,
+                name: Vec::new(),
+                tries,
+                start_time: now,
+                cached: false,
+                connection: None,
+                hint: None,
+                sid: None,
+                log: r.connection.log.clone(),
+                keepalive: false,
+                request_body_sent: false,
+                tag,
+            },
+            balancer,
+            next_upstream,
+            next_upstream_timeout,
+            request_sent: false,
+            start_time: now,
         }
     }
-    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
-    let m = umcf.borrow();
-    let mut b = m.current_builder.borrow_mut();
-    if let Some(bld) = b.as_mut() {
-        bld.servers.push(server);
+
+    /// uscf->peer.init for the request's upstream.
+    pub fn init(r: &R, uscf: &Rc<UpstreamSrvConf>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> Result<UpstreamPeer, i64> {
+        let balancer = uscf.init_peer(r).map_err(|_| crate::NGX_HTTP_INTERNAL_SERVER_ERROR)?;
+        Ok(UpstreamPeer::new(r, balancer, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
     }
-    Ok(())
+
+    /// ngx_http_upstream_create_round_robin_peer for addresses resolved for
+    /// this request.
+    pub fn resolved(r: &R, host: &[u8], addrs: Vec<Addr>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+        let balancer = Box::new(crate::upstream_round_robin::create_round_robin_peer(host, addrs));
+        UpstreamPeer::new(r, balancer, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
+    }
+
+    /// The start of ngx_http_upstream_connect: a new state, and the peer
+    /// (ngx_event_connect_peer's pc->get). NGX_OK, NGX_DONE with a cached
+    /// connection in pc.connection, or NGX_BUSY ("no live upstreams" is
+    /// logged, and the caller goes to next() with FT_NOLIVE).
+    pub fn connect(&mut self, r: &R) -> i64 {
+        let now = ngx_core::times::current_msec();
+
+        {
+            let mut states = r.upstream_states.borrow_mut();
+
+            if let Some(last) = states.last_mut() {
+                if last.response_time == u64::MAX {
+                    last.response_time = now.saturating_sub(self.start_time);
+                }
+            }
+
+            states.push(UpstreamState {
+                response_time: u64::MAX,
+                connect_time: u64::MAX,
+                header_time: u64::MAX,
+                ..Default::default()
+            });
+        }
+
+        self.start_time = now;
+
+        let rc = self.balancer.get(&mut self.pc);
+
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream connect: {}", rc);
+
+        if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
+            last.peer = self.pc.name.clone();
+        }
+
+        if rc == NGX_BUSY {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no live upstreams");
+        }
+
+        rc
+    }
+
+    /// peer.notify
+    pub fn notify(&mut self, r: &R, typ: u32) {
+        let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
+        self.balancer.notify(&mut self.pc, typ, &us);
+    }
+
+    /// ngx_http_upstream_next: free the peer (NGX_PEER_NEXT for 403 and
+    /// 404, NGX_PEER_FAILED otherwise), then Ok(()) to connect to the next
+    /// one, or Err(status) to finalize with.
+    pub fn next(&mut self, r: &R, ft: u32) -> Result<(), i64> {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http next upstream, {:x}", ft);
+
+        if self.pc.sockaddr.is_some() {
+            let state = if ft == NGX_HTTP_UPSTREAM_FT_HTTP_403 || ft == NGX_HTTP_UPSTREAM_FT_HTTP_404 {
+                NGX_PEER_NEXT
+            } else {
+                NGX_PEER_FAILED
+            };
+
+            let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
+            self.pc.connection = None;
+            self.balancer.free(&mut self.pc, state, &us);
+            self.pc.sockaddr = None;
+            self.pc.sid = None;
+        }
+
+        if self.pc.cached && ft == NGX_HTTP_UPSTREAM_FT_ERROR {
+            // TODO: inform balancer instead
+            self.pc.tries += 1;
+        }
+
+        let status = match ft {
+            NGX_HTTP_UPSTREAM_FT_TIMEOUT | NGX_HTTP_UPSTREAM_FT_HTTP_504 => crate::NGX_HTTP_GATEWAY_TIME_OUT,
+            NGX_HTTP_UPSTREAM_FT_HTTP_500 => crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
+            NGX_HTTP_UPSTREAM_FT_HTTP_503 => crate::NGX_HTTP_SERVICE_UNAVAILABLE,
+            NGX_HTTP_UPSTREAM_FT_HTTP_403 => crate::NGX_HTTP_FORBIDDEN,
+            NGX_HTTP_UPSTREAM_FT_HTTP_404 => crate::NGX_HTTP_NOT_FOUND,
+            NGX_HTTP_UPSTREAM_FT_HTTP_429 => crate::NGX_HTTP_TOO_MANY_REQUESTS,
+            _ => crate::NGX_HTTP_BAD_GATEWAY,
+        };
+
+        if r.connection.error.get() {
+            return Err(crate::NGX_HTTP_CLIENT_CLOSED_REQUEST);
+        }
+
+        if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
+            last.status = status;
+        }
+
+        let mut ft = ft;
+
+        if self.request_sent && matches!(r.method.get(), crate::NGX_HTTP_POST | crate::NGX_HTTP_LOCK | crate::NGX_HTTP_PATCH) {
+            ft |= NGX_HTTP_UPSTREAM_FT_NON_IDEMPOTENT;
+        }
+
+        let timeout = self.next_upstream_timeout;
+
+        if self.pc.tries == 0
+            || self.next_upstream & ft != ft
+            || (self.request_sent && r.request_body_no_buffering.get())
+            || (timeout != 0 && ngx_core::times::current_msec().saturating_sub(self.pc.start_time) >= timeout)
+        {
+            return Err(status);
+        }
+
+        Ok(())
+    }
+
+    /// The peer part of ngx_http_upstream_finalize_request: free the peer
+    /// (state 0), offering the connection to the keepalive cache when the
+    /// response allows (u->keepalive) and the request body was sent.
+    pub fn finalize(&mut self, r: &R, conn: Option<UpstreamConn>, keepalive: bool, request_body_sent: bool) {
+        if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
+            if last.response_time == u64::MAX {
+                last.response_time = ngx_core::times::current_msec().saturating_sub(self.start_time);
+            }
+        }
+
+        if self.pc.sockaddr.is_none() {
+            return;
+        }
+
+        self.pc.connection = conn;
+        self.pc.keepalive = keepalive;
+        self.pc.request_body_sent = request_body_sent;
+
+        let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
+        self.balancer.free(&mut self.pc, 0, &us);
+
+        self.pc.sockaddr = None;
+
+        // a connection the cache did not take is closed
+        self.pc.connection = None;
+    }
 }
 
-fn resolver_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("no resolver address specified"));
+impl UpstreamPeer {
+    /// The peers of a host resolved per request (u->resolved,
+    /// ngx_http_upstream_init_request): the upstream it names, its address
+    /// if it is one, or the addresses the resolver finds
+    /// (ngx_http_upstream_resolve_handler).
+    pub async fn resolve(r: &R, u: &Url, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> Result<UpstreamPeer, i64> {
+        if let Some(uscf) = find_upstream(r, &u.host, u.port, u.no_port) {
+            return UpstreamPeer::init(r, &uscf, next_upstream, next_upstream_tries, next_upstream_timeout, tag);
+        }
+
+        if !u.addrs.is_empty() {
+            if u.port == 0 && u.family != libc::AF_UNIX {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no port in upstream \"{}\"", B(&u.host));
+                return Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR);
+            }
+            let addrs = vec![u.addrs[0].clone()];
+            return Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag));
+        }
+
+        if u.port == 0 {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no port in upstream \"{}\"", B(&u.host));
+            return Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        let (resolver, timeout) = {
+            let clcf = r.clcf();
+            let c = clcf.borrow();
+            (c.resolver.clone(), *c.resolver_timeout.get())
+        };
+
+        let resolver = match resolver {
+            Some(res) if res.has_servers() => res,
+            _ => {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no resolver defined to resolve {}", B(&u.host));
+                return Err(crate::NGX_HTTP_BAD_GATEWAY);
+            }
+        };
+
+        match resolver.resolve_name(&u.host, timeout, &r.connection.log).await {
+            Ok(addrs) => {
+                let addrs: Vec<Addr> = addrs
+                    .into_iter()
+                    .map(|a| {
+                        let mut sa = a.sockaddr;
+                        sa.set_port(u.port);
+                        let name = sa.to_text(true);
+                        Addr { sockaddr: sa, name }
+                    })
+                    .collect();
+
+                Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+            }
+            Err(code) => {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "{} could not be resolved ({}: {})", B(&u.host), code, Resolver::strerror(code));
+                Err(crate::NGX_HTTP_BAD_GATEWAY)
+            }
+        }
     }
-    // TODO: Parse resolver directive
-    Ok(())
 }
 
-fn resolver_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("no timeout value specified"));
+/// Frees the upstream peer when the request is done (the peer part of
+/// ngx_http_upstream_finalize_request, run on every way out of the
+/// handler), handing a connection that may be kept alive to the
+/// keepalive cache.
+pub struct PeerGuard {
+    r: R,
+    pub u: UpstreamPeer,
+    pub conn: Option<UpstreamConn>,
+    pub keepalive: bool,
+}
+
+impl PeerGuard {
+    pub fn new(r: &R, u: UpstreamPeer) -> PeerGuard {
+        PeerGuard { r: r.clone(), u, conn: None, keepalive: false }
     }
-    // TODO: Parse timeout
-    Ok(())
+
+    pub fn finalize(&mut self) {
+        let body_sent = !self.r.reading_body.get();
+        self.u.finalize(&self.r, self.conn.take(), self.keepalive, body_sent);
+    }
+}
+
+impl Drop for PeerGuard {
+    fn drop(&mut self) {
+        self.finalize();
+    }
 }
 
 // ============================================================================
@@ -1160,80 +1265,10 @@ pub fn upstream_module() -> ModuleDef {
         preconfiguration: Some(preconfiguration),
         create_main_conf: Some(create_main_conf),
         init_main_conf: Some(init_main_conf),
-        postconfiguration: Some(register_active_main),
         ..Default::default()
     };
 
     http_module_def("ngx_http_upstream_module", def, commands)
-}
-
-fn register_active_main(cf: &mut Conf) -> ConfResult {
-    let umcf = crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index());
-    set_active_main(umcf);
-    Ok(())
-}
-
-// ============================================================================
-// UPSTREAM INIT AND REQUEST PROCESSING
-// ============================================================================
-
-/// Initialize upstream request: create peer connection, send request, read response.
-pub async fn upstream_init(_r: &R, _ctx: Rc<UpstreamCtx>) -> i64 {
-    // Create upstream structure from configuration
-    // Resolve upstream addresses (DNS if needed)
-    // Select peer via load balancer
-    // Connect with timeout
-    // Send request body
-    // Read response headers via process_header callback
-    // Stream response body through output filters
-    // Support buffering to disk on large responses
-    // Handle next_upstream retries on error
-    // Support keepalive pool
-
-    NGX_OK
-}
-
-/// Get upstream by name from main config.
-pub fn get_upstream_by_name(r: &R, name: &[u8]) -> Option<Rc<Upstream>> {
-    let umcf = r.main_conf::<UpstreamMainConf>(ctx_index());
-    let upstreams = umcf.borrow().upstreams.clone();
-    upstreams.iter().find(|(n, _)| n == name).map(|(_, u)| u.clone())
-}
-
-/// Default round-robin peer initializer (placeholder).
-pub struct RoundRobinInit;
-
-impl PeerInit for RoundRobinInit {
-    fn init(&self, _r: &R, _upstream: &Upstream) -> Rc<dyn Peer> {
-        // TODO: Implement round-robin selection
-        // - Distribute across peers with weight
-        // - Track current_weight, effective_weight
-        // - Mark down on failures
-        // - Slow start ramp-up
-        // - Backup peers fallback
-        Rc::new(DummyPeer)
-    }
-}
-
-/// Dummy peer for placeholder implementation
-struct DummyPeer;
-
-impl Peer for DummyPeer {
-    fn free(&self, _r: &R, _pc: &Rc<Connection>, _state: u32) {}
-
-    fn tries(&self) -> u32 {
-        0
-    }
-
-    fn name(&self) -> Vec<u8> {
-        b"dummy".to_vec()
-    }
-
-    fn mark_down(&self) {}
-
-    fn stats(&self) -> PeerStats {
-        Default::default()
-    }
 }
 
 // ============================================================================
