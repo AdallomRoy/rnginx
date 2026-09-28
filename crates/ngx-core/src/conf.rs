@@ -383,6 +383,26 @@ impl<'c> Conf<'c> {
         self.parse_inner(ParseType::Block)
     }
 
+    /// Skip the body of a block (after "{") and the blocks in it, for the
+    /// parse-only stubs of the modules not ported (not in C).
+    pub fn skip_block(&mut self) -> ConfResult {
+        let mut depth = 0usize;
+
+        loop {
+            match self.read_token()? {
+                Token::BlockStart => depth += 1,
+                Token::BlockDone => {
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                    depth -= 1;
+                }
+                Token::FileDone => return Err(self.emerg(format_args!("unexpected end of file, expecting \"}}\""))),
+                Token::Ok => {}
+            }
+        }
+    }
+
     fn parse_inner(&mut self, ty: ParseType) -> ConfResult {
         loop {
             let rc = self.read_token()?;
@@ -408,10 +428,13 @@ impl<'c> Conf<'c> {
             }
 
             if let Some(h) = self.handler {
+                /*
+                 * the custom handler, i.e., that is used in the http's
+                 * "types { ... }" directive
+                 */
+
                 if rc == Token::BlockStart {
-                    // Recurse into the nested block using the same handler.
-                    self.parse_block()?;
-                    continue;
+                    return Err(self.emerg(format_args!("unexpected \"{{\"")));
                 }
                 let hc = self.handler_conf.clone().expect("handler conf");
                 match h(self, hc) {

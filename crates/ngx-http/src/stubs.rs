@@ -18,20 +18,9 @@ fn accept(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfRes
     Ok(())
 }
 
-fn skip_any(_cf: &mut Conf, _c: Rc<dyn Any>) -> ConfResult {
-    Ok(())
-}
-
 /// Consume a `{ ... }` block, ignoring its contents.
 pub fn skip_block(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let saved_h = cf.handler.take();
-    let saved_hc = cf.handler_conf.take();
-    cf.handler = Some(skip_any);
-    cf.handler_conf = Some(Rc::new(()));
-    let rv = cf.parse_block();
-    cf.handler = saved_h;
-    cf.handler_conf = saved_hc;
-    rv
+    cf.skip_block()
 }
 
 fn stub(name: &'static str, commands: Vec<Command>) -> ModuleDef {
