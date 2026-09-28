@@ -94,7 +94,10 @@ thread_local! {
 
 /// Set the process-wide current cycle (ngx_cycle).
 pub fn set_cycle(c: Rc<Cycle>) {
-    CURRENT_CYCLE.with(|cc| *cc.borrow_mut() = Some(c));
+    // the old cycle is dropped once the new one is current: its cleanups
+    // (the ssl object cache) use ngx_cycle
+    let old = CURRENT_CYCLE.with(|cc| cc.borrow_mut().replace(c));
+    drop(old);
 }
 
 /// The current cycle (ngx_cycle). Panics if unset.

@@ -158,6 +158,14 @@ pub fn for_each_connection(mut f: impl FnMut(&Rc<Connection>)) {
     }
 }
 
+/// The Rc of a connection known by reference only (the OpenSSL callbacks
+/// find the connection by a pointer, ngx_ssl_get_connection()).
+pub fn connection_rc(c: &Connection) -> Option<Rc<Connection>> {
+    CONNECTIONS
+        .with(|m| m.borrow().get(&c.number).and_then(|w| w.upgrade()))
+        .filter(|rc| std::ptr::eq(Rc::as_ptr(rc), c))
+}
+
 pub struct Connection {
     pub fd: Cell<RawFd>,
     afd: RefCell<Option<Rc<AsyncFd<Fd>>>>,

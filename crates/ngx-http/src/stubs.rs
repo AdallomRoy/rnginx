@@ -9,10 +9,8 @@ use std::any::Any;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
-use ngx_core::connection::Connection;
 use ngx_core::module::ModuleDef;
 
-use crate::core::*;
 use crate::request::*;
 use crate::*;
 
@@ -648,16 +646,3 @@ pub fn upstream_log_info(_r: &Request) -> Option<Vec<u8>> {
     None
 }
 
-pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool {
-    crate::ssl_module::ssl_handshake(c, hc).await
-}
-
-pub fn ssl_verify_enabled(cscf: &Rc<std::cell::RefCell<CoreSrvConf>>) -> bool {
-    crate::ssl_module::ssl_verify_enabled(cscf)
-}
-
-pub fn ssl_process_request_checks(r: &R) -> Option<i64> {
-    crate::ssl_module::ssl_process_request_checks(r)
-}
-
-pub async fn ssl_shutdown(c: &Rc<Connection>) { crate::ssl_module::ssl_shutdown(c).await }

@@ -738,11 +738,9 @@ async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut 
         h2c.lingering_time.set(ngx_core::times::time() + (lingering_time / 1000) as i64);
     }
 
-    if let Some(ssl) = c.ssl.borrow().clone() {
-        ssl.shutdown_without_free.set(true);
-    }
-    if c.ssl.borrow().is_some() {
-        crate::stubs::ssl_shutdown(&c).await;
+    if c.ssl.borrow().is_some() && crate::ssl_module::ngx_http_ssl_lingering_shutdown(&c).await == ngx_core::rc::NGX_ERROR {
+        // ngx_http_close_connection(c)
+        return;
     }
 
     if let Err(e) = c.shutdown_write() {
@@ -814,6 +812,11 @@ async fn finish(h2c: &Rc<H2Connection>, d: &Driver) {
     h2c.streams_index.borrow_mut().clear();
     h2c.dependencies.borrow_mut().clear();
     h2c.closed.borrow_mut().clear();
+
+    // ngx_http_close_connection: the SSL shutdown, then the close
+    if !crate::ssl_module::ngx_http_ssl_close_connection(c, crate::request_rt::close_connection) {
+        return;
+    }
 
     c.close();
 }
