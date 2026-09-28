@@ -35,6 +35,15 @@ pub struct Http2LocConf {
     pub chunk_size: Val<usize>,
 }
 
+/// h2scf->enable of a configuration context (the connection's default or
+/// SNI-selected server).
+pub fn srv_enabled(ctx: &ConfCtx) -> bool {
+    match ctx.srv.as_ref() {
+        Some(slots) => *slot_of::<Http2SrvConf>(slots, ctx_index()).borrow().enable,
+        None => false,
+    }
+}
+
 /// ngx_http_v2_add_variables
 fn add_variables(cf: &mut Conf) -> ConfResult {
     let vars = [crate::variables::VarDef { name: "http2", set: None, get: Some(variable), data: 0, flags: 0 }];

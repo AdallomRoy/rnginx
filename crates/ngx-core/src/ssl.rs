@@ -109,6 +109,20 @@ impl SslConnection {
         .await?
     }
 
+    /// A single SSL_write attempt; WANT_READ / WANT_WRITE map to WouldBlock.
+    pub fn try_send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
+        let rc = unsafe { openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32) };
+        if rc > 0 {
+            c.sent.set(c.sent.get() + rc as u64);
+            return Ok(rc as usize);
+        }
+        match unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) } {
+            openssl_sys::SSL_ERROR_WANT_READ | openssl_sys::SSL_ERROR_WANT_WRITE => Err(io::ErrorKind::WouldBlock.into()),
+            openssl_sys::SSL_ERROR_SYSCALL => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string()))),
+        }
+    }
+
     pub fn free_on_close(&self, _c: &Connection) {
         // Ssl is dropped when SslConnection is dropped.
     }

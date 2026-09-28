@@ -80,7 +80,10 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     if size == 0 && !(c.buffer.borrow().is_empty() == false) && !flush && !sync {
         // nothing to send
     }
-    if size == 0 && !flush && !sync {
+    // an HTTP/2 stream's connection wants empty last/flush chains too
+    // (c->need_last_buf / c->need_flush_buf): they end the stream
+    let pass_empty = (last && c.need_last_buf.get()) || (flush && c.need_flush_buf.get());
+    if size == 0 && !flush && !sync && !pass_empty {
         if last || r.out.borrow().iter().any(|b| b.last_buf) {
             r.out.borrow_mut().clear();
             r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
@@ -90,11 +93,11 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             return NGX_OK;
         }
     }
-    if size == 0 && !flush && sync {
+    if size == 0 && !flush && sync && !pass_empty {
         // only sync bufs: drop them
         r.out.borrow_mut().retain(|b| b.buf_size() > 0 || b.flush || b.last_buf);
     }
-    if size == 0 && !flush {
+    if size == 0 && !flush && !pass_empty {
         // last_buf only: nothing to write
         if !last {
             return NGX_OK;
@@ -139,7 +142,12 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         }
         let mut out = std::mem::take(&mut *r.out.borrow_mut());
         let before = c.sent.get();
-        let res = tokio::time::timeout(std::time::Duration::from_millis(send_timeout), crate::output::send_chain(&c, &mut out, limit)).await;
+        let res = if r.stream.borrow().is_some() {
+            // fc->send_chain = ngx_http_v2_send_chain
+            tokio::time::timeout(std::time::Duration::from_millis(send_timeout), crate::v2::filter::send_chain(&r, &mut out, limit)).await
+        } else {
+            tokio::time::timeout(std::time::Duration::from_millis(send_timeout), crate::output::send_chain(&c, &mut out, limit)).await
+        };
         let sent_now = c.sent.get() - before;
         *r.out.borrow_mut() = out;
         match res {

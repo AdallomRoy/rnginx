@@ -26,7 +26,7 @@ pub fn set_pending_finalize(_r: &R, rc: i64) {
     PENDING_FINALIZE.with(|p| p.set(rc));
 }
 
-fn take_pending_finalize() -> i64 {
+pub fn take_pending_finalize() -> i64 {
     PENDING_FINALIZE.with(|p| p.replace(0))
 }
 
@@ -106,9 +106,23 @@ async fn connection_task(c: Rc<Connection>) {
     loop {
         if first {
             first = false;
-            if wait_request(&c, &hc).await.is_err() {
-                close_connection(&c);
-                return;
+            match wait_request(&c, &hc).await {
+                Err(()) => {
+                    close_connection(&c);
+                    return;
+                }
+                Ok(Waited::Http2) => {
+                    // ngx_http_v2_init takes over, with the buffered bytes
+                    let preread = {
+                        let mut b = hc.buffer.borrow_mut();
+                        let v = b.unread().to_vec();
+                        b.pos = b.last;
+                        v
+                    };
+                    crate::v2::connection::init(c.clone(), hc.clone(), preread).await;
+                    return;
+                }
+                Ok(Waited::Http1) => {}
             }
         }
         c.log.set_action(Some("reading client request line"));
@@ -150,8 +164,15 @@ fn http_debug_c(c: &Connection, msg: &str) {
     }
 }
 
+/// What the first bytes of a connection turned out to be.
+enum Waited {
+    Http1,
+    /// The HTTP/2 connection preface (prior knowledge, plain TCP).
+    Http2,
+}
+
 /// ngx_http_wait_request_handler: read the first bytes of a connection.
-async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<(), ()> {
+async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<Waited, ()> {
     let cscf = srv_conf_from_ctx(&hc.conf_ctx.borrow());
     let timeout = *cscf.borrow().client_header_timeout;
     let size = *cscf.borrow().client_header_buffer_size;
@@ -166,7 +187,8 @@ async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<(),
         }
         c.set_reusable(true);
         let n = {
-            let mut buf = vec![0u8; size];
+            let last = hc.buffer.borrow().last;
+            let mut buf = vec![0u8; size - last];
             let res = tokio::select! {
                 r = tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)) => r,
                 _ = c.close_notify.notified() => {
@@ -218,7 +240,22 @@ async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<(),
                 }
             }
         }
-        return Ok(());
+        if !hc.ssl.get() && (crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2) {
+            let (matches, complete) = {
+                let b = hc.buffer.borrow();
+                let data = b.unread();
+                let size = data.len().min(crate::v2::NGX_HTTP_V2_PREFACE.len());
+                (data[..size] == crate::v2::NGX_HTTP_V2_PREFACE[..size], size == crate::v2::NGX_HTTP_V2_PREFACE.len())
+            };
+            if matches {
+                if complete {
+                    return Ok(Waited::Http2);
+                }
+                // a prefix of the preface so far: wait for more
+                continue;
+            }
+        }
+        return Ok(Waited::Http1);
     }
 }
 
@@ -609,11 +646,19 @@ async fn run_request(r: &R) -> End {
     }
 }
 
-/// ngx_http_process_request_uri
+/// ngx_http_process_request_uri for the HTTP/1 request line.
 async fn process_request_uri(r: &R) -> Result<(), ()> {
-    let hc = &r.http_connection;
+    let data = {
+        let b = r.http_connection.buffer.borrow();
+        b.data[..b.last].to_vec()
+    };
+    process_request_uri_data(r, &data)
+}
+
+/// ngx_http_process_request_uri over `data`, the buffer r.parse's offsets
+/// refer to (the request line, or an HTTP/2 :path value).
+pub fn process_request_uri_data(r: &R, data: &[u8]) -> Result<(), ()> {
     let (uri, unparsed, exten, args, complex, merge_slashes) = {
-        let b = hc.buffer.borrow();
         let p = r.parse.borrow();
         let us = p.uri_start.unwrap_or(0);
         let ue = p.uri_end.unwrap_or(us);
@@ -621,25 +666,24 @@ async fn process_request_uri(r: &R) -> Result<(), ()> {
             Some(a) => a - 1 - us,
             None => ue - us,
         };
-        let unparsed = b.data[us..ue].to_vec();
+        let unparsed = data[us..ue].to_vec();
         let exten = p.uri_ext.map(|x| match p.args_start {
-            Some(a) => b.data[x..a - 1].to_vec(),
-            None => b.data[x..ue].to_vec(),
+            Some(a) => data[x..a - 1].to_vec(),
+            None => data[x..ue].to_vec(),
         });
         let args = match p.args_start {
-            Some(a) if ue > a => b.data[a..ue].to_vec(),
+            Some(a) if ue > a => data[a..ue].to_vec(),
             _ => Vec::new(),
         };
         let complex = p.complex_uri || p.quoted_uri || p.empty_path_in_uri;
         let cscf = r.cscf();
         let ms = *cscf.borrow().merge_slashes;
-        (b.data[us..us + uri_len].to_vec(), unparsed, exten, args, complex, ms)
+        (data[us..us + uri_len].to_vec(), unparsed, exten, args, complex, ms)
     };
     if complex {
         let res = {
-            let b = hc.buffer.borrow();
             let p = r.parse.borrow();
-            parse::parse_complex_uri(&p, &b.data[..b.last], merge_slashes)
+            parse::parse_complex_uri(&p, data, merge_slashes)
         };
         match res {
             Ok(cu) => {
@@ -978,6 +1022,11 @@ async fn post_action(r: &R) -> i64 {
 
 /// ngx_http_finalize_connection: decide what happens to the connection.
 async fn finalize_connection(r: &R) -> End {
+    if r.stream.borrow().is_some() {
+        // ngx_http_close_request -> ngx_http_v2_close_stream, done by the
+        // stream task once the request returns
+        return End::Close;
+    }
     let c = r.connection.clone();
     if r.terminated.get() || c.error.get() {
         return End::Close;

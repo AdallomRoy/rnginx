@@ -353,6 +353,27 @@ impl Connection {
         Ok(())
     }
 
+    /// One non-blocking send attempt (plain or TLS), without waiting:
+    /// WouldBlock when the socket (or OpenSSL) can't take data now. A TLS
+    /// retry must pass the same bytes again.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.fake_io_error()?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(ssl) = self.ssl.borrow().clone() {
+            return ssl.try_send(self, buf);
+        }
+        let n = unsafe {
+            libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT)
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.sent.set(self.sent.get() + n as u64);
+        Ok(n as usize)
+    }
+
     /// Drive a non-blocking operation that does its own socket I/O (an
     /// OpenSSL call) until it completes. The first attempt runs at once; on
     /// WantRead/WantWrite it is retried after the socket becomes ready, while

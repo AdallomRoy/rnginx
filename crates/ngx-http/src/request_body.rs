@@ -107,6 +107,9 @@ pub async fn read_client_request_body(r: &R) -> i64 {
             return NGX_OK;
         }
     }
+    if r.stream.borrow().is_some() {
+        return crate::v2::request_body::read_request_body(r, &rb).await;
+    }
     let hc = r.http_connection.clone();
     // preread bytes already in the header buffer
     let preread: Vec<u8> = {
@@ -427,7 +430,8 @@ pub async fn discard_request_body(r: &R) -> i64 {
     if !r.is_main() || r.discard_body.get() || r.request_body.borrow().is_some() {
         return NGX_OK;
     }
-    if r.stream.borrow().is_some() {
+    if let Some(stream) = crate::v2::stream::request_stream(r) {
+        stream.skip_data.set(true);
         return NGX_OK;
     }
     if test_expect(r).await != NGX_OK {

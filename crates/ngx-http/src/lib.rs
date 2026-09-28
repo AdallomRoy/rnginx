@@ -616,7 +616,7 @@ pub fn modules() -> Vec<ModuleDef> {
         write_filter::write_filter_module(),
         header_filter::header_filter_module(),
         chunked_filter::chunked_filter_module(),
-        stubs::v2_filter_module(),
+        v2::filter::v2_filter_module(),
         stubs::v3_filter_module(),
         range_filter::range_header_filter_module(),
         gzip_filter::gzip_filter_module(),

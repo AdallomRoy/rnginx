@@ -669,11 +669,6 @@ pub fn upstream_sticky_module() -> ModuleDef {
     ])
 }
 
-pub fn v2_filter_module() -> ModuleDef {
-    stub("ngx_http_v2_filter_module", vec![
-    ])
-}
-
 pub fn v3_filter_module() -> ModuleDef {
     stub("ngx_http_v3_filter_module", vec![
     ])
