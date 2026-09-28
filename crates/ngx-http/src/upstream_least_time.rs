@@ -32,16 +32,9 @@ struct LeastTimePeerData {
     inflight: bool,
 }
 
-/// ngx_http_upstream_response_time_avg: exponential moving average with
-/// rounding.
-fn response_time_avg(avg: &std::cell::Cell<u64>, v: u64) {
-    let a = avg.get();
-    avg.set(if a != 0 { (0.5 + (v as f64 * 0.05 + a as f64 * 0.95)) as u64 } else { v });
-}
-
 impl PeerBalancer for LeastTimePeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.rrp.peers) as u32
+        unsafe { upstream_tries(self.rrp.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -60,11 +53,11 @@ impl PeerBalancer for LeastTimePeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.rrp.set_session()
+        set_round_robin_peer_session(&mut self.rrp)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        self.rrp.save_session(session)
+        save_round_robin_peer_session(&mut self.rrp, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
@@ -93,201 +86,210 @@ fn init_least_time(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
 fn get_least_time_peer(pc: &mut PeerConnection, ltp: &mut LeastTimePeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, try: {}", pc.tries);
 
-    if ltp.rrp.peers.single.get() {
-        return get_round_robin_peer(pc, &mut ltp.rrp);
-    }
-
-    pc.cached = false;
-    pc.connection = None;
-
-    let now = ngx_core::times::time();
-
-    let peers = ltp.rrp.peers.clone();
-
-    if ltp.rrp.config_changed() {
-        pc.name = peers.name.clone();
-        return NGX_BUSY;
-    }
-
-    let list = peers.peers();
-
-    let mut p = 0usize;
-    let mut chosen = get_rr_peer_by_sid(&ltp.rrp, pc.hint.as_deref(), &mut p);
-
-    if chosen.is_none() {
-        let mut best: Option<(Rc<RrPeer>, u64)> = None;
-        let mut many = false;
-
-        for (i, peer) in list.iter().enumerate() {
-            if ltp.rrp.is_tried(i) {
-                continue;
-            }
-
-            if peer.unavailable(now) {
-                continue;
-            }
-
-            if peer.inflight_reqs.get() > 0 {
-                let ift = peer.inflight_last.get() / peer.inflight_reqs.get()
-                    + ngx_core::times::current_msec().saturating_sub(peer.inflight_reqs_changed.get());
-
-                response_time_avg(&peer.inflight_time, ift);
-            }
-
-            // select peer with least estimated time of processing; if there
-            // are multiple peers with the same time, select based on
-            // round-robin
-
-            let eta = least_time_eta(&ltp.conf, peer);
-
-            match best.as_ref() {
-                None => {
-                    best = Some((peer.clone(), eta));
-                    many = false;
-                    p = i;
-                }
-                Some((b, best_eta)) => {
-                    let (x, y) = (eta as i128 * b.weight as i128, *best_eta as i128 * peer.weight as i128);
-                    if x < y {
-                        best = Some((peer.clone(), eta));
-                        many = false;
-                        p = i;
-                    } else if x == y {
-                        many = true;
-                    }
-                }
-            }
+    unsafe {
+        if (*ltp.rrp.peers).single {
+            return get_round_robin_peer(pc, &mut ltp.rrp);
         }
 
-        let (mut best, best_eta) = match best {
-            Some(b) => b,
-            None => {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, no peer found");
+        pc.cached = false;
+        pc.connection = None;
 
-                let next = peers.next.borrow().clone();
+        let now = ngx_core::times::time();
 
-                if let Some(next) = next {
-                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, backup servers");
+        let peers = ltp.rrp.peers;
 
-                    ltp.rrp.peers = next;
-                    ltp.rrp.clear_tried();
+        peers_wlock(peers);
 
-                    let rc = get_least_time_peer(pc, ltp);
+        let failed = 'pick: {
+            if ltp.rrp.config_changed() {
+                // busy
+                peers_unlock(peers);
 
-                    if rc != NGX_BUSY {
-                        return rc;
-                    }
-                }
+                pc.name = (*(*peers).name).bytes().to_vec();
 
-                pc.name = peers.name.clone();
                 return NGX_BUSY;
             }
+
+            let mut total: isize = 0;
+            let mut many = false;
+            let mut p = 0usize;
+            let mut best_eta: usize = 0;
+
+            let mut best = get_rr_peer_by_sid(&ltp.rrp, pc.hint.as_deref(), &mut p, false);
+
+            if best.is_null() {
+                let mut peer = (*peers).peer;
+                let mut i = 0;
+
+                while !peer.is_null() {
+                    let skip = ltp.rrp.is_tried(i)
+                        || (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                    if !skip {
+                        if (*peer).inflight_reqs > 0 {
+                            let ift = (*peer).inflight_last / (*peer).inflight_reqs as u64
+                                + ngx_core::times::current_msec().wrapping_sub((*peer).inflight_reqs_changed);
+
+                            response_time_avg(&mut (*peer).inflight_time, ift);
+                        }
+
+                        // select peer with least estimated time of processing;
+                        // if there are multiple peers with the same time,
+                        // select based on round-robin
+
+                        let eta = least_time_eta(&ltp.conf, peer);
+
+                        if best.is_null() || eta.wrapping_mul((*best).weight as usize) < best_eta.wrapping_mul((*peer).weight as usize) {
+                            best = peer;
+                            best_eta = eta;
+                            many = false;
+                            p = i;
+                        } else if eta.wrapping_mul((*best).weight as usize) == best_eta.wrapping_mul((*peer).weight as usize) {
+                            many = true;
+                        }
+                    }
+
+                    peer = (*peer).next;
+                    i += 1;
+                }
+
+                if best.is_null() {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, no peer found");
+
+                    break 'pick true;
+                }
+
+                if many {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, many");
+
+                    let mut peer = best;
+                    let mut i = p;
+
+                    while !peer.is_null() {
+                        let mut skip = ltp.rrp.is_tried(i) || (*peer).down != 0;
+
+                        if !skip {
+                            let eta = least_time_eta(&ltp.conf, peer);
+
+                            skip = eta.wrapping_mul((*best).weight as usize) != best_eta.wrapping_mul((*peer).weight as usize)
+                                || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                                || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+                        }
+
+                        if !skip {
+                            (*peer).current_weight += (*peer).effective_weight;
+                            total += (*peer).effective_weight;
+
+                            if (*peer).effective_weight < (*peer).weight {
+                                (*peer).effective_weight += 1;
+                            }
+
+                            if (*peer).current_weight > (*best).current_weight {
+                                best = peer;
+                                p = i;
+                            }
+                        }
+
+                        peer = (*peer).next;
+                        i += 1;
+                    }
+                }
+
+                (*best).current_weight -= total;
+            }
+
+            // best_chosen:
+
+            if ltp.conf.use_inflight {
+                let now_ms = ngx_core::times::current_msec();
+
+                if (*best).inflight_reqs > 0 {
+                    // account time spent by inflight requests
+                    (*best).inflight_last += now_ms.wrapping_sub((*best).inflight_reqs_changed) * (*best).inflight_reqs as u64;
+                }
+
+                (*best).inflight_reqs_changed = now_ms;
+                (*best).inflight_reqs += 1;
+
+                ltp.inflight = true;
+            }
+
+            if now - (*best).checked > (*best).fail_timeout {
+                (*best).checked = now;
+            }
+
+            connect_peer(pc, best);
+
+            (*best).conns += 1;
+
+            ltp.rrp.current = best;
+            peer_ref(peers, best);
+
+            ltp.rrp.set_tried(p);
+
+            peers_unlock(peers);
+
+            false
         };
 
-        let mut total = 0i64;
+        if !failed {
+            return NGX_OK;
+        }
 
-        if many {
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, many");
+        // failed:
 
-            let first = p;
+        if !(*peers).next.is_null() {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least time peer, backup servers");
 
-            for (i, peer) in list.iter().enumerate().skip(first) {
-                if ltp.rrp.is_tried(i) {
-                    continue;
-                }
+            ltp.rrp.peers = (*peers).next;
 
-                if peer.down.get() != 0 {
-                    continue;
-                }
-
-                let eta = least_time_eta(&ltp.conf, peer);
-
-                if eta as i128 * best.weight as i128 != best_eta as i128 * peer.weight as i128 {
-                    continue;
-                }
-
-                if peer.max_fails != 0 && peer.fails.get() >= peer.max_fails && now - peer.checked.get() <= peer.fail_timeout {
-                    continue;
-                }
-
-                if peer.max_conns != 0 && peer.conns.get() >= peer.max_conns {
-                    continue;
-                }
-
-                peer.current_weight.set(peer.current_weight.get() + peer.effective_weight.get());
-                total += peer.effective_weight.get();
-
-                if peer.effective_weight.get() < peer.weight {
-                    peer.effective_weight.set(peer.effective_weight.get() + 1);
-                }
-
-                if peer.current_weight.get() > best.current_weight.get() {
-                    best = peer.clone();
-                    p = i;
-                }
+            for t in ltp.rrp.tried.iter_mut() {
+                *t = 0;
             }
+
+            peers_unlock(peers);
+
+            let rc = get_least_time_peer(pc, ltp);
+
+            if rc != NGX_BUSY {
+                return rc;
+            }
+
+            peers_wlock(peers);
         }
 
-        best.current_weight.set(best.current_weight.get() - total);
+        // busy:
 
-        chosen = Some(best);
+        peers_unlock(peers);
+
+        pc.name = (*(*peers).name).bytes().to_vec();
+
+        NGX_BUSY
     }
-
-    let best = chosen.unwrap();
-
-    if ltp.conf.use_inflight {
-        let now_ms = ngx_core::times::current_msec();
-
-        if best.inflight_reqs.get() > 0 {
-            // account time spent by inflight requests
-            best.inflight_last
-                .set(best.inflight_last.get() + now_ms.saturating_sub(best.inflight_reqs_changed.get()) * best.inflight_reqs.get());
-        }
-
-        best.inflight_reqs_changed.set(now_ms);
-        best.inflight_reqs.set(best.inflight_reqs.get() + 1);
-
-        ltp.inflight = true;
-    }
-
-    if now - best.checked.get() > best.fail_timeout {
-        best.checked.set(now);
-    }
-
-    pc.sockaddr = Some(best.sockaddr.clone());
-    pc.name = best.name.clone();
-    pc.sid = Some(best.sid.clone());
-
-    best.conns.set(best.conns.get() + 1);
-
-    ltp.rrp.current = Some(best.clone());
-    best.refs.set(best.refs.get() + 1);
-
-    ltp.rrp.set_tried(p);
-
-    NGX_OK
 }
 
 /// ngx_http_upstream_least_time_eta
-fn least_time_eta(conf: &LeastTimeConf, peer: &RrPeer) -> u64 {
+unsafe fn least_time_eta(conf: &LeastTimeConf, peer: *mut RrPeer) -> usize {
     let mut rt = match conf.mode {
-        NGX_HTTP_UPSTREAM_LT_HEADER => peer.header_time.get(),
-        _ => peer.response_time.get(),
+        NGX_HTTP_UPSTREAM_LT_HEADER => (*peer).header_time,
+        _ => (*peer).response_time,
     };
 
     let now = ngx_core::times::time();
 
-    if now - peer.checked.get() > peer.fail_timeout {
+    if now - (*peer).checked > (*peer).fail_timeout {
         // once in fail_timeout make response time of a peer 2 times
         // lower to give chances to slow peers
-        let shift = (now - peer.checked.get()) / (peer.fail_timeout + 1);
+        let shift = (now - (*peer).checked) / ((*peer).fail_timeout + 1);
         rt = if shift >= 64 { 0 } else { rt >> shift };
     }
 
-    if peer.inflight_reqs.get() > 0 {
+    if (*peer).inflight_reqs > 0 {
         // average inflight time exceeding average response time indicates
         // bad (low priority) peer
-        rt = rt.max(peer.inflight_time.get());
+        rt = rt.max((*peer).inflight_time);
     }
 
     if rt > 5000 {
@@ -301,15 +303,17 @@ fn least_time_eta(conf: &LeastTimeConf, peer: &RrPeer) -> u64 {
     }
 
     // estimated time peer has to spend to finish processing current requests
-    rt * (1 + peer.conns.get())
+    rt as usize * (1 + (*peer).conns)
 }
 
 /// ngx_http_upstream_least_time_notify
 fn least_time_notify(ltp: &mut LeastTimePeerData, typ: u32, us: &UpstreamState) {
-    let peer = match ltp.rrp.current.clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let peers = ltp.rrp.peers;
+    let peer = ltp.rrp.current;
+
+    if peer.is_null() {
+        return;
+    }
 
     // Only update average time here if needed for balancing.
     // Otherwise, it will be updated in peer.free().
@@ -320,28 +324,35 @@ fn least_time_notify(ltp: &mut LeastTimePeerData, typ: u32, us: &UpstreamState) 
 
     let last = us.header_time;
 
-    response_time_avg(&peer.header_time, last);
+    unsafe {
+        peers_rlock(peers);
+        peer_lock(peers, peer);
 
-    if ltp.inflight {
-        inflight_done(ltp, &peer, last);
+        response_time_avg(&mut (*peer).header_time, last);
+
+        if ltp.inflight {
+            inflight_done(ltp, peer, last);
+        }
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
     }
 }
 
 /// ngx_http_upstream_least_time_inflight_done
-fn inflight_done(ltp: &mut LeastTimePeerData, peer: &RrPeer, last: u64) {
-    if peer.inflight_reqs.get() == 1 {
+unsafe fn inflight_done(ltp: &mut LeastTimePeerData, peer: *mut RrPeer, last: u64) {
+    if (*peer).inflight_reqs == 1 {
         // no more inflight requests
-        peer.inflight_last.set(0);
+        (*peer).inflight_last = 0;
     } else {
         // account time spent by inflight requests and forget about
         // request "completed" right now
         let now_ms = ngx_core::times::current_msec();
-        let spent = now_ms.saturating_sub(peer.inflight_reqs_changed.get()) * peer.inflight_reqs.get();
-        peer.inflight_last.set((peer.inflight_last.get() + spent).saturating_sub(last));
-        peer.inflight_reqs_changed.set(now_ms);
+        (*peer).inflight_last = (*peer).inflight_last.wrapping_add(now_ms.wrapping_sub((*peer).inflight_reqs_changed) * (*peer).inflight_reqs as u64).wrapping_sub(last);
+        (*peer).inflight_reqs_changed = now_ms;
     }
 
-    peer.inflight_reqs.set(peer.inflight_reqs.get().saturating_sub(1));
+    (*peer).inflight_reqs -= 1;
     ltp.inflight = false;
 }
 
@@ -350,23 +361,31 @@ fn inflight_done(ltp: &mut LeastTimePeerData, peer: &RrPeer, last: u64) {
 fn free_least_time_peer(pc: &mut PeerConnection, ltp: &mut LeastTimePeerData, state: u32, us: &UpstreamState) {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free least time peer");
 
-    if let Some(peer) = ltp.rrp.current.clone() {
+    let peers = ltp.rrp.peers;
+    let peer = ltp.rrp.current;
+
+    unsafe {
+        peers_rlock(peers);
+        peer_lock(peers, peer);
+
         if ltp.inflight {
-            inflight_done(ltp, &peer, us.response_time);
+            inflight_done(ltp, peer, us.response_time);
         }
 
         // only successful attempts are accounted to mitigate preferring
         // of failing peers
         if state & (NGX_PEER_FAILED | NGX_PEER_NEXT) == 0 && us.header_time != u64::MAX {
-            response_time_avg(&peer.response_time, us.response_time);
+            response_time_avg(&mut (*peer).response_time, us.response_time);
 
             if !(ltp.conf.use_inflight && ltp.conf.mode == NGX_HTTP_UPSTREAM_LT_HEADER) {
-                response_time_avg(&peer.header_time, us.header_time);
+                response_time_avg(&mut (*peer).header_time, us.header_time);
             }
         }
     }
 
-    free_round_robin_peer(pc, &mut ltp.rrp, state);
+    // done:
+
+    free_round_robin_peer_locked(pc, &mut ltp.rrp, state);
 }
 
 /// ngx_http_upstream_least_time

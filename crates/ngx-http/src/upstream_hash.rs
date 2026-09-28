@@ -42,7 +42,7 @@ struct HashPeerData {
 
 impl PeerBalancer for HashPeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.rrp.peers) as u32
+        unsafe { upstream_tries(self.rrp.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -58,11 +58,11 @@ impl PeerBalancer for HashPeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.rrp.set_session()
+        set_round_robin_peer_session(&mut self.rrp)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        self.rrp.save_session(session)
+        save_round_robin_peer_session(&mut self.rrp, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
@@ -102,82 +102,109 @@ fn init_hash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> {
 fn get_hash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, try: {}", pc.tries);
 
-    let peers = hp.rrp.peers.clone();
+    unsafe {
+        let peers = hp.rrp.peers;
 
-    if hp.tries > 20 || peers.number.get() < 2 || hp.key.is_empty() {
-        return get_round_robin_peer(pc, &mut hp.rrp);
+        peers_rlock(peers);
+
+        if hp.tries > 20 || (*peers).number < 2 || hp.key.is_empty() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut hp.rrp);
+        }
+
+        if hp.rrp.config_changed() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut hp.rrp);
+        }
+
+        let now = ngx_core::times::time();
+
+        pc.cached = false;
+        pc.connection = None;
+
+        let mut p = 0usize;
+
+        let mut peer = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut p, true);
+
+        if peer.is_null() {
+            loop {
+                // Hash expression is compatible with Cache::Memcached:
+                // ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH
+                // with REHASH omitted at the first iteration.
+
+                let mut h = crc32fast::Hasher::new();
+
+                if hp.rehash > 0 {
+                    h.update(hp.rehash.to_string().as_bytes());
+                }
+
+                h.update(&hp.key);
+
+                let hash = (h.finalize() >> 16) & 0x7fff;
+
+                hp.hash = hp.hash.wrapping_add(hash);
+                hp.rehash += 1;
+
+                let mut w = (hp.hash as usize % (*peers).total_weight) as isize;
+                peer = (*peers).peer;
+                p = 0;
+
+                while w >= (*peer).weight {
+                    w -= (*peer).weight;
+                    peer = (*peer).next;
+                    p += 1;
+                }
+
+                let skip = if hp.rrp.is_tried(p) {
+                    true
+                } else {
+                    peer_lock(peers, peer);
+
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, value:{}, peer:{}", hp.hash, p);
+
+                    let unavailable = (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                    if unavailable {
+                        peer_unlock(peers, peer);
+                    }
+
+                    unavailable
+                };
+
+                if !skip {
+                    break;
+                }
+
+                // next:
+
+                hp.tries += 1;
+                if hp.tries > 20 {
+                    peers_unlock(peers);
+                    return get_round_robin_peer(pc, &mut hp.rrp);
+                }
+            }
+        }
+
+        // found:
+
+        hp.rrp.current = peer;
+        peer_ref(peers, peer);
+
+        connect_peer(pc, peer);
+
+        (*peer).conns += 1;
+
+        if now - (*peer).checked > (*peer).fail_timeout {
+            (*peer).checked = now;
+        }
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
+
+        hp.rrp.set_tried(p);
     }
-
-    if hp.rrp.config_changed() {
-        return get_round_robin_peer(pc, &mut hp.rrp);
-    }
-
-    let now = ngx_core::times::time();
-
-    pc.cached = false;
-    pc.connection = None;
-
-    let list = peers.peers();
-
-    let mut p = 0usize;
-    let peer = match get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut p) {
-        Some(peer) => peer,
-        None => loop {
-            // Hash expression is compatible with Cache::Memcached:
-            // ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH
-            // with REHASH omitted at the first iteration.
-            let mut h = crc32fast::Hasher::new();
-            if hp.rehash > 0 {
-                h.update(hp.rehash.to_string().as_bytes());
-            }
-            h.update(&hp.key);
-            let hash = (h.finalize() >> 16) & 0x7fff;
-
-            hp.hash = hp.hash.wrapping_add(hash);
-            hp.rehash += 1;
-
-            let mut w = hp.hash as i64 % peers.total_weight.get();
-            p = 0;
-
-            while w >= list[p].weight {
-                w -= list[p].weight;
-                p += 1;
-            }
-
-            let peer = &list[p];
-
-            let skip = if hp.rrp.is_tried(p) {
-                true
-            } else {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, value:{}, peer:{}", hp.hash, p);
-                peer.unavailable(now)
-            };
-
-            if !skip {
-                break peer.clone();
-            }
-
-            hp.tries += 1;
-            if hp.tries > 20 {
-                return get_round_robin_peer(pc, &mut hp.rrp);
-            }
-        },
-    };
-
-    hp.rrp.current = Some(peer.clone());
-    peer.refs.set(peer.refs.get() + 1);
-
-    pc.sockaddr = Some(peer.sockaddr.clone());
-    pc.name = peer.name.clone();
-    pc.sid = Some(peer.sid.clone());
-
-    peer.conns.set(peer.conns.get() + 1);
-
-    if now - peer.checked.get() > peer.fail_timeout {
-        peer.checked.set(now);
-    }
-
-    hp.rrp.set_tried(p);
 
     NGX_OK
 }
@@ -190,7 +217,7 @@ fn init_chash(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
         Ok(Box::new(init_chash_peer(r, us)?))
     }));
 
-    if us.zone.borrow().is_some() {
+    if us.shm_zone.borrow().is_some() {
         return Ok(());
     }
 
@@ -206,56 +233,63 @@ fn update_chash(us: &Rc<UpstreamSrvConf>) {
         None => return,
     };
 
-    let peers = match us.peers.borrow().clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let peers = us.peers.get();
 
-    let mut points: Vec<ChashPoint> = Vec::with_capacity(peers.total_weight.get().max(0) as usize * 160);
-
-    for peer in peers.peers().iter() {
-        let server = &peer.server;
-
-        let (host, port): (&[u8], &[u8]) = if server.len() >= 5 && server[..5].eq_ignore_ascii_case(b"unix:") {
-            (&server[5..], &[])
-        } else {
-            let mut split = None;
-            for j in 0..server.len() {
-                let c = server[server.len() - j - 1];
-                if c == b':' {
-                    split = Some((&server[..server.len() - j - 1], &server[server.len() - j..]));
-                    break;
-                }
-                if !c.is_ascii_digit() {
-                    break;
-                }
-            }
-            split.unwrap_or((&server[..], &[]))
-        };
-
-        let mut base = crc32fast::Hasher::new();
-        base.update(host);
-        base.update(&[0]);
-        base.update(port);
-
-        let mut prev_hash: u32 = 0;
-        let npoints = peer.weight as usize * 160;
-
-        for _ in 0..npoints {
-            let mut h = base.clone();
-            h.update(&prev_hash.to_le_bytes());
-            let hash = h.finalize();
-
-            points.push(ChashPoint { hash, server: server.clone() });
-
-            prev_hash = hash;
-        }
+    if peers.is_null() {
+        return;
     }
 
-    points.sort_by_key(|p| p.hash);
-    points.dedup_by_key(|p| p.hash);
+    unsafe {
+        let mut points: Vec<ChashPoint> = Vec::with_capacity((*peers).total_weight * 160);
 
-    *hcf.points.borrow_mut() = Some(Rc::new(points));
+        let mut peer = (*peers).peer;
+
+        while !peer.is_null() {
+            let server = (*peer).server.bytes();
+
+            let (host, port): (&[u8], &[u8]) = if server.len() >= 5 && server[..5].eq_ignore_ascii_case(b"unix:") {
+                (&server[5..], &[])
+            } else {
+                let mut split = None;
+                for j in 0..server.len() {
+                    let c = server[server.len() - j - 1];
+                    if c == b':' {
+                        split = Some((&server[..server.len() - j - 1], &server[server.len() - j..]));
+                        break;
+                    }
+                    if !c.is_ascii_digit() {
+                        break;
+                    }
+                }
+                split.unwrap_or((server, &[]))
+            };
+
+            let mut base = crc32fast::Hasher::new();
+            base.update(host);
+            base.update(&[0]);
+            base.update(port);
+
+            let mut prev_hash: u32 = 0;
+            let npoints = (*peer).weight as usize * 160;
+
+            for _ in 0..npoints {
+                let mut h = base.clone();
+                h.update(&prev_hash.to_le_bytes());
+                let hash = h.finalize();
+
+                points.push(ChashPoint { hash, server: server.to_vec() });
+
+                prev_hash = hash;
+            }
+
+            peer = (*peer).next;
+        }
+
+        points.sort_by_key(|p| p.hash);
+        points.dedup_by_key(|p| p.hash);
+
+        *hcf.points.borrow_mut() = Some(Rc::new(points));
+    }
 }
 
 /// ngx_http_upstream_find_chash_point: the first point >= hash.
@@ -284,21 +318,25 @@ fn init_chash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> 
 
     let hash = crc32(&hp.key);
 
-    let config = hp.rrp.peers.config.clone();
+    unsafe {
+        let peers = hp.rrp.peers;
 
-    if let Some(config) = config {
-        if hp.conf.points.borrow().is_none() || hp.conf.config.get() != config.get() {
+        peers_rlock(peers);
+
+        if !(*peers).config.is_null() && (hp.conf.points.borrow().is_none() || hp.conf.config.get() != *(*peers).config as u64) {
             update_chash(us);
-            hp.conf.config.set(config.get());
+            hp.conf.config.set(*(*peers).config as u64);
         }
-    }
 
-    let points = hp.conf.points.borrow().clone();
+        let points = hp.conf.points.borrow().clone();
 
-    if let Some(points) = points {
-        if !points.is_empty() {
-            hp.hash = find_chash_point(&points, hash);
+        if let Some(points) = points {
+            if !points.is_empty() {
+                hp.hash = find_chash_point(&points, hash);
+            }
         }
+
+        peers_unlock(peers);
     }
 
     Ok(hp)
@@ -308,99 +346,114 @@ fn init_chash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> 
 fn get_chash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get consistent hash peer, try: {}", pc.tries);
 
-    let peers = hp.rrp.peers.clone();
+    unsafe {
+        let peers = hp.rrp.peers;
 
-    if hp.tries > 20 || peers.single.get() || hp.key.is_empty() {
-        return get_round_robin_peer(pc, &mut hp.rrp);
-    }
+        peers_wlock(peers);
 
-    pc.cached = false;
-    pc.connection = None;
+        if hp.tries > 20 || (*peers).single || hp.key.is_empty() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut hp.rrp);
+        }
 
-    if peers.number.get() == 0 {
-        pc.name = peers.name.clone();
-        return NGX_BUSY;
-    }
+        pc.cached = false;
+        pc.connection = None;
 
-    if hp.rrp.config_changed() {
-        pc.name = peers.name.clone();
-        return NGX_BUSY;
-    }
+        if (*peers).number == 0 {
+            pc.name = (*(*peers).name).bytes().to_vec();
+            peers_unlock(peers);
+            return NGX_BUSY;
+        }
 
-    let now = ngx_core::times::time();
+        if hp.rrp.config_changed() {
+            pc.name = (*(*peers).name).bytes().to_vec();
+            peers_unlock(peers);
+            return NGX_BUSY;
+        }
 
-    let points = match hp.conf.points.borrow().clone() {
-        Some(p) => p,
-        None => return get_round_robin_peer(pc, &mut hp.rrp),
-    };
+        let now = ngx_core::times::time();
 
-    let list = peers.peers();
+        let points = hp.conf.points.borrow().clone().unwrap_or_default();
 
-    let mut best_i = 0usize;
-    let best = match get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut best_i) {
-        Some(best) => best,
-        None => loop {
-            let server = &points[hp.hash as usize % points.len()].server;
+        if points.is_empty() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut hp.rrp);
+        }
 
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "consistent hash peer:{}, server:\"{}\"", hp.hash, B(server));
+        let mut best_i = 0usize;
 
-            let mut best: Option<(std::rc::Rc<RrPeer>, usize)> = None;
-            let mut total = 0i64;
+        let mut best = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut best_i, false);
 
-            for (i, peer) in list.iter().enumerate() {
-                if hp.rrp.is_tried(i) {
-                    continue;
+        if best.is_null() {
+            loop {
+                let server = &points[hp.hash as usize % points.len()].server;
+
+                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "consistent hash peer:{}, server:\"{}\"", hp.hash, B(server));
+
+                best = std::ptr::null_mut();
+                best_i = 0;
+                let mut total: isize = 0;
+
+                let mut peer = (*peers).peer;
+                let mut i = 0;
+
+                while !peer.is_null() {
+                    let skip = hp.rrp.is_tried(i)
+                        || (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns)
+                        || (*peer).server.bytes() != server.as_slice();
+
+                    if !skip {
+                        (*peer).current_weight += (*peer).effective_weight;
+                        total += (*peer).effective_weight;
+
+                        if (*peer).effective_weight < (*peer).weight {
+                            (*peer).effective_weight += 1;
+                        }
+
+                        if best.is_null() || (*peer).current_weight > (*best).current_weight {
+                            best = peer;
+                            best_i = i;
+                        }
+                    }
+
+                    peer = (*peer).next;
+                    i += 1;
                 }
 
-                if peer.unavailable(now) {
-                    continue;
+                if !best.is_null() {
+                    (*best).current_weight -= total;
+                    break;
                 }
 
-                if peer.server != *server {
-                    continue;
-                }
+                hp.hash = hp.hash.wrapping_add(1);
+                hp.tries += 1;
 
-                peer.current_weight.set(peer.current_weight.get() + peer.effective_weight.get());
-                total += peer.effective_weight.get();
-
-                if peer.effective_weight.get() < peer.weight {
-                    peer.effective_weight.set(peer.effective_weight.get() + 1);
-                }
-
-                if best.as_ref().is_none_or(|(b, _)| peer.current_weight.get() > b.current_weight.get()) {
-                    best = Some((peer.clone(), i));
+                if hp.tries > 20 {
+                    peers_unlock(peers);
+                    return get_round_robin_peer(pc, &mut hp.rrp);
                 }
             }
+        }
 
-            if let Some((best, i)) = best {
-                best.current_weight.set(best.current_weight.get() - total);
-                best_i = i;
-                break best;
-            }
+        // found:
 
-            hp.hash = hp.hash.wrapping_add(1);
-            hp.tries += 1;
+        hp.rrp.current = best;
+        peer_ref(peers, best);
 
-            if hp.tries > 20 {
-                return get_round_robin_peer(pc, &mut hp.rrp);
-            }
-        },
-    };
+        connect_peer(pc, best);
 
-    hp.rrp.current = Some(best.clone());
-    best.refs.set(best.refs.get() + 1);
+        (*best).conns += 1;
 
-    pc.sockaddr = Some(best.sockaddr.clone());
-    pc.name = best.name.clone();
-    pc.sid = Some(best.sid.clone());
+        if now - (*best).checked > (*best).fail_timeout {
+            (*best).checked = now;
+        }
 
-    best.conns.set(best.conns.get() + 1);
+        peers_unlock(peers);
 
-    if now - best.checked.get() > best.fail_timeout {
-        best.checked.set(now);
+        hp.rrp.set_tried(best_i);
     }
-
-    hp.rrp.set_tried(best_i);
 
     NGX_OK
 }

@@ -33,6 +33,7 @@ pub mod shm;
 pub mod slab;
 pub mod shmtx;
 pub mod rbtree;
+pub mod rwlock;
 pub mod queue;
 pub mod listening;
 pub mod inet;

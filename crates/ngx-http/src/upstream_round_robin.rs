@@ -1,14 +1,22 @@
 //! ngx_http_upstream_round_robin.c: the peers of an upstream, the default
-//! (smooth weighted) round-robin balancer, and the per-peer failure and
+//! (smooth weighted) round robin balancer, and the per-peer failure and
 //! connection accounting the other balancers build on.
+//!
+//! Peers are the C structures: in the upstream's memory, or, with "zone",
+//! copied to shared memory (upstream_zone.rs), where the workers share
+//! them under the peers' rwlock and each peer's lock, and where the
+//! servers resolved at run time come and go.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::ptr::null_mut;
 use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
 
 use ngx_core::conf::*;
-use ngx_core::rc::*;
 use ngx_core::inet::{Addr, SockAddr, Url};
 use ngx_core::log::*;
+use ngx_core::rc::*;
+use ngx_core::slab::SlabPool;
 use ngx_core::string::B;
 use ngx_core::{ngx_log_debug, ngx_log_error};
 
@@ -19,166 +27,339 @@ use crate::upstream::*;
 pub const NGX_HTTP_UPSTREAM_SID_LEN: usize = 32;
 
 /// peer->down values.
-pub const NGX_HTTP_UPSTREAM_FAILED: u32 = 1;
-pub const NGX_HTTP_UPSTREAM_DRAINING: u32 = 8;
+pub const NGX_HTTP_UPSTREAM_FAILED: usize = 1;
+pub const NGX_HTTP_UPSTREAM_DRAINING: usize = 8;
 
-/// A resolvable server of a zone upstream (ngx_http_upstream_host_t).
+/// NGX_SOCKADDR_STRLEN
+pub const NGX_SOCKADDR_STRLEN: usize = 112;
+
+/// NGX_SSL_MAX_SESSION_SIZE
+pub const NGX_SSL_MAX_SESSION_SIZE: usize = 4096;
+
+/// ngx_str_t in the peers' memory
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NgxStr {
+    pub data: *mut u8,
+    pub len: usize,
+}
+
+impl NgxStr {
+    pub const NULL: NgxStr = NgxStr { data: null_mut(), len: 0 };
+
+    /// The bytes; the memory outlives the borrow while the peers do.
+    pub fn bytes<'a>(&self) -> &'a [u8] {
+        if self.len == 0 || self.data.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+/// ngx_http_upstream_host_t: a server resolved at run time; its resolve
+/// timer is the worker's (upstream_zone.rs)
+#[repr(C)]
 pub struct UpstreamHost {
-    pub name: Vec<u8>,
-    pub service: Vec<u8>,
-    pub valid: Cell<i64>,
-    /// The peers list the resolved peers go into.
-    pub peers: RefCell<Option<std::rc::Weak<RrPeers>>>,
-    /// The template peer (the server's parameters).
-    pub peer: RefCell<Option<Rc<RrPeer>>>,
-    /// The resolve task of the worker, while it runs.
-    pub task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    pub worker: usize,
+    pub name: NgxStr,
+    pub service: NgxStr,
+    pub valid: i64,
+    pub peers: *mut RrPeers,
+    pub peer: *mut RrPeer,
 }
 
 /// ngx_http_upstream_rr_peer_t
+#[repr(C)]
 pub struct RrPeer {
-    pub sockaddr: SockAddr,
-    pub name: Vec<u8>,
-    pub server: Vec<u8>,
+    pub sockaddr: *mut libc::sockaddr,
+    pub socklen: libc::socklen_t,
+    pub name: NgxStr,
+    pub server: NgxStr,
 
-    pub current_weight: Cell<i64>,
-    pub effective_weight: Cell<i64>,
-    pub weight: i64,
+    pub current_weight: isize,
+    pub effective_weight: isize,
+    pub weight: isize,
 
-    pub conns: Cell<u64>,
-    pub max_conns: u64,
+    pub conns: usize,
+    pub max_conns: usize,
 
-    pub fails: Cell<u64>,
-    pub accessed: Cell<i64>,
-    pub checked: Cell<i64>,
+    pub fails: usize,
+    pub accessed: i64,
+    pub checked: i64,
 
-    pub max_fails: u64,
+    pub max_fails: usize,
     pub fail_timeout: i64,
     pub slow_start: u64,
-    pub start_time: Cell<u64>,
+    pub start_time: u64,
 
-    pub down: Cell<u32>,
+    pub down: usize,
 
-    pub ssl_session: RefCell<Option<openssl::ssl::SslSession>>,
+    /// the saved session, DER
+    pub ssl_session: *mut u8,
+    pub ssl_session_len: i32,
 
-    /// sticky: the route (route=), or the md5 of the name
     pub route: bool,
-    pub sid: Vec<u8>,
 
-    /// zone: removed while still referenced
-    pub zombie: Cell<bool>,
-    pub refs: Cell<u64>,
-    pub host: Option<Rc<UpstreamHost>>,
+    pub zombie: bool,
 
-    /// least_time
-    pub header_time: Cell<u64>,
-    pub response_time: Cell<u64>,
-    pub inflight_time: Cell<u64>,
-    pub inflight_last: Cell<u64>,
-    pub inflight_reqs_changed: Cell<u64>,
-    pub inflight_reqs: Cell<u64>,
-}
+    pub lock: AtomicUsize,
+    pub refs: usize,
+    pub host: *mut UpstreamHost,
 
-impl RrPeer {
-    /// A peer with the parameters of a server.
-    pub fn new(addr: &Addr, s: &UpstreamServer) -> RrPeer {
-        RrPeer {
-            sockaddr: addr.sockaddr.clone(),
-            name: addr.name.clone(),
-            server: s.name.clone(),
-            current_weight: Cell::new(0),
-            effective_weight: Cell::new(s.weight as i64),
-            weight: s.weight as i64,
-            conns: Cell::new(0),
-            max_conns: s.max_conns as u64,
-            fails: Cell::new(0),
-            accessed: Cell::new(0),
-            checked: Cell::new(0),
-            max_fails: s.max_fails as u64,
-            fail_timeout: s.fail_timeout,
-            slow_start: s.slow_start,
-            start_time: Cell::new(0),
-            down: Cell::new(s.down),
-            ssl_session: RefCell::new(None),
-            route: false,
-            sid: Vec::new(),
-            zombie: Cell::new(false),
-            refs: Cell::new(0),
-            host: None,
-            header_time: Cell::new(0),
-            response_time: Cell::new(0),
-            inflight_time: Cell::new(0),
-            inflight_last: Cell::new(0),
-            inflight_reqs_changed: Cell::new(0),
-            inflight_reqs: Cell::new(0),
-        }
-    }
+    pub sid: NgxStr,
 
-    /// A peer of an implicit upstream or of per-request addresses.
-    fn implicit(sockaddr: SockAddr, name: Vec<u8>) -> RrPeer {
-        let s = UpstreamServer { weight: 1, max_fails: 1, fail_timeout: 10, ..Default::default() };
-        let mut p = RrPeer::new(&Addr { sockaddr, name }, &s);
-        p.server = Vec::new();
-        p
-    }
+    pub next: *mut RrPeer,
 
-    /// The peer does not take requests now: down, failed within
-    /// fail_timeout, or at max_conns.
-    pub fn unavailable(&self, now: i64) -> bool {
-        if self.down.get() != 0 {
-            return true;
-        }
-
-        if self.max_fails != 0 && self.fails.get() >= self.max_fails && now - self.checked.get() <= self.fail_timeout {
-            return true;
-        }
-
-        self.max_conns != 0 && self.conns.get() >= self.max_conns
-    }
+    pub header_time: u64,
+    pub response_time: u64,
+    pub inflight_time: u64,
+    pub inflight_last: u64,
+    pub inflight_reqs_changed: u64,
+    pub inflight_reqs: usize,
 }
 
 /// ngx_http_upstream_rr_peers_t
+#[repr(C)]
 pub struct RrPeers {
-    pub number: Cell<usize>,
-    pub total_weight: Cell<i64>,
-    pub tries: Cell<usize>,
-    pub single: Cell<bool>,
-    pub weighted: Cell<bool>,
-    pub name: Vec<u8>,
-    pub next: RefCell<Option<Rc<RrPeers>>>,
-    pub peer: RefCell<Vec<Rc<RrPeer>>>,
+    pub number: usize,
 
-    /// zone: the peers are shared, and changed by resolving
-    pub shared: bool,
-    pub config: Option<Rc<Cell<u64>>>,
-    pub resolve: RefCell<Vec<Rc<RrPeer>>>,
+    pub shpool: *mut SlabPool,
+    pub rwlock: AtomicUsize,
+    pub config: *mut usize,
+    pub resolve: *mut RrPeer,
+    pub zone_next: *mut RrPeers,
+
+    pub total_weight: usize,
+    pub tries: usize,
+
+    pub single: bool,
+    pub weighted: bool,
+
+    pub name: *mut NgxStr,
+
+    pub next: *mut RrPeers,
+
+    pub peer: *mut RrPeer,
 }
 
-impl RrPeers {
-    fn new(name: &[u8], peers: Vec<Rc<RrPeer>>, tries: usize, total_weight: i64, weighted: bool) -> RrPeers {
-        RrPeers {
-            number: Cell::new(peers.len()),
-            total_weight: Cell::new(total_weight),
-            tries: Cell::new(tries),
-            single: Cell::new(peers.len() == 1),
-            weighted: Cell::new(weighted),
-            name: name.to_vec(),
-            next: RefCell::new(None),
-            peer: RefCell::new(peers),
-            shared: false,
-            config: None,
-            resolve: RefCell::new(Vec::new()),
+/// The process memory of peers (C allocates them from cf->pool or
+/// r->pool): freed with its owner.
+#[derive(Default)]
+pub struct Arena {
+    blocks: RefCell<Vec<*mut u8>>,
+}
+
+impl Arena {
+    /// ngx_pcalloc
+    pub fn calloc(&self, size: usize) -> *mut u8 {
+        let p = unsafe { libc::calloc(1, size.max(1)) } as *mut u8;
+        if p.is_null() {
+            panic!("calloc({}) failed", size);
         }
+        self.blocks.borrow_mut().push(p);
+        p
     }
 
-    pub fn peers(&self) -> Vec<Rc<RrPeer>> {
-        self.peer.borrow().clone()
+    pub fn alloc<T>(&self) -> *mut T {
+        self.calloc(std::mem::size_of::<T>()) as *mut T
     }
+
+    pub fn alloc_n<T>(&self, n: usize) -> *mut T {
+        self.calloc(std::mem::size_of::<T>() * n) as *mut T
+    }
+
+    /// A copy of bytes.
+    pub fn dup(&self, s: &[u8]) -> NgxStr {
+        if s.is_empty() {
+            return NgxStr::NULL;
+        }
+        let p = self.calloc(s.len());
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len()) };
+        NgxStr { data: p, len: s.len() }
+    }
+
+    /// A copy of a socket address.
+    pub fn sockaddr(&self, sa: &SockAddr) -> (*mut libc::sockaddr, libc::socklen_t) {
+        let (ss, len) = sa.to_libc();
+        let p = self.calloc(std::mem::size_of::<libc::sockaddr_storage>());
+        unsafe { std::ptr::copy_nonoverlapping(&ss as *const libc::sockaddr_storage as *const u8, p, len as usize) };
+        (p as *mut libc::sockaddr, len)
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for p in self.blocks.borrow_mut().drain(..) {
+            unsafe { libc::free(p as *mut libc::c_void) };
+        }
+    }
+}
+
+/// The address of a peer.
+pub fn peer_sockaddr(peer: *const RrPeer) -> SockAddr {
+    unsafe { SockAddr::from_libc((*peer).sockaddr, (*peer).socklen).expect("peer sockaddr") }
+}
+
+// ngx_http_upstream_rr_peers_rlock() and the like: no-ops unless the
+// peers are in shared memory
+
+#[inline]
+pub unsafe fn peers_rlock(peers: *mut RrPeers) {
+    if !(*peers).shpool.is_null() {
+        ngx_core::rwlock::rlock(&(*peers).rwlock);
+    }
+}
+
+#[inline]
+pub unsafe fn peers_wlock(peers: *mut RrPeers) {
+    if !(*peers).shpool.is_null() {
+        ngx_core::rwlock::wlock(&(*peers).rwlock);
+    }
+}
+
+#[inline]
+pub unsafe fn peers_unlock(peers: *mut RrPeers) {
+    if !(*peers).shpool.is_null() {
+        ngx_core::rwlock::unlock(&(*peers).rwlock);
+    }
+}
+
+#[inline]
+pub unsafe fn peer_lock(peers: *mut RrPeers, peer: *mut RrPeer) {
+    if !(*peers).shpool.is_null() {
+        ngx_core::rwlock::wlock(&(*peer).lock);
+    }
+}
+
+#[inline]
+pub unsafe fn peer_unlock(peers: *mut RrPeers, peer: *mut RrPeer) {
+    if !(*peers).shpool.is_null() {
+        ngx_core::rwlock::unlock(&(*peer).lock);
+    }
+}
+
+/// ngx_http_upstream_rr_peer_ref
+#[inline]
+pub unsafe fn peer_ref(_peers: *mut RrPeers, peer: *mut RrPeer) {
+    (*peer).refs += 1;
+}
+
+/// ngx_http_upstream_rr_peer_free_locked
+pub unsafe fn peer_free_locked(peers: *mut RrPeers, peer: *mut RrPeer) {
+    if (*peer).refs != 0 {
+        (*peer).zombie = true;
+        return;
+    }
+
+    let pool = &*(*peers).shpool;
+
+    pool.free_locked((*peer).sockaddr as *mut u8);
+    pool.free_locked((*peer).name.data);
+    pool.free_locked((*peer).sid.data);
+
+    if !(*peer).server.data.is_null() {
+        pool.free_locked((*peer).server.data);
+    }
+
+    if !(*peer).ssl_session.is_null() {
+        pool.free_locked((*peer).ssl_session);
+    }
+
+    pool.free_locked(peer as *mut u8);
+}
+
+/// ngx_http_upstream_rr_peer_free
+pub unsafe fn peer_free(peers: *mut RrPeers, peer: *mut RrPeer) {
+    let pool = &*(*peers).shpool;
+    pool.lock();
+    peer_free_locked(peers, peer);
+    pool.unlock();
+}
+
+/// ngx_http_upstream_rr_peer_unref
+pub unsafe fn peer_unref(peers: *mut RrPeers, peer: *mut RrPeer) -> i64 {
+    (*peer).refs -= 1;
+
+    if (*peers).shpool.is_null() {
+        return NGX_OK;
+    }
+
+    if (*peer).refs == 0 && (*peer).zombie {
+        peer_free(peers, peer);
+        return NGX_DONE;
+    }
+
+    NGX_OK
+}
+
+/// ngx_http_upstream_response_time_avg: exponential moving average with
+/// rounding
+pub fn response_time_avg(avg: &mut u64, v: u64) {
+    *avg = if *avg != 0 { (0.5 + (v as f64 * 0.05 + *avg as f64 * 0.95)) as u64 } else { v };
 }
 
 /// ngx_http_upstream_tries
-pub fn upstream_tries(p: &RrPeers) -> usize {
-    p.tries.get() + p.next.borrow().as_ref().map_or(0, |n| n.tries.get())
+pub unsafe fn upstream_tries(p: *mut RrPeers) -> usize {
+    (*p).tries + if (*p).next.is_null() { 0 } else { (*(*p).next).tries }
+}
+
+/// Fill a peer with the parameters of a server.
+unsafe fn set_peer(peer: *mut RrPeer, arena: &Arena, addr: &Addr, s: &UpstreamServer) {
+    let (sa, len) = arena.sockaddr(&addr.sockaddr);
+    (*peer).sockaddr = sa;
+    (*peer).socklen = len;
+    (*peer).name = arena.dup(&addr.name);
+    (*peer).weight = s.weight as isize;
+    (*peer).effective_weight = s.weight as isize;
+    (*peer).current_weight = 0;
+    (*peer).max_conns = s.max_conns as usize;
+    (*peer).max_fails = s.max_fails as usize;
+    (*peer).fail_timeout = s.fail_timeout;
+    (*peer).down = s.down as usize;
+    (*peer).server = arena.dup(&s.name);
+
+    create_sid(arena, peer, &s.sid);
+}
+
+/// The peers of the servers, backup or not, with the resolvable ones.
+unsafe fn make_peers(arena: &Arena, servers: &[UpstreamServer], backup: bool, peers: *mut RrPeers, peer: *mut RrPeer) {
+    let mut n = 0;
+
+    let mut peerp: *mut *mut RrPeer = &mut (*peers).peer;
+    let mut rpeerp: *mut *mut RrPeer = &mut (*peers).resolve;
+
+    for s in servers.iter() {
+        if s.backup != backup {
+            continue;
+        }
+
+        if !s.host.is_empty() {
+            let p = peer.add(n);
+
+            let host = arena.alloc::<UpstreamHost>();
+            (*host).name = arena.dup(&s.host);
+            (*host).service = arena.dup(&s.service);
+            (*p).host = host;
+
+            set_peer(p, arena, &s.addrs[0], s);
+
+            *rpeerp = p;
+            rpeerp = &mut (*p).next;
+            n += 1;
+
+            continue;
+        }
+
+        for a in s.addrs.iter() {
+            let p = peer.add(n);
+
+            set_peer(p, arena, a, s);
+
+            *peerp = p;
+            peerp = &mut (*p).next;
+            n += 1;
+        }
+    }
 }
 
 /// ngx_http_upstream_init_round_robin: the peers of the upstream's servers,
@@ -189,14 +370,14 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
         Ok(Box::new(init_round_robin_peer(r, us)?))
     }));
 
+    let arena = &us.arena;
+
     let servers = us.servers.borrow();
 
     if let Some(servers) = servers.as_ref() {
-        let zone = us.zone.borrow().is_some();
+        let (mut n, mut r, mut w, mut t) = (0usize, 0usize, 0usize, 0usize);
 
         let mut resolve = false;
-
-        let (mut n, mut r, mut w, mut t) = (0usize, 0usize, 0i64, 0usize);
 
         for s in servers.iter() {
             if !s.host.is_empty() {
@@ -213,14 +394,14 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
             }
 
             n += s.addrs.len();
-            w += s.addrs.len() as i64 * s.weight as i64;
+            w += s.addrs.len() * s.weight as usize;
 
             if s.down == 0 {
                 t += s.addrs.len();
             }
         }
 
-        if zone {
+        if us.shm_zone.borrow().is_some() {
             if resolve && us.flags.get() & NGX_HTTP_UPSTREAM_MODIFY == 0 {
                 return Err(cf.emerg(format_args!(
                     "load balancing method does not support resolving names at run time in upstream \"{}\" in {}:{}",
@@ -236,6 +417,7 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
                 *us.resolver.borrow_mut() = resolver;
             }
 
+            // Without "resolver_timeout" in http{} the merged value is unset.
             if us.resolver_timeout.get().is_none() {
                 us.resolver_timeout.set(Some(resolver_timeout.unwrap_or(30000)));
             }
@@ -261,54 +443,72 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
             return Err(cf.emerg(format_args!("no servers in upstream \"{}\" in {}:{}", B(&us.host), B(&us.file_name), us.line)));
         }
 
-        let (list, resolve_list) = make_peers(servers, false);
+        unsafe {
+            let peers = arena.alloc::<RrPeers>();
+            let peer = arena.alloc_n::<RrPeer>(n + r);
 
-        let peers = Rc::new(RrPeers::new(&us.host, list, t, w, w != n as i64));
-        peers.number.set(n);
-        peers.single.set(n == 1);
-        *peers.resolve.borrow_mut() = resolve_list;
+            let name = arena.alloc::<NgxStr>();
+            *name = arena.dup(&us.host);
 
-        // backup servers
+            (*peers).single = n == 1;
+            (*peers).number = n;
+            (*peers).weighted = w != n;
+            (*peers).total_weight = w;
+            (*peers).tries = t;
+            (*peers).name = name;
 
-        let (mut bn, mut br, mut bw, mut bt) = (0usize, 0usize, 0i64, 0usize);
+            make_peers(arena, servers, false, peers, peer);
 
-        for s in servers.iter() {
-            if !s.backup {
-                continue;
+            us.peers.set(peers);
+
+            // backup servers
+
+            let (mut n, mut r, mut w, mut t) = (0usize, 0usize, 0usize, 0usize);
+
+            for s in servers.iter() {
+                if !s.backup {
+                    continue;
+                }
+
+                if !s.host.is_empty() {
+                    r += 1;
+                    continue;
+                }
+
+                n += s.addrs.len();
+                w += s.addrs.len() * s.weight as usize;
+
+                if s.down == 0 {
+                    t += s.addrs.len();
+                }
             }
 
-            if !s.host.is_empty() {
-                br += 1;
-                continue;
+            if n == 0 && !resolve {
+                return Ok(());
             }
 
-            bn += s.addrs.len();
-            bw += s.addrs.len() as i64 * s.weight as i64;
-
-            if s.down == 0 {
-                bt += s.addrs.len();
+            if n + r == 0 && us.flags.get() & NGX_HTTP_UPSTREAM_BACKUP == 0 {
+                return Ok(());
             }
+
+            let backup = arena.alloc::<RrPeers>();
+            let peer = arena.alloc_n::<RrPeer>(n + r);
+
+            if n > 0 {
+                (*peers).single = false;
+            }
+
+            (*backup).single = false;
+            (*backup).number = n;
+            (*backup).weighted = w != n;
+            (*backup).total_weight = w;
+            (*backup).tries = t;
+            (*backup).name = name;
+
+            make_peers(arena, servers, true, backup, peer);
+
+            (*peers).next = backup;
         }
-
-        if bn == 0 && !resolve || bn + br == 0 && us.flags.get() & NGX_HTTP_UPSTREAM_BACKUP == 0 {
-            *us.peers.borrow_mut() = Some(peers);
-            return Ok(());
-        }
-
-        let (blist, bresolve) = make_peers(servers, true);
-
-        if bn > 0 {
-            peers.single.set(false);
-        }
-
-        let backup = Rc::new(RrPeers::new(&us.host, blist, bt, bw, bw != bn as i64));
-        backup.number.set(bn);
-        backup.single.set(false);
-        *backup.resolve.borrow_mut() = bresolve;
-
-        *peers.next.borrow_mut() = Some(backup);
-
-        *us.peers.borrow_mut() = Some(peers);
 
         return Ok(());
     }
@@ -334,158 +534,197 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
 
     let n = u.addrs.len();
 
-    let list: Vec<Rc<RrPeer>> = u.addrs.iter().map(|a| Rc::new(RrPeer::implicit(a.sockaddr.clone(), a.name.clone()))).collect();
+    unsafe {
+        let peers = arena.alloc::<RrPeers>();
+        let peer = arena.alloc_n::<RrPeer>(n);
 
-    let peers = Rc::new(RrPeers::new(&us.host, list, n, n as i64, false));
+        let name = arena.alloc::<NgxStr>();
+        *name = arena.dup(&us.host);
 
-    *us.peers.borrow_mut() = Some(peers);
+        (*peers).single = n == 1;
+        (*peers).number = n;
+        (*peers).weighted = false;
+        (*peers).total_weight = n;
+        (*peers).tries = n;
+        (*peers).name = name;
+
+        let mut peerp: *mut *mut RrPeer = &mut (*peers).peer;
+
+        for (i, a) in u.addrs.iter().enumerate() {
+            let p = peer.add(i);
+            let (sa, len) = arena.sockaddr(&a.sockaddr);
+            (*p).sockaddr = sa;
+            (*p).socklen = len;
+            (*p).name = arena.dup(&a.name);
+            (*p).weight = 1;
+            (*p).effective_weight = 1;
+            (*p).current_weight = 0;
+            (*p).max_conns = 0;
+            (*p).max_fails = 1;
+            (*p).fail_timeout = 10;
+            *peerp = p;
+            peerp = &mut (*p).next;
+        }
+
+        us.peers.set(peers);
+    }
 
     // implicitly defined upstream has no backup servers
 
     Ok(())
 }
 
-/// The peers of the servers (backup or not), and the resolvable ones.
-fn make_peers(servers: &[UpstreamServer], backup: bool) -> (Vec<Rc<RrPeer>>, Vec<Rc<RrPeer>>) {
-    let mut list = Vec::new();
-    let mut resolve = Vec::new();
-
-    for s in servers.iter() {
-        if s.backup != backup {
-            continue;
-        }
-
-        if !s.host.is_empty() {
-            let host = Rc::new(UpstreamHost {
-                name: s.host.clone(),
-                service: s.service.clone(),
-                valid: Cell::new(0),
-                peers: RefCell::new(None),
-                peer: RefCell::new(None),
-                task: RefCell::new(None),
-            });
-
-            let mut p = RrPeer::new(&s.addrs[0], s);
-            create_sid(&mut p, &s.sid);
-            p.host = Some(host);
-
-            resolve.push(Rc::new(p));
-            continue;
-        }
-
-        for a in s.addrs.iter() {
-            let mut p = RrPeer::new(a, s);
-            create_sid(&mut p, &s.sid);
-            list.push(Rc::new(p));
-        }
-    }
-
-    (list, resolve)
-}
-
 /// ngx_http_upstream_create_sid
-fn create_sid(peer: &mut RrPeer, route: &[u8]) {
-    init_round_robin_sid(peer, route);
-}
-
-/// ngx_http_upstream_init_round_robin_sid: the route, or the md5 of the
-/// peer's printable address.
-pub fn init_round_robin_sid(peer: &mut RrPeer, route: &[u8]) {
+unsafe fn create_sid(arena: &Arena, peer: *mut RrPeer, route: &[u8]) {
     if !route.is_empty() {
-        peer.route = true;
-        peer.sid = route.to_vec();
+        (*peer).route = true;
+        (*peer).sid = arena.dup(route);
         return;
     }
 
-    peer.route = false;
+    (*peer).sid.data = arena.calloc(NGX_HTTP_UPSTREAM_SID_LEN);
 
-    if peer.name.is_empty() {
-        peer.sid.clear();
+    init_round_robin_sid(peer, None);
+}
+
+/// ngx_http_upstream_init_round_robin_sid: the route, or the md5 of the
+/// peer's printable address; sid.data has room for either.
+pub unsafe fn init_round_robin_sid(peer: *mut RrPeer, route: Option<&[u8]>) {
+    if let Some(route) = route.filter(|r| !r.is_empty()) {
+        (*peer).route = true;
+        (*peer).sid.len = route.len();
+        std::ptr::copy_nonoverlapping(route.as_ptr(), (*peer).sid.data, route.len());
+        return;
+    }
+
+    (*peer).route = false;
+
+    // SID is the MD5 hash of a printable socket address
+
+    if (*peer).name.len == 0 {
+        (*peer).sid.len = 0;
         return;
     }
 
     use md5::{Digest, Md5};
-    let hash = Md5::digest(&peer.name);
-    peer.sid = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>().into_bytes();
+    let hash = Md5::digest((*peer).name.bytes());
+    let hex: Vec<u8> = hash.iter().flat_map(|b| format!("{:02x}", b).into_bytes()).collect();
+
+    std::ptr::copy_nonoverlapping(hex.as_ptr(), (*peer).sid.data, NGX_HTTP_UPSTREAM_SID_LEN);
+    (*peer).sid.len = NGX_HTTP_UPSTREAM_SID_LEN;
+}
+
+/// ngx_http_upstream_copy_round_robin_sid
+pub unsafe fn copy_round_robin_sid(dst: *mut RrPeer, src: *mut RrPeer) {
+    let route = if (*src).route { Some((*src).sid.bytes()) } else { None };
+    init_round_robin_sid(dst, route);
 }
 
 /// ngx_http_upstream_rr_peer_data_t
 pub struct RrPeerData {
-    pub config: u64,
-    pub peers: Rc<RrPeers>,
-    pub current: Option<Rc<RrPeer>>,
-    pub tried: Vec<u64>,
+    pub config: usize,
+    pub peers: *mut RrPeers,
+    pub current: *mut RrPeer,
+    pub tried: Vec<usize>,
+    /// keeps the peers alive: the upstream's, or the request's own
+    pub upstream: Option<Rc<UpstreamSrvConf>>,
+    pub arena: Option<Arena>,
 }
 
+const UINTPTR_BITS: usize = usize::BITS as usize;
+
 impl RrPeerData {
-    fn tried_bitmap(n: usize) -> Vec<u64> {
-        vec![0; n.div_ceil(64).max(1)]
+    fn tried_bitmap(n: usize) -> Vec<usize> {
+        vec![0; n.div_ceil(UINTPTR_BITS).max(1)]
     }
 
     pub fn is_tried(&self, i: usize) -> bool {
-        self.tried[i / 64] & (1 << (i % 64)) != 0
+        self.tried.get(i / UINTPTR_BITS).is_some_and(|t| t & (1 << (i % UINTPTR_BITS)) != 0)
     }
 
     pub fn set_tried(&mut self, i: usize) {
-        self.tried[i / 64] |= 1 << (i % 64);
-    }
-
-    /// Clear the tried bits for the backup peers.
-    pub fn clear_tried(&mut self) {
-        let n = self.peers.number.get().div_ceil(64).max(1);
-        if self.tried.len() < n {
-            self.tried.resize(n, 0);
+        let n = i / UINTPTR_BITS;
+        if n >= self.tried.len() {
+            self.tried.resize(n + 1, 0);
         }
-        for t in self.tried.iter_mut() {
-            *t = 0;
-        }
+        self.tried[n] |= 1 << (i % UINTPTR_BITS);
     }
 
     /// The zone's peers changed since the request started.
-    pub fn config_changed(&self) -> bool {
-        self.peers.config.as_ref().is_some_and(|c| c.get() != self.config)
+    pub unsafe fn config_changed(&self) -> bool {
+        !(*self.peers).config.is_null() && self.config != *(*self.peers).config
     }
 }
 
 /// ngx_http_upstream_init_round_robin_peer
-pub fn init_round_robin_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<RrPeerData, ()> {
-    let peers = match us.peers.borrow().clone() {
-        Some(p) => p,
-        None => return Err(()),
-    };
+pub fn init_round_robin_peer(_r: &R, us: &Rc<UpstreamSrvConf>) -> Result<RrPeerData, ()> {
+    let peers = us.peers.get();
 
-    let mut n = peers.number.get();
-
-    if let Some(next) = peers.next.borrow().as_ref() {
-        if next.number.get() > n {
-            n = next.number.get();
-        }
+    if peers.is_null() {
+        return Err(());
     }
 
-    let config = peers.config.as_ref().map_or(0, |c| c.get());
+    unsafe {
+        peers_rlock(peers);
 
-    let _ = r;
+        let config = if (*peers).config.is_null() { 0 } else { *(*peers).config };
 
-    Ok(RrPeerData { config, peers, current: None, tried: RrPeerData::tried_bitmap(n) })
+        let mut n = (*peers).number;
+
+        if !(*peers).next.is_null() && (*(*peers).next).number > n {
+            n = (*(*peers).next).number;
+        }
+
+        peers_unlock(peers);
+
+        Ok(RrPeerData { config, peers, current: null_mut(), tried: RrPeerData::tried_bitmap(n), upstream: Some(us.clone()), arena: None })
+    }
 }
 
 /// ngx_http_upstream_create_round_robin_peer: the peers of addresses
-/// resolved for this request.
+/// resolved for this request, in its memory.
 pub fn create_round_robin_peer(host: &[u8], addrs: Vec<Addr>) -> RrPeerData {
+    let arena = Arena::default();
+
     let n = addrs.len();
 
-    let list: Vec<Rc<RrPeer>> = addrs.into_iter().map(|a| Rc::new(RrPeer::implicit(a.sockaddr, a.name))).collect();
+    unsafe {
+        let peers = arena.alloc::<RrPeers>();
+        let peer = arena.alloc_n::<RrPeer>(n);
 
-    let mut peers = RrPeers::new(host, list, n, 0, false);
-    peers.total_weight.set(0);
-    let peers = Rc::new(peers);
+        let name = arena.alloc::<NgxStr>();
+        *name = arena.dup(host);
 
-    RrPeerData { config: 0, peers, current: None, tried: RrPeerData::tried_bitmap(n) }
+        (*peers).single = n == 1;
+        (*peers).number = n;
+        (*peers).tries = n;
+        (*peers).name = name;
+
+        let mut peerp: *mut *mut RrPeer = &mut (*peers).peer;
+
+        for (i, a) in addrs.iter().enumerate() {
+            let p = peer.add(i);
+            let (sa, len) = arena.sockaddr(&a.sockaddr);
+            (*p).sockaddr = sa;
+            (*p).socklen = len;
+            (*p).name = arena.dup(&a.name);
+            (*p).weight = 1;
+            (*p).effective_weight = 1;
+            (*p).current_weight = 0;
+            (*p).max_conns = 0;
+            (*p).max_fails = 1;
+            (*p).fail_timeout = 10;
+            *peerp = p;
+            peerp = &mut (*p).next;
+        }
+
+        RrPeerData { config: 0, peers, current: null_mut(), tried: RrPeerData::tried_bitmap(n), upstream: None, arena: Some(arena) }
+    }
 }
 
 impl PeerBalancer for RrPeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.peers) as u32
+        unsafe { upstream_tries(self.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -497,18 +736,23 @@ impl PeerBalancer for RrPeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.current.as_ref().and_then(|p| p.ssl_session.borrow().clone())
+        set_round_robin_peer_session(self)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        if let Some(p) = self.current.as_ref() {
-            *p.ssl_session.borrow_mut() = Some(session);
-        }
+        save_round_robin_peer_session(self, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
         Some(self)
     }
+}
+
+/// pc->sockaddr, pc->name and pc->sid of a chosen peer.
+pub unsafe fn connect_peer(pc: &mut PeerConnection, peer: *mut RrPeer) {
+    pc.sockaddr = Some(peer_sockaddr(peer));
+    pc.name = (*peer).name.bytes().to_vec();
+    pc.sid = Some((*peer).sid.bytes().to_vec());
 }
 
 /// ngx_http_upstream_get_round_robin_peer
@@ -518,243 +762,411 @@ pub fn get_round_robin_peer(pc: &mut PeerConnection, rrp: &mut RrPeerData) -> i6
     pc.cached = false;
     pc.connection = None;
 
-    let peers = rrp.peers.clone();
+    unsafe {
+        let peers = rrp.peers;
+        peers_wlock(peers);
 
-    let failed = 'pick: {
-        if rrp.config_changed() {
-            // busy
-            pc.name = peers.name.clone();
-            return NGX_BUSY;
-        }
+        let failed = 'pick: {
+            if rrp.config_changed() {
+                // busy
+                peers_unlock(peers);
 
-        let peer = if peers.single.get() {
-            let mut i = 0;
-            let peer = match get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut i) {
-                Some(p) => p,
-                None => {
-                    let peer = match peers.peer.borrow().first().cloned() {
-                        Some(p) => p,
-                        None => break 'pick true,
-                    };
+                pc.name = (*(*peers).name).bytes().to_vec();
 
-                    if peer.down.get() != 0 {
+                return NGX_BUSY;
+            }
+
+            let peer = if (*peers).single {
+                let mut i = 0;
+                let mut peer = get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut i, false);
+
+                if peer.is_null() {
+                    peer = (*peers).peer;
+
+                    if (*peer).down != 0 {
                         break 'pick true;
                     }
 
-                    if peer.max_conns != 0 && peer.conns.get() >= peer.max_conns {
+                    if (*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns {
                         break 'pick true;
                     }
-
-                    peer
                 }
+
+                rrp.current = peer;
+                peer_ref(peers, peer);
+
+                peer
+            } else {
+                // there are several peers
+
+                let peer = get_peer(rrp, pc);
+
+                if peer.is_null() {
+                    break 'pick true;
+                }
+
+                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get rr peer, current: {:p} {}", peer, (*peer).current_weight);
+
+                peer
             };
 
-            rrp.current = Some(peer.clone());
-            peer.refs.set(peer.refs.get() + 1);
-            peer
-        } else {
-            // there are several peers
-            match get_peer(rrp, pc) {
-                Some(p) => {
-                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get rr peer, current: {} {}", B(&p.name), p.current_weight.get());
-                    p
-                }
-                None => break 'pick true,
-            }
+            connect_peer(pc, peer);
+
+            (*peer).conns += 1;
+
+            peers_unlock(peers);
+
+            false
         };
 
-        pc.sockaddr = Some(peer.sockaddr.clone());
-        pc.name = peer.name.clone();
-        pc.sid = Some(peer.sid.clone());
-
-        peer.conns.set(peer.conns.get() + 1);
-
-        false
-    };
-
-    if !failed {
-        return NGX_OK;
-    }
-
-    let next = peers.next.borrow().clone();
-
-    if let Some(next) = next {
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "backup servers");
-
-        rrp.peers = next;
-        rrp.clear_tried();
-
-        let rc = get_round_robin_peer(pc, rrp);
-
-        if rc != NGX_BUSY {
-            return rc;
+        if !failed {
+            return NGX_OK;
         }
+
+        // failed:
+
+        if !(*peers).next.is_null() {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "backup servers");
+
+            rrp.peers = (*peers).next;
+
+            let n = (*rrp.peers).number.div_ceil(UINTPTR_BITS);
+
+            for i in 0..n.min(rrp.tried.len()) {
+                rrp.tried[i] = 0;
+            }
+
+            peers_unlock(peers);
+
+            let rc = get_round_robin_peer(pc, rrp);
+
+            if rc != NGX_BUSY {
+                return rc;
+            }
+
+            peers_wlock(peers);
+        }
+
+        // busy:
+
+        peers_unlock(peers);
+
+        pc.name = (*(*peers).name).bytes().to_vec();
+
+        NGX_BUSY
     }
-
-    pc.name = peers.name.clone();
-
-    NGX_BUSY
 }
 
 /// ngx_http_upstream_get_peer: smooth weighted round robin over the peers
 /// not tried yet, not down, failed or at max_conns; a sticky peer is
 /// preferred while its weight allows.
-pub fn get_peer(rrp: &mut RrPeerData, pc: &mut PeerConnection) -> Option<Rc<RrPeer>> {
+pub unsafe fn get_peer(rrp: &mut RrPeerData, pc: &mut PeerConnection) -> *mut RrPeer {
     let now = ngx_core::times::time();
 
-    let mut best: Option<(Rc<RrPeer>, usize)> = None;
-    let mut total = 0i64;
+    let mut best: *mut RrPeer = null_mut();
+    let mut total: isize = 0;
 
     let mut p = 0usize;
-    let st_peer = get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut p);
 
-    if let Some(st) = st_peer.as_ref() {
-        let low_limit = -(rrp.peers.total_weight.get() - st.weight);
+    let st_peer = get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut p, false);
 
-        // note: current code accounts only one sticky request in a row, if it
-        //       is required to account more, multiply low_limit by N below
-        if st.current_weight.get() <= low_limit {
-            // do not update weights if the limit exceeded
-            return Some(chosen(rrp, st.clone(), p, now));
+    'best_chosen: {
+        if !st_peer.is_null() {
+            let low_limit = -(((*rrp.peers).total_weight as isize) - (*st_peer).weight);
+
+            // note: current code accounts only one sticky request in a row,
+            //       if it is required to account more, multiply low_limit
+            //       by N below
+            if (*st_peer).current_weight <= low_limit {
+                // do not update weights if the limit exceeded
+                best = st_peer;
+                break 'best_chosen;
+            }
+            // else: proceed to reweight with existing st_peer
         }
+
+        let st_p = p;
+
+        let mut peer = (*rrp.peers).peer;
+        let mut i = 0;
+
+        while !peer.is_null() {
+            if rrp.is_tried(i)
+                || (*peer).down != 0
+                || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns)
+            {
+                peer = (*peer).next;
+                i += 1;
+                continue;
+            }
+
+            (*peer).current_weight += (*peer).effective_weight;
+            total += (*peer).effective_weight;
+
+            if (*peer).effective_weight < (*peer).weight {
+                (*peer).effective_weight += 1;
+            }
+
+            if best.is_null() || (*peer).current_weight > (*best).current_weight {
+                best = peer;
+                p = i;
+            }
+
+            peer = (*peer).next;
+            i += 1;
+        }
+
+        // prefer peer chosen by sticky to best from RR
+
+        if !st_peer.is_null() {
+            best = st_peer;
+            p = st_p;
+        }
+
+        if best.is_null() {
+            return null_mut();
+        }
+
+        (*best).current_weight -= total;
     }
 
-    let st_p = p;
+    // best_chosen:
 
-    let list = rrp.peers.peers();
-
-    for (i, peer) in list.iter().enumerate() {
-        if rrp.is_tried(i) {
-            continue;
-        }
-
-        if peer.unavailable(now) {
-            continue;
-        }
-
-        peer.current_weight.set(peer.current_weight.get() + peer.effective_weight.get());
-        total += peer.effective_weight.get();
-
-        if peer.effective_weight.get() < peer.weight {
-            peer.effective_weight.set(peer.effective_weight.get() + 1);
-        }
-
-        if best.as_ref().is_none_or(|(b, _)| peer.current_weight.get() > b.current_weight.get()) {
-            best = Some((peer.clone(), i));
-        }
-    }
-
-    // prefer peer chosen by sticky to best from RR
-    if let Some(st) = st_peer {
-        best = Some((st, st_p));
-    }
-
-    let (best, p) = best?;
-
-    best.current_weight.set(best.current_weight.get() - total);
-
-    Some(chosen(rrp, best, p, now))
-}
-
-fn chosen(rrp: &mut RrPeerData, best: Rc<RrPeer>, p: usize, now: i64) -> Rc<RrPeer> {
-    rrp.current = Some(best.clone());
-    best.refs.set(best.refs.get() + 1);
+    rrp.current = best;
+    peer_ref(rrp.peers, best);
 
     rrp.set_tried(p);
 
-    if now - best.checked.get() > best.fail_timeout {
-        best.checked.set(now);
+    if now - (*best).checked > (*best).fail_timeout {
+        (*best).checked = now;
     }
 
     best
 }
 
 /// ngx_http_upstream_get_rr_peer_by_sid: the peer the sticky hint names,
-/// if it is not tried yet and can take the request (a draining peer can).
-pub fn get_rr_peer_by_sid(rrp: &RrPeerData, hint: Option<&[u8]>, p: &mut usize) -> Option<Rc<RrPeer>> {
-    let hint = hint?;
+/// if it is not tried yet and can take the request (a draining peer can);
+/// locked if asked.
+pub unsafe fn get_rr_peer_by_sid(rrp: &RrPeerData, hint: Option<&[u8]>, p: &mut usize, lock: bool) -> *mut RrPeer {
+    let hint = match hint {
+        Some(h) => h,
+        None => return null_mut(),
+    };
 
-    let list = rrp.peers.peers();
+    let mut peer = (*rrp.peers).peer;
+    let mut i = 0;
 
-    let (i, peer) = list.iter().enumerate().find(|(_, peer)| peer.sid.as_slice() == hint)?;
+    while !peer.is_null() {
+        if (*peer).sid.bytes() == hint {
+            break;
+        }
+
+        peer = (*peer).next;
+        i += 1;
+    }
+
+    if peer.is_null() {
+        return null_mut();
+    }
+
+    // found:
 
     if rrp.is_tried(i) {
-        return None;
+        return null_mut();
     }
 
-    if peer.down.get() & !NGX_HTTP_UPSTREAM_DRAINING != 0 {
-        return None;
+    if lock {
+        peer_lock(rrp.peers, peer);
     }
 
-    if peer.max_fails != 0 && peer.fails.get() >= peer.max_fails && ngx_core::times::time() - peer.checked.get() <= peer.fail_timeout {
-        return None;
-    }
+    let failed = (*peer).down & !NGX_HTTP_UPSTREAM_DRAINING != 0
+        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && ngx_core::times::time() - (*peer).checked <= (*peer).fail_timeout)
+        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
 
-    if peer.max_conns != 0 && peer.conns.get() >= peer.max_conns {
-        return None;
+    if failed {
+        if lock {
+            peer_unlock(rrp.peers, peer);
+        }
+
+        return null_mut();
     }
 
     *p = i;
-    Some(peer.clone())
+    peer
 }
 
 /// ngx_http_upstream_free_round_robin_peer
 pub fn free_round_robin_peer(pc: &mut PeerConnection, rrp: &mut RrPeerData, state: u32) {
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free rr peer {} {}", pc.tries, state);
-
-    let peer = match rrp.current.clone() {
-        Some(p) => p,
-        None => return,
-    };
-
-    if rrp.peers.single.get() {
-        if peer.fails.get() != 0 {
-            peer.fails.set(0);
-        }
-
-        peer.conns.set(peer.conns.get().saturating_sub(1));
-        peer_unref(&peer);
-
-        pc.tries = 0;
-        return;
+    unsafe {
+        peers_rlock(rrp.peers);
+        peer_lock(rrp.peers, rrp.current);
     }
 
-    if state & NGX_PEER_FAILED != 0 {
-        let now = ngx_core::times::time();
+    free_round_robin_peer_locked(pc, rrp, state);
+}
 
-        peer.fails.set(peer.fails.get() + 1);
-        peer.accessed.set(now);
-        peer.checked.set(now);
+/// ngx_http_upstream_free_round_robin_peer_locked: with the peers read
+/// locked and the peer locked, which it unlocks
+pub fn free_round_robin_peer_locked(pc: &mut PeerConnection, rrp: &mut RrPeerData, state: u32) {
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free rr peer {} {}", pc.tries, state);
 
-        if peer.max_fails != 0 {
-            peer.effective_weight.set(peer.effective_weight.get() - peer.weight / peer.max_fails as i64);
+    // TODO: NGX_PEER_KEEPALIVE
 
-            if peer.fails.get() >= peer.max_fails {
-                ngx_log_error!(NGX_LOG_WARN, pc.log, None, "upstream server temporarily disabled");
+    unsafe {
+        let peer = rrp.current;
+
+        if (*rrp.peers).single {
+            if (*peer).fails != 0 {
+                (*peer).fails = 0;
+            }
+
+            (*peer).conns -= 1;
+
+            if peer_unref(rrp.peers, peer) == NGX_OK {
+                peer_unlock(rrp.peers, peer);
+            }
+
+            peers_unlock(rrp.peers);
+
+            pc.tries = 0;
+            return;
+        }
+
+        if state & NGX_PEER_FAILED != 0 {
+            let now = ngx_core::times::time();
+
+            (*peer).fails += 1;
+            (*peer).accessed = now;
+            (*peer).checked = now;
+
+            if (*peer).max_fails != 0 {
+                (*peer).effective_weight -= (*peer).weight / (*peer).max_fails as isize;
+
+                if (*peer).fails >= (*peer).max_fails {
+                    ngx_log_error!(NGX_LOG_WARN, pc.log, None, "upstream server temporarily disabled");
+                }
+            }
+
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free rr peer failed: {:p} {}", peer, (*peer).effective_weight);
+
+            if (*peer).effective_weight < 0 {
+                (*peer).effective_weight = 0;
+            }
+        } else {
+            // mark peer live if check passed
+
+            if (*peer).accessed < (*peer).checked {
+                (*peer).fails = 0;
             }
         }
 
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free rr peer failed: {} {}", B(&peer.name), peer.effective_weight.get());
+        (*peer).conns -= 1;
 
-        if peer.effective_weight.get() < 0 {
-            peer.effective_weight.set(0);
+        if peer_unref(rrp.peers, peer) == NGX_OK {
+            peer_unlock(rrp.peers, peer);
         }
-    } else {
-        // mark peer live if check passed
-        if peer.accessed.get() < peer.checked.get() {
-            peer.fails.set(0);
-        }
+
+        peers_unlock(rrp.peers);
     }
-
-    peer.conns.set(peer.conns.get().saturating_sub(1));
-    peer_unref(&peer);
 
     if pc.tries > 0 {
         pc.tries -= 1;
     }
 }
 
-/// ngx_http_upstream_rr_peer_unref
-fn peer_unref(peer: &RrPeer) {
-    peer.refs.set(peer.refs.get().saturating_sub(1));
+/// ngx_http_upstream_set_round_robin_peer_session
+pub fn set_round_robin_peer_session(rrp: &mut RrPeerData) -> Option<openssl::ssl::SslSession> {
+    // per-request peers have no sessions (ngx_http_upstream_empty_set_session)
+    if rrp.arena.is_some() || rrp.current.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let peers = rrp.peers;
+        let peer = rrp.current;
+
+        peers_rlock(peers);
+        peer_lock(peers, peer);
+
+        if (*peer).ssl_session.is_null() {
+            peer_unlock(peers, peer);
+            peers_unlock(peers);
+            return None;
+        }
+
+        let der = std::slice::from_raw_parts((*peer).ssl_session, (*peer).ssl_session_len as usize).to_vec();
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
+
+        openssl::ssl::SslSession::from_der(&der).ok()
+    }
+}
+
+/// ngx_http_upstream_save_round_robin_peer_session
+pub fn save_round_robin_peer_session(rrp: &mut RrPeerData, session: openssl::ssl::SslSession) {
+    // ngx_http_upstream_empty_save_session
+    if rrp.arena.is_some() || rrp.current.is_null() {
+        return;
+    }
+
+    let der = match session.to_der() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let len = der.len();
+
+    // do not cache too big session
+
+    if len > NGX_SSL_MAX_SESSION_SIZE {
+        return;
+    }
+
+    unsafe {
+        let peers = rrp.peers;
+        let peer = rrp.current;
+
+        peers_rlock(peers);
+        peer_lock(peers, peer);
+
+        if len > (*peer).ssl_session_len as usize {
+            if !(*peers).shpool.is_null() {
+                let pool = &*(*peers).shpool;
+
+                pool.lock();
+
+                if !(*peer).ssl_session.is_null() {
+                    pool.free_locked((*peer).ssl_session);
+                }
+
+                (*peer).ssl_session = pool.alloc_locked(len);
+
+                pool.unlock();
+            } else {
+                // a process's peer: its own buffer
+                if !(*peer).ssl_session.is_null() {
+                    libc::free((*peer).ssl_session as *mut libc::c_void);
+                }
+
+                (*peer).ssl_session = libc::malloc(len) as *mut u8;
+            }
+
+            if (*peer).ssl_session.is_null() {
+                (*peer).ssl_session_len = 0;
+
+                peer_unlock(peers, peer);
+                peers_unlock(peers);
+                return;
+            }
+        }
+
+        (*peer).ssl_session_len = len as i32;
+
+        std::ptr::copy_nonoverlapping(der.as_ptr(), (*peer).ssl_session, len);
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
+    }
 }

@@ -21,7 +21,7 @@ use crate::{http_module_def, HttpModuleDef, NGX_CONF_NOARGS, NGX_CONF_TAKE12, NG
 pub struct RandomConf {
     two: bool,
     config: Cell<u64>,
-    ranges: RefCell<Option<Rc<Vec<(Rc<RrPeer>, i64)>>>>,
+    ranges: RefCell<Option<Rc<Vec<(*mut RrPeer, usize)>>>>,
 }
 
 struct RandomPeerData {
@@ -32,7 +32,7 @@ struct RandomPeerData {
 
 impl PeerBalancer for RandomPeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.rrp.peers) as u32
+        unsafe { upstream_tries(self.rrp.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -48,11 +48,11 @@ impl PeerBalancer for RandomPeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.rrp.set_session()
+        set_round_robin_peer_session(&mut self.rrp)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        self.rrp.save_session(session)
+        save_round_robin_peer_session(&mut self.rrp, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
@@ -70,7 +70,7 @@ fn init_random(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
         Ok(Box::new(init_random_peer(r, us)?))
     }));
 
-    if us.zone.borrow().is_some() {
+    if us.shm_zone.borrow().is_some() {
         return Ok(());
     }
 
@@ -85,22 +85,25 @@ fn update_random(us: &Rc<UpstreamSrvConf>) {
         None => return,
     };
 
-    let peers = match us.peers.borrow().clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let peers = us.peers.get();
 
-    let mut total_weight = 0i64;
+    if peers.is_null() {
+        return;
+    }
 
-    let ranges: Vec<(Rc<RrPeer>, i64)> = peers
-        .peers()
-        .into_iter()
-        .map(|peer| {
-            let range = total_weight;
-            total_weight += peer.weight;
-            (peer, range)
-        })
-        .collect();
+    let mut ranges: Vec<(*mut RrPeer, usize)> = Vec::new();
+
+    let mut total_weight = 0usize;
+
+    unsafe {
+        let mut peer = (*peers).peer;
+
+        while !peer.is_null() {
+            ranges.push((peer, total_weight));
+            total_weight += (*peer).weight as usize;
+            peer = (*peer).next;
+        }
+    }
 
     *rcf.ranges.borrow_mut() = Some(Rc::new(ranges));
 }
@@ -113,21 +116,27 @@ fn init_random_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<RandomPeerData, (
 
     let rrp = init_round_robin_peer(r, us)?;
 
-    if let Some(config) = rrp.peers.config.clone() {
-        if rcf.ranges.borrow().is_none() || rcf.config.get() != config.get() {
+    unsafe {
+        let peers = rrp.peers;
+
+        peers_rlock(peers);
+
+        if !(*peers).config.is_null() && (rcf.ranges.borrow().is_none() || rcf.config.get() != *(*peers).config as u64) {
             update_random(us);
-            rcf.config.set(config.get());
+            rcf.config.set(*(*peers).config as u64);
         }
+
+        peers_unlock(peers);
     }
 
     Ok(RandomPeerData { rrp, conf: rcf, tries: 0 })
 }
 
 /// ngx_http_upstream_peek_random_peer
-fn peek_random_peer(peers: &RrPeers, ranges: &[(Rc<RrPeer>, i64)]) -> usize {
-    let x = (unsafe { random() } as i64) % peers.total_weight.get();
+unsafe fn peek_random_peer(peers: *mut RrPeers, ranges: &[(*mut RrPeer, usize)]) -> usize {
+    let x = (random() as usize) % (*peers).total_weight;
 
-    let (mut i, mut j) = (0usize, peers.number.get());
+    let (mut i, mut j) = (0usize, (*peers).number);
 
     while j - i > 1 {
         let k = (i + j) / 2;
@@ -146,46 +155,88 @@ fn peek_random_peer(peers: &RrPeers, ranges: &[(Rc<RrPeer>, i64)]) -> usize {
 fn get_random_peer(pc: &mut PeerConnection, rp: &mut RandomPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get random peer, try: {}", pc.tries);
 
-    let peers = rp.rrp.peers.clone();
+    unsafe {
+        let peers = rp.rrp.peers;
 
-    if rp.tries > 20 || peers.number.get() < 2 {
-        return get_round_robin_peer(pc, &mut rp.rrp);
+        peers_rlock(peers);
+
+        if rp.tries > 20 || (*peers).number < 2 {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut rp.rrp);
+        }
+
+        if rp.rrp.config_changed() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut rp.rrp);
+        }
+
+        pc.cached = false;
+        pc.connection = None;
+
+        let now = ngx_core::times::time();
+
+        let ranges = rp.conf.ranges.borrow().clone().unwrap_or_default();
+
+        let mut i = 0usize;
+
+        let mut peer = get_rr_peer_by_sid(&rp.rrp, pc.hint.as_deref(), &mut i, true);
+
+        if peer.is_null() {
+            loop {
+                i = peek_random_peer(peers, &ranges);
+
+                peer = ranges[i].0;
+
+                let skip = if rp.rrp.is_tried(i) {
+                    true
+                } else {
+                    peer_lock(peers, peer);
+
+                    let unavailable = (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                    if unavailable {
+                        peer_unlock(peers, peer);
+                    }
+
+                    unavailable
+                };
+
+                if !skip {
+                    break;
+                }
+
+                // next:
+
+                rp.tries += 1;
+                if rp.tries > 20 {
+                    peers_unlock(peers);
+                    return get_round_robin_peer(pc, &mut rp.rrp);
+                }
+            }
+        }
+
+        // found:
+
+        rp.rrp.current = peer;
+        peer_ref(peers, peer);
+
+        if now - (*peer).checked > (*peer).fail_timeout {
+            (*peer).checked = now;
+        }
+
+        connect_peer(pc, peer);
+
+        (*peer).conns += 1;
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
+
+        rp.rrp.set_tried(i);
     }
 
-    if rp.rrp.config_changed() {
-        return get_round_robin_peer(pc, &mut rp.rrp);
-    }
-
-    pc.cached = false;
-    pc.connection = None;
-
-    let now = ngx_core::times::time();
-
-    let ranges = match rp.conf.ranges.borrow().clone() {
-        Some(r) => r,
-        None => return get_round_robin_peer(pc, &mut rp.rrp),
-    };
-
-    let mut i = 0usize;
-    let peer = match get_rr_peer_by_sid(&rp.rrp, pc.hint.as_deref(), &mut i) {
-        Some(p) => p,
-        None => loop {
-            i = peek_random_peer(&peers, &ranges);
-
-            let peer = &ranges[i].0;
-
-            if !rp.rrp.is_tried(i) && !peer.unavailable(now) {
-                break peer.clone();
-            }
-
-            rp.tries += 1;
-            if rp.tries > 20 {
-                return get_round_robin_peer(pc, &mut rp.rrp);
-            }
-        },
-    };
-
-    chosen(pc, &mut rp.rrp, peer, i, now)
+    NGX_OK
 }
 
 /// ngx_http_upstream_get_random2_peer: of two random peers, the one with
@@ -193,79 +244,88 @@ fn get_random_peer(pc: &mut PeerConnection, rp: &mut RandomPeerData) -> i64 {
 fn get_random2_peer(pc: &mut PeerConnection, rp: &mut RandomPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get random2 peer, try: {}", pc.tries);
 
-    let peers = rp.rrp.peers.clone();
+    unsafe {
+        let peers = rp.rrp.peers;
 
-    if rp.tries > 20 || peers.number.get() < 2 {
-        return get_round_robin_peer(pc, &mut rp.rrp);
-    }
+        peers_wlock(peers);
 
-    if rp.rrp.config_changed() {
-        return get_round_robin_peer(pc, &mut rp.rrp);
-    }
+        if rp.tries > 20 || (*peers).number < 2 {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut rp.rrp);
+        }
 
-    pc.cached = false;
-    pc.connection = None;
+        if rp.rrp.config_changed() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut rp.rrp);
+        }
 
-    let now = ngx_core::times::time();
+        pc.cached = false;
+        pc.connection = None;
 
-    let ranges = match rp.conf.ranges.borrow().clone() {
-        Some(r) => r,
-        None => return get_round_robin_peer(pc, &mut rp.rrp),
-    };
+        let now = ngx_core::times::time();
 
-    let mut i = 0usize;
-    let (peer, i) = match get_rr_peer_by_sid(&rp.rrp, pc.hint.as_deref(), &mut i) {
-        Some(p) => (p, i),
-        None => {
-            let mut prev: Option<(Rc<RrPeer>, usize)> = None;
+        let ranges = rp.conf.ranges.borrow().clone().unwrap_or_default();
 
+        let mut prev: *mut RrPeer = std::ptr::null_mut();
+        let mut p = 0usize;
+
+        let mut i = 0usize;
+
+        let mut peer = get_rr_peer_by_sid(&rp.rrp, pc.hint.as_deref(), &mut i, false);
+
+        if peer.is_null() {
             loop {
-                let i = peek_random_peer(&peers, &ranges);
+                i = peek_random_peer(peers, &ranges);
 
-                let peer = ranges[i].0.clone();
+                peer = ranges[i].0;
 
-                let same = prev.as_ref().is_some_and(|(p, _)| Rc::ptr_eq(p, &peer));
+                let skip = peer == prev
+                    || rp.rrp.is_tried(i)
+                    || (*peer).down != 0
+                    || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                    || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
 
-                if !same && !rp.rrp.is_tried(i) && !peer.unavailable(now) {
-                    match prev {
-                        Some((p, pi)) => {
-                            if peer.conns.get() as i64 * p.weight > p.conns.get() as i64 * peer.weight {
-                                break (p, pi);
-                            }
-                            break (peer, i);
+                if !skip {
+                    if !prev.is_null() {
+                        if ((*peer).conns as isize) * (*prev).weight > ((*prev).conns as isize) * (*peer).weight {
+                            peer = prev;
+                            i = p;
                         }
-                        None => {
-                            prev = Some((peer, i));
-                        }
+
+                        break;
                     }
+
+                    prev = peer;
+                    p = i;
                 }
+
+                // next:
 
                 rp.tries += 1;
                 if rp.tries > 20 {
+                    peers_unlock(peers);
                     return get_round_robin_peer(pc, &mut rp.rrp);
                 }
             }
         }
-    };
 
-    chosen(pc, &mut rp.rrp, peer, i, now)
-}
+        // found:
 
-fn chosen(pc: &mut PeerConnection, rrp: &mut RrPeerData, peer: Rc<RrPeer>, i: usize, now: i64) -> i64 {
-    rrp.current = Some(peer.clone());
-    peer.refs.set(peer.refs.get() + 1);
+        rp.rrp.current = peer;
+        peer_ref(peers, peer);
 
-    if now - peer.checked.get() > peer.fail_timeout {
-        peer.checked.set(now);
+        if now - (*peer).checked > (*peer).fail_timeout {
+            (*peer).checked = now;
+        }
+
+        connect_peer(pc, peer);
+
+        (*peer).conns += 1;
+
+        peers_unlock(peers);
+
+        rp.rrp.set_tried(i);
     }
-
-    pc.sockaddr = Some(peer.sockaddr.clone());
-    pc.name = peer.name.clone();
-    pc.sid = Some(peer.sid.clone());
-
-    peer.conns.set(peer.conns.get() + 1);
-
-    rrp.set_tried(i);
 
     NGX_OK
 }

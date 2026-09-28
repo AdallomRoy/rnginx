@@ -18,14 +18,14 @@ use crate::{http_module_def, HttpModuleDef, NGX_CONF_NOARGS, NGX_HTTP_UPS_CONF};
 /// ngx_http_upstream_ip_hash_peer_data_t
 struct IpHashPeerData {
     rrp: RrPeerData,
-    hash: u64,
+    hash: usize,
     addr: Vec<u8>,
     tries: u32,
 }
 
 impl PeerBalancer for IpHashPeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.rrp.peers) as u32
+        unsafe { upstream_tries(self.rrp.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -37,11 +37,11 @@ impl PeerBalancer for IpHashPeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.rrp.set_session()
+        set_round_robin_peer_session(&mut self.rrp)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        self.rrp.save_session(session)
+        save_round_robin_peer_session(&mut self.rrp, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
@@ -81,76 +81,99 @@ fn get_ip_hash_peer(pc: &mut PeerConnection, iphp: &mut IpHashPeerData) -> i64 {
 
     // TODO: cached
 
-    let peers = iphp.rrp.peers.clone();
+    unsafe {
+        let peers = iphp.rrp.peers;
 
-    if iphp.tries > 20 || peers.number.get() < 2 {
-        return get_round_robin_peer(pc, &mut iphp.rrp);
+        peers_rlock(peers);
+
+        if iphp.tries > 20 || (*peers).number < 2 {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut iphp.rrp);
+        }
+
+        if iphp.rrp.config_changed() {
+            peers_unlock(peers);
+            return get_round_robin_peer(pc, &mut iphp.rrp);
+        }
+
+        let now = ngx_core::times::time();
+
+        pc.cached = false;
+        pc.connection = None;
+
+        let mut hash = iphp.hash;
+
+        let mut p = 0usize;
+
+        let mut peer = get_rr_peer_by_sid(&iphp.rrp, pc.hint.as_deref(), &mut p, true);
+
+        if peer.is_null() {
+            loop {
+                for &b in iphp.addr.iter() {
+                    hash = (hash * 113 + b as usize) % 6271;
+                }
+
+                let mut w = (hash % (*peers).total_weight) as isize;
+                peer = (*peers).peer;
+                p = 0;
+
+                while w >= (*peer).weight {
+                    w -= (*peer).weight;
+                    peer = (*peer).next;
+                    p += 1;
+                }
+
+                let skip = if iphp.rrp.is_tried(p) {
+                    true
+                } else {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get ip hash peer, hash: {} {:04X}", p, 1u64 << (p % 64));
+
+                    peer_lock(peers, peer);
+
+                    let unavailable = (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                    if unavailable {
+                        peer_unlock(peers, peer);
+                    }
+
+                    unavailable
+                };
+
+                if !skip {
+                    break;
+                }
+
+                // next:
+
+                iphp.tries += 1;
+                if iphp.tries > 20 {
+                    peers_unlock(peers);
+                    return get_round_robin_peer(pc, &mut iphp.rrp);
+                }
+            }
+        }
+
+        // found:
+
+        iphp.rrp.current = peer;
+        peer_ref(peers, peer);
+
+        connect_peer(pc, peer);
+
+        (*peer).conns += 1;
+
+        if now - (*peer).checked > (*peer).fail_timeout {
+            (*peer).checked = now;
+        }
+
+        peer_unlock(peers, peer);
+        peers_unlock(peers);
+
+        iphp.rrp.set_tried(p);
+        iphp.hash = hash;
     }
-
-    if iphp.rrp.config_changed() {
-        return get_round_robin_peer(pc, &mut iphp.rrp);
-    }
-
-    let now = ngx_core::times::time();
-
-    pc.cached = false;
-    pc.connection = None;
-
-    let mut hash = iphp.hash;
-
-    let list = peers.peers();
-
-    let mut p = 0usize;
-    let peer = match get_rr_peer_by_sid(&iphp.rrp, pc.hint.as_deref(), &mut p) {
-        Some(peer) => peer,
-        None => loop {
-            for &b in iphp.addr.iter() {
-                hash = (hash * 113 + b as u64) % 6271;
-            }
-
-            let mut w = (hash % peers.total_weight.get() as u64) as i64;
-            p = 0;
-
-            while w >= list[p].weight {
-                w -= list[p].weight;
-                p += 1;
-            }
-
-            let peer = &list[p];
-
-            let skip = if iphp.rrp.is_tried(p) {
-                true
-            } else {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get ip hash peer, hash: {} {:04X}", p, 1u64 << (p % 64));
-                peer.unavailable(now)
-            };
-
-            if !skip {
-                break peer.clone();
-            }
-
-            iphp.tries += 1;
-            if iphp.tries > 20 {
-                return get_round_robin_peer(pc, &mut iphp.rrp);
-            }
-        },
-    };
-
-    iphp.rrp.current = Some(peer.clone());
-    peer.refs.set(peer.refs.get() + 1);
-
-    pc.sockaddr = Some(peer.sockaddr.clone());
-    pc.name = peer.name.clone();
-    pc.sid = Some(peer.sid.clone());
-
-    peer.conns.set(peer.conns.get() + 1);
-
-    if now - peer.checked.get() > peer.fail_timeout {
-        peer.checked.set(now);
-    }
-
-    iphp.rrp.set_tried(p);
-    iphp.hash = hash;
 
     NGX_OK
 }

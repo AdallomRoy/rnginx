@@ -240,10 +240,11 @@ pub struct UpstreamSrvConf {
     pub init_upstream: Cell<Option<InitUpstream>>,
     pub init: RefCell<Option<InitPeer>>,
     /// us->peer.data of the round-robin based balancers
-    pub peers: RefCell<Option<Rc<RrPeers>>>,
+    pub peers: Cell<*mut RrPeers>,
+    /// the memory of the peers (cf->pool)
+    pub arena: crate::upstream_round_robin::Arena,
 
-    /// zone name and size (shm_zone)
-    pub zone: RefCell<Option<(Vec<u8>, usize)>>,
+    pub shm_zone: RefCell<Option<Rc<ngx_core::shm::ShmZone>>>,
     pub resolver: RefCell<Option<Rc<Resolver>>>,
     /// msec; None until merged (NGX_CONF_UNSET_MSEC)
     pub resolver_timeout: Cell<Option<u64>>,
@@ -265,8 +266,9 @@ impl UpstreamSrvConf {
             block: Cell::new(false),
             init_upstream: Cell::new(None),
             init: RefCell::new(None),
-            peers: RefCell::new(None),
-            zone: RefCell::new(None),
+            peers: Cell::new(std::ptr::null_mut()),
+            arena: Default::default(),
+            shm_zone: RefCell::new(None),
             resolver: RefCell::new(None),
             resolver_timeout: Cell::new(None),
             modules: RefCell::new(Vec::new()),
@@ -309,7 +311,7 @@ fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(UpstreamMainConf { upstreams: RefCell::new(Vec::new()), current: RefCell::new(None) })
 }
 
-fn main_conf(cf: &Conf) -> Rc<RefCell<UpstreamMainConf>> {
+pub(crate) fn main_conf(cf: &Conf) -> Rc<RefCell<UpstreamMainConf>> {
     crate::get_main_conf::<UpstreamMainConf>(cf, ctx_index())
 }
 
@@ -465,7 +467,7 @@ fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
             if flags & NGX_HTTP_UPSTREAM_DOWN == 0 {
                 return Err(not_supported(cf, v));
             }
-            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_FAILED;
+            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_FAILED as u32;
             continue;
         }
 
@@ -473,7 +475,7 @@ fn server_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
             if flags & NGX_HTTP_UPSTREAM_DOWN == 0 {
                 return Err(not_supported(cf, v));
             }
-            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_DRAINING;
+            us.down = crate::upstream_round_robin::NGX_HTTP_UPSTREAM_DRAINING as u32;
             continue;
         }
 

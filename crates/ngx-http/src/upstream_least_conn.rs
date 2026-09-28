@@ -20,7 +20,7 @@ struct LeastConnPeerData {
 
 impl PeerBalancer for LeastConnPeerData {
     fn tries(&self) -> u32 {
-        upstream_tries(&self.rrp.peers) as u32
+        unsafe { upstream_tries(self.rrp.peers) as u32 }
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -32,11 +32,11 @@ impl PeerBalancer for LeastConnPeerData {
     }
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.rrp.set_session()
+        set_round_robin_peer_session(&mut self.rrp)
     }
 
     fn save_session(&mut self, session: openssl::ssl::SslSession) {
-        self.rrp.save_session(session)
+        save_round_robin_peer_session(&mut self.rrp, session)
     }
 
     fn rr(&mut self) -> Option<&mut RrPeerData> {
@@ -63,153 +63,159 @@ fn init_least_conn(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
 fn get_least_conn_peer(pc: &mut PeerConnection, rrp: &mut RrPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, try: {}", pc.tries);
 
-    if rrp.peers.single.get() {
-        return get_round_robin_peer(pc, rrp);
-    }
-
-    pc.cached = false;
-    pc.connection = None;
-
-    let now = ngx_core::times::time();
-
-    let peers = rrp.peers.clone();
-
-    if rrp.config_changed() {
-        pc.name = peers.name.clone();
-        return NGX_BUSY;
-    }
-
-    let list = peers.peers();
-
-    let mut p = 0usize;
-    let mut chosen = get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut p);
-
-    if chosen.is_none() {
-        let mut best: Option<std::rc::Rc<RrPeer>> = None;
-        let mut many = false;
-
-        for (i, peer) in list.iter().enumerate() {
-            if rrp.is_tried(i) {
-                continue;
-            }
-
-            if peer.unavailable(now) {
-                continue;
-            }
-
-            // select peer with least number of connections; if there are
-            // multiple peers with the same number of connections, select
-            // based on round-robin
-
-            match best.as_ref() {
-                None => {
-                    best = Some(peer.clone());
-                    many = false;
-                    p = i;
-                }
-                Some(b) => {
-                    let (pc_w, bc_w) = (peer.conns.get() as i64 * b.weight, b.conns.get() as i64 * peer.weight);
-                    if pc_w < bc_w {
-                        best = Some(peer.clone());
-                        many = false;
-                        p = i;
-                    } else if pc_w == bc_w {
-                        many = true;
-                    }
-                }
-            }
+    unsafe {
+        if (*rrp.peers).single {
+            return get_round_robin_peer(pc, rrp);
         }
 
-        let mut best = match best {
-            Some(b) => b,
-            None => {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, no peer found");
+        pc.cached = false;
+        pc.connection = None;
 
-                let next = peers.next.borrow().clone();
+        let now = ngx_core::times::time();
 
-                if let Some(next) = next {
-                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, backup servers");
+        let peers = rrp.peers;
 
-                    rrp.peers = next;
-                    rrp.clear_tried();
+        peers_wlock(peers);
 
-                    let rc = get_least_conn_peer(pc, rrp);
+        let failed = 'pick: {
+            if rrp.config_changed() {
+                // busy
+                peers_unlock(peers);
 
-                    if rc != NGX_BUSY {
-                        return rc;
-                    }
-                }
+                pc.name = (*(*peers).name).bytes().to_vec();
 
-                pc.name = peers.name.clone();
                 return NGX_BUSY;
             }
+
+            let mut total: isize = 0;
+            let mut many = false;
+            let mut p = 0usize;
+
+            let mut best = get_rr_peer_by_sid(rrp, pc.hint.as_deref(), &mut p, false);
+
+            if best.is_null() {
+                let mut peer = (*peers).peer;
+                let mut i = 0;
+
+                while !peer.is_null() {
+                    let skip = rrp.is_tried(i)
+                        || (*peer).down != 0
+                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                    if !skip {
+                        // select peer with least number of connections; if
+                        // there are multiple peers with the same number of
+                        // connections, select based on round-robin
+
+                        if best.is_null() || ((*peer).conns as isize) * (*best).weight < ((*best).conns as isize) * (*peer).weight {
+                            best = peer;
+                            many = false;
+                            p = i;
+                        } else if ((*peer).conns as isize) * (*best).weight == ((*best).conns as isize) * (*peer).weight {
+                            many = true;
+                        }
+                    }
+
+                    peer = (*peer).next;
+                    i += 1;
+                }
+
+                if best.is_null() {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, no peer found");
+
+                    break 'pick true;
+                }
+
+                if many {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, many");
+
+                    let mut peer = best;
+                    let mut i = p;
+
+                    while !peer.is_null() {
+                        let skip = rrp.is_tried(i)
+                            || (*peer).down != 0
+                            || ((*peer).conns as isize) * (*best).weight != ((*best).conns as isize) * (*peer).weight
+                            || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
+                            || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
+
+                        if !skip {
+                            (*peer).current_weight += (*peer).effective_weight;
+                            total += (*peer).effective_weight;
+
+                            if (*peer).effective_weight < (*peer).weight {
+                                (*peer).effective_weight += 1;
+                            }
+
+                            if (*peer).current_weight > (*best).current_weight {
+                                best = peer;
+                                p = i;
+                            }
+                        }
+
+                        peer = (*peer).next;
+                        i += 1;
+                    }
+                }
+
+                (*best).current_weight -= total;
+            }
+
+            // best_chosen:
+
+            if now - (*best).checked > (*best).fail_timeout {
+                (*best).checked = now;
+            }
+
+            connect_peer(pc, best);
+
+            (*best).conns += 1;
+
+            rrp.current = best;
+            peer_ref(peers, best);
+
+            rrp.set_tried(p);
+
+            peers_unlock(peers);
+
+            false
         };
 
-        let mut total = 0i64;
-
-        if many {
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, many");
-
-            let first = p;
-
-            for (i, peer) in list.iter().enumerate().skip(first) {
-                if rrp.is_tried(i) {
-                    continue;
-                }
-
-                if peer.down.get() != 0 {
-                    continue;
-                }
-
-                if peer.conns.get() as i64 * best.weight != best.conns.get() as i64 * peer.weight {
-                    continue;
-                }
-
-                if peer.max_fails != 0 && peer.fails.get() >= peer.max_fails && now - peer.checked.get() <= peer.fail_timeout {
-                    continue;
-                }
-
-                if peer.max_conns != 0 && peer.conns.get() >= peer.max_conns {
-                    continue;
-                }
-
-                peer.current_weight.set(peer.current_weight.get() + peer.effective_weight.get());
-                total += peer.effective_weight.get();
-
-                if peer.effective_weight.get() < peer.weight {
-                    peer.effective_weight.set(peer.effective_weight.get() + 1);
-                }
-
-                if peer.current_weight.get() > best.current_weight.get() {
-                    best = peer.clone();
-                    p = i;
-                }
-            }
+        if !failed {
+            return NGX_OK;
         }
 
-        best.current_weight.set(best.current_weight.get() - total);
+        // failed:
 
-        chosen = Some(best);
+        if !(*peers).next.is_null() {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get least conn peer, backup servers");
+
+            rrp.peers = (*peers).next;
+
+            for t in rrp.tried.iter_mut() {
+                *t = 0;
+            }
+
+            peers_unlock(peers);
+
+            let rc = get_least_conn_peer(pc, rrp);
+
+            if rc != NGX_BUSY {
+                return rc;
+            }
+
+            peers_wlock(peers);
+        }
+
+        // busy:
+
+        peers_unlock(peers);
+
+        pc.name = (*(*peers).name).bytes().to_vec();
+
+        NGX_BUSY
     }
-
-    let best = chosen.unwrap();
-
-    if now - best.checked.get() > best.fail_timeout {
-        best.checked.set(now);
-    }
-
-    pc.sockaddr = Some(best.sockaddr.clone());
-    pc.name = best.name.clone();
-    pc.sid = Some(best.sid.clone());
-
-    best.conns.set(best.conns.get() + 1);
-
-    rrp.current = Some(best.clone());
-    best.refs.set(best.refs.get() + 1);
-
-    rrp.set_tried(p);
-
-    NGX_OK
 }
 
 /// ngx_http_upstream_least_conn
