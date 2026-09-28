@@ -139,6 +139,11 @@ fn get_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData) -> i6
 
     item.watch.abort();
 
+    // c->idle = 0; c->sent = 0; c->data = NULL
+    if let UpstreamSock::Conn(c) = &item.conn.sock {
+        c.set_idle(false);
+    }
+
     pc.connection = Some(item.conn);
     pc.cached = true;
 
@@ -199,18 +204,34 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free keepalive peer: saving connection {}", id);
 
-        let watch = spawn_close_handler(Rc::downgrade(&kp.conf), id, fd, kp.conf.timeout.get().unwrap_or(60000));
+        // an https connection is closed when the worker shuts down (c->close)
+        let c = match &conn.sock {
+            UpstreamSock::Conn(c) => Some(c.c.clone()),
+            _ => None,
+        };
 
-        let mut cache = kp.conf.cache.borrow_mut();
+        let watch = spawn_close_handler(Rc::downgrade(&kp.conf), id, fd, kp.conf.timeout.get().unwrap_or(60000), c);
 
-        if cache.len() >= kp.conf.max_cached.get().unwrap_or(32) {
-            // the least recently used one is closed
-            if let Some(old) = cache.pop_back() {
-                old.watch.abort();
-            }
+        // c->idle = 1
+        if let UpstreamSock::Conn(c) = &conn.sock {
+            c.set_idle(true);
         }
 
-        cache.push_front(CacheItem { id, conn, sockaddr, tag: pc.tag, watch });
+        let old = {
+            let mut cache = kp.conf.cache.borrow_mut();
+
+            // the least recently used one is closed
+            let old = if cache.len() >= kp.conf.max_cached.get().unwrap_or(32) { cache.pop_back() } else { None };
+
+            cache.push_front(CacheItem { id, conn, sockaddr, tag: pc.tag, watch });
+
+            old
+        };
+
+        if let Some(old) = old {
+            old.watch.abort();
+            keepalive_close(old);
+        }
     }
 
     kp.original.free(pc, state, us);
@@ -220,17 +241,42 @@ fn raw_fd(sock: &UpstreamSock) -> Option<RawFd> {
     match sock {
         UpstreamSock::Tcp(s) => Some(s.as_raw_fd()),
         UpstreamSock::Unix(s) => Some(s.as_raw_fd()),
-        UpstreamSock::Ssl(s) => s.raw_fd(),
+        UpstreamSock::Conn(c) => Some(c.fd()),
     }
+}
+
+/// ngx_http_upstream_keepalive_close: an https connection is closed
+/// without "close notify".
+fn keepalive_close(item: CacheItem) {
+    item.conn.sock.set_no_shutdown();
+    drop(item);
 }
 
 /// ngx_http_upstream_keepalive_close_handler, as a task on a duplicate of
 /// the socket: the connection is closed when data or the end of it arrives
 /// (a peek that does not return EAGAIN), or on keepalive_timeout.
-fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u64) -> tokio::task::JoinHandle<()> {
+fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u64, c: Option<Rc<ngx_core::connection::Connection>>) -> tokio::task::JoinHandle<()> {
     let dup = unsafe { libc::dup(fd) };
 
     tokio::task::spawn_local(async move {
+        // c->close: ngx_close_idle_connections() at the worker's shutdown
+        let close = async {
+            match &c {
+                Some(c) => loop {
+                    let notified = c.close_notify.notified();
+
+                    if c.close.get() {
+                        return;
+                    }
+
+                    notified.await;
+                },
+                None => std::future::pending().await,
+            }
+        };
+
+        tokio::pin!(close);
+
         if dup >= 0 {
             let owned = unsafe { OwnedFd::from_raw_fd(dup) };
 
@@ -254,7 +300,10 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u
                     }
                 };
 
-                let _ = tokio::time::timeout(Duration::from_millis(timeout), watch).await;
+                tokio::select! {
+                    _ = tokio::time::timeout(Duration::from_millis(timeout), watch) => {}
+                    _ = &mut close => {}
+                }
             }
         }
 
@@ -266,7 +315,9 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u
             };
 
             // the watch handle is this task's own: dropping it detaches
-            drop(item);
+            if let Some(item) = item {
+                keepalive_close(item);
+            }
         }
     })
 }

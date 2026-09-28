@@ -98,11 +98,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 /// Upstream connection — either TCP or UNIX so proxy_pass to
-/// http://unix:/path.sock:/uri works.
+/// http://unix:/path.sock:/uri works, or a connection of
+/// ngx_event_connect_peer with c->ssl (https upstreams).
 pub enum UpstreamSock {
     Tcp(TcpStream),
     Unix(tokio::net::UnixStream),
-    Ssl(Box<crate::upstream_ssl::UpstreamSsl>),
+    Conn(crate::upstream_ssl::PeerConn),
 }
 
 
@@ -113,7 +114,7 @@ impl AsyncRead for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
-                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_read(cx, buf),
+                UpstreamSock::Conn(c) => c.poll_read(cx, buf),
             }
         }
     }
@@ -125,7 +126,7 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, b),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_write(cx, b),
-                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_write(cx, b),
+                UpstreamSock::Conn(c) => c.poll_write(cx, b),
             }
         }
     }
@@ -135,7 +136,7 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
-                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_flush(cx),
+                UpstreamSock::Conn(_) => Poll::Ready(Ok(())),
             }
         }
     }
@@ -145,17 +146,17 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
-                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_shutdown(cx),
+                UpstreamSock::Conn(c) => c.poll_shutdown(cx),
             }
         }
     }
 }
 impl UpstreamSock {
-    /// A new TLS session of the connection, for peer.save_session.
-    pub fn take_ssl_session(&self) -> Option<openssl::ssl::SslSession> {
-        match self {
-            UpstreamSock::Ssl(s) => s.take_session(),
-            _ => None,
+    /// The connection is closed as ngx_http_upstream_next does: an https
+    /// one without "close notify".
+    pub fn set_no_shutdown(&self) {
+        if let UpstreamSock::Conn(c) = self {
+            c.set_no_shutdown();
         }
     }
 
@@ -168,7 +169,7 @@ impl UpstreamSock {
             let (ready, peek) = match self {
                 UpstreamSock::Tcp(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
                 UpstreamSock::Unix(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
-                UpstreamSock::Ssl(s) => return s.wait_readable().await,
+                UpstreamSock::Conn(c) => return c.wait_readable().await,
             };
             if ready.is_err() {
                 return;
@@ -725,16 +726,21 @@ pub trait PeerBalancer {
 /// the next upstream settings, request_sent).
 pub struct UpstreamPeer {
     pub pc: PeerConnection,
-    pub balancer: Box<dyn PeerBalancer>,
+    /// peer.data with its methods; shared with c->data of the upstream
+    /// connection (ngx_http_upstream_ssl_save_session)
+    pub balancer: Rc<RefCell<Box<dyn PeerBalancer>>>,
     pub next_upstream: u32,
     pub next_upstream_timeout: u64,
     pub request_sent: bool,
     /// ngx_current_msec at the start of the current try (u->start_time)
     pub start_time: u64,
+    /// u->ssl_name: the host of the upstream (uscf->host, or
+    /// u->resolved->host), the name ngx_http_upstream_ssl_name found
+    pub ssl_name: Vec<u8>,
 }
 
 impl UpstreamPeer {
-    fn new(r: &R, balancer: Box<dyn PeerBalancer>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+    fn new(r: &R, balancer: Box<dyn PeerBalancer>, ssl_name: &[u8], next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
         let mut tries = balancer.tries();
 
         // ngx_http_upstream_init_request
@@ -759,25 +765,26 @@ impl UpstreamPeer {
                 request_body_sent: false,
                 tag,
             },
-            balancer,
+            balancer: Rc::new(RefCell::new(balancer)),
             next_upstream,
             next_upstream_timeout,
             request_sent: false,
             start_time: now,
+            ssl_name: ssl_name.to_vec(),
         }
     }
 
     /// uscf->peer.init for the request's upstream.
     pub fn init(r: &R, uscf: &Rc<UpstreamSrvConf>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> Result<UpstreamPeer, i64> {
         let balancer = uscf.init_peer(r).map_err(|_| crate::NGX_HTTP_INTERNAL_SERVER_ERROR)?;
-        Ok(UpstreamPeer::new(r, balancer, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+        Ok(UpstreamPeer::new(r, balancer, &uscf.host, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
     }
 
     /// ngx_http_upstream_create_round_robin_peer for addresses resolved for
     /// this request.
     pub fn resolved(r: &R, host: &[u8], addrs: Vec<Addr>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
         let balancer = Box::new(crate::upstream_round_robin::create_round_robin_peer(host, addrs));
-        UpstreamPeer::new(r, balancer, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
+        UpstreamPeer::new(r, balancer, host, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
     }
 
     /// The start of ngx_http_upstream_connect: a new state, and the peer
@@ -806,7 +813,7 @@ impl UpstreamPeer {
 
         self.start_time = now;
 
-        let rc = self.balancer.get(&mut self.pc);
+        let rc = self.balancer.borrow_mut().get(&mut self.pc);
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream connect: {}", rc);
 
@@ -823,21 +830,27 @@ impl UpstreamPeer {
 
     /// peer.set_session: the session to resume with the peer
     pub fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
-        self.balancer.set_session()
+        self.balancer.borrow_mut().set_session()
     }
 
-    /// ngx_http_upstream_ssl_save_session: a new session of the peer's
-    /// connection goes to peer.save_session.
-    pub fn save_session(&mut self, sock: &UpstreamSock) {
-        if let Some(session) = sock.take_ssl_session() {
-            self.balancer.save_session(session);
+    /// c->data = r (ngx_http_upstream_connect): the request's upstream
+    /// uses the connection (its new TLS sessions go to peer.save_session).
+    pub fn attach(&self, c: &ngx_core::connection::Connection) {
+        let data = crate::upstream_ssl::UpstreamConnData { balancer: Rc::downgrade(&self.balancer) };
+        *c.data.borrow_mut() = Some(Rc::new(data));
+    }
+
+    /// attach() for the connection of a socket.
+    pub fn attach_sock(&self, sock: &UpstreamSock) {
+        if let UpstreamSock::Conn(c) = sock {
+            self.attach(&c.c);
         }
     }
 
     /// peer.notify
     pub fn notify(&mut self, r: &R, typ: u32) {
         let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
-        self.balancer.notify(&mut self.pc, typ, &us);
+        self.balancer.borrow_mut().notify(&mut self.pc, typ, &us);
     }
 
     /// ngx_http_upstream_next: free the peer (NGX_PEER_NEXT for 403 and
@@ -855,7 +868,7 @@ impl UpstreamPeer {
 
             let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
             self.pc.connection = None;
-            self.balancer.free(&mut self.pc, state, &us);
+            self.balancer.borrow_mut().free(&mut self.pc, state, &us);
             self.pc.sockaddr = None;
             self.pc.sid = None;
         }
@@ -916,16 +929,12 @@ impl UpstreamPeer {
             return;
         }
 
-        if let Some(c) = &conn {
-            self.save_session(&c.sock);
-        }
-
         self.pc.connection = conn;
         self.pc.keepalive = keepalive;
         self.pc.request_body_sent = request_body_sent;
 
         let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
-        self.balancer.free(&mut self.pc, 0, &us);
+        self.balancer.borrow_mut().free(&mut self.pc, 0, &us);
 
         self.pc.sockaddr = None;
         self.pc.sid = None;

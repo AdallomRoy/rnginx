@@ -552,6 +552,53 @@ impl Connection {
         }
     }
 
+    /// The poll form of drive_io(), for AsyncRead / AsyncWrite adapters of
+    /// a connection: attempts until the operation completes or waits for
+    /// the socket. An attempt made under the readiness that still wants it
+    /// found the socket drained, so the retained readiness is cleared and
+    /// the task is woken by the next event (as drive_io does).
+    pub fn poll_io<T>(&self, cx: &mut std::task::Context<'_>, mut op: impl FnMut() -> IoStep<T>) -> std::task::Poll<io::Result<T>> {
+        use std::task::Poll;
+
+        let mut step = op();
+
+        loop {
+            match step {
+                IoStep::Done(v) => return Poll::Ready(Ok(v)),
+                IoStep::WantRead => {
+                    let afd = match self.afd() {
+                        Ok(a) => a,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    };
+                    let mut guard = match afd.poll_read_ready(cx) {
+                        Poll::Ready(Ok(g)) => g,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    step = op();
+                    if matches!(step, IoStep::WantRead) {
+                        guard.clear_ready();
+                    }
+                }
+                IoStep::WantWrite => {
+                    let afd = match self.afd() {
+                        Ok(a) => a,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    };
+                    let mut guard = match afd.poll_write_ready(cx) {
+                        Poll::Ready(Ok(g)) => g,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    step = op();
+                    if matches!(step, IoStep::WantWrite) {
+                        guard.clear_ready();
+                    }
+                }
+            }
+        }
+    }
+
     /// One non-blocking recv attempt (plain or TLS), without waiting:
     /// WouldBlock when no data can be read now. OpenSSL may hold decrypted
     /// data the socket no longer shows, so TLS is always tried first. A

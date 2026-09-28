@@ -16,6 +16,11 @@ pub use crate::upstream::UpstreamSock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::cell::RefCell;
 
+use ngx_core::event_openssl::{
+    ngx_ssl_certificate, ngx_ssl_ciphers, ngx_ssl_client_session_cache, ngx_ssl_conf_commands, ngx_ssl_create, ngx_ssl_crl, ngx_ssl_read_password_file,
+    ngx_ssl_trusted_certificate, NgxSsl, NGX_SSL_DEFAULT_PROTOCOLS,
+};
+
 use crate::core::*;
 use crate::request::*;
 use crate::upstream::*;
@@ -51,24 +56,26 @@ pub struct NgxHttpProxyLocConf {
     /// proxy_connect_timeout (default 60s): connecting, and the TLS
     /// handshake.
     pub connect_timeout: Val<u64>,
+    /// plcf->ssl: proxy_pass to https, or with variables (the location
+    /// needs the SSL context, ngx_http_proxy_set_ssl).
+    pub ssl: bool,
     /// proxy_ssl_protocols (a bitmask, 0 when not set).
     pub ssl_protocols: u32,
     /// proxy_ssl_ciphers (default "DEFAULT").
     pub ssl_ciphers: Val<Vec<u8>>,
-    /// proxy_ssl_server_name (default off).
-    pub ssl_server_name: Val<bool>,
-    /// proxy_ssl_name (default: the host of proxy_pass).
-    pub ssl_name: Option<crate::script::ComplexValue>,
-    /// proxy_ssl_session_reuse (default on).
-    pub ssl_session_reuse: Val<bool>,
-    /// proxy_ssl_verify (default off).
-    pub ssl_verify: Val<bool>,
     /// proxy_ssl_verify_depth (default 1).
     pub ssl_verify_depth: Val<i64>,
     /// proxy_ssl_trusted_certificate.
     pub ssl_trusted_certificate: Val<Vec<u8>>,
-    /// The SSL context of https upstreams (ngx_http_proxy_set_ssl).
-    pub ssl_ctx: Option<openssl::ssl::SslContext>,
+    /// proxy_ssl_crl.
+    pub ssl_crl: Val<Vec<u8>>,
+    /// proxy_ssl_conf_command.
+    pub ssl_conf_commands: Val<Option<Vec<(Vec<u8>, Vec<u8>)>>>,
+    /// The SSL fields of plcf->upstream: proxy_ssl_session_reuse,
+    /// proxy_ssl_name, proxy_ssl_server_name, proxy_ssl_verify,
+    /// proxy_ssl_certificate, proxy_ssl_certificate_key,
+    /// proxy_ssl_certificate_cache, proxy_ssl_password_file, and the context.
+    pub upstream_ssl: crate::upstream_ssl::UpstreamSslConf,
     /// proxy_set_body: overrides the request body sent upstream (complex value).
     pub set_body: Option<crate::script::ComplexValue>,
     /// proxy_set_header entries: (name, complex value). Empty value drops the
@@ -232,15 +239,14 @@ impl Default for NgxHttpProxyLocConf {
             request_buffering: Val::unset(),
             buffering: Val::unset(),
             connect_timeout: Val::unset(),
+            ssl: false,
             ssl_protocols: 0,
             ssl_ciphers: Val::unset(),
-            ssl_server_name: Val::unset(),
-            ssl_name: None,
-            ssl_session_reuse: Val::unset(),
-            ssl_verify: Val::unset(),
             ssl_verify_depth: Val::unset(),
             ssl_trusted_certificate: Val::unset(),
-            ssl_ctx: None,
+            ssl_crl: Val::unset(),
+            ssl_conf_commands: Val::unset(),
+            upstream_ssl: crate::upstream_ssl::UpstreamSslConf::default(),
             set_body: None,
             set_headers: Vec::new(),
             force_ranges: Val::unset(),
@@ -271,9 +277,16 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 }
 
 fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
-    let p = conf_cell::<NgxHttpProxyLocConf>(prev).borrow();
+    let mut p = conf_cell::<NgxHttpProxyLocConf>(prev).borrow_mut();
     let mut c = conf_cell::<NgxHttpProxyLocConf>(conf).borrow_mut();
-    merge_ssl(cf, &p, &mut c)?;
+    // conf->ssl = prev->ssl with the proxy_pass inherited below (C inherits
+    // it in "if" and "limit_except" only, where it follows
+    // ngx_http_proxy_set_ssl; here the context is set up for every
+    // location proxying to https)
+    if c.upstream_uri.is_none() {
+        c.ssl = p.ssl;
+    }
+    merge_ssl(cf, &mut p, &mut c)?;
     if c.upstream_uri.is_none() {
         c.upstream_uri = p.upstream_uri.clone();
         c.upstream = p.upstream.clone();
@@ -364,72 +377,320 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
 }
 
 /// The proxy_ssl_* part of ngx_http_proxy_merge_loc_conf, with
-/// ngx_http_proxy_merge_ssl and ngx_http_proxy_set_ssl: a location that
-/// proxies to https (or to a URL with variables) gets an SSL context, the
-/// parent's when it sets no proxy_ssl_* directive of its own.
-fn merge_ssl(cf: &mut Conf, p: &NgxHttpProxyLocConf, c: &mut NgxHttpProxyLocConf) -> ConfResult {
-    let own = c.ssl_protocols != 0
-        || c.ssl_ciphers.is_set()
-        || c.ssl_verify.is_set()
-        || c.ssl_verify_depth.is_set()
-        || c.ssl_trusted_certificate.is_set()
-        || c.ssl_session_reuse.is_set();
+/// ngx_http_proxy_merge_ssl, ngx_http_upstream_merge_ssl_passwords and
+/// ngx_http_proxy_set_ssl.
+fn merge_ssl(cf: &mut Conf, prev: &mut NgxHttpProxyLocConf, conf: &mut NgxHttpProxyLocConf) -> ConfResult {
+    use crate::upstream_ssl::merge_ptr;
 
-    if c.ssl_protocols == 0 {
-        c.ssl_protocols = if p.ssl_protocols != 0 { p.ssl_protocols } else { crate::upstream_ssl::DEFAULT_PROTOCOLS };
-    }
-    c.ssl_ciphers.merge(&p.ssl_ciphers, b"DEFAULT".to_vec());
-    c.ssl_server_name.merge(&p.ssl_server_name, false);
-    if c.ssl_name.is_none() {
-        c.ssl_name = p.ssl_name.clone();
-    }
-    c.ssl_session_reuse.merge(&p.ssl_session_reuse, true);
-    c.ssl_verify.merge(&p.ssl_verify, false);
-    c.ssl_verify_depth.merge(&p.ssl_verify_depth, 1);
-    c.ssl_trusted_certificate.merge(&p.ssl_trusted_certificate, Vec::new());
+    proxy_merge_ssl(cf, conf, prev);
 
-    if !own && p.ssl_ctx.is_some() {
-        c.ssl_ctx = p.ssl_ctx.clone();
-        return Ok(());
+    conf.upstream_ssl.ssl_session_reuse.merge(&prev.upstream_ssl.ssl_session_reuse, true);
+
+    // ngx_conf_merge_bitmask_value
+    if conf.ssl_protocols == 0 {
+        conf.ssl_protocols = if prev.ssl_protocols == 0 { NGX_CONF_BITMASK_SET | NGX_SSL_DEFAULT_PROTOCOLS } else { prev.ssl_protocols };
     }
 
-    let upstream_uri = match c.upstream_uri.as_ref().or(p.upstream_uri.as_ref()) {
-        Some(u) => u,
-        None => return Ok(()),
-    };
-    let ssl = upstream_uri.len() >= 8 && upstream_uri[..8].eq_ignore_ascii_case(b"https://") || upstream_uri.contains(&b'$');
-    if !ssl {
-        return Ok(());
+    conf.ssl_ciphers.merge(&prev.ssl_ciphers, b"DEFAULT".to_vec());
+
+    merge_ptr(&mut conf.upstream_ssl.ssl_name, &prev.upstream_ssl.ssl_name);
+    conf.upstream_ssl.ssl_server_name.merge(&prev.upstream_ssl.ssl_server_name, false);
+    conf.upstream_ssl.ssl_verify.merge(&prev.upstream_ssl.ssl_verify, false);
+    conf.ssl_verify_depth.merge(&prev.ssl_verify_depth, 1);
+    conf.ssl_trusted_certificate.merge(&prev.ssl_trusted_certificate, Vec::new());
+    conf.ssl_crl.merge(&prev.ssl_crl, Vec::new());
+
+    merge_ptr(&mut conf.upstream_ssl.ssl_certificate, &prev.upstream_ssl.ssl_certificate);
+    merge_ptr(&mut conf.upstream_ssl.ssl_certificate_key, &prev.upstream_ssl.ssl_certificate_key);
+    merge_ptr(&mut conf.upstream_ssl.ssl_certificate_cache, &prev.upstream_ssl.ssl_certificate_cache);
+
+    crate::upstream_ssl::merge_ssl_passwords(cf, &mut conf.upstream_ssl, &mut prev.upstream_ssl)?;
+
+    merge_ptr(&mut conf.ssl_conf_commands, &prev.ssl_conf_commands);
+
+    if conf.ssl {
+        proxy_set_ssl(cf, conf)?;
     }
 
-    let trusted;
-    let verify = if *c.ssl_verify.get() {
-        if c.ssl_trusted_certificate.get().is_empty() {
-            return Err(cf.emerg(format_args!("no proxy_ssl_trusted_certificate for proxy_ssl_verify")));
-        }
-        // ngx_conf_full_name
-        trusted = cf.cycle.full_name(c.ssl_trusted_certificate.get(), true);
-        Some((trusted.as_slice(), *c.ssl_verify_depth.get() as u32))
-    } else {
-        None
-    };
-
-    match crate::upstream_ssl::create_ctx(c.ssl_protocols, c.ssl_ciphers.get(), verify, *c.ssl_session_reuse.get()) {
-        Ok(ctx) => c.ssl_ctx = Some(ctx),
-        Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-    }
     Ok(())
 }
 
-fn proxy_ssl_name_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+/// ngx_http_proxy_merge_ssl: the context of the parent level when the
+/// level has no SSL directive, else a new one.
+fn proxy_merge_ssl(cf: &mut Conf, conf: &mut NgxHttpProxyLocConf, prev: &mut NgxHttpProxyLocConf) {
+    let u = &conf.upstream_ssl;
+
+    let preserve = if conf.ssl_protocols == 0
+        && !conf.ssl_ciphers.is_set()
+        && !u.ssl_certificate.is_set()
+        && !u.ssl_certificate_key.is_set()
+        && !u.ssl_passwords.is_set()
+        && !u.ssl_verify.is_set()
+        && !conf.ssl_verify_depth.is_set()
+        && !conf.ssl_trusted_certificate.is_set()
+        && !conf.ssl_crl.is_set()
+        && !u.ssl_session_reuse.is_set()
+        && !conf.ssl_conf_commands.is_set()
+    {
+        if let Some(ssl) = prev.upstream_ssl.ssl.clone() {
+            conf.upstream_ssl.ssl = Some(ssl);
+            return;
+        }
+
+        true
+    } else {
+        false
+    };
+
+    let ssl = Rc::new(RefCell::new(NgxSsl::new(cf.log.clone())));
+
+    conf.upstream_ssl.ssl = Some(ssl.clone());
+
+    // special handling to preserve conf->upstream.ssl
+    // in the "http" section to inherit it to all servers
+
+    if preserve {
+        prev.upstream_ssl.ssl = Some(ssl);
+    }
+}
+
+/// ngx_http_proxy_set_ssl: the context of the upstream connections
+fn proxy_set_ssl(cf: &mut Conf, plcf: &mut NgxHttpProxyLocConf) -> ConfResult {
+    let ssl = plcf.upstream_ssl.ssl.clone().expect("ssl");
+    let mut ssl = ssl.borrow_mut();
+
+    if !ssl.ctx.is_null() {
+        return Ok(());
+    }
+
+    if ngx_ssl_create(&mut ssl, plcf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    // the context is freed with the ngx_ssl_t (ngx_ssl_cleanup_ctx)
+
+    let ciphers = plcf.ssl_ciphers.get().clone();
+
+    if ngx_ssl_ciphers(cf, &mut ssl, &ciphers, false) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    let u = &plcf.upstream_ssl;
+
+    if let Some(cert) = u.ssl_certificate.as_option().cloned().flatten() {
+        if !cert.value.is_empty() {
+            let key = match u.ssl_certificate_key.as_option().cloned().flatten() {
+                Some(k) => k,
+                None => {
+                    ngx_core::ngx_log_error!(
+                        ngx_core::log::NGX_LOG_EMERG,
+                        cf.log,
+                        None,
+                        "no \"proxy_ssl_certificate_key\" is defined for certificate \"{}\"",
+                        ngx_core::string::B(&cert.value)
+                    );
+                    return Err(ConfError::Logged);
+                }
+            };
+
+            if cert.is_constant() && key.is_constant() {
+                let mut c = cert.value.clone();
+                let mut k = key.value.clone();
+
+                let passwords = u.ssl_passwords.as_option().cloned().flatten();
+
+                if ngx_ssl_certificate(cf, &mut ssl, &mut c, &mut k, passwords.as_ref()) != NGX_OK {
+                    return Err(ConfError::Logged);
+                }
+            }
+        }
+    }
+
+    if *u.ssl_verify {
+        if plcf.ssl_trusted_certificate.get().is_empty() {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_EMERG, cf.log, None, "no proxy_ssl_trusted_certificate for proxy_ssl_verify");
+            return Err(ConfError::Logged);
+        }
+
+        let mut trusted = plcf.ssl_trusted_certificate.get().clone();
+
+        if ngx_ssl_trusted_certificate(cf, &mut ssl, &mut trusted, *plcf.ssl_verify_depth) != NGX_OK {
+            return Err(ConfError::Logged);
+        }
+
+        let mut crl = plcf.ssl_crl.get().clone();
+
+        if ngx_ssl_crl(cf, &mut ssl, &mut crl) != NGX_OK {
+            return Err(ConfError::Logged);
+        }
+    }
+
+    if ngx_ssl_client_session_cache(cf, &mut ssl, *u.ssl_session_reuse) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    let mut commands = plcf.ssl_conf_commands.as_option().cloned().flatten();
+
+    if ngx_ssl_conf_commands(cf, &mut ssl, commands.as_mut()) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    Ok(())
+}
+
+/// proxy_ssl_name: ngx_http_set_complex_value_slot
+fn proxy_ssl_name_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-    if cell.borrow().ssl_name.is_some() {
+    let mut slot = cell.borrow().upstream_ssl.ssl_name.clone();
+    crate::script::set_complex_value_slot(cf, cmd, &mut slot)?;
+    cell.borrow_mut().upstream_ssl.ssl_name = slot;
+    Ok(())
+}
+
+/// proxy_ssl_certificate, proxy_ssl_certificate_key:
+/// ngx_http_set_complex_value_zero_slot
+fn proxy_ssl_certificate_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let key = cmd.name == "proxy_ssl_certificate_key";
+
+    let mut slot = {
+        let c = cell.borrow();
+        if key { c.upstream_ssl.ssl_certificate_key.clone() } else { c.upstream_ssl.ssl_certificate.clone() }
+    };
+
+    crate::script::set_complex_value_zero_slot(cf, cmd, &mut slot)?;
+
+    let mut c = cell.borrow_mut();
+
+    if key {
+        c.upstream_ssl.ssl_certificate_key = slot;
+    } else {
+        c.upstream_ssl.ssl_certificate = slot;
+    }
+
+    Ok(())
+}
+
+/// ngx_http_proxy_ssl_certificate_cache
+fn proxy_ssl_certificate_cache_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+
+    if cell.borrow().upstream_ssl.ssl_certificate_cache.is_set() {
         return Err(msg("is duplicate"));
     }
-    let args = cf.args.clone();
-    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
-    cell.borrow_mut().ssl_name = Some(cv);
+
+    let value = cf.args.clone();
+
+    let mut max: i64 = 0;
+    let mut inactive: i64 = 10;
+    let mut valid: i64 = 60;
+    let mut off = false;
+
+    for v in &value[1..] {
+        let failed = |cf: &Conf| cf.emerg(format_args!("invalid parameter \"{}\"", ngx_core::string::B(v)));
+
+        if let Some(n) = v.strip_prefix(b"max=") {
+            max = match ngx_core::string::atoi(n) {
+                Some(m) if m > 0 => m,
+                _ => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if let Some(t) = v.strip_prefix(b"inactive=") {
+            inactive = match ngx_core::parse::parse_time(t, true) {
+                Some(t) => t,
+                None => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if let Some(t) = v.strip_prefix(b"valid=") {
+            valid = match ngx_core::parse::parse_time(t, true) {
+                Some(t) => t,
+                None => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if v == b"off" {
+            off = true;
+            continue;
+        }
+
+        return Err(failed(cf));
+    }
+
+    if off {
+        cell.borrow_mut().upstream_ssl.ssl_certificate_cache = Val::set(None);
+        return Ok(());
+    }
+
+    if max == 0 {
+        return Err(cf.emerg(format_args!("\"proxy_ssl_certificate_cache\" must have the \"max\" parameter")));
+    }
+
+    let cache = ngx_core::event_openssl_cache::ngx_ssl_cache_init(max as usize, valid, inactive);
+
+    cell.borrow_mut().upstream_ssl.ssl_certificate_cache = Val::set(Some(Rc::new(RefCell::new(cache))));
+
     Ok(())
+}
+
+/// ngx_http_proxy_ssl_password_file
+fn proxy_ssl_password_file_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+
+    if cell.borrow().upstream_ssl.ssl_passwords.is_set() {
+        return Err(msg("is duplicate"));
+    }
+
+    let file = cf.args[1].clone();
+
+    match ngx_ssl_read_password_file(cf, &file) {
+        Some(p) => {
+            cell.borrow_mut().upstream_ssl.ssl_passwords = Val::set(Some(p));
+            Ok(())
+        }
+        None => Err(ConfError::Logged),
+    }
+}
+
+/// proxy_ssl_conf_command: ngx_conf_set_keyval_slot with
+/// ngx_http_proxy_ssl_conf_command_check (SSL_CONF_cmd() is available)
+fn proxy_ssl_conf_command_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut c = cell.borrow_mut();
+
+    if !c.ssl_conf_commands.is_set() {
+        c.ssl_conf_commands = Val::set(Some(Vec::new()));
+    }
+
+    c.ssl_conf_commands.0.as_mut().unwrap().as_mut().unwrap().push((cf.args[1].clone(), cf.args[2].clone()));
+
+    Ok(())
+}
+
+/// proxy_ssl_protocols: ngx_conf_set_bitmask_slot
+fn proxy_ssl_protocols_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut c = cell.borrow_mut();
+    set_bitmask(cf, cmd, &mut c.ssl_protocols, SSL_PROTOCOLS)
+}
+
+/// proxy_ssl_session_reuse, proxy_ssl_server_name, proxy_ssl_verify:
+/// ngx_conf_set_flag_slot
+fn proxy_ssl_flag_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut c = cell.borrow_mut();
+
+    let slot = match cmd.name {
+        "proxy_ssl_session_reuse" => &mut c.upstream_ssl.ssl_session_reuse,
+        "proxy_ssl_server_name" => &mut c.upstream_ssl.ssl_server_name,
+        _ => &mut c.upstream_ssl.ssl_verify,
+    };
+
+    set_flag(cf, cmd, slot)
 }
 
 fn proxy_set_body_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
@@ -462,11 +723,13 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
         if uri.contains(&b'$') {
             let cv = crate::script::compile_complex_value(cf, &uri, 0)?;
             conf.borrow_mut().upstream_uri_cv = Some(cv);
+            conf.borrow_mut().ssl = true;
         } else {
             // ngx_http_proxy_pass: the upstream of the URL
             let add = if uri.len() >= 7 && uri[..7].eq_ignore_ascii_case(b"http://") {
                 (7, 80)
             } else if uri.len() >= 8 && uri[..8].eq_ignore_ascii_case(b"https://") {
+                conf.borrow_mut().ssl = true;
                 (8, 443)
             } else {
                 return Err(cf.emerg(format_args!("invalid URL prefix in \"{}\"", ngx_core::string::B(&uri))));
@@ -774,8 +1037,6 @@ async fn proxy_handler(r: R) -> i64 {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
-    // u->ssl_name: the host of the URL, or the upstream{} name
-    let ssl_host = host.clone();
 
     // If proxy_pass URL includes a URI (e.g. "http://backend/local/"), rewrite:
     //   forwarded = upstream_path + (request_uri - location_prefix)
@@ -1090,32 +1351,12 @@ async fn proxy_handler(r: R) -> i64 {
         method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, reval_hdrs, forward_headers
     );
 
-    // https: ngx_http_upstream_ssl_init_connection after connecting
+    // u->ssl (the URL is https): ngx_http_upstream_ssl_init_connection
+    // after connecting, with u->conf's SSL fields
     let connect_timeout = *lcf.borrow().connect_timeout.get();
     let ssl_setup = if upstream_uri.len() >= 8 && upstream_uri[..8].eq_ignore_ascii_case(b"https://") {
-        let c = lcf.borrow();
-        let ctx = match c.ssl_ctx.clone() {
-            Some(ctx) => ctx,
-            None => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
-        };
-        let (server_name, verify) = (*c.ssl_server_name.get(), *c.ssl_verify.get());
-        let name_cv = c.ssl_name.clone();
-        let session_reuse = *c.ssl_session_reuse.get();
-        drop(c);
-        // ngx_http_upstream_ssl_name: proxy_ssl_name, or the upstream host
-        let name = if server_name || verify {
-            let name = match name_cv {
-                Some(cv) => match crate::script::complex_value(&r, &cv) {
-                    Ok(v) => v,
-                    Err(_) => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
-                },
-                None => ssl_host.clone().into_bytes(),
-            };
-            Some((name, server_name))
-        } else {
-            None
-        };
-        Some(SslSetup { ctx, session_reuse, name, verify })
+        let conf = lcf.borrow().upstream_ssl.clone();
+        Some(crate::upstream_ssl::SslSetup { conf, alpn: Vec::new() })
     } else {
         None
     };
@@ -1184,19 +1425,16 @@ async fn proxy_handler(r: R) -> i64 {
             let c = g.u.pc.connection.take().unwrap();
             upstream_requests = c.requests;
             upstream_start_time = c.start_time;
+            // c->data = r
+            g.u.attach_sock(&c.sock);
             c.sock
         } else {
             let sockaddr = match g.u.pc.sockaddr.clone() {
                 Some(sa) => sa,
                 None => return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR).await,
             };
-            let session = match &ssl_setup {
-                Some(ssl) if ssl.session_reuse => g.u.set_session(),
-                _ => None,
-            };
-            match connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), session, connect_timeout).await {
+            match connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), Some(&mut g.u), connect_timeout).await {
                 Ok(s) => {
-                    g.u.save_session(&s);
                     upstream_requests = 0;
                     upstream_start_time = ngx_core::times::current_msec();
                     s
@@ -1438,11 +1676,6 @@ async fn proxy_handler(r: R) -> i64 {
                 }
                 Err(_) => break,
             }
-        }
-        // a session ticket read with the response goes to the peer
-        // (ngx_ssl_new_client_session, c->ssl->save_session)
-        if let Some(u) = upstream.as_ref() {
-            g.u.save_session(u);
         }
         let read_ok = true;
         // If we finished this read cleanly (framing terminated: known
@@ -2665,20 +2898,20 @@ pub fn proxy_module() -> ModuleDef {
             }
             Ok(())
         }),
-        cmd_fn!("proxy_ssl_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_certificate_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_password_file", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_ssl_session_reuse", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, proxy_ssl_flag_handler),
+        cmd_fn!("proxy_ssl_protocols", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, proxy_ssl_protocols_handler),
         ngx_core::cmd!("proxy_ssl_ciphers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_ciphers, set_str),
-        ngx_core::cmd!("proxy_ssl_protocols", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_protocols, set_bitmask, SSL_PROTOCOLS),
         cmd_fn!("proxy_ssl_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_ssl_name_handler),
-        ngx_core::cmd!("proxy_ssl_server_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_server_name, set_flag),
-        ngx_core::cmd!("proxy_ssl_verify", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_verify, set_flag),
+        cmd_fn!("proxy_ssl_server_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, proxy_ssl_flag_handler),
+        cmd_fn!("proxy_ssl_verify", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, proxy_ssl_flag_handler),
         ngx_core::cmd!("proxy_ssl_verify_depth", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_verify_depth, set_num),
         ngx_core::cmd!("proxy_ssl_trusted_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_trusted_certificate, set_str),
-        cmd_fn!("proxy_ssl_crl", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_conf_command", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd!("proxy_ssl_session_reuse", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_session_reuse, set_flag),
-        cmd_fn!("proxy_ssl_key_log", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_ssl_crl", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_crl, set_str),
+        cmd_fn!("proxy_ssl_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_ssl_certificate_handler),
+        cmd_fn!("proxy_ssl_certificate_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_ssl_certificate_handler),
+        cmd_fn!("proxy_ssl_certificate_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::Loc, proxy_ssl_certificate_cache_handler),
+        cmd_fn!("proxy_ssl_password_file", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_ssl_password_file_handler),
+        cmd_fn!("proxy_ssl_conf_command", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, proxy_ssl_conf_command_handler),
     ];
 
     let def = HttpModuleDef {
@@ -2954,13 +3187,6 @@ pub(crate) enum ConnectError {
     Internal,
 }
 
-/// The TLS side of an https upstream.
-pub(crate) struct SslSetup {
-    ctx: openssl::ssl::SslContext,
-    session_reuse: bool,
-    name: Option<(Vec<u8>, bool)>,
-    verify: bool,
-}
 
 /// ngx_http_upstream_process_non_buffered_request with the proxy's input
 /// filters (ngx_http_proxy_input_filter_init, the non-buffered copy and
@@ -3170,76 +3396,47 @@ fn set_upstream_headers_in(r: &R, block: &[u8]) {
     }
 }
 
-/// Connect to the upstream and, for https, run the TLS handshake
-/// (ngx_http_upstream_ssl_init_connection), both within
-/// proxy_connect_timeout.
+/// Connect to the upstream within proxy_connect_timeout; for https (`ssl`,
+/// with the request's upstream `u`) ngx_event_connect_peer and
+/// ngx_http_upstream_ssl_init_connection (upstream_ssl::connect).
 pub(crate) async fn connect_upstream(
     r: &R,
     sockaddr: &ngx_core::inet::SockAddr,
     bind: Option<std::net::SocketAddr>,
-    ssl: Option<&SslSetup>,
-    session: Option<openssl::ssl::SslSession>,
+    ssl: Option<&crate::upstream_ssl::SslSetup>,
+    u: Option<&mut crate::upstream::UpstreamPeer>,
     timeout: u64,
 ) -> Result<UpstreamSock, ConnectError> {
     let log = r.connection.log.clone();
     let action = log.action();
-    let handshaking = std::cell::Cell::new(false);
+
+    if let (Some(ssl), Some(u)) = (ssl, u) {
+        // proxy_bind
+        let local = bind.map(|a| ngx_core::event_connect::LocalAddr {
+            sockaddr: match a {
+                std::net::SocketAddr::V4(a) => ngx_core::inet::SockAddr::V4(a),
+                std::net::SocketAddr::V6(a) => ngx_core::inet::SockAddr::V6(a),
+            },
+            name: a.to_string().into_bytes(),
+        });
+
+        return crate::upstream_ssl::connect(r, u, sockaddr, local.as_ref(), ssl, timeout).await.map(UpstreamSock::Conn);
+    }
 
     let connect = async {
-        let sock = connect_with_optional_bind(sockaddr, bind).await.map_err(|e| {
+        connect_with_optional_bind(sockaddr, bind).await.map_err(|e| {
             let action = log.action();
             log.set_action(Some("connecting to upstream"));
             ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, e.raw_os_error(), "connect() failed");
             log.set_action(action);
             ConnectError::Error
-        })?;
-
-        let ssl = match ssl {
-            Some(s) => s,
-            None => return Ok(sock),
-        };
-
-        let io = match sock {
-            UpstreamSock::Tcp(s) => crate::upstream_ssl::SockIo::Tcp(s),
-            UpstreamSock::Unix(s) => crate::upstream_ssl::SockIo::Unix(s),
-            UpstreamSock::Ssl(_) => unreachable!(),
-        };
-
-        handshaking.set(true);
-        log.set_action(Some("SSL handshaking to upstream"));
-
-        let params = crate::upstream_ssl::Params {
-            ctx: &ssl.ctx,
-            session_reuse: ssl.session_reuse,
-            session,
-            name: ssl.name.as_ref().map(|(n, sni)| (n.as_slice(), *sni)),
-            verify: ssl.verify,
-        };
-
-        let rc = crate::upstream_ssl::handshake(io, params).await;
-
-        let rc = match rc {
-            Ok(s) => Ok(UpstreamSock::Ssl(Box::new(s))),
-            Err(crate::upstream_ssl::HandshakeError::Failed(e)) => {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, None, "{}", e);
-                Err(ConnectError::Error)
-            }
-            Err(crate::upstream_ssl::HandshakeError::Internal(e)) => {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, None, "{}", e);
-                Err(ConnectError::Internal)
-            }
-        };
-
-        log.set_action(action);
-
-        rc
+        })
     };
 
     match tokio::time::timeout(std::time::Duration::from_millis(timeout), connect).await {
         Ok(rc) => rc,
         Err(_) => {
-            let during = if handshaking.get() { "SSL handshaking to upstream" } else { "connecting to upstream" };
-            log.set_action(Some(during));
+            log.set_action(Some("connecting to upstream"));
             ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
             log.set_action(action);
             Err(ConnectError::Timeout)
