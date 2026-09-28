@@ -964,32 +964,51 @@ impl UpstreamPeer {
         };
 
         let resolver = match resolver {
-            Some(res) if res.has_servers() => res,
-            _ => {
+            Some(res) => res,
+            None => {
                 ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no resolver defined to resolve {}", B(&u.host));
                 return Err(crate::NGX_HTTP_BAD_GATEWAY);
             }
         };
 
-        match resolver.resolve_name(&u.host, timeout, &r.connection.log).await {
-            Ok(addrs) => {
-                let addrs: Vec<Addr> = addrs
-                    .into_iter()
-                    .map(|a| {
-                        let mut sa = a.sockaddr;
-                        sa.set_port(u.port);
-                        let name = sa.to_text(true);
-                        Addr { sockaddr: sa, name }
-                    })
-                    .collect();
+        let resolved = match resolver.resolve_host(&u.host, timeout).await {
+            ngx_core::resolver::Resolved::NoResolver => {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no resolver defined to resolve {}", B(&u.host));
+                return Err(crate::NGX_HTTP_BAD_GATEWAY);
+            }
+            ngx_core::resolver::Resolved::Error => return Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR),
+            ngx_core::resolver::Resolved::Done(g) => g,
+        };
 
-                Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
-            }
-            Err(code) => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "{} could not be resolved ({}: {})", B(&u.host), code, Resolver::strerror(code));
-                Err(crate::NGX_HTTP_BAD_GATEWAY)
-            }
+        // ngx_http_upstream_resolve_handler
+        let ctx = &resolved.ctx;
+
+        if ctx.state.get() != 0 {
+            ngx_log_error!(
+                NGX_LOG_ERR,
+                r.connection.log,
+                None,
+                "{} could not be resolved ({}: {})",
+                B(&ctx.name.borrow()),
+                ctx.state.get(),
+                Resolver::strerror(ctx.state.get())
+            );
+            return Err(crate::NGX_HTTP_BAD_GATEWAY);
         }
+
+        let addrs: Vec<Addr> = ctx
+            .addrs
+            .borrow()
+            .iter()
+            .map(|a| {
+                let mut sa = a.sockaddr.clone();
+                sa.set_port(u.port);
+                let name = sa.to_text(true);
+                Addr { sockaddr: sa, name }
+            })
+            .collect();
+
+        Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
     }
 }
 
