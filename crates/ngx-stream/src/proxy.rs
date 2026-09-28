@@ -19,6 +19,8 @@ use tokio::time::Instant;
 use ngx_core::conf::*;
 use ngx_core::connection::Connection;
 use ngx_core::event_connect::{event_connect_peer, LocalAddr, PeerConnect, PeerSocket};
+use ngx_core::event_openssl::*;
+use ngx_core::event_openssl_cache::*;
 use ngx_core::inet::{Addr, Url};
 use ngx_core::log::*;
 use ngx_core::module::*;
@@ -65,6 +67,29 @@ pub struct ProxySrvConf {
     pub socket_keepalive: Val<bool>,
     pub socket_rcvbuf: Val<usize>,
     pub socket_sndbuf: Val<usize>,
+
+    pub ssl_enable: Val<bool>,
+    pub ssl_session_reuse: Val<bool>,
+    pub ssl_protocols: u32,
+    pub ssl_ciphers: Val<Vec<u8>>,
+    pub ssl_name: Val<Option<ComplexValue>>,
+    pub ssl_server_name: Val<bool>,
+    pub ssl_alpn: Val<Option<Vec<ComplexValue>>>,
+
+    pub ssl_verify: Val<bool>,
+    pub ssl_verify_depth: Val<i64>,
+    pub ssl_trusted_certificate: Val<Vec<u8>>,
+    pub ssl_crl: Val<Vec<u8>>,
+    pub ssl_certificate: Val<Option<ComplexValue>>,
+    pub ssl_certificate_key: Val<Option<ComplexValue>>,
+    /// Some(None): "off"
+    pub ssl_certificate_cache: Val<Option<Rc<RefCell<SslCache>>>>,
+    pub ssl_passwords: Val<Option<Rc<SslPasswords>>>,
+    pub ssl_conf_commands: Val<Option<Vec<(Vec<u8>, Vec<u8>)>>>,
+
+    /// the context, shared with the stream{} level when no SSL directive
+    /// is in the server (ngx_stream_proxy_merge_ssl)
+    pub ssl: Option<Rc<RefCell<NgxSsl>>>,
 
     pub upstream: Option<Rc<UpstreamSrvConf>>,
     pub upstream_value: Option<ComplexValue>,
@@ -583,6 +608,26 @@ async fn connect_once(s: &S) -> Connected {
         return Connected::Next;
     }
 
+    let ssl_enable = *pscf.borrow().ssl_enable;
+
+    if pc.ty == libc::SOCK_STREAM && ssl_enable {
+        if u.proxy_protocol.get() != 0 {
+            match send_proxy_protocol(s, &u, &pc).await {
+                Connected::Upstream(_) => {}
+                other => return other,
+            }
+
+            u.proxy_protocol.set(0);
+        }
+
+        if pc.ssl.borrow().is_none() {
+            match ssl_init_connection(s, &u, &pc, connect_timeout).await {
+                Connected::Upstream(_) => {}
+                other => return other,
+            }
+        }
+    }
+
     if c.log.level() >= NGX_LOG_INFO {
         if let Some(local) = pc.local_sockaddr() {
             let name = u.name.borrow().clone().unwrap_or_default();
@@ -598,6 +643,340 @@ async fn connect_once(s: &S) -> Connected {
     u.peer_notify(s, pc.ty, NGX_STREAM_UPSTREAM_NOTIFY_CONNECT);
 
     Connected::Upstream(pc)
+}
+
+/// The PROXY protocol header of the client connection (the TLS TLVs of an
+/// SSL client with v2).
+fn proxy_protocol_header(c: &Connection, version: u32) -> Option<Vec<u8>> {
+    let local = c.local_sockaddr()?;
+
+    let sockaddr = c.sockaddr.borrow().clone();
+
+    if version == 2 {
+        let (tlvs, ssl) = if c.ssl.borrow().is_some() {
+            let (tlvs, ssl) = ngx_core::proxy_protocol::proxy_protocol_v2_eval_ssl(c).ok()?;
+            (tlvs, Some(ssl))
+        } else {
+            (Vec::new(), None)
+        };
+
+        return Some(ngx_core::proxy_protocol::proxy_protocol_v2_write(&sockaddr, &local, c.ty, &tlvs, ssl.as_ref()));
+    }
+
+    Some(ngx_core::proxy_protocol::proxy_protocol_write(&sockaddr, &local))
+}
+
+/// ngx_stream_proxy_send_proxy_protocol: the header sent at once before
+/// the TLS handshake
+async fn send_proxy_protocol(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>) -> Connected {
+    let c = s.connection.clone();
+
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, c.log, "stream proxy send PROXY protocol header");
+
+    let header = match proxy_protocol_header(&c, u.proxy_protocol.get()) {
+        Some(h) => h,
+        None => {
+            proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+            return Connected::Done;
+        }
+    };
+
+    let timeout = *pscf_of(s).borrow().timeout;
+
+    loop {
+        let n = match pc.try_send(&header) {
+            Ok(n) => n,
+
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // NGX_AGAIN: ngx_stream_proxy_connect_handler on the write
+                // event with proxy_timeout
+                match tokio::time::timeout(Duration::from_millis(timeout), pc.writable()).await {
+                    Ok(_) => continue,
+                    Err(_) => {
+                        ngx_log_error!(NGX_LOG_ERR, c.log, Some(libc::ETIMEDOUT), "upstream timed out");
+                        return Connected::Next;
+                    }
+                }
+            }
+
+            Err(e) => {
+                pc.connection_error(e.raw_os_error().unwrap_or(0), "send() failed");
+                proxy_finalize(s, NGX_STREAM_OK).await;
+                return Connected::Done;
+            }
+        };
+
+        if n != header.len() {
+            // PROXY protocol specification:
+            // The sender must always ensure that the header
+            // is sent at once, so that the transport layer
+            // maintains atomicity along the path to the receiver.
+
+            ngx_log_error!(NGX_LOG_ERR, c.log, None, "could not send PROXY protocol header at once");
+
+            proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+            return Connected::Done;
+        }
+
+        return Connected::Upstream(pc.clone());
+    }
+}
+
+/// ngx_stream_proxy_ssl_init_connection and ngx_stream_proxy_ssl_handshake
+async fn ssl_init_connection(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>, connect_timeout: u64) -> Connected {
+    let pscf = pscf_of(s);
+
+    let (ssl, ssl_server_name, ssl_verify, has_alpn, dynamic_cert, session_reuse) = {
+        let p = pscf.borrow();
+
+        let cert = p.ssl_certificate.as_option().cloned().flatten();
+        let key = p.ssl_certificate_key.as_option().cloned().flatten();
+
+        let dynamic_cert = match (&cert, &key) {
+            (Some(c), Some(k)) => !c.value.is_empty() && (!c.is_constant() || !k.is_constant()),
+            _ => false,
+        };
+
+        (p.ssl.clone().expect("ssl"), *p.ssl_server_name, *p.ssl_verify, p.ssl_alpn.as_option().is_some_and(|a| a.is_some()), dynamic_cert, *p.ssl_session_reuse)
+    };
+
+    if ngx_ssl_create_connection(&ssl.borrow(), pc, NGX_SSL_BUFFER | NGX_SSL_CLIENT) != NGX_OK {
+        proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+        return Connected::Done;
+    }
+
+    if (ssl_server_name || ssl_verify) && proxy_ssl_name(s, u, pc).is_err() {
+        proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+        return Connected::Done;
+    }
+
+    if has_alpn && proxy_ssl_alpn(s, pc).is_err() {
+        proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+        return Connected::Done;
+    }
+
+    if dynamic_cert && proxy_ssl_certificate(s, pc).is_err() {
+        proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+        return Connected::Done;
+    }
+
+    if session_reuse {
+        // ngx_stream_proxy_ssl_save_session
+        let weak = Rc::downgrade(u);
+
+        ngx_ssl_set_save_session(
+            pc,
+            Some(Rc::new(move |pc: &Connection| {
+                let u = match weak.upgrade() {
+                    Some(u) => u,
+                    None => return,
+                };
+
+                let sess = ngx_ssl_get_session(pc);
+
+                if sess.is_null() {
+                    return;
+                }
+
+                // the reference of ngx_ssl_get_session() is the session's
+                let session = unsafe { <openssl::ssl::SslSession as foreign_types::ForeignType>::from_ptr(sess) };
+
+                let mut balancer = u.balancer.borrow_mut();
+
+                if let Some(b) = balancer.as_mut() {
+                    b.save_session(session);
+                }
+            })),
+        );
+
+        // u->peer.set_session
+        let session = u.balancer.borrow_mut().as_mut().and_then(|b| b.set_session());
+
+        if let Some(session) = session {
+            let rc = ngx_ssl_set_session(pc, <openssl::ssl::SslSession as foreign_types::ForeignType>::as_ptr(&session));
+
+            if rc != NGX_OK {
+                proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
+                return Connected::Done;
+            }
+        }
+    }
+
+    s.connection.log.set_action(Some("SSL handshaking to upstream"));
+
+    let mut rc = ngx_ssl_handshake(pc);
+
+    if rc == NGX_AGAIN {
+        rc = match tokio::time::timeout(Duration::from_millis(connect_timeout), ngx_ssl_handshake_wait(pc)).await {
+            Ok(rc) => rc,
+            // the write timer: the handshake handler with the handshake
+            // not done
+            Err(_) => NGX_ERROR,
+        };
+    }
+
+    let _ = rc;
+
+    // ngx_stream_proxy_ssl_handshake
+
+    let handshaked = pc.ssl.borrow().as_ref().is_some_and(|sc| sc.handshaked.get());
+
+    if handshaked {
+        if ssl_verify {
+            let rc = ngx_ssl_get_verify_result(pc);
+
+            // X509_V_OK
+            if rc != 0 {
+                ngx_log_error!(NGX_LOG_ERR, pc.log, None, "upstream SSL certificate verify error: ({}:{})", rc, B(&ngx_ssl_verify_error_string(rc)));
+                return Connected::Next;
+            }
+
+            let name = u.ssl_name.borrow().clone();
+
+            if ngx_ssl_check_host(pc, &name) != NGX_OK {
+                ngx_log_error!(NGX_LOG_ERR, pc.log, None, "upstream SSL certificate does not match \"{}\"", B(&name));
+                return Connected::Next;
+            }
+        }
+
+        return Connected::Upstream(pc.clone());
+    }
+
+    Connected::Next
+}
+
+/// ngx_stream_proxy_ssl_name: the server name (SNI) and the name verified
+fn proxy_ssl_name(s: &S, u: &StreamUpstream, pc: &Connection) -> Result<(), ()> {
+    let pscf = pscf_of(s);
+
+    let (ssl_name, ssl_server_name) = {
+        let p = pscf.borrow();
+        (p.ssl_name.as_option().cloned().flatten(), *p.ssl_server_name)
+    };
+
+    let mut name = match ssl_name {
+        Some(cv) => complex_value(s, &cv)?,
+        None => u.ssl_name.borrow().clone(),
+    };
+
+    'done: {
+        if name.is_empty() {
+            break 'done;
+        }
+
+        // ssl name here may contain port, strip it for compatibility
+        // with the http module
+
+        let mut p = 0;
+
+        if name[0] == b'[' {
+            p = name.iter().position(|&c| c == b']').unwrap_or(0);
+        }
+
+        if let Some(colon) = name[p..].iter().position(|&c| c == b':') {
+            name.truncate(p + colon);
+        }
+
+        if !ssl_server_name {
+            break 'done;
+        }
+
+        // as per RFC 6066, literal IPv4 and IPv6 addresses are not permitted
+
+        if name.is_empty() || name[0] == b'[' {
+            break 'done;
+        }
+
+        if ngx_core::inet::inet_addr(&name).is_some() {
+            break 'done;
+        }
+
+        ngx_log_debug!(NGX_LOG_DEBUG_STREAM, s.connection.log, "upstream SSL server name: \"{}\"", B(&name));
+
+        if !ngx_ssl_set_tlsext_host_name(pc, &name) {
+            ngx_ssl_error(NGX_LOG_ERR, &s.connection.log, 0, format_args!("SSL_set_tlsext_host_name(\"{}\") failed", B(&name)));
+            return Err(());
+        }
+    }
+
+    *u.ssl_name.borrow_mut() = name;
+
+    Ok(())
+}
+
+/// ngx_stream_proxy_ssl_alpn
+fn proxy_ssl_alpn(s: &S, pc: &Connection) -> Result<(), ()> {
+    let alpn = pscf_of(s).borrow().ssl_alpn.as_option().cloned().flatten().unwrap_or_default();
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    for cv in alpn.iter() {
+        let proto = complex_value(s, cv)?;
+
+        if proto.is_empty() || proto.len() > 255 {
+            continue;
+        }
+
+        ngx_log_debug!(NGX_LOG_DEBUG_STREAM, pc.log, "upstream SSL ALPN: \"{}\"", B(&proto));
+
+        buf.push(proto.len() as u8);
+        buf.extend_from_slice(&proto);
+    }
+
+    if buf.is_empty() {
+        return Ok(());
+    }
+
+    if ngx_ssl_set_alpn_protos(pc, &buf) != 0 {
+        ngx_ssl_error(NGX_LOG_ERR, &pc.log, 0, format_args!("SSL_set_alpn_protos() failed"));
+        return Err(());
+    }
+
+    Ok(())
+}
+
+/// The value of a complex value compiled with "zero", without the NUL.
+fn zero_value(s: &Session, cv: &ComplexValue) -> Result<Vec<u8>, ()> {
+    let mut v = complex_value(s, cv)?;
+
+    if v.last() == Some(&0) {
+        v.pop();
+    }
+
+    Ok(v)
+}
+
+/// ngx_stream_proxy_ssl_certificate: a certificate with variables
+fn proxy_ssl_certificate(s: &S, pc: &Connection) -> Result<(), ()> {
+    let pscf = pscf_of(s);
+
+    let (cert_cv, key_cv, cache, passwords) = {
+        let p = pscf.borrow();
+        (
+            p.ssl_certificate.as_option().cloned().flatten().expect("certificate"),
+            p.ssl_certificate_key.as_option().cloned().flatten().expect("certificate key"),
+            p.ssl_certificate_cache.as_option().cloned().flatten(),
+            p.ssl_passwords.as_option().cloned().flatten(),
+        )
+    };
+
+    let mut cert = zero_value(s, &cert_cv)?;
+
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, pc.log, "stream upstream ssl cert: \"{}\"", B(&cert));
+
+    if cert.is_empty() {
+        return Ok(());
+    }
+
+    let mut key = zero_value(s, &key_cv)?;
+
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, pc.log, "stream upstream ssl key: \"{}\"", B(&key));
+
+    if ngx_ssl_connection_certificate(pc, &mut cert, &mut key, cache.as_ref(), passwords.as_ref()) != NGX_OK {
+        return Err(());
+    }
+
+    Ok(())
 }
 
 /// ngx_stream_proxy_next_upstream: false if the session is finalized
@@ -639,6 +1018,15 @@ async fn next_upstream(s: &S) -> bool {
             st.bytes_received = received;
             st.bytes_sent = sent;
         });
+
+        let sc = pc.ssl.borrow().clone();
+
+        if let Some(sc) = sc {
+            sc.no_wait_shutdown.set(true);
+            sc.no_send_shutdown.set(true);
+
+            let _ = ngx_ssl_shutdown(&pc);
+        }
 
         pc.close();
 
@@ -690,6 +1078,14 @@ pub async fn proxy_finalize(s: &S, rc: i64) {
 
         if let Some(pc) = pc {
             ngx_log_debug!(NGX_LOG_DEBUG_STREAM, s.connection.log, "close stream proxy upstream connection: {}", pc.fd.get());
+
+            let sc = pc.ssl.borrow().clone();
+
+            if let Some(sc) = sc {
+                sc.no_wait_shutdown.set(true);
+
+                let _ = ngx_ssl_shutdown(&pc);
+            }
 
             pc.close();
 
@@ -1054,7 +1450,9 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
 
                 Err(e) => {
                     // NGX_ERROR: c->recv() logged it
-                    src.connection_error(e.raw_os_error().unwrap_or(0), "recv() failed");
+                    if !is_ssl_error_logged(&e) {
+                        src.connection_error(e.raw_os_error().unwrap_or(0), "recv() failed");
+                    }
                     src.error.set(true);
                     r.eof(from_upstream).set(true);
                     0
@@ -1246,15 +1644,237 @@ fn proxy_create_srv_conf(_cf: &mut Conf) -> Rc<dyn Any> {
         socket_keepalive: Val::unset(),
         socket_rcvbuf: Val::unset(),
         socket_sndbuf: Val::unset(),
+        ssl_enable: Val::unset(),
+        ssl_session_reuse: Val::unset(),
+        ssl_protocols: 0,
+        ssl_ciphers: Val::unset(),
+        ssl_name: Val::unset(),
+        ssl_server_name: Val::unset(),
+        ssl_alpn: Val::unset(),
+        ssl_verify: Val::unset(),
+        ssl_verify_depth: Val::unset(),
+        ssl_trusted_certificate: Val::unset(),
+        ssl_crl: Val::unset(),
+        ssl_certificate: Val::unset(),
+        ssl_certificate_key: Val::unset(),
+        ssl_certificate_cache: Val::unset(),
+        ssl_passwords: Val::unset(),
+        ssl_conf_commands: Val::unset(),
+        ssl: None,
         upstream: None,
         upstream_value: None,
     })
 }
 
-fn proxy_merge_srv_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) -> ConfResult {
-    let prev = conf_cell::<ProxySrvConf>(parent).borrow();
-    let mut conf = conf_cell::<ProxySrvConf>(child).borrow_mut();
+fn proxy_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) -> ConfResult {
+    let prev_rc = conf_rc::<ProxySrvConf>(parent);
+    let conf_rc = conf_rc::<ProxySrvConf>(child);
 
+    merge_values(&prev_rc.borrow(), &mut conf_rc.borrow_mut());
+
+    // ngx_stream_proxy_merge_ssl
+
+    merge_ssl(&prev_rc, &conf_rc, &cf.log);
+
+    let prev = prev_rc.borrow();
+    let mut conf = conf_rc.borrow_mut();
+
+    conf.ssl_enable.merge(&prev.ssl_enable, false);
+
+    conf.ssl_session_reuse.merge(&prev.ssl_session_reuse, true);
+
+    if conf.ssl_protocols == 0 {
+        conf.ssl_protocols = if prev.ssl_protocols == 0 { NGX_CONF_BITMASK_SET | NGX_SSL_DEFAULT_PROTOCOLS } else { prev.ssl_protocols };
+    }
+
+    conf.ssl_ciphers.merge(&prev.ssl_ciphers, b"DEFAULT".to_vec());
+
+    merge_ptr(&mut conf.ssl_name, &prev.ssl_name);
+
+    conf.ssl_server_name.merge(&prev.ssl_server_name, false);
+
+    merge_ptr(&mut conf.ssl_alpn, &prev.ssl_alpn);
+
+    conf.ssl_verify.merge(&prev.ssl_verify, false);
+
+    conf.ssl_verify_depth.merge(&prev.ssl_verify_depth, 1);
+
+    conf.ssl_trusted_certificate.merge(&prev.ssl_trusted_certificate, Vec::new());
+
+    conf.ssl_crl.merge(&prev.ssl_crl, Vec::new());
+
+    merge_ptr(&mut conf.ssl_certificate, &prev.ssl_certificate);
+
+    merge_ptr(&mut conf.ssl_certificate_key, &prev.ssl_certificate_key);
+
+    merge_ptr(&mut conf.ssl_certificate_cache, &prev.ssl_certificate_cache);
+
+    drop(prev);
+
+    merge_ssl_passwords(cf, &prev_rc, &mut conf);
+
+    let prev = prev_rc.borrow();
+
+    merge_ptr(&mut conf.ssl_conf_commands, &prev.ssl_conf_commands);
+
+    drop(prev);
+
+    if *conf.ssl_enable {
+        set_ssl(cf, &mut conf)?;
+    }
+
+    Ok(())
+}
+
+/// ngx_conf_merge_ptr_value(conf, prev, NULL)
+fn merge_ptr<T: Clone>(conf: &mut Val<Option<T>>, prev: &Val<Option<T>>) {
+    if !conf.is_set() {
+        *conf = Val::set(prev.as_option().cloned().flatten());
+    }
+}
+
+/// ngx_stream_proxy_merge_ssl: the context of the server, or the one of
+/// stream{} when no SSL directive is in the server
+fn merge_ssl(prev_rc: &Rc<RefCell<ProxySrvConf>>, conf_rc: &Rc<RefCell<ProxySrvConf>>, log: &Log) {
+    let preserve = {
+        let conf = conf_rc.borrow();
+
+        let untouched = conf.ssl_protocols == 0
+            && !conf.ssl_ciphers.is_set()
+            && !conf.ssl_certificate.is_set()
+            && !conf.ssl_certificate_key.is_set()
+            && !conf.ssl_passwords.is_set()
+            && !conf.ssl_verify.is_set()
+            && !conf.ssl_verify_depth.is_set()
+            && !conf.ssl_trusted_certificate.is_set()
+            && !conf.ssl_crl.is_set()
+            && !conf.ssl_session_reuse.is_set()
+            && !conf.ssl_conf_commands.is_set();
+
+        if untouched {
+            let prev_ssl = prev_rc.borrow().ssl.clone();
+
+            if let Some(ssl) = prev_ssl {
+                drop(conf);
+                conf_rc.borrow_mut().ssl = Some(ssl);
+                return;
+            }
+        }
+
+        untouched
+    };
+
+    let ssl = Rc::new(RefCell::new(NgxSsl::new(log.clone())));
+
+    conf_rc.borrow_mut().ssl = Some(ssl.clone());
+
+    // special handling to preserve conf->ssl in the "stream" section to
+    // inherit it to all servers
+
+    if preserve && !Rc::ptr_eq(prev_rc, conf_rc) {
+        prev_rc.borrow_mut().ssl = Some(ssl);
+    }
+}
+
+/// ngx_stream_proxy_merge_ssl_passwords: a certificate with variables
+/// needs the passwords at run time
+fn merge_ssl_passwords(cf: &mut Conf, prev_rc: &Rc<RefCell<ProxySrvConf>>, conf: &mut ProxySrvConf) {
+    let prev_passwords = prev_rc.borrow().ssl_passwords.clone();
+
+    merge_ptr(&mut conf.ssl_passwords, &prev_passwords);
+
+    let (cert, key) = match (conf.ssl_certificate.as_option().cloned().flatten(), conf.ssl_certificate_key.as_option().cloned().flatten()) {
+        (Some(c), Some(k)) if !c.value.is_empty() => (c, k),
+        _ => return,
+    };
+
+    if cert.is_constant() && key.is_constant() {
+        return;
+    }
+
+    let passwords = conf.ssl_passwords.as_option().cloned().flatten();
+
+    let preserved = ngx_ssl_preserve_passwords(cf, passwords.as_ref());
+
+    conf.ssl_passwords = Val::set(Some(preserved));
+}
+
+/// ngx_stream_proxy_set_ssl: the context of the upstream connections
+fn set_ssl(cf: &mut Conf, pscf: &mut ProxySrvConf) -> ConfResult {
+    let ssl = pscf.ssl.clone().expect("ssl");
+    let mut ssl = ssl.borrow_mut();
+
+    if !ssl.ctx.is_null() {
+        return Ok(());
+    }
+
+    if ngx_ssl_create(&mut ssl, pscf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    let ciphers = pscf.ssl_ciphers.get().clone();
+
+    if ngx_ssl_ciphers(cf, &mut ssl, &ciphers, false) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    if let Some(cert) = pscf.ssl_certificate.as_option().cloned().flatten() {
+        if !cert.value.is_empty() {
+            let key = match pscf.ssl_certificate_key.as_option().cloned().flatten() {
+                Some(k) => k,
+                None => {
+                    ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "no \"proxy_ssl_certificate_key\" is defined for certificate \"{}\"", B(&cert.value));
+                    return Err(ConfError::Logged);
+                }
+            };
+
+            if cert.is_constant() && key.is_constant() {
+                let mut c = cert.value.clone();
+                let mut k = key.value.clone();
+
+                let passwords = pscf.ssl_passwords.as_option().cloned().flatten();
+
+                if ngx_ssl_certificate(cf, &mut ssl, &mut c, &mut k, passwords.as_ref()) != NGX_OK {
+                    return Err(ConfError::Logged);
+                }
+            }
+        }
+    }
+
+    if *pscf.ssl_verify {
+        if pscf.ssl_trusted_certificate.get().is_empty() {
+            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "no proxy_ssl_trusted_certificate for proxy_ssl_verify");
+            return Err(ConfError::Logged);
+        }
+
+        let mut trusted = pscf.ssl_trusted_certificate.get().clone();
+
+        if ngx_ssl_trusted_certificate(cf, &mut ssl, &mut trusted, *pscf.ssl_verify_depth) != NGX_OK {
+            return Err(ConfError::Logged);
+        }
+
+        let mut crl = pscf.ssl_crl.get().clone();
+
+        if ngx_ssl_crl(cf, &mut ssl, &mut crl) != NGX_OK {
+            return Err(ConfError::Logged);
+        }
+    }
+
+    if ngx_ssl_client_session_cache(cf, &mut ssl, *pscf.ssl_session_reuse) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    let mut commands = pscf.ssl_conf_commands.as_option().cloned().flatten();
+
+    if ngx_ssl_conf_commands(cf, &mut ssl, commands.as_mut()) != NGX_OK {
+        return Err(ConfError::Logged);
+    }
+
+    Ok(())
+}
+
+/// The values of ngx_stream_proxy_merge_srv_conf before the SSL ones.
+fn merge_values(prev: &ProxySrvConf, conf: &mut ProxySrvConf) {
     conf.connect_timeout.merge(&prev.connect_timeout, 60000);
 
     conf.timeout.merge(&prev.timeout, 10 * 60000);
@@ -1291,8 +1911,6 @@ fn proxy_merge_srv_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any
     conf.socket_sndbuf.merge(&prev.socket_sndbuf, 0);
 
     conf.half_close.merge(&prev.half_close, false);
-
-    Ok(())
 }
 
 /// ngx_stream_proxy_pass
@@ -1402,6 +2020,186 @@ fn proxy_download_rate(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
 
 static PROXY_PROTOCOL_VERSIONS: &[(&str, u32)] = &[("off", 0), ("on", 1), ("v2", 2)];
 
+static PROXY_SSL_PROTOCOLS: &[(&str, u32)] = &[
+    ("SSLv2", NGX_SSL_SSLV2),
+    ("SSLv3", NGX_SSL_SSLV3),
+    ("TLSv1", NGX_SSL_TLSV1),
+    ("TLSv1.1", NGX_SSL_TLSV1_1),
+    ("TLSv1.2", NGX_SSL_TLSV1_2),
+    ("TLSv1.3", NGX_SSL_TLSV1_3),
+];
+
+fn proxy_ssl_protocols(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+    let mut p = pscf.borrow_mut();
+    set_bitmask(cf, cmd, &mut p.ssl_protocols, PROXY_SSL_PROTOCOLS)
+}
+
+/// proxy_ssl_name: ngx_stream_set_complex_value_slot
+fn proxy_ssl_name_slot(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    if pscf.borrow().ssl_name.as_option().is_some_and(|v| v.is_some()) {
+        return Err(msg("is duplicate"));
+    }
+
+    let mut slot = None;
+    set_complex_value_slot(cf, &mut slot)?;
+
+    pscf.borrow_mut().ssl_name = Val::set(slot);
+
+    Ok(())
+}
+
+/// proxy_ssl_certificate, proxy_ssl_certificate_key:
+/// ngx_stream_set_complex_value_zero_slot
+fn proxy_ssl_certificate_slot(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    let mut slot = if cmd.name == "proxy_ssl_certificate" { pscf.borrow().ssl_certificate.clone() } else { pscf.borrow().ssl_certificate_key.clone() };
+
+    set_complex_value_zero_slot(cf, &mut slot)?;
+
+    let mut p = pscf.borrow_mut();
+
+    if cmd.name == "proxy_ssl_certificate" {
+        p.ssl_certificate = slot;
+    } else {
+        p.ssl_certificate_key = slot;
+    }
+
+    Ok(())
+}
+
+/// ngx_stream_proxy_ssl_alpn_set_slot
+fn proxy_ssl_alpn_set_slot(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    if pscf.borrow().ssl_alpn.is_set() {
+        return Err(msg("is duplicate"));
+    }
+
+    let value = cf.args.clone();
+
+    let mut alpn = Vec::with_capacity(value.len() - 1);
+
+    for v in &value[1..] {
+        let mut ccv = CompileComplexValue::default();
+        let cv = compile_complex_value(cf, v, &mut ccv)?;
+
+        if cv.is_constant() && v.len() > 255 {
+            return Err(msg("protocol too long"));
+        }
+
+        alpn.push(cv);
+    }
+
+    pscf.borrow_mut().ssl_alpn = Val::set(Some(alpn));
+
+    Ok(())
+}
+
+/// ngx_stream_proxy_ssl_certificate_cache
+fn proxy_ssl_certificate_cache(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    if pscf.borrow().ssl_certificate_cache.is_set() {
+        return Err(msg("is duplicate"));
+    }
+
+    let value = cf.args.clone();
+
+    let mut max: i64 = 0;
+    let mut inactive: i64 = 10;
+    let mut valid: i64 = 60;
+    let mut off = false;
+
+    for v in &value[1..] {
+        let failed = |cf: &Conf| cf.emerg(format_args!("invalid parameter \"{}\"", B(v)));
+
+        if let Some(n) = v.strip_prefix(b"max=") {
+            max = match ngx_core::string::atoi(n) {
+                Some(m) if m > 0 => m,
+                _ => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if let Some(t) = v.strip_prefix(b"inactive=") {
+            inactive = match ngx_core::parse::parse_time(t, true) {
+                Some(t) => t,
+                None => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if let Some(t) = v.strip_prefix(b"valid=") {
+            valid = match ngx_core::parse::parse_time(t, true) {
+                Some(t) => t,
+                None => return Err(failed(cf)),
+            };
+            continue;
+        }
+
+        if v == b"off" {
+            off = true;
+            continue;
+        }
+
+        return Err(failed(cf));
+    }
+
+    if off {
+        pscf.borrow_mut().ssl_certificate_cache = Val::set(None);
+        return Ok(());
+    }
+
+    if max == 0 {
+        return Err(cf.emerg(format_args!("\"proxy_ssl_certificate_cache\" must have the \"max\" parameter")));
+    }
+
+    let cache = ngx_ssl_cache_init(max as usize, valid, inactive);
+
+    pscf.borrow_mut().ssl_certificate_cache = Val::set(Some(Rc::new(RefCell::new(cache))));
+
+    Ok(())
+}
+
+/// ngx_stream_proxy_ssl_password_file
+fn proxy_ssl_password_file(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    if pscf.borrow().ssl_passwords.is_set() {
+        return Err(msg("is duplicate"));
+    }
+
+    let file = cf.args[1].clone();
+
+    match ngx_ssl_read_password_file(cf, &file) {
+        Some(p) => {
+            pscf.borrow_mut().ssl_passwords = Val::set(Some(p));
+            Ok(())
+        }
+        None => Err(ConfError::Logged),
+    }
+}
+
+/// proxy_ssl_conf_command: ngx_conf_set_keyval_slot with
+/// ngx_stream_proxy_ssl_conf_command_check (SSL_CONF_cmd() is available)
+fn proxy_ssl_conf_command(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
+
+    let mut p = pscf.borrow_mut();
+
+    if !p.ssl_conf_commands.is_set() {
+        p.ssl_conf_commands = Val::set(Some(Vec::new()));
+    }
+
+    p.ssl_conf_commands.0.as_mut().unwrap().as_mut().unwrap().push((cf.args[1].clone(), cf.args[2].clone()));
+
+    Ok(())
+}
+
 fn proxy_protocol_directive(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let pscf = conf_rc::<ProxySrvConf>(conf.as_ref().expect("conf"));
     let mut p = pscf.borrow_mut();
@@ -1434,6 +2232,22 @@ pub fn proxy_module() -> ModuleDef {
             cmd!("proxy_next_upstream_timeout", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, ProxySrvConf, next_upstream_timeout, set_msec),
             cmd_fn!("proxy_protocol", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, proxy_protocol_directive),
             cmd!("proxy_half_close", SRV | NGX_CONF_FLAG, ConfLevel::Srv, ProxySrvConf, half_close, set_flag),
+            cmd!("proxy_ssl", SRV | NGX_CONF_FLAG, ConfLevel::Srv, ProxySrvConf, ssl_enable, set_flag),
+            cmd!("proxy_ssl_session_reuse", SRV | NGX_CONF_FLAG, ConfLevel::Srv, ProxySrvConf, ssl_session_reuse, set_flag),
+            cmd_fn!("proxy_ssl_protocols", SRV | NGX_CONF_1MORE, ConfLevel::Srv, proxy_ssl_protocols),
+            cmd!("proxy_ssl_ciphers", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, ProxySrvConf, ssl_ciphers, set_str),
+            cmd_fn!("proxy_ssl_name", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, proxy_ssl_name_slot),
+            cmd!("proxy_ssl_server_name", SRV | NGX_CONF_FLAG, ConfLevel::Srv, ProxySrvConf, ssl_server_name, set_flag),
+            cmd_fn!("proxy_ssl_alpn", SRV | NGX_CONF_1MORE, ConfLevel::Srv, proxy_ssl_alpn_set_slot),
+            cmd!("proxy_ssl_verify", SRV | NGX_CONF_FLAG, ConfLevel::Srv, ProxySrvConf, ssl_verify, set_flag),
+            cmd!("proxy_ssl_verify_depth", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, ProxySrvConf, ssl_verify_depth, set_num),
+            cmd!("proxy_ssl_trusted_certificate", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, ProxySrvConf, ssl_trusted_certificate, set_str),
+            cmd!("proxy_ssl_crl", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, ProxySrvConf, ssl_crl, set_str),
+            cmd_fn!("proxy_ssl_certificate", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, proxy_ssl_certificate_slot),
+            cmd_fn!("proxy_ssl_certificate_key", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, proxy_ssl_certificate_slot),
+            cmd_fn!("proxy_ssl_certificate_cache", SRV | NGX_CONF_TAKE123, ConfLevel::Srv, proxy_ssl_certificate_cache),
+            cmd_fn!("proxy_ssl_password_file", SRV | NGX_CONF_TAKE1, ConfLevel::Srv, proxy_ssl_password_file),
+            cmd_fn!("proxy_ssl_conf_command", SRV | NGX_CONF_TAKE2, ConfLevel::Srv, proxy_ssl_conf_command),
         ],
     )
 }

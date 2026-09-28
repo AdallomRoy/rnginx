@@ -614,7 +614,7 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
     let vars = [
         VarDef { name: "ssl_protocol", set: None, get: Some(var_ssl_protocol), data: 0, flags: 0 },
         VarDef { name: "ssl_cipher", set: None, get: Some(var_ssl_cipher), data: 0, flags: 0 },
-        VarDef { name: "ssl_ciphers", set: None, get: Some(var_notfound), data: 0, flags: 0 },
+        VarDef { name: "ssl_ciphers", set: None, get: Some(ssl_variable), data: SSL_CIPHERS, flags: 0 },
         VarDef { name: "ssl_session_id", set: None, get: Some(var_ssl_session_id), data: 0, flags: 0 },
         VarDef { name: "ssl_session_reused", set: None, get: Some(var_ssl_session_reused), data: 0, flags: 0 },
         VarDef { name: "ssl_server_name", set: None, get: Some(var_ssl_server_name), data: 0, flags: 0 },
@@ -622,19 +622,19 @@ fn postconfiguration(cf: &mut Conf) -> ConfResult {
         VarDef { name: "ssl_client_cert", set: None, get: Some(var_ssl_client_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
         VarDef { name: "ssl_client_raw_cert", set: None, get: Some(var_ssl_client_raw_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
         VarDef { name: "ssl_client_escaped_cert", set: None, get: Some(var_ssl_client_escaped_cert), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
-        VarDef { name: "ssl_client_s_dn", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_i_dn", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_s_dn_legacy", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_i_dn_legacy", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_serial_number", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_fingerprint", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_v_start", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_v_end", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_client_v_remain", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_alpn_protocol", set: None, get: Some(var_notfound), data: 0, flags: 0 },
-        VarDef { name: "ssl_early_data", set: None, get: Some(var_notfound), data: 0, flags: 0 },
+        VarDef { name: "ssl_client_s_dn", set: None, get: Some(ssl_variable), data: SSL_CLIENT_S_DN, flags: 0 },
+        VarDef { name: "ssl_client_i_dn", set: None, get: Some(ssl_variable), data: SSL_CLIENT_I_DN, flags: 0 },
+        VarDef { name: "ssl_client_s_dn_legacy", set: None, get: Some(ssl_variable), data: SSL_CLIENT_S_DN_LEGACY, flags: 0 },
+        VarDef { name: "ssl_client_i_dn_legacy", set: None, get: Some(ssl_variable), data: SSL_CLIENT_I_DN_LEGACY, flags: 0 },
+        VarDef { name: "ssl_client_serial_number", set: None, get: Some(ssl_variable), data: SSL_CLIENT_SERIAL_NUMBER, flags: 0 },
+        VarDef { name: "ssl_client_fingerprint", set: None, get: Some(ssl_variable), data: SSL_CLIENT_FINGERPRINT, flags: 0 },
+        VarDef { name: "ssl_client_v_start", set: None, get: Some(ssl_variable), data: SSL_CLIENT_V_START, flags: 0 },
+        VarDef { name: "ssl_client_v_end", set: None, get: Some(ssl_variable), data: SSL_CLIENT_V_END, flags: 0 },
+        VarDef { name: "ssl_client_v_remain", set: None, get: Some(ssl_variable), data: SSL_CLIENT_V_REMAIN, flags: 0 },
+        VarDef { name: "ssl_alpn_protocol", set: None, get: Some(ssl_variable), data: SSL_ALPN_PROTOCOL, flags: 0 },
+        VarDef { name: "ssl_early_data", set: None, get: Some(ssl_variable), data: SSL_EARLY_DATA, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
         VarDef { name: "ssl_curve", set: None, get: Some(var_ssl_curve), data: 0, flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE },
-        VarDef { name: "ssl_curves", set: None, get: Some(var_notfound), data: 0, flags: 0 },
+        VarDef { name: "ssl_curves", set: None, get: Some(ssl_variable), data: SSL_CURVES, flags: 0 },
     ];
     crate::variables::add_variables(cf, &vars)?;
 
@@ -1241,6 +1241,58 @@ pub async fn ssl_shutdown(c: &Rc<Connection>) {
             }
         }
     }
+}
+
+// The ngx_ssl_get_*() handlers of ngx_http_ssl_variable(), by the data of
+// the variables.
+
+const SSL_CIPHERS: usize = 0;
+const SSL_CLIENT_S_DN: usize = 1;
+const SSL_CLIENT_I_DN: usize = 2;
+const SSL_CLIENT_S_DN_LEGACY: usize = 3;
+const SSL_CLIENT_I_DN_LEGACY: usize = 4;
+const SSL_CLIENT_SERIAL_NUMBER: usize = 5;
+const SSL_CLIENT_FINGERPRINT: usize = 6;
+const SSL_CLIENT_V_START: usize = 7;
+const SSL_CLIENT_V_END: usize = 8;
+const SSL_CLIENT_V_REMAIN: usize = 9;
+const SSL_ALPN_PROTOCOL: usize = 10;
+const SSL_EARLY_DATA: usize = 11;
+const SSL_CURVES: usize = 12;
+
+static SSL_VARIABLE_HANDLERS: &[ngx_core::event_openssl::SslVariableHandler] = &[
+    ngx_core::event_openssl::ngx_ssl_get_ciphers,
+    ngx_core::event_openssl::ngx_ssl_get_subject_dn,
+    ngx_core::event_openssl::ngx_ssl_get_issuer_dn,
+    ngx_core::event_openssl::ngx_ssl_get_subject_dn_legacy,
+    ngx_core::event_openssl::ngx_ssl_get_issuer_dn_legacy,
+    ngx_core::event_openssl::ngx_ssl_get_serial_number,
+    ngx_core::event_openssl::ngx_ssl_get_fingerprint,
+    ngx_core::event_openssl::ngx_ssl_get_client_v_start,
+    ngx_core::event_openssl::ngx_ssl_get_client_v_end,
+    ngx_core::event_openssl::ngx_ssl_get_client_v_remain,
+    ngx_core::event_openssl::ngx_ssl_get_alpn_protocol,
+    ngx_core::event_openssl::ngx_ssl_get_early_data,
+    ngx_core::event_openssl::ngx_ssl_get_curves,
+];
+
+/// ngx_http_ssl_variable
+fn ssl_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
+    if r.connection.ssl.borrow().is_some() {
+        let mut s = Vec::new();
+
+        if SSL_VARIABLE_HANDLERS[data](&r.connection, &mut s) != NGX_OK {
+            return NGX_ERROR;
+        }
+
+        if !s.is_empty() {
+            return set_var(v, s);
+        }
+    }
+
+    v.not_found = true;
+
+    NGX_OK
 }
 
 // Variable getters — return not_found for stubs so complex_value doesn't fail.

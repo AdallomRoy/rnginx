@@ -1,7 +1,7 @@
 //! PROXY protocol v1 and v2 implementation, ported from ngx_proxy_protocol.c.
 
 use crate::inet::SockAddr;
-use crate::log::{Log, NGX_LOG_DEBUG_CORE, NGX_LOG_ERR};
+use crate::log::{Log, NGX_LOG_ALERT, NGX_LOG_DEBUG_CORE, NGX_LOG_ERR};
 use crate::string::B;
 use crate::{ngx_log_debug, ngx_log_error};
 use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -841,5 +841,189 @@ mod write_tests {
         assert_eq!(h[12], 0x20);
         assert_eq!(h[13], 0x00);
         assert_eq!(u16::from_be_bytes([h[14], h[15]]), 7);
+    }
+}
+
+// --- the SSL TLVs of a v2 header ---
+
+mod ssl_ffi {
+    use std::os::raw::{c_char, c_int, c_uchar};
+
+    pub use crate::openssl_ffi::{EVP_PKEY, X509, X509_NAME};
+
+    #[allow(non_camel_case_types)]
+    pub type X509_NAME_ENTRY = std::os::raw::c_void;
+    #[allow(non_camel_case_types)]
+    pub type ASN1_STRING = std::os::raw::c_void;
+
+    extern "C" {
+        pub fn X509_NAME_get_index_by_NID(name: *const X509_NAME, nid: c_int, lastpos: c_int) -> c_int;
+        pub fn X509_NAME_get_entry(name: *const X509_NAME, loc: c_int) -> *mut X509_NAME_ENTRY;
+        pub fn X509_NAME_ENTRY_get_data(ne: *const X509_NAME_ENTRY) -> *mut ASN1_STRING;
+        pub fn ASN1_STRING_to_UTF8(out: *mut *mut c_uchar, inp: *const ASN1_STRING) -> c_int;
+        pub fn X509_get_signature_nid(x: *const X509) -> c_int;
+        pub fn X509_get_pubkey(x: *mut X509) -> *mut EVP_PKEY;
+        pub fn EVP_PKEY_get_base_id(pkey: *const EVP_PKEY) -> c_int;
+        pub fn EVP_PKEY_get_bits(pkey: *const EVP_PKEY) -> c_int;
+    }
+
+    pub const NID_COMMON_NAME: c_int = 13;
+    pub const EVP_PKEY_RSA: c_int = 6;
+    pub const EVP_PKEY_RSA_PSS: c_int = 912;
+    pub const EVP_PKEY_EC: c_int = 408;
+    pub const EVP_PKEY_DSA: c_int = 116;
+    pub const TLSEXT_NAMETYPE_HOST_NAME: c_int = 0;
+    pub const X509_V_ERR_CERT_REVOKED: std::os::raw::c_long = 23;
+
+    pub unsafe fn cstr<'a>(p: *const c_char) -> &'a [u8] {
+        if p.is_null() {
+            return b"";
+        }
+        std::ffi::CStr::from_ptr(p).to_bytes()
+    }
+}
+
+pub const NGX_PROXY_PROTOCOL_V2_CLIENT_SSL: u8 = 0x01;
+pub const NGX_PROXY_PROTOCOL_V2_CLIENT_CERT_CONN: u8 = 0x02;
+pub const NGX_PROXY_PROTOCOL_V2_CLIENT_CERT_SESS: u8 = 0x04;
+
+/// ngx_proxy_protocol_v2_ssl_sub: Ok(None) is NGX_DECLINED
+unsafe fn v2_ssl_sub(c: &crate::connection::Connection, ssl: *mut crate::openssl_ffi::SSL, ty: u8) -> Result<Option<Vec<u8>>, ()> {
+    use crate::openssl_ffi::*;
+    use ssl_ffi::*;
+
+    match ty {
+        NGX_PROXY_PROTOCOL_TLV_SSL_VERSION => Ok(Some(cstr(SSL_get_version(ssl)).to_vec())),
+
+        NGX_PROXY_PROTOCOL_TLV_SSL_CIPHER => Ok(Some(cstr(SSL_CIPHER_get_name(SSL_get_current_cipher(ssl))).to_vec())),
+
+        NGX_PROXY_PROTOCOL_TLV_SSL_CN => {
+            let cert = SSL_get1_peer_certificate(ssl);
+            if cert.is_null() {
+                return Ok(None);
+            }
+
+            let subject = X509_get_subject_name(cert);
+            if subject.is_null() {
+                X509_free(cert);
+                return Err(());
+            }
+
+            let i = X509_NAME_get_index_by_NID(subject, NID_COMMON_NAME, -1);
+            if i < 0 {
+                X509_free(cert);
+                return Ok(None);
+            }
+
+            let entry = X509_NAME_get_entry(subject, i);
+
+            let mut s: *mut u8 = std::ptr::null_mut();
+            let len = ASN1_STRING_to_UTF8(&mut s, X509_NAME_ENTRY_get_data(entry));
+            if len < 0 {
+                crate::event_openssl::ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("ASN1_STRING_to_UTF8() failed"));
+                X509_free(cert);
+                return Err(());
+            }
+
+            let v = std::slice::from_raw_parts(s, len as usize).to_vec();
+
+            OPENSSL_free(s as *mut std::os::raw::c_void);
+            X509_free(cert);
+
+            Ok(Some(v))
+        }
+
+        NGX_PROXY_PROTOCOL_TLV_SSL_SIG_ALG => {
+            let cert = SSL_get_certificate(ssl);
+            Ok(Some(cstr(OBJ_nid2sn(X509_get_signature_nid(cert))).to_vec()))
+        }
+
+        NGX_PROXY_PROTOCOL_TLV_SSL_KEY_ALG => {
+            let cert = SSL_get_certificate(ssl);
+
+            let pkey = X509_get_pubkey(cert);
+            if pkey.is_null() {
+                return Err(());
+            }
+
+            let alg = match EVP_PKEY_get_base_id(pkey) {
+                EVP_PKEY_RSA | EVP_PKEY_RSA_PSS => "RSA",
+                EVP_PKEY_EC => "EC",
+                EVP_PKEY_DSA => "DSA",
+                _ => {
+                    EVP_PKEY_free(pkey);
+                    return Ok(None);
+                }
+            };
+
+            let v = format!("{}{}", alg, EVP_PKEY_get_bits(pkey)).into_bytes();
+
+            EVP_PKEY_free(pkey);
+
+            Ok(Some(v))
+        }
+
+        _ => Ok(None),
+    }
+}
+
+/// ngx_proxy_protocol_v2_eval_ssl: the TLVs of the TLS client connection
+/// (authority, ALPN) and its SSL TLV
+pub fn proxy_protocol_v2_eval_ssl(c: &crate::connection::Connection) -> Result<(Vec<(u8, Vec<u8>)>, ProxyProtocolSslTlv), ()> {
+    use crate::openssl_ffi::*;
+    use ssl_ffi::*;
+
+    let ssl = crate::event_openssl::ngx_ssl_conn(c);
+
+    let mut tlvs = Vec::new();
+
+    unsafe {
+        // ngx_proxy_protocol_v2_authority
+        let sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_HOST_NAME);
+        if !sni.is_null() {
+            tlvs.push((NGX_PROXY_PROTOCOL_TLV_AUTHORITY, cstr(sni).to_vec()));
+        }
+
+        // ngx_proxy_protocol_v2_alpn
+        let mut alpn: *const u8 = std::ptr::null();
+        let mut alpnlen: std::os::raw::c_uint = 0;
+        SSL_get0_alpn_selected(ssl, &mut alpn, &mut alpnlen);
+        if !alpn.is_null() && alpnlen != 0 {
+            tlvs.push((NGX_PROXY_PROTOCOL_TLV_ALPN, std::slice::from_raw_parts(alpn, alpnlen as usize).to_vec()));
+        }
+
+        let mut ssl_tlvs = Vec::new();
+
+        for ty in NGX_PROXY_PROTOCOL_TLV_SSL_VERSION..=NGX_PROXY_PROTOCOL_TLV_SSL_KEY_ALG {
+            if let Some(v) = v2_ssl_sub(c, ssl, ty)? {
+                ssl_tlvs.push((ty, v));
+            }
+        }
+
+        let mut client = NGX_PROXY_PROTOCOL_V2_CLIENT_SSL;
+        // X509_V_ERR_UNSPECIFIED
+        let mut verify: u32 = 1;
+
+        let cert = SSL_get1_peer_certificate(ssl);
+
+        if !cert.is_null() {
+            X509_free(cert);
+
+            client |= NGX_PROXY_PROTOCOL_V2_CLIENT_CERT_SESS;
+
+            if SSL_session_reused(ssl) == 0 {
+                client |= NGX_PROXY_PROTOCOL_V2_CLIENT_CERT_CONN;
+            }
+
+            let mut n = SSL_get_verify_result(ssl);
+
+            if n == X509_V_OK && crate::event_openssl_stapling::ngx_ssl_ocsp_get_status(c).is_err() {
+                n = X509_V_ERR_CERT_REVOKED;
+            }
+
+            verify = n as u32;
+        }
+
+        Ok((tlvs, ProxyProtocolSslTlv { client, verify, tlvs: ssl_tlvs }))
     }
 }
