@@ -12,4 +12,4 @@ tokio.workspace = true
 openssl.workspace = true
 crc32fast.workspace = true
 foreign-types.workspace = true
-flate2.workspace = true
+libz-sys.workspace = true

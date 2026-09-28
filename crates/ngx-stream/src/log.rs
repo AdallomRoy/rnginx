@@ -7,7 +7,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use flate2::{Compress, Compression, FlushCompress, Status};
 
 use ngx_core::conf::*;
 use ngx_core::log::*;
@@ -413,59 +412,117 @@ fn log_script_write(s: &Session, script: &[Code], buf: &[u8]) -> (Vec<u8>, Resul
     (log, n)
 }
 
+/// The pool of ngx_stream_log_gzip(): zlib's allocations, freed together
+/// (ngx_stream_log_gzip_free does nothing).
+struct GzipPool {
+    log: Log,
+    allocs: Vec<*mut libc::c_void>,
+}
+
+impl Drop for GzipPool {
+    fn drop(&mut self) {
+        for p in self.allocs.drain(..) {
+            unsafe { libc::free(p) };
+        }
+    }
+}
+
+/// ngx_stream_log_gzip_alloc
+unsafe extern "C" fn log_gzip_alloc(opaque: *mut libc::c_void, items: libz_sys::uInt, size: libz_sys::uInt) -> *mut libc::c_void {
+    let pool = &mut *(opaque as *mut GzipPool);
+
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, pool.log, "gzip alloc: n:{} s:{}", items, size);
+
+    let p = libc::malloc(items as usize * size as usize);
+
+    if !p.is_null() {
+        pool.allocs.push(p);
+    }
+
+    p
+}
+
+/// ngx_stream_log_gzip_free
+unsafe extern "C" fn log_gzip_free(_opaque: *mut libc::c_void, _address: *mut libc::c_void) {}
+
 /// ngx_stream_log_gzip: Ok(len) unless write() fails ("simulate successful
 /// logging")
 fn log_gzip(fd: i32, buf: &[u8], level: i64, log: &Log) -> Result<usize, i32> {
     let len = buf.len();
 
-    let mut wbits: i64 = 15;
-    let mut memlevel: i64 = 8;
+    let mut wbits: i32 = 15; // MAX_WBITS
+    let mut memlevel: i32 = 9 - 1; // MAX_MEM_LEVEL - 1
 
-    while (len as i64) < ((1 << (wbits - 1)) - 262) {
+    while (len as i64) < ((1i64 << (wbits - 1)) - 262) {
         wbits -= 1;
         memlevel -= 1;
     }
 
-    let _ = memlevel;
-
     // This is a formula from deflateBound() for conservative upper bound of
     // compressed data plus 18 bytes of gzip wrapper.
 
-    let size = len + ((len + 7) >> 3) + ((len + 63) >> 6) + 5 + 18;
+    let mut size = len + ((len + 7) >> 3) + ((len + 63) >> 6) + 5 + 18;
+
+    let mut pool = Box::new(GzipPool { log: log.clone(), allocs: Vec::new() });
 
     let mut out = vec![0u8; size];
 
-    let mut zstream = Compress::new_gzip(Compression::new(level as u32), wbits as u8);
+    let mut zstream = libz_sys::z_stream {
+        next_in: buf.as_ptr() as *mut u8,
+        avail_in: len as libz_sys::uInt,
+        total_in: 0,
+        next_out: out.as_mut_ptr(),
+        avail_out: size as libz_sys::uInt,
+        total_out: 0,
+        msg: std::ptr::null_mut(),
+        state: std::ptr::null_mut(),
+        zalloc: log_gzip_alloc,
+        zfree: log_gzip_free,
+        opaque: &mut *pool as *mut GzipPool as *mut libc::c_void,
+        data_type: 0,
+        adler: 0,
+        reserved: 0,
+    };
 
-    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, log, "deflate in: ni:{:p} no:{:p} ai:{} ao:{}", buf.as_ptr(), out.as_ptr(), len, size);
+    let rc = unsafe {
+        libz_sys::deflateInit2_(
+            &mut zstream,
+            level as i32,
+            libz_sys::Z_DEFLATED,
+            wbits + 16,
+            memlevel,
+            libz_sys::Z_DEFAULT_STRATEGY,
+            libz_sys::zlibVersion(),
+            std::mem::size_of::<libz_sys::z_stream>() as i32,
+        )
+    };
 
-    let rc = zstream.compress(buf, &mut out, FlushCompress::Finish);
-
-    match rc {
-        Ok(Status::StreamEnd) => {}
-
-        Ok(Status::Ok) => {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "deflate(Z_FINISH) failed: 0");
-            return Ok(len);
-        }
-
-        Ok(Status::BufError) | Err(_) => {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "deflate(Z_FINISH) failed: -5");
-            return Ok(len);
-        }
+    if rc != libz_sys::Z_OK {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "deflateInit2() failed: {}", rc);
+        return Ok(len);
     }
 
-    let size = zstream.total_out() as usize;
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, log, "deflate in: ni:{:p} no:{:p} ai:{} ao:{}", zstream.next_in, zstream.next_out, zstream.avail_in, zstream.avail_out);
 
-    ngx_log_debug!(
-        NGX_LOG_DEBUG_STREAM,
-        log,
-        "deflate out: ni:{:p} no:{:p} ai:{} ao:{} rc:1",
-        buf[zstream.total_in() as usize..].as_ptr(),
-        out[size..].as_ptr(),
-        len - zstream.total_in() as usize,
-        out.len() - size
-    );
+    let rc = unsafe { libz_sys::deflate(&mut zstream, libz_sys::Z_FINISH) };
+
+    if rc != libz_sys::Z_STREAM_END {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "deflate(Z_FINISH) failed: {}", rc);
+        return Ok(len);
+    }
+
+    ngx_log_debug!(NGX_LOG_DEBUG_STREAM, log, "deflate out: ni:{:p} no:{:p} ai:{} ao:{} rc:{}", zstream.next_in, zstream.next_out, zstream.avail_in, zstream.avail_out, rc);
+
+    size -= zstream.avail_out as usize;
+
+    let rc = unsafe { libz_sys::deflateEnd(&mut zstream) };
+
+    if rc != libz_sys::Z_OK {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "deflateEnd() failed: {}", rc);
+        return Ok(len);
+    }
+
+    drop(pool);
 
     match os::write_fd(fd, &out[..size]) {
         Ok(n) if n == size => {}
