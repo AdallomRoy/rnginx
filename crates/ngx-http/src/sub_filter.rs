@@ -167,6 +167,7 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
 
     let mut output = Chain::new();
     let mut last_buf_flag = false;
+    let mut flush_flag = false;
     let mut had_memory_buf = false;
 
     // Collect all memory buffers and pass through non-memory buffers.
@@ -181,6 +182,9 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
                 full_content.extend_from_slice(&v[buf.pos..buf.last]);
                 if buf.last_buf {
                     last_buf_flag = true;
+                }
+                if buf.flush {
+                    flush_flag = true;
                 }
             }
             _ => {
@@ -283,11 +287,15 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     if !emit_vec.is_empty() {
         let mut new_buf = Buf::from_vec(emit_vec);
         new_buf.last_buf = last_buf_flag;
+        new_buf.flush = flush_flag;
         output.push_back(new_buf);
-    } else if last_buf_flag {
-        // Preserve the last_buf signal downstream even if nothing to emit.
+    } else if last_buf_flag || flush_flag {
+        // Preserve the last_buf and flush signals downstream even if
+        // nothing to emit (b->last_buf = ctx->buf->last_buf, b->flush =
+        // ctx->buf->flush on a sync buffer).
         let mut new_buf = Buf::from_vec(Vec::new());
-        new_buf.last_buf = true;
+        new_buf.last_buf = last_buf_flag;
+        new_buf.flush = flush_flag;
         new_buf.sync = true;
         output.push_back(new_buf);
     }
