@@ -16,6 +16,7 @@ use tokio::net::TcpStream;
 pub enum UpstreamSock {
     Tcp(TcpStream),
     Unix(tokio::net::UnixStream),
+    Ssl(Box<crate::upstream_ssl::UpstreamSsl>),
 }
 
 use std::pin::Pin;
@@ -29,6 +30,7 @@ impl AsyncRead for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_read(cx, buf),
             }
         }
     }
@@ -40,6 +42,7 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, b),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_write(cx, b),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_write(cx, b),
             }
         }
     }
@@ -49,6 +52,7 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_flush(cx),
             }
         }
     }
@@ -58,6 +62,7 @@ impl AsyncWrite for UpstreamSock {
             match this {
                 UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                UpstreamSock::Ssl(s) => Pin::new_unchecked(&mut **s).poll_shutdown(cx),
             }
         }
     }
@@ -66,12 +71,13 @@ impl UpstreamSock {
     /// Wait until the upstream has sent data or closed. The readiness is
     /// checked with a peek, so a stale one (a keepalive connection whose
     /// last response ended without EAGAIN) is cleared instead of reported.
-    async fn wait_readable(&self) {
+    async fn wait_readable(&mut self) {
         use std::os::unix::io::AsRawFd;
         loop {
             let (ready, peek) = match self {
                 UpstreamSock::Tcp(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
                 UpstreamSock::Unix(s) => (s.readable().await, s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd()))),
+                UpstreamSock::Ssl(s) => return s.wait_readable().await,
             };
             if ready.is_err() {
                 return;
@@ -126,6 +132,27 @@ pub struct NgxHttpProxyLocConf {
     pub pass_request_body: Val<bool>,
     /// proxy_request_buffering (default on).
     pub request_buffering: Val<bool>,
+    /// proxy_connect_timeout (default 60s): connecting, and the TLS
+    /// handshake.
+    pub connect_timeout: Val<u64>,
+    /// proxy_ssl_protocols (a bitmask, 0 when not set).
+    pub ssl_protocols: u32,
+    /// proxy_ssl_ciphers (default "DEFAULT").
+    pub ssl_ciphers: Val<Vec<u8>>,
+    /// proxy_ssl_server_name (default off).
+    pub ssl_server_name: Val<bool>,
+    /// proxy_ssl_name (default: the host of proxy_pass).
+    pub ssl_name: Option<crate::script::ComplexValue>,
+    /// proxy_ssl_session_reuse (default on).
+    pub ssl_session_reuse: Val<bool>,
+    /// proxy_ssl_verify (default off).
+    pub ssl_verify: Val<bool>,
+    /// proxy_ssl_verify_depth (default 1).
+    pub ssl_verify_depth: Val<i64>,
+    /// proxy_ssl_trusted_certificate.
+    pub ssl_trusted_certificate: Val<Vec<u8>>,
+    /// The SSL context of https upstreams (ngx_http_proxy_set_ssl).
+    pub ssl_ctx: Option<openssl::ssl::SslContext>,
     /// proxy_set_body: overrides the request body sent upstream (complex value).
     pub set_body: Option<crate::script::ComplexValue>,
     /// proxy_set_header entries: (name, complex value). Empty value drops the
@@ -278,6 +305,16 @@ impl Default for NgxHttpProxyLocConf {
             pass_request_headers: Val::unset(),
             pass_request_body: Val::unset(),
             request_buffering: Val::unset(),
+            connect_timeout: Val::unset(),
+            ssl_protocols: 0,
+            ssl_ciphers: Val::unset(),
+            ssl_server_name: Val::unset(),
+            ssl_name: None,
+            ssl_session_reuse: Val::unset(),
+            ssl_verify: Val::unset(),
+            ssl_verify_depth: Val::unset(),
+            ssl_trusted_certificate: Val::unset(),
+            ssl_ctx: None,
             set_body: None,
             set_headers: Vec::new(),
             force_ranges: Val::unset(),
@@ -303,9 +340,10 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(NgxHttpProxyLocConf::default())
 }
 
-fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
+fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let p = conf_cell::<NgxHttpProxyLocConf>(prev).borrow();
     let mut c = conf_cell::<NgxHttpProxyLocConf>(conf).borrow_mut();
+    merge_ssl(cf, &p, &mut c)?;
     if c.upstream_uri.is_none() {
         c.upstream_uri = p.upstream_uri.clone();
     }
@@ -319,6 +357,7 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     c.pass_request_headers.merge(&p.pass_request_headers, true);
     c.pass_request_body.merge(&p.pass_request_body, true);
     c.request_buffering.merge(&p.request_buffering, true);
+    c.connect_timeout.merge(&p.connect_timeout, 60000);
     if c.set_body.is_none() {
         c.set_body = p.set_body.clone();
     }
@@ -386,6 +425,75 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
     if c.cache.max_range_offset.is_none() { c.cache.max_range_offset = p.cache.max_range_offset; }
     if c.cache.min_uses == 1 { c.cache.min_uses = p.cache.min_uses; }
+    Ok(())
+}
+
+/// The proxy_ssl_* part of ngx_http_proxy_merge_loc_conf, with
+/// ngx_http_proxy_merge_ssl and ngx_http_proxy_set_ssl: a location that
+/// proxies to https (or to a URL with variables) gets an SSL context, the
+/// parent's when it sets no proxy_ssl_* directive of its own.
+fn merge_ssl(cf: &mut Conf, p: &NgxHttpProxyLocConf, c: &mut NgxHttpProxyLocConf) -> ConfResult {
+    let own = c.ssl_protocols != 0
+        || c.ssl_ciphers.is_set()
+        || c.ssl_verify.is_set()
+        || c.ssl_verify_depth.is_set()
+        || c.ssl_trusted_certificate.is_set()
+        || c.ssl_session_reuse.is_set();
+
+    if c.ssl_protocols == 0 {
+        c.ssl_protocols = if p.ssl_protocols != 0 { p.ssl_protocols } else { crate::upstream_ssl::DEFAULT_PROTOCOLS };
+    }
+    c.ssl_ciphers.merge(&p.ssl_ciphers, b"DEFAULT".to_vec());
+    c.ssl_server_name.merge(&p.ssl_server_name, false);
+    if c.ssl_name.is_none() {
+        c.ssl_name = p.ssl_name.clone();
+    }
+    c.ssl_session_reuse.merge(&p.ssl_session_reuse, true);
+    c.ssl_verify.merge(&p.ssl_verify, false);
+    c.ssl_verify_depth.merge(&p.ssl_verify_depth, 1);
+    c.ssl_trusted_certificate.merge(&p.ssl_trusted_certificate, Vec::new());
+
+    if !own && p.ssl_ctx.is_some() {
+        c.ssl_ctx = p.ssl_ctx.clone();
+        return Ok(());
+    }
+
+    let upstream_uri = match c.upstream_uri.as_ref().or(p.upstream_uri.as_ref()) {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+    let ssl = upstream_uri.len() >= 8 && upstream_uri[..8].eq_ignore_ascii_case(b"https://") || upstream_uri.contains(&b'$');
+    if !ssl {
+        return Ok(());
+    }
+
+    let trusted;
+    let verify = if *c.ssl_verify.get() {
+        if c.ssl_trusted_certificate.get().is_empty() {
+            return Err(cf.emerg(format_args!("no proxy_ssl_trusted_certificate for proxy_ssl_verify")));
+        }
+        // ngx_conf_full_name
+        trusted = cf.cycle.full_name(c.ssl_trusted_certificate.get(), true);
+        Some((trusted.as_slice(), *c.ssl_verify_depth.get() as u32))
+    } else {
+        None
+    };
+
+    match crate::upstream_ssl::create_ctx(c.ssl_protocols, c.ssl_ciphers.get(), verify, *c.ssl_session_reuse.get()) {
+        Ok(ctx) => c.ssl_ctx = Some(ctx),
+        Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+    }
+    Ok(())
+}
+
+fn proxy_ssl_name_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    if cell.borrow().ssl_name.is_some() {
+        return Err(msg("is duplicate"));
+    }
+    let args = cf.args.clone();
+    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+    cell.borrow_mut().ssl_name = Some(cv);
     Ok(())
 }
 
@@ -502,13 +610,6 @@ fn proxy_bind_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
     }
     let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
     cell.borrow_mut().local_bind = Some(LocalBind::Addr(cv));
-    Ok(())
-}
-
-fn proxy_connect_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("invalid number of arguments"));
-    }
     Ok(())
 }
 
@@ -693,7 +794,7 @@ async fn proxy_handler(r: R) -> i64 {
             prefixed
         };
         // Ensure a trailing slash for path so parse_upstream_uri finds "/".
-        if !u.contains(&b'/') || (u.starts_with(b"http://") && !u[7..].contains(&b'/')) {
+        if !u.contains(&b'/') || (u.starts_with(b"http://") && !u[7..].contains(&b'/')) || (u.starts_with(b"https://") && !u[8..].contains(&b'/')) {
             u.push(b'/');
         }
         u
@@ -736,6 +837,8 @@ async fn proxy_handler(r: R) -> i64 {
             return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
         }
     };
+    // u->ssl_name: the host of the URL, or the upstream{} name
+    let ssl_host = host.clone();
 
     // Name of the upstream {} block if `host` is one; used by
     // proxy_next_upstream to iterate its peers after the initial pick
@@ -782,7 +885,7 @@ async fn proxy_handler(r: R) -> i64 {
     let is_variable_pass = conf_borrowed.upstream_uri_cv.is_some();
     let forwarded_uri: Vec<u8> = if is_variable_pass {
         upstream_path.as_bytes().to_vec()
-    } else if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[7..].contains('/') {
+    } else if upstream_path != "/" || upstream_uri_str.ends_with('/') || upstream_uri_str.contains("//") && upstream_uri_str[scheme_len(upstream_uri_str)..].contains('/') {
         let mut u = upstream_path.as_bytes().to_vec();
         // Strip trailing slash if adding suffix that starts with /
         let tail = if request_uri.starts_with(loc_name.as_slice()) {
@@ -1100,6 +1203,36 @@ async fn proxy_handler(r: R) -> i64 {
         method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, reval_hdrs, forward_headers
     );
 
+    // https: ngx_http_upstream_ssl_init_connection after connecting
+    let connect_timeout = *lcf.borrow().connect_timeout.get();
+    let ssl_setup = if upstream_uri.len() >= 8 && upstream_uri[..8].eq_ignore_ascii_case(b"https://") {
+        let c = lcf.borrow();
+        let ctx = match c.ssl_ctx.clone() {
+            Some(ctx) => ctx,
+            None => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
+        };
+        let (server_name, verify) = (*c.ssl_server_name.get(), *c.ssl_verify.get());
+        let name_cv = c.ssl_name.clone();
+        let session_reuse = *c.ssl_session_reuse.get();
+        drop(c);
+        // ngx_http_upstream_ssl_name: proxy_ssl_name, or the upstream host
+        let name = if server_name || verify {
+            let name = match name_cv {
+                Some(cv) => match crate::script::complex_value(&r, &cv) {
+                    Ok(v) => v,
+                    Err(_) => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
+                },
+                None => ssl_host.clone().into_bytes(),
+            };
+            Some((name, server_name))
+        } else {
+            None
+        };
+        Some(SslSetup { ctx, session_reuse, name, verify })
+    } else {
+        None
+    };
+
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
     // rotate to the next non-tried peer of the named upstream and reconnect.
     let mut upstream: Option<UpstreamSock> = None;
@@ -1136,9 +1269,14 @@ async fn proxy_handler(r: R) -> i64 {
         };
         upstream = Some(match pooled {
             Some(s) => { connect_ms = 0; UpstreamSock::Tcp(s) }
-            None => match connect_with_optional_bind(&addr, bind_addr).await {
+            None => match connect_upstream(&r, &addr, bind_addr, ssl_setup.as_ref(), connect_timeout).await {
             Ok(s) => s,
-            Err(_e) => {
+            Err(e) => {
+                let (status, ft) = match e {
+                    ConnectError::Error => (NGX_HTTP_BAD_GATEWAY as i64, FT_ERROR),
+                    ConnectError::Timeout => (crate::NGX_HTTP_GATEWAY_TIME_OUT, FT_TIMEOUT),
+                    ConnectError::Internal => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
+                };
                 // Record this attempt as a failed peer so $upstream_addr
                 // reflects every hop (matches C's u->state list-append). The
                 // connect timer already captured how long we spent before
@@ -1146,7 +1284,7 @@ async fn proxy_handler(r: R) -> i64 {
                 // (u64::MAX ⇒ formatted as "-" like C's ms == -1).
                 let connect_ms_err = ngx_core::times::current_msec().saturating_sub(try_started_ms);
                 r.upstream_states.borrow_mut().push(crate::request::UpstreamState {
-                    status: 502,
+                    status,
                     response_length: 0,
                     bytes_received: 0,
                     bytes_sent: 0,
@@ -1159,7 +1297,7 @@ async fn proxy_handler(r: R) -> i64 {
                 if let Some(name) = &named_upstream {
                     crate::upstream::mark_bad_server(&r, name, &host, port);
                 }
-                if next_upstream_mask & FT_ERROR != 0 {
+                if next_upstream_mask & ft != 0 {
                     if let Some(name) = &named_upstream {
                         let can_try = attempts < peer_limit
                             && (next_upstream_tries == 0 || attempts < next_upstream_tries);
@@ -1172,7 +1310,7 @@ async fn proxy_handler(r: R) -> i64 {
                         }
                     }
                 }
-                return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
+                return return_error(&r, status).await;
             }
         } });
         connect_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
@@ -1600,11 +1738,7 @@ async fn proxy_handler(r: R) -> i64 {
     r.upstream_headers_in.borrow_mut().clear();
 
     // Set status in response headers and copy upstream headers
-    let mut upstream_chunked = false;
-    let mut saw_content_length = false;
-    let mut saw_transfer_encoding = false;
-    let mut invalid_headers = false;
-    let mut duplicate_expires = false;
+    let mut copied = crate::upstream::CopiedHeaders::default();
     // Effective hide list: default PROXY_HIDE_HEADERS + user's hide_headers,
     // minus user's pass_headers (pass wins over hide). Precompute once so the
     // per-header check is a linear scan on a short vec.
@@ -1647,123 +1781,7 @@ async fn proxy_handler(r: R) -> i64 {
                     pos = line_end + 1;
                     continue;
                 }
-                // Handle a few well-known headers specially so header_filter renders them.
-                match lc.as_slice() {
-                    b"content-length" => {
-                        if saw_content_length {
-                            invalid_headers = true;
-                        }
-                        saw_content_length = true;
-                        // Parse strictly: any non-digit → invalid. C sets
-                        // NGX_HTTP_UPSTREAM_INVALID_HEADER on parse failure.
-                        let vtrim = std::str::from_utf8(value).map(|s| s.trim()).unwrap_or("");
-                        match vtrim.parse::<i64>() {
-                            Ok(n) if n >= 0 => ho.content_length_n = n,
-                            _ => invalid_headers = true,
-                        }
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.content_length = Some(h);
-                    }
-                    b"content-type" => {
-                        // Mirror ngx_http_upstream_copy_content_type: split on
-                        // the first `;` that begins `; charset=…` and copy
-                        // the charset out to headers_out.charset so downstream
-                        // filters (e.g. charset_filter override) can find it.
-                        ho.content_type = value.to_vec();
-                        ho.content_type_len = value.len();
-                        let mut p = 0usize;
-                        while p < value.len() {
-                            if value[p] != b';' { p += 1; continue; }
-                            let semi = p;
-                            let mut q = p + 1;
-                            while q < value.len() && value[q] == b' ' { q += 1; }
-                            if q + 8 <= value.len() && value[q..q+8].eq_ignore_ascii_case(b"charset=") {
-                                let mut cs_start = q + 8;
-                                let mut cs_end = value.len();
-                                if cs_start < cs_end && value[cs_start] == b'"' { cs_start += 1; }
-                                if cs_end > cs_start && value[cs_end - 1] == b'"' { cs_end -= 1; }
-                                ho.content_type_len = semi;
-                                ho.charset = value[cs_start..cs_end].to_vec();
-                                break;
-                            }
-                            p = q;
-                        }
-                    }
-                    b"transfer-encoding" => {
-                        // C rejects duplicate Transfer-Encoding, and any value
-                        // other than "chunked" or "identity".
-                        if saw_transfer_encoding {
-                            invalid_headers = true;
-                        }
-                        saw_transfer_encoding = true;
-                        if value.eq_ignore_ascii_case(b"chunked") {
-                            upstream_chunked = true;
-                        } else if !value.eq_ignore_ascii_case(b"identity") {
-                            invalid_headers = true;
-                        }
-                    }
-                    b"expires" => {
-                        // Only accept the first Expires; C's header handler for
-                        // Expires drops duplicates.
-                        if ho.expires.is_some() {
-                            duplicate_expires = true;
-                        } else {
-                            let h = crate::request::TableElt::new(name, value);
-                            ho.expires = Some(h.clone());
-                            ho.add(name, value);
-                        }
-                    }
-                    b"connection" | b"keep-alive" => {
-                        // Hop-by-hop headers: normally stripped to the
-                        // client — except 101 Switching Protocols, where
-                        // Connection: Upgrade is the negotiation the client
-                        // is waiting to see.
-                        if status == 101 {
-                            ho.add(name, value);
-                        }
-                    }
-                    b"date" => {
-                        // Only reached if not hidden (proxy_pass_header Date).
-                        // Populate the typed slot so header_filter's "if
-                        // ho.date.is_none()" branch does NOT then also emit
-                        // its own Date, which would give two Date lines.
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.date = Some(h);
-                    }
-                    b"server" => {
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.server = Some(h);
-                    }
-                    b"location" => {
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.location = Some(h);
-                    }
-                    b"last-modified" => {
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.last_modified = Some(h);
-                        // Also parse into last_modified_time so If-Range and
-                        // If-Modified-Since date comparisons work.
-                        if let Some(t) = ngx_core::parse::parse_http_time(value) {
-                            ho.last_modified_time = t;
-                        }
-                    }
-                    b"etag" => {
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.etag = Some(h);
-                    }
-                    b"content-encoding" => {
-                        // Populate the typed slot so gunzip_filter can detect
-                        // upstream-gzipped responses (matches C's
-                        // ngx_http_upstream_process_header stash into
-                        // headers_in.content_encoding).
-                        let h = crate::request::TableElt::new(name, value);
-                        ho.content_encoding = Some(h.clone());
-                        ho.headers.push(h);
-                    }
-                    _ => {
-                        ho.add(name, value);
-                    }
-                }
+                crate::upstream::copy_header(&mut ho, &mut copied, status, name, value);
             }
             pos = line_end + 1;
         }
@@ -1772,13 +1790,13 @@ async fn proxy_handler(r: R) -> i64 {
     // If the upstream sent malformed / duplicate framing headers per C
     // ngx_http_proxy_process_header semantics, bail with 502 before we send
     // anything to the client.
-    if invalid_headers
-        || (upstream_chunked && saw_content_length)
+    if copied.invalid
+        || (copied.chunked && copied.saw_content_length)
     {
         return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
     }
     // Suppress duplicate Expires (silently drop the second occurrence).
-    let _ = duplicate_expires;
+    let _ = copied.duplicate_expires;
 
     // X-Accel-Limit-Rate: bytes-per-second cap on the response, matching
     // ngx_http_upstream_process_limit_rate. Applied to r.limit_rate BEFORE
@@ -2103,7 +2121,7 @@ async fn proxy_handler(r: R) -> i64 {
     if body_start < response.len() {
         let mut short_response = false;
         let body_owned: Vec<u8>;
-        let body: &[u8] = if upstream_chunked {
+        let body: &[u8] = if copied.chunked {
             body_owned = decode_chunked(&response[body_start..]);
             &body_owned
         } else {
@@ -2451,6 +2469,15 @@ fn decode_chunked(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The length of the "http://" or "https://" prefix of a proxy_pass URL.
+fn scheme_len(uri: &str) -> usize {
+    if uri.len() >= 8 && uri[..8].eq_ignore_ascii_case("https://") {
+        8
+    } else {
+        7
+    }
+}
+
 fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
     let (rest, default_port) = if let Some(r) = uri.strip_prefix("http://") {
         (r, 80u16)
@@ -2513,6 +2540,16 @@ fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
+/// The values of proxy_ssl_protocols (ngx_http_proxy_ssl_protocols).
+const SSL_PROTOCOLS: &[(&str, u32)] = &[
+    ("SSLv2", 0x0002),
+    ("SSLv3", 0x0004),
+    ("TLSv1", 0x0008),
+    ("TLSv1.1", 0x0010),
+    ("TLSv1.2", 0x0020),
+    ("TLSv1.3", 0x0040),
+];
+
 pub fn proxy_module() -> ModuleDef {
     let commands = vec![
         cmd_fn!("proxy_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_pass_handler),
@@ -2520,7 +2557,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_buffering_handler),
         ngx_core::cmd!("proxy_request_buffering", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, request_buffering, set_flag),
         cmd_fn!("proxy_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_bind_handler),
-        cmd_fn!("proxy_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_connect_timeout_handler),
+        ngx_core::cmd!("proxy_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, connect_timeout, set_msec),
         cmd_fn!("proxy_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_send_timeout_handler),
         cmd_fn!("proxy_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_read_timeout_handler),
         cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_set_header_handler),
@@ -2686,16 +2723,16 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_ssl_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ssl_certificate_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ssl_password_file", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_ciphers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_protocols", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_server_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_verify", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_verify_depth", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_trusted_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_ssl_ciphers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_ciphers, set_str),
+        ngx_core::cmd!("proxy_ssl_protocols", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_protocols, set_bitmask, SSL_PROTOCOLS),
+        cmd_fn!("proxy_ssl_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_ssl_name_handler),
+        ngx_core::cmd!("proxy_ssl_server_name", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_server_name, set_flag),
+        ngx_core::cmd!("proxy_ssl_verify", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_verify, set_flag),
+        ngx_core::cmd!("proxy_ssl_verify_depth", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_verify_depth, set_num),
+        ngx_core::cmd!("proxy_ssl_trusted_certificate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_trusted_certificate, set_str),
         cmd_fn!("proxy_ssl_crl", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_ssl_conf_command", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_ssl_session_reuse", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_ssl_session_reuse", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_session_reuse, set_flag),
         cmd_fn!("proxy_ssl_key_log", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
     ];
 
@@ -2962,6 +2999,93 @@ fn parse_bind_addr(s: &str) -> Option<std::net::SocketAddr> {
 /// `bind` with port 0 lets the kernel pick the source port; a nonzero port
 /// (from `proxy_bind 127.0.0.1:$remote_port` style) will be used verbatim,
 /// with SO_REUSEADDR to allow rebinding TIME_WAIT sockets.
+/// How connecting to the upstream failed (ngx_http_upstream_next).
+enum ConnectError {
+    /// NGX_HTTP_UPSTREAM_FT_ERROR: 502, unless another upstream is tried.
+    Error,
+    /// NGX_HTTP_UPSTREAM_FT_TIMEOUT: 504, unless another upstream is tried.
+    Timeout,
+    /// The TLS connection could not be set up: 500.
+    Internal,
+}
+
+/// The TLS side of an https upstream.
+struct SslSetup {
+    ctx: openssl::ssl::SslContext,
+    session_reuse: bool,
+    name: Option<(Vec<u8>, bool)>,
+    verify: bool,
+}
+
+/// Connect to the upstream and, for https, run the TLS handshake
+/// (ngx_http_upstream_ssl_init_connection), both within
+/// proxy_connect_timeout.
+async fn connect_upstream(
+    r: &R,
+    addr: &str,
+    bind: Option<std::net::SocketAddr>,
+    ssl: Option<&SslSetup>,
+    timeout: u64,
+) -> Result<UpstreamSock, ConnectError> {
+    let log = r.connection.log.clone();
+    let action = log.action();
+    let handshaking = std::cell::Cell::new(false);
+
+    let connect = async {
+        let sock = connect_with_optional_bind(addr, bind).await.map_err(|_| ConnectError::Error)?;
+
+        let ssl = match ssl {
+            Some(s) => s,
+            None => return Ok(sock),
+        };
+
+        let io = match sock {
+            UpstreamSock::Tcp(s) => crate::upstream_ssl::SockIo::Tcp(s),
+            UpstreamSock::Unix(s) => crate::upstream_ssl::SockIo::Unix(s),
+            UpstreamSock::Ssl(_) => unreachable!(),
+        };
+
+        handshaking.set(true);
+        log.set_action(Some("SSL handshaking to upstream"));
+
+        let params = crate::upstream_ssl::Params {
+            ctx: &ssl.ctx,
+            session_peer: if ssl.session_reuse { Some(addr) } else { None },
+            name: ssl.name.as_ref().map(|(n, sni)| (n.as_slice(), *sni)),
+            verify: ssl.verify,
+        };
+
+        let rc = crate::upstream_ssl::handshake(io, params).await;
+
+        let rc = match rc {
+            Ok(s) => Ok(UpstreamSock::Ssl(Box::new(s))),
+            Err(crate::upstream_ssl::HandshakeError::Failed(e)) => {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, None, "{}", e);
+                Err(ConnectError::Error)
+            }
+            Err(crate::upstream_ssl::HandshakeError::Internal(e)) => {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, None, "{}", e);
+                Err(ConnectError::Internal)
+            }
+        };
+
+        log.set_action(action);
+
+        rc
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout), connect).await {
+        Ok(rc) => rc,
+        Err(_) => {
+            let during = if handshaking.get() { "SSL handshaking to upstream" } else { "connecting to upstream" };
+            log.set_action(Some(during));
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
+            log.set_action(action);
+            Err(ConnectError::Timeout)
+        }
+    }
+}
+
 async fn connect_with_optional_bind(
     addr: &str,
     bind: Option<std::net::SocketAddr>,

@@ -1277,3 +1277,137 @@ mod tests {
         assert!(ctx.pass_request_headers);
     }
 }
+
+/// What copying an upstream's response headers found about the framing
+/// (the checks of ngx_http_proxy_process_header and of the upstream
+/// headers_in handlers).
+#[derive(Default)]
+pub struct CopiedHeaders {
+    pub saw_content_length: bool,
+    pub saw_transfer_encoding: bool,
+    pub chunked: bool,
+    pub invalid: bool,
+    pub duplicate_expires: bool,
+}
+
+/// Copy one upstream response header to headers_out: those
+/// ngx_http_upstream.c handles go to their slots, the rest are added.
+pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, status: i64, name: &[u8], value: &[u8]) {
+    let lc = name.to_ascii_lowercase();
+    match lc.as_slice() {
+        b"content-length" => {
+            if st.saw_content_length {
+                st.invalid = true;
+            }
+            st.saw_content_length = true;
+            // Parse strictly: any non-digit → invalid. C sets
+            // NGX_HTTP_UPSTREAM_INVALID_HEADER on parse failure.
+            let vtrim = std::str::from_utf8(value).map(|s| s.trim()).unwrap_or("");
+            match vtrim.parse::<i64>() {
+                Ok(n) if n >= 0 => ho.content_length_n = n,
+                _ => st.invalid = true,
+            }
+            let h = crate::request::TableElt::new(name, value);
+            ho.content_length = Some(h);
+        }
+        b"content-type" => {
+            // Mirror ngx_http_upstream_copy_content_type: split on
+            // the first `;` that begins `; charset=…` and copy
+            // the charset out to headers_out.charset so downstream
+            // filters (e.g. charset_filter override) can find it.
+            ho.content_type = value.to_vec();
+            ho.content_type_len = value.len();
+            let mut p = 0usize;
+            while p < value.len() {
+                if value[p] != b';' { p += 1; continue; }
+                let semi = p;
+                let mut q = p + 1;
+                while q < value.len() && value[q] == b' ' { q += 1; }
+                if q + 8 <= value.len() && value[q..q+8].eq_ignore_ascii_case(b"charset=") {
+                    let mut cs_start = q + 8;
+                    let mut cs_end = value.len();
+                    if cs_start < cs_end && value[cs_start] == b'"' { cs_start += 1; }
+                    if cs_end > cs_start && value[cs_end - 1] == b'"' { cs_end -= 1; }
+                    ho.content_type_len = semi;
+                    ho.charset = value[cs_start..cs_end].to_vec();
+                    break;
+                }
+                p = q;
+            }
+        }
+        b"transfer-encoding" => {
+            // C rejects duplicate Transfer-Encoding, and any value
+            // other than "chunked" or "identity".
+            if st.saw_transfer_encoding {
+                st.invalid = true;
+            }
+            st.saw_transfer_encoding = true;
+            if value.eq_ignore_ascii_case(b"chunked") {
+                st.chunked = true;
+            } else if !value.eq_ignore_ascii_case(b"identity") {
+                st.invalid = true;
+            }
+        }
+        b"expires" => {
+            // Only accept the first Expires; C's header handler for
+            // Expires drops duplicates.
+            if ho.expires.is_some() {
+                st.duplicate_expires = true;
+            } else {
+                let h = crate::request::TableElt::new(name, value);
+                ho.expires = Some(h.clone());
+                ho.add(name, value);
+            }
+        }
+        b"connection" | b"keep-alive" => {
+            // Hop-by-hop headers: normally stripped to the
+            // client — except 101 Switching Protocols, where
+            // Connection: Upgrade is the negotiation the client
+            // is waiting to see.
+            if status == 101 {
+                ho.add(name, value);
+            }
+        }
+        b"date" => {
+            // Only reached if not hidden (proxy_pass_header Date).
+            // Populate the typed slot so header_filter's "if
+            // ho.date.is_none()" branch does NOT then also emit
+            // its own Date, which would give two Date lines.
+            let h = crate::request::TableElt::new(name, value);
+            ho.date = Some(h);
+        }
+        b"server" => {
+            let h = crate::request::TableElt::new(name, value);
+            ho.server = Some(h);
+        }
+        b"location" => {
+            let h = crate::request::TableElt::new(name, value);
+            ho.location = Some(h);
+        }
+        b"last-modified" => {
+            let h = crate::request::TableElt::new(name, value);
+            ho.last_modified = Some(h);
+            // Also parse into last_modified_time so If-Range and
+            // If-Modified-Since date comparisons work.
+            if let Some(t) = ngx_core::parse::parse_http_time(value) {
+                ho.last_modified_time = t;
+            }
+        }
+        b"etag" => {
+            let h = crate::request::TableElt::new(name, value);
+            ho.etag = Some(h);
+        }
+        b"content-encoding" => {
+            // Populate the typed slot so gunzip_filter can detect
+            // upstream-gzipped responses (matches C's
+            // ngx_http_upstream_process_header stash into
+            // headers_in.content_encoding).
+            let h = crate::request::TableElt::new(name, value);
+            ho.content_encoding = Some(h.clone());
+            ho.headers.push(h);
+        }
+        _ => {
+            ho.add(name, value);
+        }
+    }
+}

@@ -60,6 +60,7 @@ pub mod upstream;
 pub mod upstream_keepalive;
 pub mod upstream_keepalive_pool;
 pub mod upstream_round_robin;
+pub mod upstream_ssl;
 pub mod event_pipe;
 pub mod ssl_module;
 pub mod gzip_filter;
