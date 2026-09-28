@@ -679,11 +679,11 @@ impl PeerBalancer for RrPeerData {
         get_round_robin_peer(pc, self)
     }
 
-    fn free(&mut self, pc: &mut PeerConnection, state: u32) {
+    fn free(&mut self, pc: &mut PeerConnection, state: u32, _us: &UpstreamState) {
         free_round_robin_peer(pc, self, state);
     }
 
-    fn notify(&mut self, pc: &mut PeerConnection, ty: i32, notify: u32) {
+    fn notify(&mut self, pc: &mut PeerConnection, ty: i32, notify: u32, _us: &UpstreamState) {
         notify_round_robin_peer(pc, self, ty, notify);
     }
 

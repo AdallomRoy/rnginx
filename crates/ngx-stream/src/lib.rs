@@ -30,6 +30,11 @@ pub mod upstream;
 pub mod upstream_round_robin;
 pub mod return_module;
 pub mod set;
+pub mod upstream_hash;
+pub mod upstream_least_conn;
+pub mod upstream_least_time;
+pub mod upstream_random;
+pub mod upstream_zone;
 
 pub use session::{Session, S};
 
@@ -873,6 +878,11 @@ pub fn modules() -> Vec<ModuleDef> {
         write_filter::write_filter_module(),
         return_module::return_module(),
         set::set_module(),
+        upstream_hash::upstream_hash_module(),
+        upstream_least_conn::upstream_least_conn_module(),
+        upstream_least_time::upstream_least_time_module(),
+        upstream_random::upstream_random_module(),
+        upstream_zone::upstream_zone_module(),
     ]
 }
 

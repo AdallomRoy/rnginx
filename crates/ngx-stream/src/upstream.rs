@@ -662,10 +662,11 @@ pub trait PeerBalancer {
     /// available (pc.name is the upstream's).
     fn get(&mut self, pc: &mut PeerConnection) -> i64;
 
-    fn free(&mut self, pc: &mut PeerConnection, state: u32);
+    /// `us` is the current state of the session's upstream (u->state)
+    fn free(&mut self, pc: &mut PeerConnection, state: u32, us: &UpstreamState);
 
     /// `ty` is the type of the connection to the peer
-    fn notify(&mut self, _pc: &mut PeerConnection, _ty: i32, _notify: u32) {}
+    fn notify(&mut self, _pc: &mut PeerConnection, _ty: i32, _notify: u32, _us: &UpstreamState) {}
 
     fn set_session(&mut self) -> Option<openssl::ssl::SslSession> {
         None
@@ -787,22 +788,26 @@ impl StreamUpstream {
     }
 
     /// pc->free
-    pub fn peer_free(&self, state: u32) {
+    pub fn peer_free(&self, s: &Session, state: u32) {
+        let us = self.with_state(s, |st| st.clone()).unwrap_or_default();
+
         let mut balancer = self.balancer.borrow_mut();
 
         if let Some(b) = balancer.as_mut() {
             let mut pc = self.peer.borrow_mut();
-            b.free(&mut pc, state);
+            b.free(&mut pc, state, &us);
         }
     }
 
     /// pc->notify
-    pub fn peer_notify(&self, ty: i32, notify: u32) {
+    pub fn peer_notify(&self, s: &Session, ty: i32, notify: u32) {
+        let us = self.with_state(s, |st| st.clone()).unwrap_or_default();
+
         let mut balancer = self.balancer.borrow_mut();
 
         if let Some(b) = balancer.as_mut() {
             let mut pc = self.peer.borrow_mut();
-            b.notify(&mut pc, ty, notify);
+            b.notify(&mut pc, ty, notify, &us);
         }
     }
 

@@ -287,6 +287,7 @@ dependencies = [
 name = "ngx-stream"
 version = "1.31.7"
 dependencies = [
+ "crc32fast",
  "libc",
  "ngx-core",
  "nix",

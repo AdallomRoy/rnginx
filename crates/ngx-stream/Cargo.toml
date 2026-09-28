@@ -10,3 +10,4 @@ libc.workspace = true
 nix.workspace = true
 tokio.workspace = true
 openssl.workspace = true
+crc32fast.workspace = true

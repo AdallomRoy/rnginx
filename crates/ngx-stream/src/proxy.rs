@@ -74,34 +74,18 @@ fn pscf_of(s: &Session) -> Rc<RefCell<ProxySrvConf>> {
     s.srv_conf::<ProxySrvConf>(ctx_index())
 }
 
-/// The values of the server's conf a session works with.
+/// The values of the server's conf the relay works with.
 struct ProxyConf {
-    connect_timeout: u64,
     timeout: u64,
-    next_upstream_timeout: u64,
     buffer_size: usize,
     requests: i64,
     responses: i64,
-    next_upstream_tries: i64,
-    next_upstream: bool,
-    proxy_protocol: u32,
     half_close: bool,
 }
 
 impl ProxyConf {
     fn of(pscf: &ProxySrvConf) -> ProxyConf {
-        ProxyConf {
-            connect_timeout: *pscf.connect_timeout,
-            timeout: *pscf.timeout,
-            next_upstream_timeout: *pscf.next_upstream_timeout,
-            buffer_size: *pscf.buffer_size,
-            requests: *pscf.requests,
-            responses: *pscf.responses,
-            next_upstream_tries: *pscf.next_upstream_tries,
-            next_upstream: *pscf.next_upstream,
-            proxy_protocol: *pscf.proxy_protocol,
-            half_close: *pscf.half_close,
-        }
+        ProxyConf { timeout: *pscf.timeout, buffer_size: *pscf.buffer_size, requests: *pscf.requests, responses: *pscf.responses, half_close: *pscf.half_close }
     }
 }
 
@@ -611,7 +595,7 @@ async fn connect_once(s: &S) -> Connected {
 
     u.with_state(s, |st| st.connect_time = (now - u.start_time.get()) as i64);
 
-    u.peer_notify(pc.ty, NGX_STREAM_UPSTREAM_NOTIFY_CONNECT);
+    u.peer_notify(s, pc.ty, NGX_STREAM_UPSTREAM_NOTIFY_CONNECT);
 
     Connected::Upstream(pc)
 }
@@ -625,7 +609,7 @@ async fn next_upstream(s: &S) -> bool {
     let pc = u.connection.borrow().clone();
 
     if u.peer.borrow().sockaddr.is_some() {
-        u.peer_free(NGX_PEER_FAILED);
+        u.peer_free(s, NGX_PEER_FAILED);
         u.peer.borrow_mut().sockaddr = None;
     }
 
@@ -700,7 +684,7 @@ pub async fn proxy_finalize(s: &S, rc: i64) {
                 }
             }
 
-            u.peer_free(state);
+            u.peer_free(s, state);
             u.peer.borrow_mut().sockaddr = None;
         }
 
@@ -1085,7 +1069,7 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
 
                     u.with_state(s, |st| st.first_byte_time = (now - start_time) as i64);
 
-                    u.peer_notify(r.pc.ty, NGX_STREAM_UPSTREAM_NOTIFY_FIRST_BYTE);
+                    u.peer_notify(s, r.pc.ty, NGX_STREAM_UPSTREAM_NOTIFY_FIRST_BYTE);
                 }
             }
 
