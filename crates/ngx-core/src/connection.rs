@@ -33,6 +33,14 @@ pub enum TcpNopush {
     Disabled,
 }
 
+/// Outcome of one attempt of an operation driven by Connection::drive_io
+/// (SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE map to WantRead / WantWrite).
+pub enum IoStep<T> {
+    Done(T),
+    WantRead,
+    WantWrite,
+}
+
 pub struct Fd(pub RawFd);
 
 impl AsRawFd for Fd {
@@ -284,6 +292,39 @@ impl Connection {
         let afd = self.afd()?;
         let _g = afd.writable().await?;
         Ok(())
+    }
+
+    /// Drive a non-blocking operation that does its own socket I/O (an
+    /// OpenSSL call) until it completes. The first attempt runs at once; on
+    /// WantRead/WantWrite it is retried after the socket becomes ready, while
+    /// the readiness guard is held. If the retry still wants the same
+    /// readiness, the socket was drained (EAGAIN), so the retained readiness
+    /// is cleared and the next wait blocks for a new event, as epoll ET
+    /// re-arming does after NGX_AGAIN in C. Waiting with readable() /
+    /// writable() instead keeps the stale readiness and spins.
+    pub async fn drive_io<T>(&self, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+        let mut step = op();
+        loop {
+            match step {
+                IoStep::Done(v) => return Ok(v),
+                IoStep::WantRead => {
+                    let afd = self.afd()?;
+                    let mut guard = afd.readable().await?;
+                    step = op();
+                    if matches!(step, IoStep::WantRead) {
+                        guard.clear_ready();
+                    }
+                }
+                IoStep::WantWrite => {
+                    let afd = self.afd()?;
+                    let mut guard = afd.writable().await?;
+                    step = op();
+                    if matches!(step, IoStep::WantWrite) {
+                        guard.clear_ready();
+                    }
+                }
+            }
+        }
     }
 
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.

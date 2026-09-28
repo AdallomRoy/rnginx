@@ -10,7 +10,7 @@ use foreign_types::ForeignType;
 use openssl::ssl::Ssl;
 
 use crate::conf::*;
-use crate::connection::Connection;
+use crate::connection::{Connection, IoStep};
 use crate::log::Log;
 use crate::module::*;
 use crate::cmd_fn;
@@ -46,28 +46,28 @@ impl SslConnection {
     }
 
     pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
+        c.drive_io(|| {
             let rc = unsafe {
                 openssl_sys::SSL_read(self.ssl_ptr(), buf.as_mut_ptr() as *mut c_void, buf.len() as i32)
             };
             if rc > 0 {
-                return Ok(rc as usize);
+                return IoStep::Done(Ok(rc as usize));
             }
             let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
             match err {
-                openssl_sys::SSL_ERROR_WANT_READ => c.readable().await?,
-                openssl_sys::SSL_ERROR_WANT_WRITE => c.writable().await?,
+                openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+                openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
                 openssl_sys::SSL_ERROR_ZERO_RETURN => {
                     c.read_eof.set(true);
-                    return Ok(0);
+                    IoStep::Done(Ok(0))
                 }
                 openssl_sys::SSL_ERROR_SYSCALL => {
                     let e = io::Error::last_os_error();
                     if e.raw_os_error() == Some(0) {
                         c.read_eof.set(true);
-                        return Ok(0);
+                        return IoStep::Done(Ok(0));
                     }
-                    return Err(e);
+                    IoStep::Done(Err(e))
                 }
                 _ => {
                     let msg = ssl_error_string();
@@ -77,39 +77,36 @@ impl SslConnection {
                     // clean EOF so callers see Ok(0).
                     if msg.contains("unexpected eof") {
                         c.read_eof.set(true);
-                        return Ok(0);
+                        return IoStep::Done(Ok(0));
                     }
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg)));
+                    IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg))))
                 }
             }
-        }
+        })
+        .await?
     }
 
     pub async fn send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        loop {
+        c.drive_io(|| {
             let rc = unsafe {
                 openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32)
             };
             if rc > 0 {
                 c.sent.set(c.sent.get() + rc as u64);
-                return Ok(rc as usize);
+                return IoStep::Done(Ok(rc as usize));
             }
             let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
             match err {
-                openssl_sys::SSL_ERROR_WANT_READ => c.readable().await?,
-                openssl_sys::SSL_ERROR_WANT_WRITE => c.writable().await?,
-                openssl_sys::SSL_ERROR_SYSCALL => {
-                    let e = io::Error::last_os_error();
-                    return Err(e);
-                }
-                _ => {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string())));
-                }
+                openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+                openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+                openssl_sys::SSL_ERROR_SYSCALL => IoStep::Done(Err(io::Error::last_os_error())),
+                _ => IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string())))),
             }
-        }
+        })
+        .await?
     }
 
     pub fn free_on_close(&self, _c: &Connection) {

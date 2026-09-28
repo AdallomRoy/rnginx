@@ -11,7 +11,7 @@ use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 use ngx_core::ssl::{SslConnection, ssl_error_string};
-use ngx_core::connection::Connection;
+use ngx_core::connection::{Connection, IoStep};
 use ngx_core::cmd_fn;
 use ngx_core::ngx_log_error;
 use openssl::ssl::{SslContext, SslContextBuilder, SslMethod, SslFiletype, SslVerifyMode};
@@ -1138,9 +1138,21 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
     *c.ssl.borrow_mut() = Some(ssl_conn.clone());
     // Drive the handshake.
     let ssl_ptr = ssl_conn.inner.borrow().as_ref().unwrap().as_ptr();
-    loop {
-        let rc = unsafe { openssl_sys::SSL_do_handshake(ssl_ptr) };
-        if rc == 1 {
+    let res = c
+        .drive_io(|| {
+            let rc = unsafe { openssl_sys::SSL_do_handshake(ssl_ptr) };
+            if rc == 1 {
+                return IoStep::Done(Ok(()));
+            }
+            match unsafe { openssl_sys::SSL_get_error(ssl_ptr, rc) } {
+                openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+                openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+                _ => IoStep::Done(Err(ssl_error_string())),
+            }
+        })
+        .await;
+    match res {
+        Ok(Ok(())) => {
             ssl_conn.handshaked.set(true);
             // Record the SNI hostname on the HttpConnection so
             // set_virtual_server / the misdirected-request check
@@ -1154,27 +1166,14 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
                     *hc.ssl_servername.borrow_mut() = Some(host);
                 }
             }
-            return true;
+            true
         }
-        let err = unsafe { openssl_sys::SSL_get_error(ssl_ptr, rc) };
-        match err {
-            openssl_sys::SSL_ERROR_WANT_READ => {
-                if c.readable().await.is_err() {
-                    return false;
-                }
-            }
-            openssl_sys::SSL_ERROR_WANT_WRITE => {
-                if c.writable().await.is_err() {
-                    return false;
-                }
-            }
-            _ => {
-                let msg = ssl_error_string();
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "SSL_do_handshake() failed (SSL: {}) while SSL handshaking", msg);
-                *c.ssl.borrow_mut() = None;
-                return false;
-            }
+        Ok(Err(msg)) => {
+            ngx_log_error!(NGX_LOG_INFO, c.log, None, "SSL_do_handshake() failed (SSL: {}) while SSL handshaking", msg);
+            *c.ssl.borrow_mut() = None;
+            false
         }
+        Err(_) => false,
     }
 }
 
