@@ -1,11 +1,10 @@
 //! ngx_http_access_module
 
 use std::any::Any;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
 use ngx_core::conf::*;
-use ngx_core::inet::SockAddr;
+use ngx_core::inet::{ptocidr, Cidr, CidrParse, SockAddr};
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
@@ -115,130 +114,22 @@ fn access_rule(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Conf
         return Ok(());
     }
 
-    // Parse CIDR (IPv4 or IPv6)
-    match parse_cidr(spec) {
-        Ok((family, addr, mask)) => {
-            let mut c = cell.borrow_mut();
-            match family {
-                "inet" => {
-                    if c.rules_v4.is_none() {
-                        c.rules_v4 = Some(Vec::new());
-                    }
-                    if let (Ok(addr_u32), Ok(mask_u32)) = (parse_ipv4_as_u32(&addr), parse_ipv4_as_u32(&mask)) {
-                        c.rules_v4.as_mut().unwrap().push(AccessRuleV4 {
-                            mask: mask_u32,
-                            addr: addr_u32,
-                            deny,
-                        });
-                    } else {
-                        return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec))));
-                    }
-                }
-                "inet6" => {
-                    if c.rules_v6.is_none() {
-                        c.rules_v6 = Some(Vec::new());
-                    }
-                    if let (Ok(addr_bytes), Ok(mask_bytes)) = (parse_ipv6_as_bytes(&addr), parse_ipv6_as_bytes(&mask)) {
-                        c.rules_v6.as_mut().unwrap().push(AccessRuleV6 {
-                            mask: mask_bytes,
-                            addr: addr_bytes,
-                            deny,
-                        });
-                    } else {
-                        return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec))));
-                    }
-                }
-                _ => {
-                    return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec))));
-                }
-            }
-            Ok(())
+    // ngx_ptocidr, as in ngx_http_access_rule
+    let cidr = match ptocidr(spec) {
+        CidrParse::Ok(cidr) => cidr,
+        CidrParse::Done(cidr) => {
+            cf.warn(format_args!("low address bits of {} are meaningless", B(spec)));
+            cidr
         }
-        Err(_) => Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec)))),
+        CidrParse::Error => return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec)))),
+    };
+    let mut c = cell.borrow_mut();
+    match cidr {
+        Cidr::V4 { addr, mask } => c.rules_v4.get_or_insert_with(Vec::new).push(AccessRuleV4 { mask, addr, deny }),
+        Cidr::V6 { addr, mask } => c.rules_v6.get_or_insert_with(Vec::new).push(AccessRuleV6 { mask, addr, deny }),
+        Cidr::Unix => c.rules_unix.get_or_insert_with(Vec::new).push(AccessRuleUnix { deny }),
     }
-}
-
-fn parse_ipv4_as_u32(addr: &str) -> Result<u32, ()> {
-    addr.parse::<Ipv4Addr>()
-        .map(|a| u32::from_be_bytes(a.octets()))
-        .map_err(|_| ())
-}
-
-fn parse_ipv6_as_bytes(addr: &str) -> Result<[u8; 16], ()> {
-    addr.parse::<Ipv6Addr>()
-        .map(|a| a.octets())
-        .map_err(|_| ())
-}
-
-fn parse_cidr(spec: &[u8]) -> Result<(&'static str, String, String), ()> {
-    let spec_str = std::str::from_utf8(spec).map_err(|_| ())?;
-
-    if spec_str.contains(':') && !spec_str.starts_with('[') {
-        // IPv6 without prefix
-        return Ok(("inet6", spec_str.to_string(), "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".to_string()));
-    }
-
-    if let Some(slash_pos) = spec_str.find('/') {
-        let addr_part = &spec_str[..slash_pos];
-        let prefix_part = &spec_str[slash_pos + 1..];
-
-        let prefix_len: u32 = prefix_part.parse().map_err(|_| ())?;
-
-        if addr_part.contains(':') {
-            // IPv6
-            let addr_str = addr_part.trim_start_matches('[').trim_end_matches(']');
-            let addr_obj = addr_str.parse::<Ipv6Addr>().map_err(|_| ())?;
-            let mask = ipv6_mask_from_prefix(prefix_len);
-            Ok(("inet6", addr_obj.to_string(), ipv6_to_string(&mask)))
-        } else {
-            // IPv4
-            let addr_obj = addr_part.parse::<Ipv4Addr>().map_err(|_| ())?;
-            let mask = ipv4_mask_from_prefix(prefix_len);
-            Ok(("inet", addr_obj.to_string(), ipv4_to_string(mask)))
-        }
-    } else if spec_str.contains(':') {
-        // IPv6 without prefix
-        let addr_str = spec_str.trim_start_matches('[').trim_end_matches(']');
-        let _ = addr_str.parse::<Ipv6Addr>().map_err(|_| ())?;
-        Ok(("inet6", spec_str.to_string(), "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".to_string()))
-    } else {
-        // IPv4 without prefix
-        let _ = spec_str.parse::<Ipv4Addr>().map_err(|_| ())?;
-        Ok(("inet", spec_str.to_string(), "255.255.255.255".to_string()))
-    }
-}
-
-fn ipv4_mask_from_prefix(prefix: u32) -> u32 {
-    if prefix >= 32 {
-        0xffffffff
-    } else {
-        (0xffffffffu32 << (32 - prefix))
-    }
-}
-
-fn ipv4_to_string(mask: u32) -> String {
-    let bytes = mask.to_be_bytes();
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-fn ipv6_mask_from_prefix(prefix: u32) -> [u8; 16] {
-    let mut mask = [0u8; 16];
-    let mut remaining = prefix;
-    for i in 0..16 {
-        if remaining >= 8 {
-            mask[i] = 0xff;
-            remaining -= 8;
-        } else if remaining > 0 {
-            mask[i] = (0xff << (8 - remaining)) as u8;
-            remaining = 0;
-        }
-    }
-    mask
-}
-
-fn ipv6_to_string(mask: &[u8; 16]) -> String {
-    let addr = Ipv6Addr::from(*mask);
-    addr.to_string()
+    Ok(())
 }
 
 pub fn access_module() -> ModuleDef {
@@ -349,25 +240,6 @@ fn access_found(r: &R, deny: bool) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ipv4_mask_from_prefix() {
-        assert_eq!(ipv4_mask_from_prefix(32), 0xffffffff);
-        assert_eq!(ipv4_mask_from_prefix(24), 0xffffff00);
-        assert_eq!(ipv4_mask_from_prefix(16), 0xffff0000);
-        assert_eq!(ipv4_mask_from_prefix(8), 0xff000000);
-        assert_eq!(ipv4_mask_from_prefix(0), 0);
-    }
-
-    #[test]
-    fn test_ipv6_mask_from_prefix() {
-        let mask = ipv6_mask_from_prefix(128);
-        assert_eq!(mask, [0xff; 16]);
-
-        let mask = ipv6_mask_from_prefix(64);
-        assert_eq!(&mask[0..8], &[0xff; 8]);
-        assert_eq!(&mask[8..16], &[0; 8]);
-    }
 
     #[test]
     fn test_ipv6_match() {
