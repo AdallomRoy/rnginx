@@ -1178,12 +1178,14 @@ pub async fn ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> bool 
     }
 }
 
+/// `sscf->verify` as tested by ngx_http_set_virtual_server: any
+/// ssl_verify_client mode other than off (on, optional, optional_no_ca).
 pub fn ssl_verify_enabled(cscf: &Rc<RefCell<CoreSrvConf>>) -> bool {
     let sctx = cscf.borrow().ctx.clone();
     let srv_slots = match &sctx.srv { Some(s) => s.clone(), None => return false };
     let ssl_conf = slot_of::<HttpSslSrvConf>(&srv_slots, ctx_index());
     let v = ssl_conf.borrow().verify.get_or(0);
-    v == 1 || v == 2
+    v != 0
 }
 
 /// Match ngx_http_ssl_check_client (called after headers are parsed).
