@@ -76,12 +76,12 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
         return Ok(());
     }
     drop(p);
+    drop(c);
     let lmcf = get_main_conf::<LogMainConf>(cf, ctx_index());
     let fmt = lmcf.borrow().formats.iter().find(|f| f.name == b"combined").cloned();
     let fmt = match fmt {
         Some(f) => f,
         None => {
-            drop(c);
             let f = compile_format(cf, b"combined", ESCAPE_DEFAULT, COMBINED_FMT)?;
             let f = Rc::new(f);
             lmcf.borrow_mut().formats.push(f.clone());
