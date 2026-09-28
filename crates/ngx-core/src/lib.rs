@@ -41,6 +41,7 @@ pub mod core_module;
 pub mod syslog;
 pub mod connection;
 pub mod event_connect;
+pub mod listen_event;
 pub mod process;
 pub mod event;
 pub mod event_udp;

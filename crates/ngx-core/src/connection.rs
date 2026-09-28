@@ -78,6 +78,8 @@ pub struct Stats {
     pub writing: std::sync::atomic::AtomicI64,
     pub waiting: std::sync::atomic::AtomicI64,
     pub temp_number: std::sync::atomic::AtomicU64,
+    /// ngx_accept_mutex: the pid of the worker holding it, or 0
+    pub accept_mutex: std::sync::atomic::AtomicI64,
 }
 
 static mut STATS_PTR: *const Stats = std::ptr::null();
@@ -91,6 +93,7 @@ static STATS_LOCAL: Stats = Stats {
     writing: std::sync::atomic::AtomicI64::new(0),
     waiting: std::sync::atomic::AtomicI64::new(0),
     temp_number: std::sync::atomic::AtomicU64::new(0),
+    accept_mutex: std::sync::atomic::AtomicI64::new(0),
 };
 
 pub fn stats() -> &'static Stats {
@@ -1284,6 +1287,8 @@ pub fn configure_listening_sockets(cycle: &mut Cycle) {
 
 /// ngx_close_listening_sockets
 pub fn close_listening_sockets(cycle: &Cycle) {
+    crate::event::close_accept_mutex();
+
     for ls in cycle.listening.iter() {
         let fd = ls.fd.get();
         if fd == -1 {

@@ -14,6 +14,7 @@ use crate::connection::*;
 use crate::core_module::core_conf;
 use crate::cycle::*;
 use crate::inet::{ptocidr, Cidr, CidrParse};
+use crate::listen_event::ListenEvent;
 use crate::listening::Listening;
 use crate::log::*;
 use crate::module::*;
@@ -22,6 +23,14 @@ use crate::string::B;
 use crate::{cmd, cmd_fn, ngx_log_debug, ngx_log_error, os};
 
 pub const DEFAULT_CONNECTIONS: u64 = 512;
+
+/// The read event of a listening socket in this worker, and the task of
+/// its handler.
+struct ListenSlot {
+    ls: Rc<Listening>,
+    ev: Rc<ListenEvent>,
+    task: tokio::task::AbortHandle,
+}
 
 pub struct EventConf {
     pub connections: Val<u64>,
@@ -34,7 +43,21 @@ pub struct EventConf {
 
 thread_local! {
     static EVENT_CONF: RefCell<Option<Rc<RefCell<EventConf>>>> = const { RefCell::new(None) };
-    static ACCEPT_TASKS: RefCell<HashMap<i32, tokio::task::AbortHandle>> = RefCell::new(HashMap::new());
+    /// The read events of the listening sockets of this worker
+    /// (ls->connection->read), by socket, and the tasks of their handlers.
+    static LISTEN_EVENTS: RefCell<HashMap<i32, ListenSlot>> = RefCell::new(HashMap::new());
+    /// ngx_accept_mutex_held
+    static ACCEPT_MUTEX_HELD: Cell<bool> = const { Cell::new(false) };
+    /// ngx_accept_disabled: accepting is skipped while the worker has less
+    /// than 1/8 of its connections free
+    static ACCEPT_DISABLED: Cell<i64> = const { Cell::new(0) };
+    /// ngx_use_exclusive_accept
+    static USE_EXCLUSIVE_ACCEPT: Cell<bool> = const { Cell::new(false) };
+    /// ngx_use_accept_mutex
+    static USE_ACCEPT_MUTEX: Cell<bool> = const { Cell::new(false) };
+    /// an accept event was handled (the end of an event loop iteration of
+    /// the accept mutex holder)
+    static ACCEPTED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
     static EXITING: Cell<bool> = const { Cell::new(false) };
     static FLAGS_NOTIFY: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
     static WORKER: Cell<i64> = const { Cell::new(0) };
@@ -566,27 +589,48 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
     }
 }
 
-/// Accept loop for one listening socket.
-async fn accept_loop(cycle: Rc<Cycle>, ls: Rc<Listening>) {
+/// ngx_accept_disabled after an accept: connection_n / 8 minus the free
+/// connections
+pub(crate) fn update_accept_disabled() {
+    ACCEPT_DISABLED.with(|d| d.set(connection_n() as i64 / 8 - free_connections() as i64));
+}
+
+pub fn accept_disabled() -> i64 {
+    ACCEPT_DISABLED.with(|d| d.get())
+}
+
+/// ngx_event_accept: the read handler of a TCP listening socket, as the
+/// task waiting for its read event.
+async fn accept_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
     let fd = ls.fd.get();
-    let afd = match AsyncFd::with_interest(Fd(fd), tokio::io::Interest::READABLE) {
-        Ok(a) => a,
-        Err(e) => {
-            ngx_log_error!(NGX_LOG_ALERT, ls.log.borrow(), e.raw_os_error(), "epoll_ctl() failed for {}", B(&ls.addr_text));
-            return;
-        }
-    };
+
+    let log = ls.log.borrow().clone();
+
     let handler = ls.handler.borrow().clone();
     let handler = match handler {
         Some(h) => h,
         None => return,
     };
-    let log = ls.log.borrow().clone();
+
+    // ls->connection->requests of ngx_reorder_accept_events
+    let mut requests: u64 = 0;
+
     loop {
-        let mut guard = match afd.readable().await {
+        let mut guard = match ev.wait().await {
             Ok(g) => g,
             Err(_) => return,
         };
+
+        let multi_accept = event_conf().map(|c| *c.borrow().multi_accept).unwrap_or(false);
+
+        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "accept on {}, ready: {}", B(&ls.addr_text), multi_accept as i32);
+
+        // ev->available = multi_accept: one connection per event without it
+
+        let mut again = false;
+        let mut emfile = false;
+        let mut reorder = false;
+
         loop {
             let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -594,22 +638,22 @@ async fn accept_loop(cycle: Rc<Cycle>, ls: Rc<Listening>) {
             if s == -1 {
                 let err = os::errno();
                 if err == libc::EAGAIN {
-                    guard.clear_ready();
+                    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "accept() not ready");
+                    again = true;
                     break;
                 }
                 let level = if err == libc::ECONNABORTED { NGX_LOG_ERR } else if err == libc::EMFILE || err == libc::ENFILE { NGX_LOG_CRIT } else { NGX_LOG_ALERT };
                 ngx_log_error!(level, log, Some(err), "accept4() failed");
-                if err == libc::ECONNABORTED {
+                if err == libc::ECONNABORTED && multi_accept {
                     continue;
                 }
                 if err == libc::EMFILE || err == libc::ENFILE {
-                    let delay = event_conf().map(|c| *c.borrow().accept_mutex_delay).unwrap_or(500);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    break;
+                    emfile = true;
                 }
-                return;
+                break;
             }
             stats().accepted.fetch_add(1, Ordering::Relaxed);
+            update_accept_disabled();
             let sa = match crate::inet::SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len) {
                 Some(sa) => sa,
                 None => {
@@ -621,7 +665,7 @@ async fn accept_loop(cycle: Rc<Cycle>, ls: Rc<Listening>) {
                 Some(c) => c,
                 None => {
                     os::close(s);
-                    continue;
+                    break;
                 }
             };
             stats().handled.fetch_add(1, Ordering::Relaxed);
@@ -637,44 +681,372 @@ async fn accept_loop(cycle: Rc<Cycle>, ls: Rc<Listening>) {
                 }
             }
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "*{} accept: {} fd:{}", c.number, B(&c.addr_text.borrow()), s);
-            if ls.addr_ntop.get() {
-                // already set
-            }
             handler(c);
+
+            if !multi_accept {
+                // the do-while loop ends
+                reorder = true;
+                break;
+            }
         }
+
+        ev.handled(&mut guard, again);
+        drop(guard);
+
+        ACCEPTED.with(|a| a.notify_one());
+
+        if emfile {
+            if disable_accept_events(true).is_ok() {
+                if USE_ACCEPT_MUTEX.with(|m| m.get()) {
+                    if ACCEPT_MUTEX_HELD.with(|h| h.replace(false)) {
+                        accept_mutex_unlock();
+                    }
+
+                    ACCEPT_DISABLED.with(|d| d.set(1));
+                } else {
+                    // the timer of the event, which then enables the
+                    // accept events (ev->timedout)
+                    let delay = event_conf().map(|c| *c.borrow().accept_mutex_delay).unwrap_or(500);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+                    let _ = enable_accept_events();
+                }
+            }
+
+            continue;
+        }
+
+        if reorder {
+            reorder_accept_events(&ls, &ev, &mut requests);
+        }
+
         if is_exiting() {
             return;
         }
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = cycle;
+
+        // back to the event loop between events
+        tokio::task::yield_now().await;
     }
 }
 
-/// Stop the accept task for a listening socket (before closing it).
+/// ngx_reorder_accept_events: Linux with EPOLLEXCLUSIVE usually notifies
+/// only the process which was first to add the listening socket to the
+/// epoll instance, so the socket is added again periodically, and other
+/// workers get a chance to accept connections.
+fn reorder_accept_events(ls: &Listening, ev: &ListenEvent, requests: &mut u64) {
+    if !use_exclusive_accept() {
+        return;
+    }
+
+    if ls.reuseport.get() {
+        return;
+    }
+
+    let n = *requests;
+    *requests += 1;
+
+    if n % 16 != 0 && accept_disabled() <= 0 {
+        return;
+    }
+
+    if del_listen_event(ls, ev).is_err() {
+        return;
+    }
+
+    let _ = add_listen_event(ls, ev, true);
+}
+
+/// ngx_add_event(ls->connection->read, NGX_READ_EVENT, 0), or with
+/// NGX_EXCLUSIVE_EVENT, logging as ngx_epoll_add_event.
+fn add_listen_event(ls: &Listening, ev: &ListenEvent, exclusive: bool) -> Result<(), ()> {
+    let fd = ls.fd.get();
+    let log = ls.log.borrow();
+
+    let events = if exclusive { libc::EPOLLIN | libc::EPOLLEXCLUSIVE } else { libc::EPOLLIN | libc::EPOLLRDHUP };
+
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "epoll add event: fd:{} op:{} ev:{:08X}", fd, libc::EPOLL_CTL_ADD, events as u32);
+
+    if let Err(e) = ev.add(exclusive) {
+        ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "epoll_ctl({}, {}) failed", libc::EPOLL_CTL_ADD, fd);
+        return Err(());
+    }
+
+    Ok(())
+}
+
+/// ngx_del_event(ls->connection->read, NGX_READ_EVENT, NGX_DISABLE_EVENT),
+/// logging as ngx_epoll_del_event.
+fn del_listen_event(ls: &Listening, ev: &ListenEvent) -> Result<(), ()> {
+    let fd = ls.fd.get();
+    let log = ls.log.borrow();
+
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "epoll del event: fd:{} op:{} ev:{:08X}", fd, libc::EPOLL_CTL_DEL, 0);
+
+    if let Err(e) = ev.del() {
+        ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "epoll_ctl({}, {}) failed", libc::EPOLL_CTL_DEL, fd);
+        return Err(());
+    }
+
+    Ok(())
+}
+
+/// The read event of a listening socket being closed: deleted, as C does
+/// explicitly (ngx_close_listening_sockets), and its handler stopped.
 pub fn stop_accepting(ls: &Listening) {
     let fd = ls.fd.get();
-    ACCEPT_TASKS.with(|t| {
-        if let Some(h) = t.borrow_mut().remove(&fd) {
-            h.abort();
+
+    let slot = LISTEN_EVENTS.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.get(&fd) {
+            Some(slot) if std::ptr::eq(Rc::as_ptr(&slot.ls), ls) => m.remove(&fd),
+            _ => None,
         }
     });
+
+    if let Some(slot) = slot {
+        slot.task.abort();
+
+        if slot.ev.is_active() {
+            let _ = del_listen_event(&slot.ls, &slot.ev);
+        }
+    }
+
     crate::event_udp::stop_recvmsg(ls);
 }
 
-fn start_accepting(cycle: &Rc<Cycle>) {
+/// The listening sockets are closed: no accept mutex any more
+/// (ngx_close_listening_sockets).
+pub fn close_accept_mutex() {
+    ACCEPT_MUTEX_HELD.with(|h| h.set(false));
+    USE_ACCEPT_MUTEX.with(|m| m.set(false));
+}
+
+/// The read events of the listening sockets are exclusive
+/// (ngx_use_exclusive_accept).
+pub fn use_exclusive_accept() -> bool {
+    USE_EXCLUSIVE_ACCEPT.with(|e| e.get())
+}
+
+/// The listening sockets of this worker: not the reuseport sockets of the
+/// other workers.
+fn worker_listenings(cycle: &Rc<Cycle>) -> Vec<Rc<Listening>> {
     let worker = worker_index();
-    for ls in cycle.listening.iter() {
-        if ls.ignore.get() || ls.fd.get() == -1 {
+
+    cycle
+        .listening
+        .iter()
+        .filter(|ls| !(ls.ignore.get() || ls.fd.get() == -1))
+        .filter(|ls| !(ls.reuseport.get() && ls.worker.get() as i64 != worker && process_type() == ProcessType::Worker))
+        .cloned()
+        .collect()
+}
+
+/// The listening sockets of the cycle with read events in this worker
+/// (ls->connection), and their events.
+fn listen_events() -> Vec<(Rc<Listening>, Rc<ListenEvent>)> {
+    let cycle = crate::cycle::cycle();
+
+    LISTEN_EVENTS.with(|m| {
+        let m = m.borrow();
+
+        cycle
+            .listening
+            .iter()
+            .filter_map(|ls| match m.get(&ls.fd.get()) {
+                Some(slot) if Rc::ptr_eq(&slot.ls, ls) => Some((slot.ls.clone(), slot.ev.clone())),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// ngx_enable_accept_events
+fn enable_accept_events() -> Result<(), ()> {
+    for (ls, ev) in listen_events() {
+        if ev.is_active() {
             continue;
         }
-        if ls.reuseport.get() && ls.worker.get() as i64 != worker && process_type() == ProcessType::Worker {
+
+        add_listen_event(&ls, &ev, false)?;
+    }
+
+    Ok(())
+}
+
+/// ngx_disable_accept_events: not the worker's own reuseport sockets when
+/// disabling accept events due to accept mutex
+fn disable_accept_events(all: bool) -> Result<(), ()> {
+    for (ls, ev) in listen_events() {
+        if !ev.is_active() {
             continue;
         }
+
+        if ls.reuseport.get() && !all {
+            continue;
+        }
+
+        del_listen_event(&ls, &ev)?;
+    }
+
+    Ok(())
+}
+
+/// ngx_shmtx_trylock(&ngx_accept_mutex)
+fn accept_mutex_trylock() -> bool {
+    let pid = os::getpid() as i64;
+    stats().accept_mutex.load(Ordering::Acquire) == 0 && stats().accept_mutex.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// ngx_shmtx_unlock(&ngx_accept_mutex)
+fn accept_mutex_unlock() {
+    let pid = os::getpid() as i64;
+    let _ = stats().accept_mutex.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// ngx_trylock_accept_mutex
+fn trylock_accept_mutex(cycle: &Cycle) -> Result<(), ()> {
+    if accept_mutex_trylock() {
+        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "accept mutex locked");
+
+        if ACCEPT_MUTEX_HELD.with(|h| h.get()) {
+            return Ok(());
+        }
+
+        if enable_accept_events().is_err() {
+            accept_mutex_unlock();
+            return Err(());
+        }
+
+        ACCEPT_MUTEX_HELD.with(|h| h.set(true));
+
+        return Ok(());
+    }
+
+    let held = ACCEPT_MUTEX_HELD.with(|h| h.get());
+
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "accept mutex lock failed: {}", held as u32);
+
+    if held {
+        disable_accept_events(false)?;
+
+        ACCEPT_MUTEX_HELD.with(|h| h.set(false));
+    }
+
+    Ok(())
+}
+
+/// The accept mutex part of ngx_process_events_and_timers: in each
+/// iteration the worker tries the mutex (unless ngx_accept_disabled);
+/// holding it, the accept events are enabled and handled, and the mutex is
+/// released at the end of the iteration; otherwise the accept events are
+/// disabled and the iteration waits at most accept_mutex_delay.
+async fn accept_mutex_loop(cycle: Rc<Cycle>) {
+    let delay = event_conf().map(|c| *c.borrow().accept_mutex_delay).unwrap_or(500);
+    let delay = std::time::Duration::from_millis(delay);
+
+    let accepted = ACCEPTED.with(|a| a.clone());
+
+    loop {
+        if is_exiting() || !USE_ACCEPT_MUTEX.with(|m| m.get()) {
+            return;
+        }
+
+        let disabled = accept_disabled();
+
+        if disabled > 0 {
+            ACCEPT_DISABLED.with(|d| d.set(disabled - 1));
+
+            // an iteration of a busy worker
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        if trylock_accept_mutex(&cycle).is_err() {
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        if !ACCEPT_MUTEX_HELD.with(|h| h.get()) {
+            // the timer of the iteration
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        // the iteration: until an accept event is handled, then the mutex
+        // is released
+        let _ = tokio::time::timeout(delay, accepted.notified()).await;
+
+        if ACCEPT_MUTEX_HELD.with(|h| h.get()) {
+            accept_mutex_unlock();
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The read events of the listening sockets (ngx_event_process_init), and
+/// the tasks of their handlers.
+fn start_accepting(cycle: &Rc<Cycle>) {
+    let ccf = core_conf(cycle);
+    let (master, worker_processes) = {
+        let c = ccf.borrow();
+        (*c.master, *c.worker_processes)
+    };
+
+    let accept_mutex = event_conf().map(|c| *c.borrow().accept_mutex).unwrap_or(false);
+
+    // the master is the process that runs the workers
+    let use_accept_mutex = master && worker_processes > 1 && accept_mutex && process_type() == ProcessType::Worker;
+
+    USE_ACCEPT_MUTEX.with(|m| m.set(use_accept_mutex));
+    ACCEPT_MUTEX_HELD.with(|h| h.set(false));
+
+    for ls in worker_listenings(cycle) {
+        let fd = ls.fd.get();
+
+        let ev = match ListenEvent::new(fd) {
+            Ok(e) => Rc::new(e),
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ALERT, ls.log.borrow(), e.raw_os_error(), "epoll_ctl({}, {}) failed", libc::EPOLL_CTL_ADD, fd);
+                continue;
+            }
+        };
+
         // rev->handler: ngx_event_accept, or ngx_event_recvmsg for UDP
-        let h = if ls.ty == libc::SOCK_DGRAM { spawn(crate::event_udp::recvmsg_loop(ls.clone())) } else { spawn(accept_loop(cycle.clone(), ls.clone())) };
-        ACCEPT_TASKS.with(|t| t.borrow_mut().insert(ls.fd.get(), h.abort_handle()));
+        let task = if ls.ty == libc::SOCK_DGRAM { spawn(crate::event_udp::recvmsg_loop(ls.clone(), ev.clone())) } else { spawn(accept_loop(ls.clone(), ev.clone())) };
+
+        let slot = ListenSlot { ls: ls.clone(), ev: ev.clone(), task: task.abort_handle() };
+
+        // the event of a previous cycle's listening on the socket
+        if let Some(old) = LISTEN_EVENTS.with(|m| m.borrow_mut().insert(fd, slot)) {
+            old.task.abort();
+
+            if old.ev.is_active() {
+                let _ = del_listen_event(&old.ls, &old.ev);
+            }
+        }
+
+        if ls.reuseport.get() {
+            let _ = add_listen_event(&ls, &ev, false);
+            continue;
+        }
+
+        if use_accept_mutex {
+            continue;
+        }
+
+        if worker_processes > 1 {
+            USE_EXCLUSIVE_ACCEPT.with(|e| e.set(true));
+
+            let _ = add_listen_event(&ls, &ev, true);
+            continue;
+        }
+
+        let _ = add_listen_event(&ls, &ev, false);
+    }
+
+    if use_accept_mutex {
+        spawn(accept_mutex_loop(cycle.clone()));
     }
 }
 

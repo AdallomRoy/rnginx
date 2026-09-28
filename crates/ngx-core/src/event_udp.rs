@@ -52,6 +52,7 @@ use tokio::io::Interest;
 
 use crate::connection::{stats, Connection, ListenHandler};
 use crate::inet::SockAddr;
+use crate::listen_event::ListenEvent;
 use crate::listening::Listening;
 use crate::log::*;
 use crate::rc::*;
@@ -114,9 +115,11 @@ pub struct UdpListening {
     /// the listening socket (c->fd of the pseudo connections)
     fd: RawFd,
     wildcard: bool,
-    /// the dup() of the listening socket registered in the reactor; taken
-    /// when the listening socket is closed
+    /// the dup() of the listening socket registered in the reactor for
+    /// writing; taken when the listening socket is closed
     sock: RefCell<Option<Rc<AsyncFd<DupFd>>>>,
+    /// the read event of the listening socket
+    read_event: RefCell<Option<Rc<ListenEvent>>>,
     /// ls->rbtree
     tree: RefCell<HashMap<UdpKey, Weak<Connection>>>,
     /// the datagrams of connections which left the lookup before reading
@@ -144,8 +147,9 @@ thread_local! {
 }
 
 impl UdpListening {
-    /// Register a dup() of the listening socket in the reactor.
-    fn open(ls: &Listening, log: &Log) -> Option<Rc<UdpListening>> {
+    /// Register a dup() of the listening socket in the reactor for writing;
+    /// it is read on its read event.
+    fn open(ls: &Listening, log: &Log, read_event: Rc<ListenEvent>) -> Option<Rc<UdpListening>> {
         let fd = ls.fd.get();
 
         let s = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -154,7 +158,7 @@ impl UdpListening {
             return None;
         }
 
-        let afd = match AsyncFd::with_interest(DupFd(s), Interest::READABLE | Interest::WRITABLE) {
+        let afd = match AsyncFd::with_interest(DupFd(s), Interest::WRITABLE) {
             Ok(a) => a,
             Err(e) => {
                 ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "epoll_ctl() failed for {}", B(&ls.addr_text));
@@ -166,6 +170,7 @@ impl UdpListening {
             fd,
             wildcard: ls.wildcard.get(),
             sock: RefCell::new(Some(Rc::new(afd))),
+            read_event: RefCell::new(Some(read_event)),
             tree: RefCell::new(HashMap::new()),
             pending: RefCell::new(VecDeque::new()),
             wake: tokio::sync::Notify::new(),
@@ -210,6 +215,7 @@ pub fn stop_recvmsg(ls: &Listening) {
 
     if let Some(ul) = ul {
         ul.stopped.set(true);
+        ul.read_event.borrow_mut().take();
         ul.sock.borrow_mut().take();
         ul.wake.notify_one();
     }
@@ -217,7 +223,7 @@ pub fn stop_recvmsg(ls: &Listening) {
 
 /// ngx_event_recvmsg: the read handler of a UDP listening socket, as the
 /// task reading its datagrams (instead of the accept loop of a TCP one).
-pub async fn recvmsg_loop(ls: Rc<Listening>) {
+pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
     let log = ls.log.borrow().clone();
 
     let handler = match ls.handler.borrow().clone() {
@@ -225,7 +231,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>) {
         None => return,
     };
 
-    let ul = match UdpListening::open(&ls, &log) {
+    let ul = match UdpListening::open(&ls, &log, ev) {
         Some(ul) => ul,
         None => return,
     };
@@ -259,8 +265,13 @@ pub async fn recvmsg_loop(ls: Rc<Listening>) {
             None => return,
         };
 
+        let ev = match ul.read_event.borrow().clone() {
+            Some(ev) => ev,
+            None => return,
+        };
+
         let mut guard = tokio::select! {
-            r = sock.readable() => match r {
+            r = ev.wait() => match r {
                 Ok(g) => g,
                 Err(e) => {
                     ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "epoll_wait() failed for {}", B(&ls.addr_text));
@@ -274,6 +285,8 @@ pub async fn recvmsg_loop(ls: Rc<Listening>) {
 
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "recvmsg on {}, ready: {}", B(&ls.addr_text), available as i32);
 
+        let mut again = false;
+
         loop {
             if !ul.pending.borrow().is_empty() {
                 // older than the datagrams in the socket
@@ -284,7 +297,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>) {
 
             let (n, sockaddr, local_sockaddr) = match r {
                 Recvmsg::Again => {
-                    guard.clear_ready();
+                    again = true;
                     break;
                 }
 
@@ -315,6 +328,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>) {
             }
         }
 
+        ev.handled(&mut guard, again);
         drop(guard);
     }
 }
@@ -440,6 +454,8 @@ fn dispatch(ul: &Rc<UdpListening>, ls: &Rc<Listening>, handler: &ListenHandler, 
     }
 
     stats().accepted.fetch_add(1, Ordering::Relaxed);
+
+    crate::event::update_accept_disabled();
 
     // ngx_get_connection (worker_connections), c->sockaddr, c->log (a copy
     // of ls->log), c->listening, c->type, c->number, c->start_time,
@@ -914,6 +930,13 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
     use std::time::Duration;
 
+    /// the read event of the listening socket, added
+    fn read_event(ls: &Listening) -> Rc<ListenEvent> {
+        let ev = ListenEvent::new(ls.fd.get()).unwrap();
+        ev.add(false).unwrap();
+        Rc::new(ev)
+    }
+
     type Conns = Rc<RefCell<Vec<Rc<Connection>>>>;
 
     fn run<F: Future<Output = ()>>(f: F) {
@@ -994,7 +1017,7 @@ mod tests {
     fn datagrams_of_a_client_go_to_its_connection() {
         run(async {
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
             let b = client("127.0.0.1:0").await;
@@ -1106,7 +1129,7 @@ mod tests {
     fn delete_dispatches_unread_datagrams_again() {
         run(async {
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
 
@@ -1171,7 +1194,7 @@ mod tests {
     fn unread_datagrams_are_limited() {
         run(async {
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
 
@@ -1203,7 +1226,7 @@ mod tests {
     fn delayed_read_drops_datagrams() {
         run(async {
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
 
@@ -1247,7 +1270,7 @@ mod tests {
             crate::connection::set_connection_n(crate::connection::active_connections() + 1);
 
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
             let b = client("127.0.0.1:0").await;
@@ -1291,7 +1314,7 @@ mod tests {
         run(async {
             let (ls, bound, conns) = udp_listening("0.0.0.0:0");
             assert!(ls.wildcard.get());
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let port = bound.port();
             let to2: SocketAddr = format!("127.0.0.2:{}", port).parse().unwrap();
@@ -1357,7 +1380,7 @@ mod tests {
             *ls.handler.borrow_mut() = Some(handler);
             let ls = Rc::new(ls);
 
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let to: SocketAddr = format!("[::1]:{}", bound.port()).parse().unwrap();
             let a = client("[::1]:0").await;
@@ -1401,7 +1424,7 @@ mod tests {
             *ls.handler.borrow_mut() = Some(handler);
             let ls = Rc::new(ls);
 
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             // a bound client: its connection gets its next datagrams, and
             // replies reach it
@@ -1474,7 +1497,7 @@ mod tests {
             *ls.handler.borrow_mut() = Some(handler);
             let ls = Rc::new(ls);
 
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = tokio::net::UnixDatagram::bind(&cpath).unwrap();
 
@@ -1499,7 +1522,7 @@ mod tests {
     fn stopped_listening_connections_cannot_send() {
         run(async {
             let (ls, addr, conns) = udp_listening("127.0.0.1:0");
-            let h = crate::event::spawn(recvmsg_loop(ls.clone()));
+            let h = crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             let a = client("127.0.0.1:0").await;
             a.send_to(b"a", addr).await.unwrap();
@@ -1596,7 +1619,7 @@ mod tests {
             });
             *ls.handler.borrow_mut() = Some(handler);
 
-            crate::event::spawn(recvmsg_loop(ls.clone()));
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
 
             // 5 datagrams at once: sessions of 1-2, 3-4 and 5
 

@@ -590,6 +590,8 @@ fn process_get_status(log: &Log) {
             return;
         }
         one = true;
+        // ngx_shmtx_force_unlock(&ngx_accept_mutex, pid)
+        let _ = crate::connection::stats().accept_mutex.compare_exchange(pid as i64, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
         let mut process = "unknown process";
         let mut idx = None;
         PROCESSES.with(|p| {

@@ -688,6 +688,8 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
         if ls.remain.get() || ls.fd.get() == -1 {
             continue;
         }
+        // its read event goes with it (a single process reloading)
+        crate::event::stop_accepting(ls);
         if unsafe { libc::close(ls.fd.get()) } == -1 {
             ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "close() listening socket on {} failed", B(&ls.addr_text));
         }
