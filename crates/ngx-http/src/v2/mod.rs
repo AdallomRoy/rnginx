@@ -247,6 +247,11 @@ pub struct H2Stream {
 
     /// DATA received before the request started reading the body.
     pub preread: RefCell<Option<Vec<u8>>>,
+    /// DATA received while the request reads the body, not yet processed.
+    pub body_pending: RefCell<Vec<u8>>,
+    /// rb->buf: the body buffer and its size.
+    pub body_buf: RefCell<Vec<u8>>,
+    pub body_cap: Cell<usize>,
 
     /// DATA frame structures allocated by this stream (counted in
     /// H2Connection.frames) and how many of them are free for reuse.
@@ -368,6 +373,9 @@ pub struct H2Connection {
     /// Effects of the frame just parsed that C runs inline; the driver runs
     /// them before parsing the next frame.
     pub posted: RefCell<VecDeque<Posted>>,
+    /// Streams whose read event was posted during the read batch (DATA
+    /// for a body being read); woken once the batch is processed.
+    pub posted_reads: RefCell<Vec<Rc<H2Stream>>>,
     /// Set once ngx_http_v2_finalize_connection ran.
     pub finalized: Cell<bool>,
     /// The connection's read timer (client_header_timeout, then

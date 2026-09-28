@@ -155,7 +155,7 @@ pub async fn read_client_request_body(r: &R) -> i64 {
     finish_body(r, &rb)
 }
 
-fn finish_body(_r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
+pub(crate) fn finish_body(_r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     let mut b = rb.borrow_mut();
     if b.temp_file.is_none() {
         let mut data = Vec::new();

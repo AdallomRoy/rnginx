@@ -721,10 +721,13 @@ pub fn close_idle_connections() {
     });
 }
 
-/// Force-close all connections (worker_shutdown_timeout expiry).
+/// Force-close all connections (worker_shutdown_timeout expiry):
+/// ngx_shutdown_timer_handler sets both c->close and c->error.
 pub fn close_all_connections() {
     for_each_connection(|c| {
+        ngx_log_debug!(crate::log::NGX_LOG_DEBUG_CORE, c.log, "*{} shutdown timeout", c.number);
         c.close.set(true);
+        c.error.set(true);
         c.close_notify.notify_waiters();
         c.close_notify.notify_one();
     });

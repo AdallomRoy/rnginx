@@ -139,6 +139,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         goaway: Cell::new(false),
         out_notify: tokio::sync::Notify::new(),
         posted: RefCell::new(VecDeque::new()),
+        posted_reads: RefCell::new(Vec::new()),
         finalized: Cell::new(false),
         read_timer: Cell::new(None),
     });
@@ -420,8 +421,20 @@ async fn after_read(h2c: &Rc<H2Connection>, d: &Driver) {
 
 /// Run the state machine over rbuf[..end]. Effects C performs inline
 /// (starting a request, waking a stream) are posted by the handlers and run
-/// here after each frame. False once the connection has been finalized.
+/// here after each frame; read events posted for request bodies run after
+/// the batch. False once the connection has been finalized.
 async fn process_batch(h2c: &Rc<H2Connection>, rbuf: &mut [u8], end: usize) -> bool {
+    let ok = run_batch(h2c, rbuf, end).await;
+
+    let posted = std::mem::take(&mut *h2c.posted_reads.borrow_mut());
+    for stream in posted {
+        stream.notify.notify_one();
+    }
+
+    ok
+}
+
+async fn run_batch(h2c: &Rc<H2Connection>, rbuf: &mut [u8], end: usize) -> bool {
     let mut p = 0;
 
     loop {
