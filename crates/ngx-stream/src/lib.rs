@@ -29,6 +29,10 @@ pub mod proxy;
 pub mod upstream;
 pub mod upstream_round_robin;
 pub mod access;
+pub mod geo;
+pub mod log;
+pub mod map;
+pub mod split_clients;
 pub mod limit_conn;
 pub mod pass;
 pub mod realip;
@@ -877,12 +881,16 @@ pub fn modules() -> Vec<ModuleDef> {
     vec![
         stream_module(),
         core::core_module(),
+        log::log_module(),
         proxy::proxy_module(),
         upstream::upstream_module(),
         write_filter::write_filter_module(),
         realip::realip_module(),
         limit_conn::limit_conn_module(),
         access::access_module(),
+        geo::geo_module(),
+        map::map_module(),
+        split_clients::split_clients_module(),
         return_module::return_module(),
         pass::pass_module(),
         set::set_module(),

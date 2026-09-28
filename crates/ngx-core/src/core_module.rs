@@ -345,7 +345,21 @@ pub fn errlog_module() -> ModuleDef {
 pub fn conf_module() -> ModuleDef {
     let mut m = ModuleDef::new("ngx_conf_module", NGX_CONF_MODULE);
     m.commands = vec![cmd_fn!("include", NGX_ANY_CONF | NGX_CONF_TAKE1, ConfLevel::None, conf_include)];
+    m.exit_process = Some(conf_flush_files);
     m
+}
+
+/// ngx_conf_flush_files: the flush of the buffered logs on the process exit
+fn conf_flush_files(cycle: &Rc<crate::cycle::Cycle>) {
+    crate::ngx_log_debug!(crate::log::NGX_LOG_DEBUG_CORE, cycle.log, "flush files");
+
+    for file in cycle.open_files.iter() {
+        let flush = file.flush.borrow().clone();
+
+        if let Some(flush) = flush {
+            flush(file, &cycle.log);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

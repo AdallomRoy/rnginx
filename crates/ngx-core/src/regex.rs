@@ -46,9 +46,16 @@ impl Regex {
             }
         };
         let re = b.build(&pat).map_err(|e| {
-            let msg = e.to_string();
+            // the PCRE2 message, without the "PCRE2: error compiling
+            // pattern at offset N: " prefix the pcre2 crate adds
+            let full = e.to_string();
+            let msg = full.splitn(3, ": ").nth(2).unwrap_or(&full).to_string();
             let off = e.offset().unwrap_or(0).min(pattern.len());
-            format!("pcre2_compile() failed: {} in \"{}\" at \"{}\"", msg, B(pattern), B(&pattern[off..]))
+            if off == pattern.len() {
+                format!("pcre2_compile() failed: {} in \"{}\"", msg, B(pattern))
+            } else {
+                format!("pcre2_compile() failed: {} in \"{}\" at \"{}\"", msg, B(pattern), B(&pattern[off..]))
+            }
         })?;
         let ncaptures = re.captures_len().saturating_sub(1);
         let mut names = Vec::new();

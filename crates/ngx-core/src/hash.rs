@@ -203,89 +203,78 @@ impl<V: Clone> HashKeysArrays<V> {
         NGX_OK
     }
 
-    fn add_wildcard_key_with_last(&mut self, mut key: Vec<u8>, value: V, skip: usize, last: usize) -> i64 {
-        // Lowercase the part after skip
-        let mut k_part = key[skip..].to_vec();
-        let mut k = hash_strlow(&mut k_part, &key[skip..]);
-        key[skip..].copy_from_slice(&k_part);
+    /// The "wildcard:" part of ngx_hash_add_key: "*.example.com" (skip 2),
+    /// ".example.com" (skip 1) and "www.example.*" (skip 0, last is the
+    /// length without ".*").
+    fn add_wildcard_key_with_last(&mut self, mut key: Vec<u8>, value: V, skip: usize, mut last: usize) -> i64 {
+        // wildcard hash
 
-        k = (k % self.hsize as u32) as u32;
-        let k_idx = k as usize;
+        let mut low = key[skip..last].to_vec();
+        let k = hash_strlow(&mut low, &key[skip..last]);
+        key[skip..last].copy_from_slice(&low);
+
+        let k = (k % self.hsize as u32) as usize;
 
         if skip == 1 {
-            // For ".example.com", also check exact hash for "example.com"
-            let exact_key = &key[1..last];
-            for existing in &self.keys_hash[k_idx] {
-                if existing == exact_key {
-                    return NGX_BUSY;
-                }
-            }
-            self.keys_hash[k_idx].insert(exact_key.to_vec());
-        }
+            // check conflicts in exact hash for ".example.com"
 
-        // Check conflicts in wildcard hash
-        let wc_key = &key[skip..last];
-        for existing in &self.dns_wc_head_hash[k_idx] {
-            if existing == wc_key {
+            let exact = &key[1..last];
+
+            if self.keys_hash[k].contains(exact) {
                 return NGX_BUSY;
             }
+
+            self.keys_hash[k].insert(exact.to_vec());
         }
 
-        if skip > 0 {
-            self.dns_wc_head_hash[k_idx].insert(wc_key.to_vec());
-        } else {
-            self.dns_wc_tail_hash[k_idx].insert(wc_key.to_vec());
-        }
+        let p = if skip > 0 {
+            // convert "*.example.com" to "com.example.\0"
+            //      and ".example.com" to "com.example\0"
 
-        // Reverse the key for wildcard head
-        let reversed = if skip > 0 {
-            // "*.example.com" -> "com.example.\0" or ".example.com" -> "com.example"
-            // Reverse domain labels: walk backwards from the end
-            let mut p = vec![0u8; last];
-            let mut p_pos = 0usize;
-            let mut label_len = 0usize;
+            let mut p = Vec::with_capacity(last);
+            let mut len = 0;
 
             let mut i = last - 1;
             while i > 0 {
                 if key[i] == b'.' {
-                    // Found a dot. Copy the label (from i+1 to i+1+label_len) to output
-                    if label_len > 0 {
-                        p[p_pos..p_pos + label_len].copy_from_slice(&key[i + 1..i + 1 + label_len]);
-                        p_pos += label_len;
-                        p[p_pos] = b'.';
-                        p_pos += 1;
-                    }
-                    label_len = 0;
-                    i -= 1;
+                    p.extend_from_slice(&key[i + 1..i + 1 + len]);
+                    p.push(b'.');
+                    len = 0;
                 } else {
-                    label_len += 1;
-                    i -= 1;
+                    len += 1;
                 }
+                i -= 1;
             }
 
-            // Handle the remaining part at the beginning (after skip)
-            // For "*.example.com" with skip=2, we process "example.com" (indices 2..13)
-            // The beginning part is key[skip..skip+label_len]
-            if label_len > 0 {
-                p[p_pos..p_pos + label_len].copy_from_slice(&key[skip..skip + label_len]);
-                p_pos += label_len;
+            if len > 0 {
+                p.extend_from_slice(&key[1..1 + len]);
             }
 
-            p.truncate(p_pos);
             p
         } else {
-            // "www.example.*" -> "www.example\0"
-            // last is already adjusted to exclude the ".*" suffix
-            let mut p = vec![0u8; last];
-            p[..last].copy_from_slice(&key[..last]);
-            p
+            // convert "www.example.*" to "www.example\0"
+
+            last += 1;
+
+            key[..last - 1].to_vec()
         };
 
-        let hk = HashKey {
-            key: reversed,
-            key_hash: 0,
-            value,
-        };
+        // check conflicts in wildcard hash ("www.example." for the tail
+        // wildcards)
+
+        let name = &key[skip..last];
+
+        let keys = if skip > 0 { &mut self.dns_wc_head_hash[k] } else { &mut self.dns_wc_tail_hash[k] };
+
+        if keys.contains(name) {
+            return NGX_BUSY;
+        }
+
+        keys.insert(name.to_vec());
+
+        // add to wildcard hash
+
+        let hk = HashKey { key: p, key_hash: 0, value };
 
         if skip > 0 {
             self.dns_wc_head.push(hk);
@@ -394,7 +383,24 @@ impl<V: Clone> Hash<V> {
             }
         }
 
-        let size = found_size.unwrap_or(max_size);
+        let size = match found_size {
+            Some(size) => size,
+            None => {
+                crate::ngx_log_error!(
+                    crate::log::NGX_LOG_WARN,
+                    hinit.log,
+                    None,
+                    "could not build optimal {}, you should increase either {}_max_size: {} or {}_bucket_size: {}; ignoring {}_bucket_size",
+                    name,
+                    name,
+                    max_size,
+                    name,
+                    bucket_size,
+                    name
+                );
+                max_size
+            }
+        };
 
         // Finalize bucket sizes
         for i in 0..size {
@@ -466,155 +472,129 @@ impl<V: Clone> Hash<V> {
     }
 }
 
-/// A wildcard hash table for prefix/suffix matching.
+/// A wildcard hash table for prefix/suffix matching (ngx_hash_wildcard_t).
 pub struct HashWildcard<V: Clone> {
     hash: Hash<WildcardValue<V>>,
+    /// hwc->value: the value of "example.com" for a hash of the
+    /// "*.example.com" wildcards
+    value: Option<V>,
 }
 
+/// The value of a wildcard hash element: the 2 low bits of the value
+/// pointer in C.
 enum WildcardValue<V: Clone> {
+    /// 00: the value for both "example.com" and "*.example.com"
     Value(V),
-    SubHashWithValue(std::rc::Rc<HashWildcard<V>>, V),
-    SubHashOnly(std::rc::Rc<HashWildcard<V>>),
+    /// 01: the value for "*.example.com" only
+    DotValue(V),
+    /// 10: a wildcard hash allowing both "example.com" and "*.example.com"
+    Hash(std::rc::Rc<HashWildcard<V>>),
+    /// 11: a wildcard hash allowing "*.example.com" only
+    DotHash(std::rc::Rc<HashWildcard<V>>),
 }
 
 impl<V: Clone> Clone for WildcardValue<V> {
     fn clone(&self) -> Self {
         match self {
             WildcardValue::Value(v) => WildcardValue::Value(v.clone()),
-            WildcardValue::SubHashWithValue(h, v) => WildcardValue::SubHashWithValue(h.clone(), v.clone()),
-            WildcardValue::SubHashOnly(h) => WildcardValue::SubHashOnly(h.clone()),
+            WildcardValue::DotValue(v) => WildcardValue::DotValue(v.clone()),
+            WildcardValue::Hash(h) => WildcardValue::Hash(h.clone()),
+            WildcardValue::DotHash(h) => WildcardValue::DotHash(h.clone()),
         }
     }
 }
 
 impl<V: Clone> HashWildcard<V> {
-    /// Initialize a wildcard hash table from keys. Keys are expected to be
-    /// pre-processed (reversed domain labels for head, etc.).
+    /// ngx_hash_wildcard_init: the keys are the converted wildcards
+    /// ("com.example." for "*.example.com", "com.example" for
+    /// ".example.com", "www.example" for "www.example.*"), sorted with
+    /// ngx_dns_strcmp().
     pub fn init(hinit: &HashInit, names: Vec<HashKey<V>>) -> Result<Self, String> {
-        if names.is_empty() {
-            // Return an empty wildcard hash
-            let empty_hash = Hash {
-                buckets: vec![],
-                size: 0,
-            };
-            return Ok(HashWildcard { hash: empty_hash });
-        }
+        let mut curr_names: Vec<HashKey<WildcardValue<V>>> = Vec::with_capacity(names.len());
 
-        Self::init_recursive(hinit, names)
-    }
-
-    fn init_recursive(hinit: &HashInit, names: Vec<HashKey<V>>) -> Result<Self, String> {
-        if names.is_empty() {
-            let empty_hash = Hash {
-                buckets: vec![],
-                size: 0,
-            };
-            return Ok(HashWildcard { hash: empty_hash });
-        }
-
-        // Split keys by first label
-        let mut curr_names = Vec::new();
-        let mut n = 0usize;
+        let mut n = 0;
 
         while n < names.len() {
             let key = &names[n].key;
 
-            // Find the first dot
-            let mut dot_pos = None;
-            for (i, &byte) in key.iter().enumerate() {
-                if byte == b'.' {
-                    dot_pos = Some(i);
+            let mut dot = false;
+            let mut len = 0;
+
+            while len < key.len() {
+                if key[len] == b'.' {
+                    dot = true;
                     break;
                 }
+                len += 1;
             }
 
-            let first_label_len = dot_pos.unwrap_or(key.len());
-            let first_label = &key[..first_label_len];
+            let name_key = key[..len].to_vec();
+            let name_hash = hash_key_lc(&name_key);
+            let mut name_value = WildcardValue::Value(names[n].value.clone());
 
-            let mut curr_key = HashKey {
-                key: first_label.to_vec(),
-                key_hash: hash_key_lc(first_label),
-                value: WildcardValue::Value(names[n].value.clone()),
-            };
+            let dot_len = len + 1;
 
-            let mut next_batch = vec![];
+            if dot {
+                len += 1;
+            }
+
+            let mut next_names: Vec<HashKey<V>> = Vec::new();
+
+            if key.len() != len {
+                next_names.push(HashKey { key: key[len..].to_vec(), key_hash: 0, value: names[n].value.clone() });
+            }
+
             let mut i = n + 1;
 
-            // Collect all keys with the same prefix
             while i < names.len() {
-                let next_key = &names[i].key;
-                let mut next_dot_pos = None;
-                for (j, &byte) in next_key.iter().enumerate() {
-                    if byte == b'.' {
-                        next_dot_pos = Some(j);
-                        break;
-                    }
-                }
+                let next = &names[i].key;
 
-                let next_first_label_len = next_dot_pos.unwrap_or(next_key.len());
-                let next_first_label = &next_key[..next_first_label_len];
-
-                if next_first_label != first_label {
+                // ngx_strncmp(names[n].key.data, names[i].key.data, len)
+                // over NUL-terminated keys
+                if next.len() < len || key[..len] != next[..len] {
                     break;
                 }
 
-                // Add remaining part to next_batch
-                if next_key.len() > next_first_label_len + 1 {
-                    next_batch.push(HashKey {
-                        key: next_key[next_first_label_len + 1..].to_vec(),
-                        key_hash: 0,
-                        value: names[i].value.clone(),
-                    });
+                if !dot && next.len() > len && next[len] != b'.' {
+                    break;
                 }
+
+                next_names.push(HashKey { key: next[dot_len.min(next.len())..].to_vec(), key_hash: 0, value: names[i].value.clone() });
 
                 i += 1;
             }
 
-            // If current key has remaining parts, add them to next_batch
-            if key.len() > first_label_len + 1 {
-                next_batch.insert(
-                    0,
-                    HashKey {
-                        key: key[first_label_len + 1..].to_vec(),
-                        key_hash: 0,
-                        value: names[n].value.clone(),
-                    },
-                );
+            if !next_names.is_empty() {
+                let mut wdc = Self::init(hinit, next_names)?;
+
+                if key.len() == len {
+                    wdc.value = Some(names[n].value.clone());
+                }
+
+                let wdc = std::rc::Rc::new(wdc);
+
+                name_value = if dot { WildcardValue::DotHash(wdc) } else { WildcardValue::Hash(wdc) };
+            } else if dot {
+                name_value = WildcardValue::DotValue(names[n].value.clone());
             }
 
-            if !next_batch.is_empty() {
-                let sub_hash = Self::init_recursive(hinit, next_batch)?;
-                curr_key.value = if first_label_len == key.len() {
-                    // Key has no trailing content after the first label
-                    WildcardValue::SubHashWithValue(std::rc::Rc::new(sub_hash), names[n].value.clone())
-                } else if key.len() == first_label_len + 1 {
-                    // Key is exactly first_label + one trailing dot
-                    // This is a complete match that should preserve its value
-                    WildcardValue::SubHashWithValue(std::rc::Rc::new(sub_hash), names[n].value.clone())
-                } else {
-                    // Key has more content after first_label and a dot
-                    WildcardValue::SubHashOnly(std::rc::Rc::new(sub_hash))
-                };
-            }
+            curr_names.push(HashKey { key: name_key, key_hash: name_hash, value: name_value });
 
-            curr_names.push(curr_key);
             n = i;
         }
 
-        // Initialize the hash for the current level
         let hash = Hash::init(hinit, curr_names)?;
 
-        Ok(HashWildcard { hash })
+        Ok(HashWildcard { hash, value: None })
     }
 
-    /// Find in wildcard head (e.g., "*.example.com").
+    /// ngx_hash_find_wc_head: a lowercased name for "*.example.com" and
+    /// ".example.com" wildcards.
     pub fn find_wc_head(&self, name: &[u8]) -> Option<&V> {
-        self.find_wc_head_impl(name)
-    }
+        let len = name.len();
 
-    fn find_wc_head_impl(&self, name: &[u8]) -> Option<&V> {
-        // Find the last dot
-        let mut n = name.len();
+        let mut n = len;
+
         while n > 0 {
             if name[n - 1] == b'.' {
                 break;
@@ -623,91 +603,86 @@ impl<V: Clone> HashWildcard<V> {
         }
 
         let mut key = 0u32;
-        for i in n..name.len() {
-            key = ngx_hash(key, name[i]);
+
+        for &c in &name[n..len] {
+            key = ngx_hash(key, c);
         }
 
-        // Try to find in the current level
-        if let Some(wildcard_val) = self.hash.find(key, &name[n..]) {
-            match wildcard_val {
-                WildcardValue::Value(v) => {
-                    // Check the encoding rules
-                    if n == 0 {
-                        // "example.com" - matches exact entry only if not marked as wildcard-only
-                        return Some(v);
-                    }
-                    return Some(v);
-                }
-                WildcardValue::SubHashWithValue(sub_hash, v) => {
-                    if n == 0 {
-                        // "example.com" - return the value associated with the wildcard
-                        return Some(v);
-                    }
-                    // Try sub-hash first
-                    if let Some(val) = sub_hash.find_wc_head_impl(&name[..n - 1]) {
-                        return Some(val);
-                    }
-                    // Return the sub-hash's default value
-                    return Some(v);
-                }
-                WildcardValue::SubHashOnly(sub_hash) => {
-                    if n == 0 {
-                        // "example.com" doesn't match wildcard-only entries
+        let value = match self.hash.find(key, &name[n..len]) {
+            Some(v) => v,
+            None => return self.value.as_ref(),
+        };
+
+        match value {
+            WildcardValue::Hash(hwc) | WildcardValue::DotHash(hwc) => {
+                if n == 0 {
+                    // "example.com"
+
+                    if let WildcardValue::DotHash(_) = value {
                         return None;
                     }
-                    // Try sub-hash
-                    if let Some(val) = sub_hash.find_wc_head_impl(&name[..n - 1]) {
-                        return Some(val);
-                    }
+
+                    return hwc.value.as_ref();
+                }
+
+                if let Some(v) = hwc.find_wc_head(&name[..n - 1]) {
+                    return Some(v);
+                }
+
+                hwc.value.as_ref()
+            }
+
+            WildcardValue::DotValue(v) => {
+                if n == 0 {
+                    // "example.com"
                     return None;
                 }
+
+                Some(v)
             }
+
+            WildcardValue::Value(v) => Some(v),
         }
-
-        None
     }
 
-    /// Find in wildcard tail (e.g., "www.example.*").
+    /// ngx_hash_find_wc_tail: a lowercased name for "www.example.*"
+    /// wildcards.
     pub fn find_wc_tail(&self, name: &[u8]) -> Option<&V> {
-        self.find_wc_tail_impl(name)
-    }
+        let len = name.len();
 
-    fn find_wc_tail_impl(&self, name: &[u8]) -> Option<&V> {
-        // Find the first dot
-        let mut i = 0;
         let mut key = 0u32;
-        while i < name.len() {
+        let mut i = 0;
+
+        while i < len {
             if name[i] == b'.' {
                 break;
             }
+
             key = ngx_hash(key, name[i]);
             i += 1;
         }
 
-        if i == name.len() {
-            // No dot found
+        if i == len {
             return None;
         }
 
-        // Try to find in the current level
-        if let Some(wildcard_val) = self.hash.find(key, &name[..i]) {
-            match wildcard_val {
-                WildcardValue::Value(v) => Some(v),
-                WildcardValue::SubHashWithValue(sub_hash, v) => {
-                    // Try sub-hash
-                    if let Some(val) = sub_hash.find_wc_tail_impl(&name[i + 1..]) {
-                        return Some(val);
-                    }
-                    // Return the sub-hash's default value
-                    Some(v)
+        let value = match self.hash.find(key, &name[..i]) {
+            Some(v) => v,
+            None => return self.value.as_ref(),
+        };
+
+        match value {
+            WildcardValue::Hash(hwc) | WildcardValue::DotHash(hwc) => {
+                i += 1;
+
+                if let Some(v) = hwc.find_wc_tail(&name[i..len]) {
+                    return Some(v);
                 }
-                WildcardValue::SubHashOnly(sub_hash) => {
-                    // Try sub-hash
-                    sub_hash.find_wc_tail_impl(&name[i + 1..])
-                }
+
+                hwc.value.as_ref()
             }
-        } else {
-            None
+
+            WildcardValue::Value(v) | WildcardValue::DotValue(v) => Some(v),
         }
     }
 }
@@ -945,5 +920,43 @@ mod tests {
         assert_eq!(h1, 97); // 'a' = 97
         let h2 = hash_key(b"ab");
         assert_eq!(h2, 97 * 31 + 98); // (97 * 31) + 'b'
+    }
+
+    #[test]
+    fn test_wildcard_find_semantics() {
+        // as ngx_hash_find_wc_head()/ngx_hash_find_wc_tail() in C
+        let mut ha: HashKeysArrays<i32> = HashKeysArrays::new(HashKind::Small);
+        assert_eq!(ha.add_key(b".example.com".to_vec(), 1, NGX_HASH_WILDCARD_KEY), NGX_OK);
+        assert_eq!(ha.add_key(b"*.y.example.com".to_vec(), 2, NGX_HASH_WILDCARD_KEY), NGX_OK);
+        assert_eq!(ha.add_key(b"*.example.org".to_vec(), 3, NGX_HASH_WILDCARD_KEY), NGX_OK);
+        assert_eq!(ha.add_key(b"*.Example.com".to_vec(), 9, NGX_HASH_WILDCARD_KEY), NGX_BUSY);
+        assert_eq!(ha.add_key(b"example.com".to_vec(), 9, NGX_HASH_WILDCARD_KEY), NGX_BUSY);
+        assert_eq!(ha.add_key(b"www.example.*".to_vec(), 4, NGX_HASH_WILDCARD_KEY), NGX_OK);
+        assert_eq!(ha.add_key(b"www.example.*".to_vec(), 5, NGX_HASH_WILDCARD_KEY), NGX_BUSY);
+        assert_eq!(ha.add_key(b"com.*".to_vec(), 6, NGX_HASH_WILDCARD_KEY), NGX_OK);
+
+        let log = Log::stderr(crate::log::NGX_LOG_EMERG);
+        let hinit = HashInit { name: "test_hash", max_size: 512, bucket_size: 64, log: &log };
+
+        let mut head = ha.dns_wc_head().to_vec();
+        head.sort_by(|a, b| crate::string::dns_strcmp(&a.key, &b.key).cmp(&0));
+        let head = HashWildcard::init(&hinit, head).unwrap();
+
+        let mut tail = ha.dns_wc_tail().to_vec();
+        tail.sort_by(|a, b| crate::string::dns_strcmp(&a.key, &b.key).cmp(&0));
+        let tail = HashWildcard::init(&hinit, tail).unwrap();
+
+        assert_eq!(head.find_wc_head(b"example.com"), Some(&1));
+        assert_eq!(head.find_wc_head(b"www.example.com"), Some(&1));
+        assert_eq!(head.find_wc_head(b"y.example.com"), Some(&1));
+        assert_eq!(head.find_wc_head(b"x.y.example.com"), Some(&2));
+        assert_eq!(head.find_wc_head(b"example.org"), None);
+        assert_eq!(head.find_wc_head(b"a.example.org"), Some(&3));
+        assert_eq!(head.find_wc_head(b"example.net"), None);
+
+        assert_eq!(tail.find_wc_tail(b"www.example.net"), Some(&4));
+        assert_eq!(tail.find_wc_tail(b"www.example"), None);
+        assert_eq!(tail.find_wc_tail(b"com.example"), Some(&6));
+        assert_eq!(tail.find_wc_tail(b"www.other.net"), None);
     }
 }

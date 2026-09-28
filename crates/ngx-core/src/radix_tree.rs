@@ -33,6 +33,21 @@ impl RadixTree {
             free: RefCell::new(Vec::new()),
         };
 
+        // ngx_radix_tree_create(): -1 is the default preallocation, the
+        // first levels of the tree that fit in a page
+        let preallocate = if preallocate == -1 {
+            match crate::os::pagesize() / (4 * std::mem::size_of::<usize>()) {
+                // amd64
+                128 => 6,
+                // i386, sparc64
+                256 => 7,
+                // sparc64 in 32-bit mode
+                _ => 8,
+            }
+        } else {
+            preallocate
+        };
+
         if preallocate > 0 {
             let mut p = preallocate as u32;
             let mut mask: u32 = 0;
@@ -77,7 +92,8 @@ impl RadixTree {
         let mut bit: u32 = 0x80000000;
         let mut node = self.root.clone();
         let mut next = self.root.clone();
-        let mut found = false;
+        // next != NULL: the root, for a zero mask
+        let mut found = true;
 
         // Find insertion point
         while bit & mask != 0 {
@@ -256,7 +272,8 @@ impl RadixTree {
         let mut bit: u8 = 0x80;
         let mut node = self.root.clone();
         let mut next = self.root.clone();
-        let mut found = false;
+        // next != NULL: the root, for a zero mask
+        let mut found = true;
 
         // Find insertion point
         while bit & mask[i] != 0 {
@@ -441,6 +458,11 @@ impl RadixTree {
                     value = borrowed.value;
                 }
 
+                // a node of a /128 network has no children
+                if i == 16 {
+                    break;
+                }
+
                 node = if key[i] & bit != 0 {
                     borrowed.right.clone()
                 } else {
@@ -456,5 +478,52 @@ impl RadixTree {
         }
 
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_zero_mask_busy() {
+        // the default network 0.0.0.0/0 is the root, as in C
+        let t = RadixTree::create(-1);
+        assert_eq!(t.insert32(0, 0, 1), 0);
+        assert_eq!(t.insert32(0, 0, 2), -3);
+        assert_eq!(t.find32(0x7f000001), 1);
+
+        assert_eq!(t.insert32(0x7f000000, 0xff000000, 3), 0);
+        assert_eq!(t.insert32(0x7f000000, 0xff000000, 4), -3);
+        assert_eq!(t.find32(0x7f000001), 3);
+        assert_eq!(t.find32(0x0a000001), 1);
+
+        assert_eq!(t.delete32(0x7f000000, 0xff000000), 0);
+        assert_eq!(t.find32(0x7f000001), 1);
+
+        // the preallocated root has children
+        assert_eq!(t.delete32(0, 0), 0);
+        assert_eq!(t.find32(0x7f000001), NGX_RADIX_NO_VALUE);
+        assert_eq!(t.delete32(0, 0), -1);
+    }
+
+    #[test]
+    fn find128_full_mask() {
+        let t = RadixTree::create(-1);
+        let zero = [0u8; 16];
+        let mut one = [0u8; 16];
+        one[15] = 1;
+        let full = [0xffu8; 16];
+
+        assert_eq!(t.insert128(&zero, &zero, 1), 0);
+        assert_eq!(t.insert128(&zero, &zero, 2), -3);
+        assert_eq!(t.insert128(&one, &full, 3), 0);
+        assert_eq!(t.insert128(&one, &full, 4), -3);
+
+        assert_eq!(t.find128(&one), 3);
+        assert_eq!(t.find128(&full), 1);
+
+        assert_eq!(t.delete128(&one, &full), 0);
+        assert_eq!(t.find128(&one), 1);
     }
 }
