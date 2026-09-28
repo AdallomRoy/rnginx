@@ -331,45 +331,95 @@ pub fn write(_log: &Log, src: &SockAddr, dst: &SockAddr) -> Option<Vec<u8>> {
     }
 }
 
-/// Get a TLV value by name or hex code
+/// ngx_proxy_protocol_get_tlv: the value of a TLV by name ("alpn",
+/// "ssl_cn", "ssl_verify", "0x2c", ...); Ok(None) is NGX_DECLINED
 pub fn get_tlv(pp: &ProxyProtocol, log: &Log, name: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-    if pp.tlvs.is_empty() {
-        return Ok(None);
+    ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "PROXY protocol v2 get tlv \"{}\"", B(name));
+
+    let mut te: &[(&str, u8)] = TLV_ENTRIES;
+    let mut tlvs: &[u8] = &pp.tlvs;
+
+    let mut p = name;
+
+    if p.len() >= 4 && &p[..4] == b"ssl_" {
+        let (off, len) = match lookup_tlv_range(log, tlvs, NGX_PROXY_PROTOCOL_TLV_SSL as u64)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let ssl = &tlvs[off..off + len];
+
+        // ngx_proxy_protocol_tlv_ssl_t: client, verify[4]
+        if ssl.len() < 5 {
+            return Err(());
+        }
+
+        p = &p[4..];
+
+        if p == b"verify" {
+            let verify = u32::from_be_bytes([ssl[1], ssl[2], ssl[3], ssl[4]]);
+            return Ok(Some(verify.to_string().into_bytes()));
+        }
+
+        te = TLV_SSL_ENTRIES;
+        tlvs = &ssl[5..];
     }
 
-    let tlv_type = if name.len() >= 2 && name[0] == b'0' && name[1] == b'x' {
-        // Hex format like "0x20"
-        parse_hex(&name[2..])
-    } else {
-        // Named TLV
-        match name {
-            b"alpn" => NGX_PROXY_PROTOCOL_TLV_ALPN,
-            b"authority" => NGX_PROXY_PROTOCOL_TLV_AUTHORITY,
-            b"unique_id" => NGX_PROXY_PROTOCOL_TLV_UNIQUE_ID,
-            b"ssl" => NGX_PROXY_PROTOCOL_TLV_SSL,
-            b"netns" => NGX_PROXY_PROTOCOL_TLV_NETNS,
-            b"ssl_version" => NGX_PROXY_PROTOCOL_TLV_SSL_VERSION,
-            b"ssl_cn" => NGX_PROXY_PROTOCOL_TLV_SSL_CN,
-            b"ssl_cipher" => NGX_PROXY_PROTOCOL_TLV_SSL_CIPHER,
-            b"ssl_sig_alg" => NGX_PROXY_PROTOCOL_TLV_SSL_SIG_ALG,
-            b"ssl_key_alg" => NGX_PROXY_PROTOCOL_TLV_SSL_KEY_ALG,
-            _ => {
-                ngx_log_error!(NGX_LOG_ERR, log, None, "unknown PROXY protocol TLV \"{}\"", B(name));
+    if p.len() >= 2 && p[0] == b'0' && p[1] == b'x' {
+        let ty = match crate::string::hextoi(&p[2..]) {
+            Some(t) => t,
+            None => {
+                ngx_log_error!(NGX_LOG_ERR, log, None, "invalid PROXY protocol TLV \"{}\"", B(name));
                 return Err(());
             }
-        }
-    };
+        };
 
-    lookup_tlv(&pp.tlvs, tlv_type)
+        return lookup_tlv(log, tlvs, ty as u64);
+    }
+
+    for (n, ty) in te.iter() {
+        if n.as_bytes() == p {
+            return lookup_tlv(log, tlvs, *ty as u64);
+        }
+    }
+
+    ngx_log_error!(NGX_LOG_ERR, log, None, "unknown PROXY protocol TLV \"{}\"", B(name));
+
+    Ok(None)
 }
 
-/// Lookup TLV value by type in TLV data
-fn lookup_tlv(tlvs: &[u8], tlv_type: u8) -> Result<Option<Vec<u8>>, ()> {
+/// ngx_proxy_protocol_tlv_entries
+static TLV_ENTRIES: &[(&str, u8)] = &[
+    ("alpn", NGX_PROXY_PROTOCOL_TLV_ALPN),
+    ("authority", NGX_PROXY_PROTOCOL_TLV_AUTHORITY),
+    ("unique_id", NGX_PROXY_PROTOCOL_TLV_UNIQUE_ID),
+    ("ssl", NGX_PROXY_PROTOCOL_TLV_SSL),
+    ("netns", NGX_PROXY_PROTOCOL_TLV_NETNS),
+];
+
+/// ngx_proxy_protocol_tlv_ssl_entries
+static TLV_SSL_ENTRIES: &[(&str, u8)] = &[
+    ("version", NGX_PROXY_PROTOCOL_TLV_SSL_VERSION),
+    ("cn", NGX_PROXY_PROTOCOL_TLV_SSL_CN),
+    ("cipher", NGX_PROXY_PROTOCOL_TLV_SSL_CIPHER),
+    ("sig_alg", NGX_PROXY_PROTOCOL_TLV_SSL_SIG_ALG),
+    ("key_alg", NGX_PROXY_PROTOCOL_TLV_SSL_KEY_ALG),
+];
+
+/// ngx_proxy_protocol_lookup_tlv
+fn lookup_tlv(log: &Log, tlvs: &[u8], tlv_type: u64) -> Result<Option<Vec<u8>>, ()> {
+    Ok(lookup_tlv_range(log, tlvs, tlv_type)?.map(|(off, len)| tlvs[off..off + len].to_vec()))
+}
+
+/// ngx_proxy_protocol_lookup_tlv: the offset and the length of the value
+fn lookup_tlv_range(log: &Log, tlvs: &[u8], tlv_type: u64) -> Result<Option<(usize, usize)>, ()> {
+    ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "PROXY protocol v2 lookup tlv:{:02x}", tlv_type);
+
     let mut p = 0;
 
     while p < tlvs.len() {
         if tlvs.len() - p < 3 {
-            ngx_log_error!(NGX_LOG_ERR, &Log::stderr(NGX_LOG_ERR), None, "broken PROXY protocol TLV");
+            ngx_log_error!(NGX_LOG_ERR, log, None, "broken PROXY protocol TLV");
             return Err(());
         }
 
@@ -377,34 +427,19 @@ fn lookup_tlv(tlvs: &[u8], tlv_type: u8) -> Result<Option<Vec<u8>>, ()> {
         let len = parse_uint16(&tlvs[p + 1..p + 3]) as usize;
         p += 3;
 
-        if p + len > tlvs.len() {
-            ngx_log_error!(NGX_LOG_ERR, &Log::stderr(NGX_LOG_ERR), None, "broken PROXY protocol TLV");
+        if tlvs.len() - p < len {
+            ngx_log_error!(NGX_LOG_ERR, log, None, "broken PROXY protocol TLV");
             return Err(());
         }
 
-        if ty == tlv_type {
-            return Ok(Some(tlvs[p..p + len].to_vec()));
+        if ty as u64 == tlv_type {
+            return Ok(Some((p, len)));
         }
 
         p += len;
     }
 
     Ok(None)
-}
-
-/// Parse hex string to u8
-fn parse_hex(s: &[u8]) -> u8 {
-    let mut val = 0u8;
-    for &byte in s {
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => return 0,
-        };
-        val = val.saturating_mul(16).saturating_add(digit);
-    }
-    val
 }
 
 #[cfg(test)]
