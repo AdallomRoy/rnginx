@@ -819,7 +819,9 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
 
     let preread = std::mem::take(&mut *c.buffer.borrow_mut());
 
-    if !preread.is_empty() {
+    // c->buffer->pos <= c->buffer->last: the first datagram of UDP is sent
+    // even if empty
+    if !preread.is_empty() || c.ty == libc::SOCK_DGRAM {
         ngx_log_debug!(NGX_LOG_DEBUG_STREAM, c.log, "stream proxy add preread buffer: {}", preread.len());
 
         upstream_out.push_back(preread);
@@ -844,7 +846,16 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
             ngx_core::proxy_protocol::proxy_protocol_write(&sockaddr, &local)
         };
 
-        upstream_out.push_front(header);
+        match upstream_out.front_mut() {
+            // the header buffer is not flushed: on UDP it goes in one
+            // datagram with the first one (ngx_udp_output_chain_to_iovec)
+            Some(first) if c.ty == libc::SOCK_DGRAM => {
+                let mut d = header;
+                d.extend_from_slice(first);
+                *first = d;
+            }
+            _ => upstream_out.push_front(header),
+        }
 
         u.proxy_protocol.set(0);
     }
@@ -979,6 +990,12 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
     // the read delay of limit_rate (src->read->delayed with its timer)
     let mut delay_until: Option<Instant> = None;
 
+    // src->read->ready of a client connection sharing a UDP listening
+    // socket: one datagram per read event (ngx_udp_shared_recv), none
+    // before the first event
+    let udp_shared = src.is_udp_shared();
+    let mut src_ready = !udp_shared;
+
     loop {
         if c.ty == libc::SOCK_DGRAM && (ngx_core::event::is_exiting() || ngx_core::cycle::globals(|g| g.terminate)) {
             // socket is already closed on worker shutdown
@@ -1009,7 +1026,7 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
                 out.clear();
             }
 
-            if r.eof(from_upstream).get() || delay_until.is_some() {
+            if r.eof(from_upstream).get() || delay_until.is_some() || !src_ready {
                 break;
             }
 
@@ -1073,10 +1090,18 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
                 }
             }
 
-            out.push_back(buf[..n].to_vec());
+            // a buffer with last_buf and no data (the end, or an error) is
+            // not sent: on UDP it is not a datagram
+            if n > 0 || !r.eof(from_upstream).get() {
+                out.push_back(buf[..n].to_vec());
+            }
 
             packets();
             received(n as i64);
+
+            if udp_shared {
+                src_ready = false;
+            }
 
             do_write = true;
         }
@@ -1121,6 +1146,8 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
         if src.readable().await.is_err() {
             // the socket is gone: the recv reports it
         }
+
+        src_ready = true;
     }
 }
 
@@ -1194,9 +1221,10 @@ fn test_finalize(r: &Relay, from_upstream: bool) -> Option<Finalize> {
 }
 
 /// ngx_delete_udp_connection: the next datagram of the client starts a new
-/// session. The UDP listening sockets (ngx_event_udp.c) are ported in the
-/// connection layer separately; until then no UDP session exists.
-fn delete_udp_connection(_c: &Connection) {}
+/// session.
+fn delete_udp_connection(c: &Connection) {
+    ngx_core::event_udp::delete_udp_connection(c);
+}
 
 // --- configuration ---
 

@@ -660,6 +660,7 @@ pub fn stop_accepting(ls: &Listening) {
             h.abort();
         }
     });
+    crate::event_udp::stop_recvmsg(ls);
 }
 
 fn start_accepting(cycle: &Rc<Cycle>) {
@@ -671,7 +672,8 @@ fn start_accepting(cycle: &Rc<Cycle>) {
         if ls.reuseport.get() && ls.worker.get() as i64 != worker && process_type() == ProcessType::Worker {
             continue;
         }
-        let h = spawn(accept_loop(cycle.clone(), ls.clone()));
+        // rev->handler: ngx_event_accept, or ngx_event_recvmsg for UDP
+        let h = if ls.ty == libc::SOCK_DGRAM { spawn(crate::event_udp::recvmsg_loop(ls.clone())) } else { spawn(accept_loop(cycle.clone(), ls.clone())) };
         ACCEPT_TASKS.with(|t| t.borrow_mut().insert(ls.fd.get(), h.abort_handle()));
     }
 }

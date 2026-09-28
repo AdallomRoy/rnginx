@@ -87,6 +87,7 @@ pub mod degradation;
 pub mod sub_filter;
 pub mod charset_filter;
 pub mod secure_link;
+pub mod geoip;
 
 pub use request::{Request, R};
 
@@ -593,7 +594,7 @@ pub fn modules() -> Vec<ModuleDef> {
         realip::realip_module(),
         stubs::json_module(),
         geo::geo_module(),
-        stubs::geoip_module(),
+        geoip::geoip_module(),
         map::map_module(),
         split_clients::split_clients_module(),
         referer::referer_module(),

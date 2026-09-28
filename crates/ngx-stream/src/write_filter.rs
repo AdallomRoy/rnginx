@@ -21,7 +21,9 @@ pub enum WriteError {
 
 /// ngx_stream_top_filter (ngx_stream_write_filter): send the buffers to
 /// `c`, the client connection for the data from the upstream and the
-/// upstream connection otherwise. On UDP each buffer is a datagram. With a
+/// upstream connection otherwise. On UDP each buffer is a datagram, an
+/// empty one too, and a client connection (sharing the listening socket)
+/// fails with "shared connection is busy" instead of waiting. With a
 /// timeout, waiting for the socket longer than it gives TimedOut (the
 /// write event timer of the callers, re-armed after each write).
 pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstream: bool, timeout: Option<Duration>) -> Result<(), WriteError> {
@@ -33,20 +35,32 @@ pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstre
 
     ngx_log_debug!(NGX_LOG_DEBUG_STREAM, c.log, "stream write filter: l:0 f:1 s:{}", size);
 
-    if size == 0 {
-        return Ok(());
-    }
-
     let _ = (s, from_upstream);
 
     if c.ty == libc::SOCK_DGRAM {
-        for b in bufs.iter().filter(|b| !b.is_empty()) {
-            let r = match timeout {
-                Some(t) => match tokio::time::timeout(t, c.send(b)).await {
-                    Ok(r) => r,
-                    Err(_) => return Err(WriteError::TimedOut),
-                },
-                None => c.send(b).await,
+        // ngx_udp_unix_sendmsg_chain: each buffer is flushed as a datagram,
+        // an empty one too (c->need_flush_buf)
+
+        for b in bufs.iter() {
+            let r = if c.shared.get() {
+                // a connection sharing a UDP listening socket does not wait
+                // for it
+
+                match c.try_send(b) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        ngx_core::ngx_log_error!(NGX_LOG_ALERT, c.log, None, "shared connection is busy");
+                        return Err(WriteError::Error);
+                    }
+                    r => r,
+                }
+            } else {
+                match timeout {
+                    Some(t) => match tokio::time::timeout(t, c.send(b)).await {
+                        Ok(r) => r,
+                        Err(_) => return Err(WriteError::TimedOut),
+                    },
+                    None => c.send(b).await,
+                }
             };
 
             if let Err(e) = r {
@@ -56,6 +70,10 @@ pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstre
             }
         }
 
+        return Ok(());
+    }
+
+    if size == 0 {
         return Ok(());
     }
 

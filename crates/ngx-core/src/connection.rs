@@ -216,6 +216,10 @@ pub struct Connection {
     /// Connection::new_fake). It never owns the socket or the SSL object,
     /// is not counted as a connection, and refuses socket I/O.
     pub fake: bool,
+    /// c->udp of a "pseudo" connection sharing a UDP listening socket
+    /// (event_udp.rs); kept after ngx_delete_udp_connection (then c.udp is
+    /// false) so that the connection can still send.
+    udp_conn: RefCell<Option<Rc<crate::event_udp::UdpConnection>>>,
 }
 
 impl Connection {
@@ -294,6 +298,7 @@ impl Connection {
             cleanups: RefCell::new(Vec::new()),
             passed_listening: RefCell::new(None),
             fake: false,
+            udp_conn: RefCell::new(None),
         });
         ACTIVE.with(|a| a.set(a.get() + 1));
         CONNECTIONS.with(|m| m.borrow_mut().insert(number, Rc::downgrade(&c)));
@@ -313,6 +318,23 @@ impl Connection {
             *c.local_sockaddr.borrow_mut() = Some(ls.sockaddr.clone());
         }
         Some(c)
+    }
+
+    /// The UDP state of a pseudo connection sharing a UDP listening socket
+    /// (made by the listening's recvmsg task, event_udp.rs); None for other
+    /// connections, including connected UDP sockets.
+    pub fn udp_conn(&self) -> Option<Rc<crate::event_udp::UdpConnection>> {
+        self.udp_conn.borrow().clone()
+    }
+
+    pub(crate) fn set_udp_conn(&self, udp: Rc<crate::event_udp::UdpConnection>) {
+        *self.udp_conn.borrow_mut() = Some(udp);
+    }
+
+    /// A pseudo connection of a UDP listening socket (c->shared with
+    /// c->type SOCK_DGRAM in C).
+    pub fn is_udp_shared(&self) -> bool {
+        self.udp_conn.borrow().is_some()
     }
 
     /// The per-stream "fake" connection of ngx_http_v2_create_stream: a copy
@@ -369,6 +391,7 @@ impl Connection {
             cleanups: RefCell::new(Vec::new()),
             passed_listening: RefCell::new(None),
             fake: true,
+            udp_conn: RefCell::new(None),
         })
     }
 
@@ -384,7 +407,9 @@ impl Connection {
             return Ok(a.clone());
         }
         let fd = self.fd.get();
-        if fd < 0 {
+        if fd < 0 || self.is_udp_shared() {
+            // the socket of a pseudo connection is the listening's, read
+            // and written through its UDP state (event_udp.rs)
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         let a = Rc::new(AsyncFd::with_interest(Fd(fd), Interest::READABLE | Interest::WRITABLE)?);
@@ -394,13 +419,29 @@ impl Connection {
 
     /// Wait until the socket is readable.
     pub async fn readable(&self) -> io::Result<()> {
+        if let Some(udp) = self.udp_conn() {
+            return udp.readable(self).await;
+        }
         let afd = self.afd()?;
+        if self.ty == libc::SOCK_DGRAM {
+            // a connected UDP socket: an ICMP error (ECONNREFUSED) comes as
+            // EPOLLERR alone, which ngx_epoll_process_events handles as
+            // EPOLLIN|EPOLLOUT; the next recv() returns the error
+            let mut g = afd.ready(Interest::READABLE | Interest::ERROR).await?;
+            if g.ready().is_error() {
+                g.clear_ready_matching(tokio::io::Ready::ERROR);
+            }
+            return Ok(());
+        }
         let _g = afd.readable().await?;
         Ok(())
     }
 
     /// Wait until the socket is writable.
     pub async fn writable(&self) -> io::Result<()> {
+        if let Some(udp) = self.udp_conn() {
+            return udp.writable().await;
+        }
         let afd = self.afd()?;
         let _g = afd.writable().await?;
         Ok(())
@@ -411,6 +452,9 @@ impl Connection {
     /// retry must pass the same bytes again.
     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.try_send(self, &[buf]);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -467,6 +511,9 @@ impl Connection {
     /// later readable() waits for a new event.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.try_recv(self, buf).ok_or_else(|| io::ErrorKind::WouldBlock.into());
+        }
         let afd = self.afd()?;
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let Some(ssl) = self.ssl.borrow().clone() {
@@ -482,6 +529,26 @@ impl Connection {
             }
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        if self.ty == libc::SOCK_DGRAM {
+            // recv() whatever the read readiness: the error of a connected
+            // UDP socket comes without it (see readable())
+            let mut guard = match afd.poll_read_ready(&mut cx) {
+                std::task::Poll::Ready(Ok(g)) => Some(g),
+                std::task::Poll::Ready(Err(e)) => return Err(e),
+                std::task::Poll::Pending => None,
+            };
+            let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                if let Some(g) = guard.as_mut() {
+                    g.clear_ready();
+                }
+            }
+            return Err(e);
+        }
         match afd.poll_read_ready(&mut cx) {
             std::task::Poll::Ready(Ok(mut guard)) => match guard.try_io(|inner| {
                 let n = unsafe { libc::recv(inner.get_ref().0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
@@ -493,7 +560,7 @@ impl Connection {
             }) {
                 Ok(r) => {
                     let n = r?;
-                    if n == 0 {
+                    if n == 0 && self.ty != libc::SOCK_DGRAM {
                         self.read_eof.set(true);
                     }
                     Ok(n)
@@ -507,6 +574,9 @@ impl Connection {
 
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.
     pub fn try_recv_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(udp) = self.udp_conn() {
+            return udp.try_recv(self, buf).ok_or_else(|| io::ErrorKind::WouldBlock.into());
+        }
         let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -515,6 +585,9 @@ impl Connection {
     }
 
     pub fn try_send_raw(&self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(udp) = self.udp_conn() {
+            return udp.try_send(self, &[buf]);
+        }
         let n = unsafe { libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -525,8 +598,19 @@ impl Connection {
     /// ngx_unix_recv equivalent: read some bytes, awaiting readiness. Ok(0) is EOF.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.recv(self, buf).await;
+        }
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.recv(self, buf).await;
+        }
+        if self.ty == libc::SOCK_DGRAM {
+            loop {
+                match self.try_recv(buf) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.readable().await?,
+                    r => return r,
+                }
+            }
         }
         let afd = self.afd()?;
         loop {
@@ -541,7 +625,7 @@ impl Connection {
             }) {
                 Ok(r) => {
                     let r = r?;
-                    if r == 0 {
+                    if r == 0 && self.ty != libc::SOCK_DGRAM {
                         self.read_eof.set(true);
                     }
                     return Ok(r);
@@ -554,6 +638,9 @@ impl Connection {
     /// Peek without consuming.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.peek(self, buf).await;
+        }
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
@@ -579,6 +666,9 @@ impl Connection {
     /// blocks for a new event, as the edge-triggered epoll does in C.
     pub async fn peek_more(&self, buf: &mut [u8], have: usize) -> io::Result<(usize, bool)> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.peek_more(self, buf, have).await;
+        }
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
@@ -603,6 +693,9 @@ impl Connection {
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.send(self, &[buf]).await;
+        }
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.send(self, buf).await;
         }
@@ -630,6 +723,9 @@ impl Connection {
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if let Some(udp) = self.udp_conn() {
+            return udp.send(self, iov).await;
+        }
         if let Some(ssl) = self.ssl.borrow().clone() {
             // SSL: write the first non-empty slice
             for s in iov {
@@ -843,6 +939,8 @@ impl Connection {
         if self.fd.get() == -1 {
             return;
         }
+        // the pool cleanup of a pseudo connection: ngx_delete_udp_connection
+        crate::event_udp::delete_udp_connection(self);
         // Use try_borrow_mut: on the h2 dispatch path a stale future
         // may still hold a shared borrow on self.ssl at close time.
         // In that case, defer the ssl drop to Connection Drop; there's

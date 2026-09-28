@@ -30,6 +30,7 @@ pub mod upstream;
 pub mod upstream_round_robin;
 pub mod access;
 pub mod geo;
+pub mod geoip;
 pub mod log;
 pub mod map;
 pub mod split_clients;
@@ -889,6 +890,7 @@ pub fn modules() -> Vec<ModuleDef> {
         limit_conn::limit_conn_module(),
         access::access_module(),
         geo::geo_module(),
+        geoip::geoip_module(),
         map::map_module(),
         split_clients::split_clients_module(),
         return_module::return_module(),
