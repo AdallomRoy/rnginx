@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use ngx_core::connection::Connection;
+use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf};
 use ngx_core::log::*;
 use ngx_core::module::*;
 use ngx_core::ngx_log_debug;
@@ -74,6 +75,31 @@ pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstre
     }
 
     if size == 0 {
+        return Ok(());
+    }
+
+    if c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get()) {
+        // c->send_chain: ngx_ssl_send_chain, the buffers of a read are
+        // flushed (or last)
+
+        let links: Vec<SslChainBuf> = bufs.iter().map(|b| SslChainBuf { mem: b, file: None, flush: true, last_buf: false }).collect();
+
+        let r = match timeout {
+            Some(t) => match tokio::time::timeout(t, ngx_ssl_send_chain_wait(c, &links, 0)).await {
+                Ok(r) => r,
+                Err(_) => return Err(WriteError::TimedOut),
+            },
+            None => ngx_ssl_send_chain_wait(c, &links, 0).await,
+        };
+
+        if let Err(e) = r {
+            if !ngx_core::event_openssl::is_ssl_error_logged(&e) {
+                c.connection_error(e.raw_os_error().unwrap_or(0), "SSL_write() failed");
+            }
+            c.error.set(true);
+            return Err(WriteError::Error);
+        }
+
         return Ok(());
     }
 

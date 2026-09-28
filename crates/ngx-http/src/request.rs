@@ -804,7 +804,9 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         weak_self: RefCell::new(Weak::new()),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
-    if c.ssl.borrow().is_some() {
+    // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is
+    // read into memory
+    if c.ssl.borrow().as_ref().is_some_and(|sc| !sc.state.sendfile.get()) {
         r.main_filter_need_in_memory.set(true);
     }
     r

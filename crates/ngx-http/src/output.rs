@@ -4,12 +4,17 @@ use std::io;
 
 use ngx_core::buf::{BufData, Chain};
 use ngx_core::connection::{Connection, TcpNopush};
+use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf, SslChainFile};
 use ngx_core::log::*;
 use ngx_core::ngx_log_error;
 
 /// Send as much of `chain` as possible up to `limit` bytes; returns bytes sent.
 /// Buffers are advanced in place (like ngx_chain_update_sent); fully sent buffers are removed.
 pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    if c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get()) {
+        return ssl_send_chain(c, chain, limit).await;
+    }
+
     let mut total: i64 = 0;
     let limit = if limit <= 0 { i64::MAX } else { limit };
     loop {
@@ -82,6 +87,31 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
             continue;
         }
     }
+}
+
+/// c->send_chain of an SSL connection: ngx_ssl_send_chain(), which keeps
+/// the data in c->ssl->buf until a flush (NGX_SSL_BUFFER), and sends the
+/// file buffers with kernel TLS.
+async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    let n = {
+        let links: Vec<SslChainBuf> = chain
+            .iter()
+            .map(|b| {
+                let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
+                    BufData::Memory(v) if b.in_memory() => (&v[b.pos..b.last], None),
+                    BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos, last: b.file_last })),
+                    _ => (&[], None),
+                };
+                SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf }
+            })
+            .collect();
+
+        ngx_ssl_send_chain_wait(c, &links, limit).await?
+    };
+
+    ngx_core::buf::chain_update_sent(chain, n);
+
+    Ok(n)
 }
 
 /// Convenience: send a whole chain (awaiting writability) — used by simple paths.
