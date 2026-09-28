@@ -210,6 +210,19 @@ async fn log_session(s: &S) {
 pub fn close_connection(c: &Rc<Connection>) {
     ngx_log_debug!(NGX_LOG_DEBUG_STREAM, c.log, "close stream connection: {}", c.fd.get());
 
+    if c.ssl.borrow().is_some() && ngx_core::event_openssl::ngx_ssl_shutdown(c) == ngx_core::rc::NGX_AGAIN {
+        // c->ssl->handler = ngx_stream_close_connection
+
+        let c = c.clone();
+
+        ngx_core::event::spawn(async move {
+            ngx_core::event_openssl::ngx_ssl_shutdown_wait(&c).await;
+            close_connection(&c);
+        });
+
+        return;
+    }
+
     c.data.borrow_mut().take();
 
     c.close();

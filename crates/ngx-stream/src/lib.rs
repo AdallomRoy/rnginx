@@ -44,6 +44,8 @@ pub mod upstream_least_conn;
 pub mod upstream_least_time;
 pub mod upstream_random;
 pub mod upstream_zone;
+pub mod ssl;
+pub mod ssl_preread;
 
 pub use session::{Session, S};
 
@@ -886,6 +888,7 @@ pub fn modules() -> Vec<ModuleDef> {
         proxy::proxy_module(),
         upstream::upstream_module(),
         write_filter::write_filter_module(),
+        ssl::ssl_module(),
         realip::realip_module(),
         limit_conn::limit_conn_module(),
         access::access_module(),
@@ -901,6 +904,7 @@ pub fn modules() -> Vec<ModuleDef> {
         upstream_least_time::upstream_least_time_module(),
         upstream_random::upstream_random_module(),
         upstream_zone::upstream_zone_module(),
+        ssl_preread::ssl_preread_module(),
     ]
 }
 

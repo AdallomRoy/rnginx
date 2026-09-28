@@ -504,6 +504,51 @@ impl Connection {
         }
     }
 
+    /// drive_io() continuing an operation whose last attempt returned
+    /// `step` (WantRead / WantWrite: NGX_AGAIN): waits for the readiness
+    /// first, as a C event handler runs only on the event.  The attempt
+    /// found the socket drained, so the retained readiness is cleared
+    /// (c->read->ready = 0).
+    pub async fn drive_io_from<T>(&self, mut step: IoStep<T>, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        match step {
+            IoStep::WantRead => {
+                if let std::task::Poll::Ready(Ok(mut guard)) = self.afd()?.poll_read_ready(&mut cx) {
+                    guard.clear_ready();
+                }
+            }
+            IoStep::WantWrite => {
+                if let std::task::Poll::Ready(Ok(mut guard)) = self.afd()?.poll_write_ready(&mut cx) {
+                    guard.clear_ready();
+                }
+            }
+            IoStep::Done(_) => {}
+        }
+
+        loop {
+            match step {
+                IoStep::Done(v) => return Ok(v),
+                IoStep::WantRead => {
+                    let afd = self.afd()?;
+                    let mut guard = afd.readable().await?;
+                    step = op();
+                    if matches!(step, IoStep::WantRead) {
+                        guard.clear_ready();
+                    }
+                }
+                IoStep::WantWrite => {
+                    let afd = self.afd()?;
+                    let mut guard = afd.writable().await?;
+                    step = op();
+                    if matches!(step, IoStep::WantWrite) {
+                        guard.clear_ready();
+                    }
+                }
+            }
+        }
+    }
+
     /// One non-blocking recv attempt (plain or TLS), without waiting:
     /// WouldBlock when no data can be read now. OpenSSL may hold decrypted
     /// data the socket no longer shows, so TLS is always tried first. A

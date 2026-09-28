@@ -24,6 +24,8 @@ pub struct SslConnection {
     pub shutdown_without_free: Cell<bool>,
     pub buffer_size: Cell<usize>,
     pub data: RefCell<Option<Rc<dyn Any>>>,
+    /// the rest of ngx_ssl_connection_t (ngx_ssl_create_connection())
+    pub state: crate::event_openssl::SslConnState,
 }
 
 impl SslConnection {
@@ -36,6 +38,7 @@ impl SslConnection {
             shutdown_without_free: Cell::new(false),
             buffer_size: Cell::new(16384),
             data: RefCell::new(None),
+            state: crate::event_openssl::SslConnState::default(),
         }
     }
 
@@ -85,12 +88,16 @@ impl SslConnection {
     }
 
     pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
+        if self.state.ngx.get() {
+            return c.drive_io(|| crate::event_openssl::ngx_ssl_recv_step(c, self, buf)).await?;
+        }
         c.drive_io(|| self.read_step(c, buf)).await?
     }
 
     /// A single SSL_read attempt; WANT_READ / WANT_WRITE map to WouldBlock.
     pub fn try_recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
-        match self.read_step(c, buf) {
+        let step = if self.state.ngx.get() { crate::event_openssl::ngx_ssl_recv_step(c, self, buf) } else { self.read_step(c, buf) };
+        match step {
             IoStep::Done(r) => r,
             IoStep::WantRead | IoStep::WantWrite => Err(io::ErrorKind::WouldBlock.into()),
         }
@@ -99,6 +106,9 @@ impl SslConnection {
     pub async fn send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.state.ngx.get() {
+            return c.drive_io(|| crate::event_openssl::ngx_ssl_write_step(c, self, buf)).await?;
         }
         c.drive_io(|| {
             let rc = unsafe {
@@ -121,6 +131,12 @@ impl SslConnection {
 
     /// A single SSL_write attempt; WANT_READ / WANT_WRITE map to WouldBlock.
     pub fn try_send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
+        if self.state.ngx.get() {
+            return match crate::event_openssl::ngx_ssl_write_step(c, self, buf) {
+                IoStep::Done(r) => r,
+                IoStep::WantRead | IoStep::WantWrite => Err(io::ErrorKind::WouldBlock.into()),
+            };
+        }
         let rc = unsafe { openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32) };
         if rc > 0 {
             c.sent.set(c.sent.get() + rc as u64);
@@ -179,6 +195,7 @@ pub fn openssl_version_text() -> String {
 
 pub fn ssl_init(_log: &Log) {
     openssl::init();
+    crate::event_openssl::ngx_ssl_init(_log);
 }
 
 fn ssl_engine(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {

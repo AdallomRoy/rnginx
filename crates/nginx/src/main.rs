@@ -181,7 +181,7 @@ fn modules() -> Vec<ModuleDef> {
         errlog_module(),
         conf_module(),
         ngx_core::ssl::openssl_module(),
-        ngx_core::stubs::openssl_cache_module(),
+        ngx_core::event_openssl_cache::openssl_cache_module(),
         ngx_core::stubs::quic_module(),
         ngx_core::stubs::quic_bpf_module(),
         ngx_core::regex::regex_module(),

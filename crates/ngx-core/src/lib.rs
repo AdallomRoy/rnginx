@@ -53,4 +53,8 @@ pub mod proxy_protocol;
 pub mod crypt;
 pub mod resolver;
 pub mod open_file_cache;
+pub mod openssl_ffi;
+pub mod event_openssl;
+pub mod event_openssl_cache;
+pub mod event_openssl_stapling;
 pub mod geoip;

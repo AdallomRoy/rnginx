@@ -109,7 +109,9 @@ pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstre
             Ok(n) => n,
             Err(e) => {
                 let err = e.raw_os_error().unwrap_or(0);
-                if c.ssl.borrow().is_some() {
+                if ngx_core::event_openssl::is_ssl_error_logged(&e) {
+                    /* logged by ngx_ssl_write() */
+                } else if c.ssl.borrow().is_some() {
                     ngx_core::ngx_log_error!(NGX_LOG_ERR, c.log, if err != 0 { Some(err) } else { None }, "SSL_write() failed");
                 } else {
                     c.connection_error(err, "writev() failed");
