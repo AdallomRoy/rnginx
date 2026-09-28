@@ -11,16 +11,13 @@ pub const NGX_PROXY_PROTOCOL_MAX_HEADER: usize = 4096;
 pub const NGX_PROXY_PROTOCOL_V2_MAX_HEADER: usize = 52;
 
 // V2 constants
-#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_CMD_LOCAL: u8 = 0;
 const NGX_PROXY_PROTOCOL_CMD_PROXY: u8 = 1;
 
-#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_AF_UNSPEC: u8 = 0;
 const NGX_PROXY_PROTOCOL_AF_INET: u8 = 1;
 const NGX_PROXY_PROTOCOL_AF_INET6: u8 = 2;
 
-#[allow(dead_code)]
 const NGX_PROXY_PROTOCOL_TYPE_UNSPEC: u8 = 0;
 const NGX_PROXY_PROTOCOL_TYPE_STREAM: u8 = 1;
 const NGX_PROXY_PROTOCOL_TYPE_DGRAM: u8 = 2;
@@ -524,4 +521,214 @@ mod tests {
         let result = get_tlv(&pp, &log, b"0x01").unwrap();
         assert_eq!(result, Some(b"http".to_vec()));
     }
+}
+
+/// The address of a sockaddr without the port, as ngx_sock_ntop(.., 0).
+fn sock_ntop_noport(sa: &SockAddr) -> Vec<u8> {
+    sa.to_text(false)
+}
+
+/// ngx_proxy_protocol_write: the v1 header of a connection with the client
+/// address `sockaddr` accepted on `local`.
+pub fn proxy_protocol_write(sockaddr: &SockAddr, local: &SockAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
+
+    match sockaddr {
+        SockAddr::V4(_) => buf.extend_from_slice(b"PROXY TCP4 "),
+        SockAddr::V6(_) => buf.extend_from_slice(b"PROXY TCP6 "),
+        _ => return b"PROXY UNKNOWN\r\n".to_vec(),
+    }
+
+    buf.extend_from_slice(&sock_ntop_noport(sockaddr));
+    buf.push(b' ');
+    buf.extend_from_slice(&sock_ntop_noport(local));
+
+    let port = sockaddr.port();
+    let lport = local.port();
+
+    buf.extend_from_slice(format!(" {} {}\r\n", port, lport).as_bytes());
+
+    buf
+}
+
+/// ngx_crc32c_table256
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            k += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+static CRC32C_TABLE256: [u32; 256] = crc32c_table();
+
+/// ngx_crc32c_long
+pub fn crc32c_long(p: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in p {
+        crc = CRC32C_TABLE256[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xffff_ffff
+}
+
+/// ngx_proxy_protocol_v2_family
+fn v2_family(sa: &SockAddr) -> u8 {
+    match sa {
+        SockAddr::V4(_) => NGX_PROXY_PROTOCOL_AF_INET,
+        SockAddr::V6(_) => NGX_PROXY_PROTOCOL_AF_INET6,
+        _ => NGX_PROXY_PROTOCOL_AF_UNSPEC,
+    }
+}
+
+/// ngx_proxy_protocol_v2_write_ipv6: an IPv4 address is promoted to
+/// ::ffff:a.b.c.d
+fn v2_write_ipv6(buf: &mut Vec<u8>, sa: &SockAddr) -> [u8; 2] {
+    match sa {
+        SockAddr::V6(a) => {
+            buf.extend_from_slice(&a.ip().octets());
+            a.port().to_be_bytes()
+        }
+        SockAddr::V4(a) => {
+            buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
+            buf.extend_from_slice(&a.ip().octets());
+            a.port().to_be_bytes()
+        }
+        _ => [0, 0],
+    }
+}
+
+/// The SSL TLV of a v2 header (ngx_proxy_protocol_v2_write_ssl).
+pub struct ProxyProtocolSslTlv {
+    pub client: u8,
+    pub verify: u32,
+    pub tlvs: Vec<(u8, Vec<u8>)>,
+}
+
+fn v2_write_tlv(buf: &mut Vec<u8>, ty: u8, value: &[u8]) {
+    buf.push(ty);
+    buf.push((value.len() >> 8) as u8);
+    buf.push(value.len() as u8);
+    buf.extend_from_slice(value);
+}
+
+/// ngx_proxy_protocol_v2_write: the v2 header of a connection (`ty`:
+/// SOCK_STREAM or SOCK_DGRAM) with the client address `sockaddr` accepted
+/// on `local`, the TLVs (the SSL ones evaluated by the caller:
+/// ngx_proxy_protocol_v2_eval_ssl) and the CRC32c TLV.
+pub fn proxy_protocol_v2_write(sockaddr: &SockAddr, local: &SockAddr, ty: i32, tlvs: &[(u8, Vec<u8>)], ssl: Option<&ProxyProtocolSslTlv>) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(NGX_PROXY_PROTOCOL_V2_MAX_HEADER);
+
+    // ngx_proxy_protocol_v2_write_header
+
+    buf.extend_from_slice(NGX_PROXY_PROTOCOL_SIGNATURE);
+
+    let src_af = v2_family(sockaddr);
+    let dst_af = v2_family(local);
+
+    // promote to the highest address family present on either side
+
+    let (command, family, transport) = if src_af == NGX_PROXY_PROTOCOL_AF_UNSPEC || dst_af == NGX_PROXY_PROTOCOL_AF_UNSPEC {
+        (NGX_PROXY_PROTOCOL_CMD_LOCAL, NGX_PROXY_PROTOCOL_AF_UNSPEC, NGX_PROXY_PROTOCOL_TYPE_UNSPEC)
+    } else {
+        let transport = match ty {
+            libc::SOCK_STREAM => NGX_PROXY_PROTOCOL_TYPE_STREAM,
+            libc::SOCK_DGRAM => NGX_PROXY_PROTOCOL_TYPE_DGRAM,
+            _ => NGX_PROXY_PROTOCOL_TYPE_UNSPEC,
+        };
+        (NGX_PROXY_PROTOCOL_CMD_PROXY, src_af.max(dst_af), transport)
+    };
+
+    buf.push(0x20 | command);
+    buf.push((family << 4) | transport);
+
+    // the length, set once all TLVs are written
+    buf.extend_from_slice(&[0, 0]);
+
+    let header_len = buf.len();
+
+    match family {
+        NGX_PROXY_PROTOCOL_AF_INET => {
+            let (SockAddr::V4(src), SockAddr::V4(dst)) = (sockaddr, local) else { unreachable!() };
+            buf.extend_from_slice(&src.ip().octets());
+            buf.extend_from_slice(&dst.ip().octets());
+            buf.extend_from_slice(&src.port().to_be_bytes());
+            buf.extend_from_slice(&dst.port().to_be_bytes());
+        }
+
+        NGX_PROXY_PROTOCOL_AF_INET6 => {
+            let mapped = |sa: &SockAddr| match sa {
+                SockAddr::V6(a) => a.ip().to_ipv4_mapped(),
+                _ => None,
+            };
+
+            match (mapped(sockaddr), mapped(local)) {
+                (Some(src4), Some(dst4)) => {
+                    // both v4-mapped: demote to AF_INET
+
+                    buf[13] = (NGX_PROXY_PROTOCOL_AF_INET << 4) | transport;
+
+                    buf.extend_from_slice(&src4.octets());
+                    buf.extend_from_slice(&dst4.octets());
+                    buf.extend_from_slice(&sockaddr.port().to_be_bytes());
+                    buf.extend_from_slice(&local.port().to_be_bytes());
+                }
+                _ => {
+                    let src_port = v2_write_ipv6(&mut buf, sockaddr);
+                    let dst_port = v2_write_ipv6(&mut buf, local);
+                    buf.extend_from_slice(&src_port);
+                    buf.extend_from_slice(&dst_port);
+                }
+            }
+        }
+
+        _ => {}
+    }
+
+    for (ty, value) in tlvs {
+        v2_write_tlv(&mut buf, *ty, value);
+    }
+
+    if let Some(ssl) = ssl {
+        // ngx_proxy_protocol_v2_write_ssl
+
+        let mut value = Vec::new();
+        value.push(ssl.client);
+        value.extend_from_slice(&ssl.verify.to_be_bytes());
+
+        for (ty, v) in ssl.tlvs.iter() {
+            v2_write_tlv(&mut value, *ty, v);
+        }
+
+        v2_write_tlv(&mut buf, NGX_PROXY_PROTOCOL_TLV_SSL, &value);
+    }
+
+    // ngx_proxy_protocol_v2_set_len: with the CRC32c TLV
+
+    let len = buf.len() + 3 + 4 - header_len;
+    buf[14] = (len >> 8) as u8;
+    buf[15] = len as u8;
+
+    // ngx_proxy_protocol_v2_write_crc32c: the checksum covers the entire
+    // header with the zeroed value
+
+    buf.push(NGX_PROXY_PROTOCOL_TLV_CRC32C);
+    buf.push(0);
+    buf.push(4);
+
+    let at = buf.len();
+    buf.extend_from_slice(&[0, 0, 0, 0]);
+
+    let crc = crc32c_long(&buf);
+
+    buf[at..at + 4].copy_from_slice(&crc.to_be_bytes());
+
+    buf
 }

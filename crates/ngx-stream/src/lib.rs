@@ -25,9 +25,11 @@ pub mod session;
 pub mod variables;
 pub mod script;
 pub mod write_filter;
+pub mod proxy;
+pub mod upstream;
+pub mod upstream_round_robin;
 pub mod return_module;
 pub mod set;
-pub mod upstream;
 
 pub use session::{Session, S};
 
@@ -866,6 +868,8 @@ pub fn modules() -> Vec<ModuleDef> {
     vec![
         stream_module(),
         core::core_module(),
+        proxy::proxy_module(),
+        upstream::upstream_module(),
         write_filter::write_filter_module(),
         return_module::return_module(),
         set::set_module(),

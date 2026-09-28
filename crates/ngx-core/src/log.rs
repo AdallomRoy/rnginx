@@ -261,6 +261,11 @@ impl Log {
         *self.inner.ctx.borrow_mut() = ctx;
     }
 
+    /// log->handler/log->data: the context of the messages
+    pub fn context(&self) -> Option<Rc<dyn LogContext>> {
+        self.inner.ctx.borrow().clone()
+    }
+
     #[inline]
     pub fn enabled(&self, level: u32) -> bool {
         self.inner.level.get() >= level

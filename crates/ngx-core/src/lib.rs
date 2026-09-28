@@ -40,6 +40,7 @@ pub mod inet;
 pub mod core_module;
 pub mod syslog;
 pub mod connection;
+pub mod event_connect;
 pub mod process;
 pub mod event;
 pub mod ssl;

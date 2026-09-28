@@ -210,13 +210,29 @@ impl Connection {
     }
 
     fn create(fd: RawFd, log: &Log, listening: Option<Rc<Listening>>, ty: i32, sockaddr: SockAddr) -> Option<Rc<Connection>> {
+        Connection::create_log(fd, log, false, listening, ty, sockaddr)
+    }
+
+    /// ngx_get_connection for ngx_event_connect_peer: a connection of an
+    /// outgoing socket, logging to pc->log (the log is shared, not copied:
+    /// its messages carry the context of the connection it belongs to).
+    pub fn peer(fd: RawFd, ty: i32, sockaddr: SockAddr, log: &Log) -> Option<Rc<Connection>> {
+        Connection::create_log(fd, log, true, None, ty, sockaddr)
+    }
+
+    fn create_log(fd: RawFd, log: &Log, shared_log: bool, listening: Option<Rc<Listening>>, ty: i32, sockaddr: SockAddr) -> Option<Rc<Connection>> {
         if active_connections() >= connection_n() {
             ngx_log_error!(NGX_LOG_ALERT, log, None, "{} worker_connections are not enough", connection_n());
             return None;
         }
         let number = stats().connection_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let clog = log.fork();
-        clog.set_connection(number);
+        let clog = if shared_log {
+            log.clone()
+        } else {
+            let clog = log.fork();
+            clog.set_connection(number);
+            clog
+        };
         let now = crate::times::cached();
         let c = Rc::new(Connection {
             fd: Cell::new(fd),
@@ -792,8 +808,12 @@ impl Connection {
         // Mirror ngx_close_connection: decrement $connections_active as soon
         // as the socket is torn down, not when the Rust Rc<Connection> is
         // finally dropped (stray Rcs on request tasks would otherwise inflate
-        // the gauge for the lifetime of the response).
-        stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // the gauge for the lifetime of the response). Only the accepted
+        // connections are counted (ngx_stat_active in ngx_event_accept);
+        // outgoing ones (ngx_event_connect_peer) are not.
+        if self.listening.is_some() {
+            stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // If we were on the reusable queue (waiting for a request), pull
         // ourselves off it before dropping the connection so
         // $connections_waiting stays consistent.
@@ -801,7 +821,11 @@ impl Connection {
             stats().waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.destroyed.set(true);
-        self.log.set_context(None);
+        // an outgoing connection shares the log of the connection it
+        // belongs to (pc->log): its context stays
+        if self.listening.is_some() {
+            self.log.set_context(None);
+        }
     }
 
     pub fn is_closed(&self) -> bool {
