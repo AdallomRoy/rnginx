@@ -28,6 +28,9 @@ pub struct RewriteRule {
     pub replacement: Vec<u8>,
     pub flags: RewriteFlags,
     pub log: bool,
+    /// regex->add_args: the replacement does not end with "?", the
+    /// original arguments are appended
+    pub add_args: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +54,9 @@ pub enum Code {
     SetHandler { var_idx: usize, value: ComplexValue, handler: crate::variables::SetHandler },
     Return { status: i64, text: Option<ComplexValue> },
     Break { is_break_cycle: bool }, // true = break, false = last
-    If { condition: IfCondition, codes: Vec<Code> },
+    /// ngx_http_script_if_code_t: `loc_conf` is the configuration of the
+    /// if block inside a location (NULL for an if at the server level).
+    If { condition: IfCondition, codes: Vec<Code>, loc_conf: Option<Rc<ConfSlots>> },
 }
 
 /// Condition types for if blocks
@@ -167,8 +172,7 @@ fn parse_if_condition(cf: &mut Conf, args_orig: &[Vec<u8>]) -> Result<IfConditio
     }
 
     let var_name = &args[0][1..]; // Remove leading '$'
-    // Create variable if it doesn't exist (for if conditions, make it weak so assignments override)
-    let _var = crate::variables::add_variable(cf, var_name, crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_WEAK).ok();
+    // ngx_http_rewrite_variable: the variable is referenced by its index only
     let var_idx = get_variable_index(cf, var_name)?;
 
     // If only variable, check if non-empty and not "0"
@@ -362,12 +366,24 @@ fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
     }
 
     let pattern = &args[1];
-    let replacement = args[2].clone();
+    let mut replacement = args[2].clone();
+
+    if replacement.is_empty() {
+        return Err(cf.emerg(format_args!("empty replacement")));
+    }
 
     // Compile regex
     let regex = match ngx_core::regex::Regex::compile(pattern, 0) {
         Ok(r) => r,
         Err(e) => return Err(cf.emerg(format_args!("{}", e))),
+    };
+
+    let add_args = if replacement.last() == Some(&b'?') {
+        // the last "?" drops the original arguments
+        replacement.pop();
+        false
+    } else {
+        true
     };
 
     // Parse flags and determine rewrite behavior
@@ -420,6 +436,7 @@ fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
         replacement,
         flags,
         log: cell.borrow().log.get_or(false),
+        add_args,
     };
 
     cell.borrow_mut().codes.push(Code::Rewrite(rule));
@@ -547,50 +564,76 @@ fn break_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> 
     Ok(())
 }
 
-/// ngx_http_rewrite_if directive handler - parses if block with condition
+/// ngx_http_rewrite_if: the block has its own location configuration, a
+/// "noname" location added to the enclosing one (merged with it like any
+/// nested location, never matched), and its rewrite directives are compiled
+/// into the code sequence of the enclosing level.
 fn if_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = cf.args.clone();
+    let lcf = conf_rc::<RewriteConf>(conf.as_ref().unwrap());
 
-    if args.len() < 2 {
-        return Err(cf.emerg(format_args!("no condition specified")));
+    let pctx = cf.ctx.clone();
+    let ctx = ConfCtx {
+        main: pctx.main.clone(),
+        srv: pctx.srv.clone(),
+        loc: Some(new_slots(http_max_module())),
+    };
+
+    let modules = cf.cycle.modules.clone();
+    for m in modules.iter().filter(|m| m.def.ty == ngx_core::module::NGX_HTTP_MODULE) {
+        if let Some(module) = m.ctx::<HttpModuleDef>() {
+            if let Some(create_loc_conf) = module.create_loc_conf {
+                let mconf = create_loc_conf(cf);
+                ctx.loc.as_ref().unwrap().borrow_mut()[m.ctx_index] = Some(mconf);
+            }
+        }
     }
 
-    // Parse condition from args[1..]
+    let pclcf = loc_conf_from_ctx(&pctx);
+
+    let clcf = loc_conf_from_ctx(&ctx);
+    {
+        let name = pclcf.borrow().name.clone();
+        let mut c = clcf.borrow_mut();
+        c.loc_conf = ctx.loc.clone();
+        c.name = name;
+        c.noname = true;
+    }
+
+    add_location(cf, &pclcf, &clcf)?;
+
+    // ngx_http_rewrite_if_condition
+    let args = cf.args.clone();
     let condition = parse_if_condition(cf, &args[1..])?;
 
-    // Get current code count before parsing block
-    let cell = conf_rc::<RewriteConf>(conf.as_ref().unwrap());
-    let block_start = cell.borrow().codes.len();
+    // the inner directives must be compiled to the same code array: they
+    // are collected in the codes of the if's rewrite conf, which are moved
+    // into the if code after the block
 
-    // Parse the block content by temporarily switching context
-    let saved_ct = cf.cmd_type;
-    cf.cmd_type = if saved_ct == NGX_HTTP_SRV_CONF {
-        NGX_HTTP_SIF_CONF
+    let nlcf = slot_of::<RewriteConf>(ctx.loc.as_ref().unwrap(), ctx_index());
+
+    let saved_ctx = std::mem::replace(&mut cf.ctx, ctx.clone());
+    let saved_cmd_type = cf.cmd_type;
+
+    let loc_conf = if cf.cmd_type == NGX_HTTP_SRV_CONF {
+        cf.cmd_type = NGX_HTTP_SIF_CONF;
+        None
     } else {
-        NGX_HTTP_LIF_CONF
+        cf.cmd_type = NGX_HTTP_LIF_CONF;
+        ctx.loc.clone()
     };
 
     let rv = cf.parse_block();
-    cf.cmd_type = saved_ct;
 
-    if rv.is_err() {
-        return rv;
-    }
+    cf.ctx = saved_ctx;
+    cf.cmd_type = saved_cmd_type;
 
-    // Extract codes that were added in the block
-    let block_codes = {
-        let mut c = cell.borrow_mut();
-        let all_codes = c.codes.clone();
-        let block = all_codes[block_start..].to_vec();
-        // Remove block codes from main list
-        c.codes.truncate(block_start);
-        block
-    };
+    rv?;
 
-    // Add the If code to the main list
-    cell.borrow_mut()
-        .codes
-        .push(Code::If { condition, codes: block_codes });
+    // the code array belong to parent block
+
+    let codes = std::mem::take(&mut nlcf.borrow_mut().codes);
+
+    lcf.borrow_mut().codes.push(Code::If { condition, codes, loc_conf });
 
     Ok(())
 }
@@ -817,12 +860,10 @@ async fn rewrite_handler(r: R) -> i64 {
 
                 // Handle redirect response
                 if rule.flags.redirect {
-                    // For redirects, check if trailing '?' suppresses original args
+                    // A trailing '?' of the replacement (removed at
+                    // configuration time) suppresses the original args
                     let mut response_url = replacement.clone();
-                    let suppress_args = response_url.ends_with(b"?");
-                    if suppress_args {
-                        response_url.pop(); // Remove the trailing '?'
-                    }
+                    let suppress_args = !rule.add_args;
 
                     // Unescape the URL per C ngx_http_script_regex_end_code:
                     // percent-encoded bytes in variable/capture expansions get
@@ -860,22 +901,21 @@ async fn rewrite_handler(r: R) -> i64 {
                 // For internal rewrites, parse replacement to separate URI and args
                 let orig_args = r.args.borrow().clone();
 
-                let (rewritten_uri, rewritten_args) = if replacement.ends_with(b"?") {
-                    // "?" at end means drop query string
-                    let uri_part = replacement[..replacement.len() - 1].to_vec();
-                    (uri_part, Vec::new())
-                } else if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
-                    // '?' in the middle: replacement has explicit args, append original args
+                // ngx_http_script_regex_end_code: the args of the
+                // replacement, then the original args unless the
+                // replacement ended with '?'
+                let (rewritten_uri, rewritten_args) = if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
                     let uri_part = replacement[..qpos].to_vec();
                     let mut args_part = replacement[qpos + 1..].to_vec();
-                    if !orig_args.is_empty() {
+                    if rule.add_args && !orig_args.is_empty() {
                         args_part.push(b'&');
                         args_part.extend_from_slice(&orig_args);
                     }
                     (uri_part, args_part)
-                } else {
-                    // No '?' - preserve original args
+                } else if rule.add_args {
                     (replacement.clone(), orig_args)
+                } else {
+                    (replacement.clone(), Vec::new())
                 };
 
                 // Update request URI and args for internal rewrites
@@ -956,9 +996,23 @@ async fn rewrite_handler(r: R) -> i64 {
                 break;
             }
 
-            Code::If { condition, codes } => {
+            Code::If { condition, codes, loc_conf } => {
                 // Evaluate condition
-                if eval_if_condition(&r, condition) {
+                let cond = eval_if_condition(&r, condition);
+
+                // ngx_http_script_if_code
+                http_debug!(r, "http script if");
+
+                if !cond {
+                    http_debug!(r, "http script if: false");
+                }
+
+                if cond {
+                    if let Some(loc_conf) = loc_conf {
+                        *r.loc_conf.borrow_mut() = loc_conf.clone();
+                        update_location_config(&r);
+                    }
+
                     // Execute codes inside the if block. `break` or a
                     // `break_cycle` rewrite inside must stop the outer
                     // rewrite-module processing too — otherwise a trailing
@@ -1051,19 +1105,18 @@ async fn rewrite_handler(r: R) -> i64 {
 
                                 // Handle query string for internal rewrite
                                 let orig_args = r.args.borrow().clone();
-                                let (rewritten_uri, rewritten_args) = if replacement.ends_with(b"?") {
-                                    let uri_part = replacement[..replacement.len() - 1].to_vec();
-                                    (uri_part, Vec::new())
-                                } else if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
+                                let (rewritten_uri, rewritten_args) = if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
                                     let uri_part = replacement[..qpos].to_vec();
                                     let mut args_part = replacement[qpos + 1..].to_vec();
-                                    if !orig_args.is_empty() {
+                                    if rule.add_args && !orig_args.is_empty() {
                                         args_part.push(b'&');
                                         args_part.extend_from_slice(&orig_args);
                                     }
                                     (uri_part, args_part)
-                                } else {
+                                } else if rule.add_args {
                                     (replacement.clone(), orig_args)
+                                } else {
+                                    (replacement.clone(), Vec::new())
                                 };
 
                                 *r.uri.borrow_mut() = rewritten_uri.clone();
