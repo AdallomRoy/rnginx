@@ -1109,6 +1109,50 @@ fn copy_capture(r: &R, n: usize, escape: bool, buf: &mut Vec<u8>) {
     }
 }
 
+/// The Location of a redirect in ngx_http_script_regex_end_code: the buffer
+/// unescaped up to the first "?", the rest as is, then the original
+/// arguments unless the replacement ended with "?" (add_args), after "&" if
+/// the replacement had a "?" (code->args), else after "?".
+fn redirect_location(buf: &[u8], add_args: bool, args: bool, orig_args: &[u8]) -> Vec<u8> {
+    let (mut location, consumed) = ngx_core::string::unescape_uri(buf, ngx_core::string::NGX_UNESCAPE_REDIRECT);
+
+    if consumed < buf.len() {
+        location.extend_from_slice(&buf[consumed..]);
+    }
+
+    if add_args && !orig_args.is_empty() {
+        location.push(if args { b'&' } else { b'?' });
+        location.extend_from_slice(orig_args);
+    }
+
+    location
+}
+
+/// The URI and the arguments of an internal rewrite in
+/// ngx_http_script_regex_end_code: with the start args code (e->args at
+/// `args_pos`) the arguments of the replacement, then "&" and the original
+/// ones if add_args; else the original arguments if add_args, or none.
+fn rewritten_uri_args(mut buf: Vec<u8>, args_pos: Option<usize>, add_args: bool, orig_args: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    match args_pos {
+        Some(pos) => {
+            let mut args = buf.split_off(pos);
+
+            if add_args && !orig_args.is_empty() {
+                args.push(b'&');
+                args.extend_from_slice(orig_args);
+            }
+
+            (buf, args)
+        }
+
+        None => {
+            let args = if add_args { orig_args.to_vec() } else { Vec::new() };
+
+            (buf, args)
+        }
+    }
+}
+
 /// ngx_http_script_regex_start_code and ngx_http_script_regex_end_code of
 /// the rewrite directive (code->uri set), with the NULL code that follows
 /// them after a rewrite with "last", "break", "redirect" or "permanent".
@@ -1201,20 +1245,9 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
     http_debug!(r, "http script regex end");
 
     if rule.flags.redirect {
-        // the unescaped URL up to the first "?", the rest as is
-        let (mut location, consumed) = ngx_core::string::unescape_uri(
-            &buf,
-            ngx_core::string::NGX_UNESCAPE_REDIRECT,
-        );
-        if consumed < buf.len() {
-            location.extend_from_slice(&buf[consumed..]);
-        }
-
         let orig_args = r.args.borrow().clone();
-        if rule.add_args && !orig_args.is_empty() {
-            location.push(if rule.args { b'&' } else { b'?' });
-            location.extend_from_slice(&orig_args);
-        }
+
+        let location = redirect_location(&buf, rule.add_args, rule.args, &orig_args);
 
         if log {
             ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten redirect: \"{}\"", B(&location));
@@ -1230,25 +1263,9 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
         return Flow::Exit(rc);
     }
 
-    let (rewritten_uri, rewritten_args) = match args_pos {
-        Some(pos) => {
-            let mut args = buf.split_off(pos);
+    let orig_args = r.args.borrow().clone();
 
-            let orig_args = r.args.borrow().clone();
-            if rule.add_args && !orig_args.is_empty() {
-                args.push(b'&');
-                args.extend_from_slice(&orig_args);
-            }
-
-            (buf, args)
-        }
-
-        None => {
-            let args = if rule.add_args { r.args.borrow().clone() } else { Vec::new() };
-
-            (buf, args)
-        }
-    };
+    let (rewritten_uri, rewritten_args) = rewritten_uri_args(buf, args_pos, rule.add_args, &orig_args);
 
     if log {
         ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten data: \"{}\", args: \"{}\"", B(&rewritten_uri), B(&rewritten_args));
@@ -1289,5 +1306,37 @@ mod tests {
         };
         assert!(flags.last);
         assert!(!flags.break_cycle);
+    }
+
+    #[test]
+    fn test_redirect_location() {
+        // the original arguments after "?", or after "&" when the
+        // replacement had a "?"
+        assert_eq!(redirect_location(b"http://x/a", true, false, b"q=1"), b"http://x/a?q=1".to_vec());
+        assert_eq!(redirect_location(b"http://x/a?b=2", true, true, b"q=1"), b"http://x/a?b=2&q=1".to_vec());
+
+        // a replacement that ended with "?" drops them
+        assert_eq!(redirect_location(b"http://x/a", false, false, b"q=1"), b"http://x/a".to_vec());
+        assert_eq!(redirect_location(b"http://x/a", true, false, b""), b"http://x/a".to_vec());
+
+        // NGX_UNESCAPE_REDIRECT up to the first "?": characters above "%"
+        // are decoded, others stay escaped; the arguments are left as is
+        assert_eq!(redirect_location(b"http://x/a%41%20%3F?c=%41", true, true, b""), b"http://x/aA%20??c=%41".to_vec());
+    }
+
+    #[test]
+    fn test_rewritten_uri_args() {
+        // e->args: the arguments of the replacement, then the original ones
+        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), true, b"q=2"), (b"/x".to_vec(), b"a=1&q=2".to_vec()));
+        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), false, b"q=2"), (b"/x".to_vec(), b"a=1".to_vec()));
+        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), true, b""), (b"/x".to_vec(), b"a=1".to_vec()));
+
+        // "?" at the end of the replacement: empty arguments of the
+        // replacement
+        assert_eq!(rewritten_uri_args(b"/x".to_vec(), Some(2), true, b"q=2"), (b"/x".to_vec(), b"&q=2".to_vec()));
+
+        // no arguments in the replacement
+        assert_eq!(rewritten_uri_args(b"/x".to_vec(), None, true, b"q=2"), (b"/x".to_vec(), b"q=2".to_vec()));
+        assert_eq!(rewritten_uri_args(b"/x".to_vec(), None, false, b"q=2"), (b"/x".to_vec(), Vec::new()));
     }
 }
