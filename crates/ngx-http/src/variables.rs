@@ -154,15 +154,18 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
             return Some(v.clone());
         }
     }
-    let get = var.get_handler.get();
+    if VARIABLE_DEPTH.with(|d| d.get()) == 0 {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "cycle while evaluating variable \"{}\"", B(&var.name));
+        return None;
+    }
+    VARIABLE_DEPTH.with(|d| d.set(d.get() - 1));
     let mut vv = VariableValue::default();
-    let rc = match get {
+    // ngx_http_variables_init_vars() left no indexed variable without one
+    let rc = match var.get_handler.get() {
         Some(g) => g(r, &mut vv, var.data.get()),
-        None => {
-            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "cycle while evaluating variable \"{}\"", B(&var.name));
-            NGX_ERROR
-        }
+        None => NGX_ERROR,
     };
+    VARIABLE_DEPTH.with(|d| d.set(d.get() + 1));
     if rc == NGX_OK {
         if !vv.not_found {
             vv.valid = true;
@@ -220,11 +223,19 @@ pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
         if v.flags.get() & NGX_HTTP_VAR_INDEXED != 0 {
             return get_flushed_variable(r, v.index.get());
         }
+        if VARIABLE_DEPTH.with(|d| d.get()) == 0 {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "cycle while evaluating variable \"{}\"", B(name));
+            return None;
+        }
+        VARIABLE_DEPTH.with(|d| d.set(d.get() - 1));
         let mut vv = VariableValue::default();
-        if let Some(g) = v.get_handler.get() {
-            if g(r, &mut vv, v.data.get()) == NGX_OK {
-                return Some(vv);
-            }
+        let rc = match v.get_handler.get() {
+            Some(g) => g(r, &mut vv, v.data.get()),
+            None => NGX_ERROR,
+        };
+        VARIABLE_DEPTH.with(|d| d.set(d.get() + 1));
+        if rc == NGX_OK {
+            return Some(vv);
         }
         return None;
     }
@@ -255,6 +266,9 @@ pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
 }
 
 thread_local! {
+    /// ngx_http_variable_depth: how many more get handlers may nest before
+    /// the evaluation is taken for a cycle
+    static VARIABLE_DEPTH: Cell<usize> = const { Cell::new(100) };
     static PREFIX_NAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static VAR_NAMES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
