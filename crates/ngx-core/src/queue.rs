@@ -29,34 +29,6 @@ impl Queue {
         self as *const Queue as *mut Queue == self.prev
     }
 
-    /// Insert after this node (insert_head).
-    pub unsafe fn insert_head(&self, x: *mut Queue) {
-        (*x).next = self.next;
-        (*(*x).next).prev = x;
-        (*x).prev = self as *const _ as *mut Queue;
-        let self_mut = self as *const Queue as *mut Queue;
-        (*self_mut).next = x;
-    }
-
-    /// Insert before this node (insert_tail on sentinel).
-    pub unsafe fn insert_tail(&self, x: *mut Queue) {
-        (*x).prev = self.prev;
-        (*(*x).prev).next = x;
-        (*x).next = self as *const Queue as *mut Queue;
-        let self_mut = self as *const Queue as *mut Queue;
-        (*self_mut).prev = x;
-    }
-
-    /// Insert after another node.
-    pub unsafe fn insert_after(&self, x: *mut Queue) {
-        self.insert_head(x);
-    }
-
-    /// Insert before another node.
-    pub unsafe fn insert_before(&self, x: *mut Queue) {
-        self.insert_tail(x);
-    }
-
     /// Get the head (first) element.
     pub fn head(&self) -> *mut Queue {
         self.next
@@ -82,35 +54,6 @@ impl Queue {
         self.prev
     }
 
-    /// Remove this node from the queue.
-    pub unsafe fn remove(&mut self) {
-        (*self.next).prev = self.prev;
-        (*self.prev).next = self.next;
-        // For debug: clear pointers
-        self.prev = ptr::null_mut();
-        self.next = ptr::null_mut();
-    }
-
-    /// Split a queue: move elements from q to end into a new queue n.
-    pub unsafe fn split(&self, q: *mut Queue, n: *mut Queue) {
-        (*n).prev = self.prev;
-        (*(*n).prev).next = n;
-        (*n).next = q;
-        let self_mut = self as *const Queue as *mut Queue;
-        (*self_mut).prev = (*q).prev;
-        (*(*self_mut).prev).next = self_mut;
-        (*q).prev = n;
-    }
-
-    /// Add another queue's elements to this one.
-    pub unsafe fn add(&self, n: *mut Queue) {
-        let self_mut = self as *const Queue as *mut Queue;
-        (*self_mut).prev.as_mut().unwrap().next = (*n).next;
-        (*(*n).next).prev = (*self_mut).prev;
-        (*self_mut).prev = (*n).prev;
-        (*(*self_mut).prev).next = self_mut;
-    }
-
     /// Find the middle element of a queue.
     pub fn middle(&self) -> *mut Queue {
         queue_middle(self as *const _ as *mut _)
@@ -129,6 +72,85 @@ impl Default for Queue {
     fn default() -> Self {
         Queue::new()
     }
+}
+
+// The operations that link and unlink nodes take raw pointers, as the
+// ngx_queue.h macros do: a node is reached through the pointers of its
+// neighbours, and changing it through a pointer derived from a shared
+// reference to it (or while a mutable one is live) is undefined behaviour,
+// which the compiler did exploit (a write to the head was dropped).
+
+/// ngx_queue_init
+pub unsafe fn queue_init(q: *mut Queue) {
+    (*q).prev = q;
+    (*q).next = q;
+}
+
+/// ngx_queue_empty
+pub unsafe fn queue_empty(h: *const Queue) -> bool {
+    h as *mut Queue == (*h).prev
+}
+
+/// ngx_queue_insert_head
+pub unsafe fn queue_insert_head(h: *mut Queue, x: *mut Queue) {
+    (*x).next = (*h).next;
+    (*(*x).next).prev = x;
+    (*x).prev = h;
+    (*h).next = x;
+}
+
+/// ngx_queue_insert_after
+pub unsafe fn queue_insert_after(h: *mut Queue, x: *mut Queue) {
+    queue_insert_head(h, x);
+}
+
+/// ngx_queue_insert_tail
+pub unsafe fn queue_insert_tail(h: *mut Queue, x: *mut Queue) {
+    (*x).prev = (*h).prev;
+    (*(*x).prev).next = x;
+    (*x).next = h;
+    (*h).prev = x;
+}
+
+/// ngx_queue_insert_before
+pub unsafe fn queue_insert_before(h: *mut Queue, x: *mut Queue) {
+    queue_insert_tail(h, x);
+}
+
+/// ngx_queue_head
+pub unsafe fn queue_head(h: *const Queue) -> *mut Queue {
+    (*h).next
+}
+
+/// ngx_queue_last
+pub unsafe fn queue_last(h: *const Queue) -> *mut Queue {
+    (*h).prev
+}
+
+/// ngx_queue_remove (NGX_DEBUG clears the pointers)
+pub unsafe fn queue_remove(x: *mut Queue) {
+    (*(*x).next).prev = (*x).prev;
+    (*(*x).prev).next = (*x).next;
+    (*x).prev = ptr::null_mut();
+    (*x).next = ptr::null_mut();
+}
+
+/// ngx_queue_split
+pub unsafe fn queue_split(h: *mut Queue, q: *mut Queue, n: *mut Queue) {
+    (*n).prev = (*h).prev;
+    (*(*n).prev).next = n;
+    (*n).next = q;
+    (*h).prev = (*q).prev;
+    (*(*h).prev).next = h;
+    (*q).prev = n;
+}
+
+/// ngx_queue_add
+pub unsafe fn queue_add(h: *mut Queue, n: *mut Queue) {
+    (*(*h).prev).next = (*n).next;
+    (*(*n).next).prev = (*h).prev;
+    (*h).prev = (*n).prev;
+    (*(*h).prev).next = h;
 }
 
 /// Find the middle node of a queue.
@@ -257,47 +279,64 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_queue_insert() {
         unsafe {
-            let mut head = Queue::new();
-            head.init();
+            let head: *mut Queue = Box::into_raw(Box::new(Queue::new()));
+            queue_init(head);
 
-            let mut nodes = vec![Queue::new(), Queue::new(), Queue::new()];
+            let nodes: Vec<*mut Queue> = (0..3).map(|_| Box::into_raw(Box::new(Queue::new()))).collect();
 
-            head.insert_head(&mut nodes[0]);
-            head.insert_head(&mut nodes[1]);
-            head.insert_head(&mut nodes[2]);
+            queue_insert_head(head, nodes[0]);
+            queue_insert_head(head, nodes[1]);
+            queue_insert_tail(head, nodes[2]);
 
-            assert!(!head.is_empty());
+            assert!(!queue_empty(head));
 
-            // Order should be 2, 1, 0 (inserted at head)
-            let mut current = head.next;
-            assert_eq!(current as *const Queue, &nodes[2] as *const Queue);
-
-            current = (*current).next;
-            assert_eq!(current as *const Queue, &nodes[1] as *const Queue);
+            // 1, 0, 2
+            let mut current = queue_head(head);
+            assert_eq!(current, nodes[1]);
 
             current = (*current).next;
-            assert_eq!(current as *const Queue, &nodes[0] as *const Queue);
+            assert_eq!(current, nodes[0]);
+
+            current = (*current).next;
+            assert_eq!(current, nodes[2]);
+
+            assert_eq!(queue_last(head), nodes[2]);
+            assert_eq!((*current).next, head);
+
+            for n in nodes.iter() {
+                queue_remove(*n);
+            }
+
+            assert!(queue_empty(head));
+
+            for n in nodes {
+                drop(Box::from_raw(n));
+            }
+            drop(Box::from_raw(head));
         }
     }
 
     #[test]
     fn test_queue_remove() {
         unsafe {
-            let mut head = Queue::new();
-            head.init();
+            let head: *mut Queue = Box::into_raw(Box::new(Queue::new()));
+            queue_init(head);
 
-            let mut node = Queue::new();
-            head.insert_head(&mut node);
+            let node: *mut Queue = Box::into_raw(Box::new(Queue::new()));
+            queue_insert_head(head, node);
 
-            assert!(!head.is_empty());
+            assert!(!queue_empty(head));
 
-            node.remove();
+            queue_remove(node);
 
             // After removal, should be empty again
-            assert_eq!(head.next as *const Queue, &head as *const Queue);
+            assert_eq!((*head).next, head);
+            assert!(queue_empty(head));
+
+            drop(Box::from_raw(node));
+            drop(Box::from_raw(head));
         }
     }
 }

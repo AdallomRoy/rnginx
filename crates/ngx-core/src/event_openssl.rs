@@ -3258,7 +3258,7 @@ pub fn ngx_ssl_session_cache_init(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn st
 
         (*cache).session_rbtree.init(&mut (*cache).sentinel, ngx_ssl_session_rbtree_insert_value);
 
-        (*cache).expire_queue.init();
+        crate::queue::queue_init(std::ptr::addr_of_mut!((*cache).expire_queue));
 
         (*cache).ticket_keys[0] = SslTicketKey::zeroed();
         (*cache).ticket_keys[1] = SslTicketKey::zeroed();
@@ -3428,7 +3428,7 @@ unsafe extern "C" fn ngx_ssl_new_session(ssl_conn: *mut SSL, sess: *mut SSL_SESS
 
         (*sess_id).expire = crate::times::time() + SSL_CTX_get_timeout(ssl_ctx) as i64;
 
-        (*cache).expire_queue.insert_head(&mut (*sess_id).queue);
+        crate::queue::queue_insert_head(std::ptr::addr_of_mut!((*cache).expire_queue), std::ptr::addr_of_mut!((*sess_id).queue));
 
         (*cache).session_rbtree.insert(&mut (*sess_id).node);
 
@@ -3515,7 +3515,7 @@ unsafe extern "C" fn ngx_ssl_get_cached_session(ssl_conn: *mut SSL, id: *const u
                 return d2i_SSL_SESSION(std::ptr::null_mut(), &mut p, slen as c_long);
             }
 
-            (*sess_id).queue.remove();
+            crate::queue::queue_remove(std::ptr::addr_of_mut!((*sess_id).queue));
 
             (*cache).session_rbtree.delete(node);
 
@@ -3589,7 +3589,7 @@ unsafe extern "C" fn ngx_ssl_remove_session(ssl: *mut SSL_CTX, sess: *mut SSL_SE
         let rc = memn2cmp(id, &(&(*sess_id).id)[..(*node).data as usize]);
 
         if rc == 0 {
-            (*sess_id).queue.remove();
+            crate::queue::queue_remove(std::ptr::addr_of_mut!((*sess_id).queue));
 
             (*cache).session_rbtree.delete(node);
 
@@ -3614,11 +3614,11 @@ unsafe fn ngx_ssl_expire_sessions(cache: *mut SslSessionCache, shpool: *mut Slab
     let now = crate::times::time();
 
     while n < 3 {
-        if (*cache).expire_queue.is_empty() {
+        if crate::queue::queue_empty(std::ptr::addr_of!((*cache).expire_queue)) {
             return;
         }
 
-        let q = (*cache).expire_queue.last();
+        let q = crate::queue::queue_last(std::ptr::addr_of!((*cache).expire_queue));
 
         let sess_id = sess_id_of_queue(q);
 
@@ -3629,7 +3629,7 @@ unsafe fn ngx_ssl_expire_sessions(cache: *mut SslSessionCache, shpool: *mut Slab
             return;
         }
 
-        (*q).remove();
+        crate::queue::queue_remove(q);
 
         if let Some(c) = crate::cycle::try_cycle() {
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "expire session: {:08X}", (*sess_id).node.key);

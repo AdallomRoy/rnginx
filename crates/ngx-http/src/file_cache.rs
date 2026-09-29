@@ -17,7 +17,7 @@ use ngx_core::buf::{Buf, BufFile, Chain};
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::open_file_cache::{open_cached_file, CachedFileHandle, OpenFileInfo};
-use ngx_core::queue::Queue;
+use ngx_core::queue::{queue_empty, queue_init, queue_insert_head, queue_last, queue_remove, Queue};
 use ngx_core::rbtree::{rbt_red, Rbtree, RbtreeNode};
 use ngx_core::rc::*;
 use ngx_core::shm::ShmZone;
@@ -273,35 +273,6 @@ impl FileCache {
     }
 }
 
-/// ngx_queue_init
-unsafe fn queue_init(h: *mut Queue) {
-    (*h).prev = h;
-    (*h).next = h;
-}
-
-/// ngx_queue_empty
-unsafe fn queue_empty(h: *mut Queue) -> bool {
-    h == (*h).prev
-}
-
-/// ngx_queue_last
-unsafe fn queue_last(h: *mut Queue) -> *mut Queue {
-    (*h).prev
-}
-
-/// ngx_queue_insert_head
-unsafe fn queue_insert_head(h: *mut Queue, x: *mut Queue) {
-    (*x).next = (*h).next;
-    (*(*x).next).prev = x;
-    (*x).prev = h;
-    (*h).next = x;
-}
-
-/// ngx_queue_remove
-unsafe fn queue_remove(x: *mut Queue) {
-    (*(*x).next).prev = (*x).prev;
-    (*(*x).prev).next = (*x).next;
-}
 
 /// The data of a cache path (cache->path->data).
 struct PathData(Weak<FileCache>);

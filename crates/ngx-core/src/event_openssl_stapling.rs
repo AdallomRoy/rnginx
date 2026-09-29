@@ -2138,7 +2138,7 @@ pub fn ngx_ssl_ocsp_cache_init(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn std::
 
         (*cache).rbtree.init(&mut (*cache).sentinel, str_rbtree_insert_value);
 
-        (*cache).expire_queue.init();
+        crate::queue::queue_init(std::ptr::addr_of_mut!((*cache).expire_queue));
 
         let ctx = format!(" in OCSP cache \"{}\"", B(&shm_zone.shm.name));
 
@@ -2194,7 +2194,7 @@ fn ngx_ssl_ocsp_cache_lookup(ctx: &mut OcspCtx) -> i64 {
                 return NGX_OK;
             }
 
-            (*node).queue.remove();
+            crate::queue::queue_remove(std::ptr::addr_of_mut!((*node).queue));
             (*cache).rbtree.delete(&mut (*node).node);
             (*shpool).free_locked(node as *mut u8);
 
@@ -2249,12 +2249,12 @@ fn ngx_ssl_ocsp_cache_store(ctx: &mut OcspCtx) -> i64 {
         let mut node = (*shpool).calloc_locked(size) as *mut SslOcspCacheNode;
 
         if node.is_null() {
-            if !(*cache).expire_queue.is_empty() {
-                let q = (*cache).expire_queue.last();
+            if !crate::queue::queue_empty(std::ptr::addr_of!((*cache).expire_queue)) {
+                let q = crate::queue::queue_last(std::ptr::addr_of!((*cache).expire_queue));
                 let old = cache_node_of_queue(q);
 
                 (*cache).rbtree.delete(&mut (*old).node);
-                (*q).remove();
+                crate::queue::queue_remove(q);
                 (*shpool).free_locked(old as *mut u8);
 
                 node = (*shpool).alloc_locked(size) as *mut SslOcspCacheNode;
@@ -2275,7 +2275,7 @@ fn ngx_ssl_ocsp_cache_store(ctx: &mut OcspCtx) -> i64 {
         (*node).valid = valid;
 
         (*cache).rbtree.insert(&mut (*node).node);
-        (*cache).expire_queue.insert_head(&mut (*node).queue);
+        crate::queue::queue_insert_head(std::ptr::addr_of_mut!((*cache).expire_queue), std::ptr::addr_of_mut!((*node).queue));
 
         (*shpool).unlock();
     }
