@@ -854,4 +854,125 @@ mod tests {
         let cache = OpenFileCache::new(5, 30);
         assert_eq!(cache.len(), 0);
     }
+
+    fn test_dir(tag: &str) -> String {
+        let d = format!("{}/ofc-{}-{}", std::env::temp_dir().display(), tag, std::process::id());
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn log_of(min_uses: u32) -> OpenFileInfo {
+        OpenFileInfo { log: true, valid: 60, min_uses, directio: usize::MAX, ..Default::default() }
+    }
+
+    fn entry_fd(cache: &OpenFileCache, name: &str) -> Option<i32> {
+        cache.lookup(name.as_bytes()).map(|f| f.borrow().fd)
+    }
+
+    #[test]
+    fn min_uses_closes_and_reopens() {
+        let d = test_dir("min-uses");
+        let log = Log::stderr(0);
+        let cache = OpenFileCache::new(10, 60);
+        let name = format!("{}/a.log", d);
+
+        // the first use: not used often enough to keep open
+        let mut of = log_of(2);
+        let h = open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap();
+        assert!(h.is_some() && of.fd >= 0);
+        drop(h);
+        assert_eq!(entry_fd(&cache, &name), Some(NGX_INVALID_FILE));
+        assert_eq!(cache.len(), 1);
+
+        // the second use reopens the file and keeps it open
+        let mut of = log_of(2);
+        let h = open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap();
+        let fd = of.fd;
+        assert!(h.is_some() && fd >= 0);
+        drop(h);
+        assert_eq!(entry_fd(&cache, &name), Some(fd));
+
+        // the third use is served from the cache
+        let mut of = log_of(2);
+        let _h = open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap();
+        assert_eq!(of.fd, fd);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn full_cache_forces_out_one_file() {
+        let d = test_dir("full");
+        let log = Log::stderr(0);
+        let cache = OpenFileCache::new(3, 60);
+
+        for n in ["a", "b", "c"] {
+            let name = format!("{}/{}.log", d, n);
+            let mut of = log_of(1);
+            drop(open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap());
+        }
+
+        assert_eq!(cache.len(), 3);
+
+        // "a" is the least recently used file, "b" and "c" are not inactive
+        let name = format!("{}/d.log", d);
+        let mut of = log_of(1);
+        drop(open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap());
+
+        assert_eq!(cache.len(), 3);
+        assert!(entry_fd(&cache, &format!("{}/a.log", d)).is_none());
+        for n in ["b", "c", "d"] {
+            assert!(entry_fd(&cache, &format!("{}/{}.log", d, n)).unwrap() >= 0);
+        }
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_open_drops_the_entry() {
+        let d = test_dir("failed");
+        let log = Log::stderr(0);
+        let cache = OpenFileCache::new(10, 60);
+        let name = format!("{}/sub/a.log", d);
+        std::fs::create_dir(format!("{}/sub", d)).unwrap();
+
+        let mut of = log_of(2);
+        drop(open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).unwrap());
+        assert_eq!(cache.len(), 1);
+
+        std::fs::rename(format!("{}/sub", d), format!("{}/moved", d)).unwrap();
+
+        // the file closed by min_uses cannot be reopened: the entry goes
+        let mut of = log_of(2);
+        assert!(open_cached_file(Some(&cache), name.as_bytes(), &mut of, &log).is_err());
+        assert_eq!(of.err, libc::ENOENT);
+        assert_eq!(of.failed, "open()");
+        assert_eq!(cache.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cached_directory_is_ok() {
+        let d = test_dir("dir");
+        let log = Log::stderr(0);
+        let cache = OpenFileCache::new(10, 60);
+
+        for _ in 0..2 {
+            let mut of = OpenFileInfo { valid: 60, min_uses: 1, test_dir: true, test_only: true, ..Default::default() };
+            let r = open_cached_file(Some(&cache), d.as_bytes(), &mut of, &log);
+            assert!(matches!(r, Ok(None)));
+            assert!(of.is_dir);
+        }
+
+        // without a cache, test_only only stats the name
+        let file = format!("{}/f", d);
+        std::fs::write(&file, b"x").unwrap();
+        let mut of = OpenFileInfo { test_only: true, ..Default::default() };
+        assert!(matches!(open_cached_file(None, file.as_bytes(), &mut of, &log), Ok(None)));
+        assert!(of.is_file && of.fd == NGX_INVALID_FILE && of.size == 1);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
