@@ -1215,6 +1215,13 @@ async fn send_response(
         let mut last = Buf::special();
         last.last_buf = true;
         chain.push_back(last);
+    } else {
+        // ngx_http_upstream_finalize_request with the header sent and an
+        // error: ngx_http_send_special(r, NGX_HTTP_FLUSH), the response
+        // header goes out even without a body
+        let mut flush = Buf::special();
+        flush.flush = true;
+        chain.push_back(flush);
     }
 
     let rc = crate::core_rt::output_filter(r, chain).await;
