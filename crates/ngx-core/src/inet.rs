@@ -59,10 +59,15 @@ impl SockAddr {
                 }
             }
             SockAddr::V6(a) => {
+                let text = inet6_ntop(&a.ip().octets());
                 if with_port {
-                    format!("[{}]:{}", a.ip(), a.port()).into_bytes()
+                    let mut v = Vec::with_capacity(text.len() + 8);
+                    v.push(b'[');
+                    v.extend_from_slice(&text);
+                    v.extend_from_slice(format!("]:{}", a.port()).as_bytes());
+                    v
                 } else {
-                    format!("{}", a.ip()).into_bytes()
+                    text
                 }
             }
             SockAddr::Unix(p) => {
@@ -214,11 +219,187 @@ pub fn inet_addr(text: &[u8]) -> Option<Ipv4Addr> {
 
 /// ngx_inet6_addr
 pub fn inet6_addr(text: &[u8]) -> Option<Ipv6Addr> {
-    let s = std::str::from_utf8(text).ok()?;
-    if s.contains('%') || s.is_empty() {
+    let mut addr = [0u8; 16];
+    let mut a = 0usize;
+
+    let mut p = text;
+
+    if p.is_empty() {
         return None;
     }
-    s.parse::<Ipv6Addr>().ok()
+
+    let mut zero: Option<usize> = None;
+    let mut digit: Option<&[u8]> = None;
+    let mut nibbles = 0u32;
+    let mut word = 0u32;
+    let mut n = 8u32;
+
+    if p[0] == b':' {
+        p = &p[1..];
+    }
+
+    let mut rest = p;
+
+    while let Some((&c, tail)) = rest.split_first() {
+        rest = tail;
+
+        if c == b':' {
+            if nibbles != 0 {
+                digit = Some(rest);
+                addr[a] = (word >> 8) as u8;
+                addr[a + 1] = (word & 0xff) as u8;
+                a += 2;
+
+                n -= 1;
+
+                if n != 0 {
+                    nibbles = 0;
+                    word = 0;
+                    continue;
+                }
+            } else if zero.is_none() {
+                digit = Some(rest);
+                zero = Some(a);
+                continue;
+            }
+
+            return None;
+        }
+
+        if c == b'.' && nibbles != 0 {
+            let digit = match digit {
+                Some(d) if n >= 2 => d,
+                _ => return None,
+            };
+
+            // the IPv4 part: from the last ':' to the end
+            let v4 = u32::from(inet_addr(digit)?);
+
+            addr[a] = ((v4 >> 24) & 0xff) as u8;
+            addr[a + 1] = ((v4 >> 16) & 0xff) as u8;
+            a += 2;
+            n -= 1;
+
+            word = v4 & 0xffff;
+            nibbles = 1;
+            rest = &[];
+            break;
+        }
+
+        nibbles += 1;
+
+        if nibbles > 4 {
+            return None;
+        }
+
+        if c.is_ascii_digit() {
+            word = word * 16 + (c - b'0') as u32;
+            continue;
+        }
+
+        let c = c | 0x20;
+
+        if (b'a'..=b'f').contains(&c) {
+            word = word * 16 + (c - b'a') as u32 + 10;
+            continue;
+        }
+
+        return None;
+    }
+
+    let _ = rest;
+
+    if nibbles == 0 && zero.is_none() {
+        return None;
+    }
+
+    addr[a] = (word >> 8) as u8;
+    addr[a + 1] = (word & 0xff) as u8;
+    a += 2;
+
+    n -= 1;
+
+    if n != 0 {
+        if let Some(z) = zero {
+            // move the words after "::" to the end
+            let shift = n as usize * 2;
+            addr.copy_within(z..a, z + shift);
+            for b in addr[z..z + shift].iter_mut() {
+                *b = 0;
+            }
+            return Some(Ipv6Addr::from(addr));
+        }
+    } else if zero.is_none() {
+        return Some(Ipv6Addr::from(addr));
+    }
+
+    None
+}
+
+/// ngx_inet6_ntop
+pub fn inet6_ntop(p: &[u8; 16]) -> Vec<u8> {
+    let mut zero = usize::MAX;
+    let mut last = usize::MAX;
+    let mut max = 1usize;
+    let mut n = 0usize;
+
+    for i in (0..16).step_by(2) {
+        if p[i] != 0 || p[i + 1] != 0 {
+            if max < n {
+                zero = last;
+                max = n;
+            }
+
+            n = 0;
+            continue;
+        }
+
+        if n == 0 {
+            last = i;
+        }
+
+        n += 1;
+    }
+
+    if max < n {
+        zero = last;
+        max = n;
+    }
+
+    let mut dst = Vec::with_capacity(46);
+    let mut n = 16;
+
+    if zero == 0 {
+        if (max == 5 && p[10] == 0xff && p[11] == 0xff) || max == 6 || (max == 7 && p[14] != 0 && p[15] != 1) {
+            n = 12;
+        }
+
+        dst.push(b':');
+    }
+
+    let mut i = 0;
+
+    while i < n {
+        if i == zero {
+            dst.push(b':');
+            i += (max - 1) * 2 + 2;
+            continue;
+        }
+
+        dst.extend_from_slice(format!("{:x}", p[i] as u32 * 256 + p[i + 1] as u32).as_bytes());
+
+        if i < 14 {
+            dst.push(b':');
+        }
+
+        i += 2;
+    }
+
+    if n == 12 {
+        dst.extend_from_slice(format!("{}.{}.{}.{}", p[12], p[13], p[14], p[15]).as_bytes());
+    }
+
+    dst
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -765,6 +946,58 @@ mod tests {
         assert_eq!(parse_addr_port(b"[]"), None);
         assert_eq!(parse_addr_port(b",192.0.2.1"), None);
         assert_eq!(parse_addr_port(b"localhost:80"), None);
+    }
+
+    #[test]
+    fn inet6_addr_as_c() {
+        let a = |s: &str| inet6_addr(s.as_bytes()).map(|a| a.to_string());
+
+        assert_eq!(a("::1"), Some("::1".into()));
+        assert_eq!(a("::"), Some("::".into()));
+        assert_eq!(a("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(a("1:2:3:4:5:6:7:8"), Some("1:2:3:4:5:6:7:8".into()));
+        assert_eq!(a("::ffff:1.2.3.4"), Some("::ffff:1.2.3.4".into()));
+        assert_eq!(a("1:2:3:4:5:6:1.2.3.4"), Some("1:2:3:4:5:6:102:304".into()));
+        assert_eq!(a("1::"), Some("1::".into()));
+        assert_eq!(a("ABCD::EF"), Some("abcd::ef".into()));
+
+        // a leading ":" is skipped by ngx_inet6_addr
+        assert_eq!(a(":1:2:3:4:5:6:7:8"), Some("1:2:3:4:5:6:7:8".into()));
+
+        // INADDR_NONE in the IPv4 part
+        assert_eq!(a("::ffff:255.255.255.255"), None);
+
+        assert_eq!(a(""), None);
+        assert_eq!(a(":::"), None);
+        assert_eq!(a("1::2::3"), None);
+        assert_eq!(a("12345::"), None);
+        assert_eq!(a("1:2:3:4:5:6:7:8:9"), None);
+        assert_eq!(a("1:2:3:4:5:6:7:8:"), None);
+        assert_eq!(a("1::2:3:4:5:6:7:8"), None);
+        assert_eq!(a("::1%eth0"), None);
+        assert_eq!(a("g::1"), None);
+        assert_eq!(a("1:2:3:4:5:6:7:1.2.3.4"), None);
+    }
+
+    #[test]
+    fn inet6_ntop_as_c() {
+        let t = |s: &str| String::from_utf8(inet6_ntop(&s.parse::<Ipv6Addr>().unwrap().octets())).unwrap();
+
+        assert_eq!(t("::1"), "::1");
+        assert_eq!(t("::"), "::");
+        assert_eq!(t("::ffff:127.0.0.1"), "::ffff:127.0.0.1");
+        assert_eq!(t("2001:db8::1"), "2001:db8::1");
+        assert_eq!(t("1::"), "1::");
+        assert_eq!(t("1:0:0:2::"), "1:0:0:2::");
+        assert_eq!(t("1:0:1:0:1:0:1:0"), "1:0:1:0:1:0:1:0");
+        assert_eq!(t("1:2:3:4:5:6:7:8"), "1:2:3:4:5:6:7:8");
+
+        // the IPv4-compatible forms of ngx_inet6_ntop
+        assert_eq!(t("::102:304"), "::1.2.3.4");
+        assert_eq!(t("::100"), "::0.0.1.0");
+        assert_eq!(t("::2"), "::2");
+        assert_eq!(t("::201"), "::201");
+        assert_eq!(t("::ffff:0:0"), "::ffff:0.0.0.0");
     }
 
     #[test]
