@@ -742,6 +742,11 @@ async fn ssi_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         return rc;
     }
 
+    // what ngx_http_ssi_output() does: the input is all parsed by now (the
+    // flag set while waiting for a subrequest would keep a subrequest
+    // from ending, see crate::postpone_filter)
+    ssi_buffered(&r, &ctx);
+
     // C returns, and the request waits for its postponed subrequests in
     // ngx_http_writer() once its handler is done
 
