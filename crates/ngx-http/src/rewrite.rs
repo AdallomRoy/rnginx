@@ -499,10 +499,8 @@ fn set_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
     )?;
     let var_idx = get_variable_index(cf, var_name)?;
 
-    // Install a null-value fallback if the variable has no handler yet, so
-    // reads before the set fires return not_found instead of "cycle" errors.
     if v.get_handler.get().is_none() {
-        v.get_handler.set(Some(rewrite_var_fallback));
+        v.get_handler.set(Some(rewrite_var));
         v.data.set(var_idx);
     }
 
@@ -526,8 +524,19 @@ fn set_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
     Ok(())
 }
 
-fn rewrite_var_fallback(_r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    v.not_found = true;
+/// ngx_http_rewrite_var: the module sets the variables directly in
+/// r->variables, so the handler only runs for a variable not set yet.
+fn rewrite_var(r: &R, v: &mut crate::request::VariableValue, data: usize) -> i64 {
+    // ngx_http_variable_null_value
+    *v = crate::request::VariableValue { valid: true, ..Default::default() };
+
+    if !*r.loc_conf::<RewriteConf>(ctx_index()).borrow().uninitialized_variable_warn {
+        return NGX_OK;
+    }
+
+    let name = r.cmcf().borrow().variables.get(data).map(|var| var.name.clone()).unwrap_or_default();
+    ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "using uninitialized \"{}\" variable", B(&name));
+
     NGX_OK
 }
 
