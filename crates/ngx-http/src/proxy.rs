@@ -2311,6 +2311,18 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
     }
 
+    // X-Accel-Charset (ngx_http_upstream_process_charset, for each):
+    // r->headers_out.override_charset, unless ignored
+    let ignore_xa_charset = lcf.borrow().cache.ignore_headers.iter().any(|h| h == b"x-accel-charset");
+
+    if !ignore_xa_charset {
+        let xac = resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-charset").last().map(|h| h.value.borrow().clone());
+
+        if let Some(v) = xac {
+            r.headers_out.borrow_mut().override_charset = Some(v);
+        }
+    }
+
     // X-Accel-Redirect: finalize the upstream (NGX_DECLINED) and redirect
     // internally, keeping only the headers marked `redirect=1` in
     // ngx_http_upstream.c. The method becomes GET (unless HEAD).
