@@ -722,6 +722,40 @@ impl Records {
 
         self.raw.len()
     }
+
+    /// The response header as u->buffer has it once
+    /// ngx_http_fastcgi_process_header is done, for the cache file: the
+    /// records read up to the end of the header; or, when stderr before the
+    /// header did not fit into the buffer (`room`), its tail in a dummy STDERR
+    /// record, as f->large_stderr leaves it, then the STDOUT records of the
+    /// header. None if the header does not fit.
+    fn cache_header(&self, hend: usize, room: usize) -> Option<Vec<u8>> {
+        let raw_hend = self.raw_header_end(hend);
+
+        if raw_hend <= room {
+            return Some(self.raw[..raw_hend].to_vec());
+        }
+
+        let stdout_start = self.stdout_map.first()?.0 - HEADER_SIZE;
+        let stdout_part = raw_hend - stdout_start;
+
+        if stdout_part + HEADER_SIZE > room {
+            return None;
+        }
+
+        let tail = (room - stdout_part - HEADER_SIZE).min(stdout_start).min(0xffff);
+
+        let mut out = Vec::with_capacity(HEADER_SIZE + tail + stdout_part);
+
+        if tail > 0 {
+            record_header(&mut out, NGX_HTTP_FASTCGI_STDERR, tail, 0);
+            out.extend_from_slice(&self.raw[stdout_start - tail..stdout_start]);
+        }
+
+        out.extend_from_slice(&self.raw[stdout_start..raw_hend]);
+
+        Some(out)
+    }
 }
 
 /// Why reading the response failed.
@@ -1251,9 +1285,15 @@ async fn fastcgi_handler(r: R) -> i64 {
             g.keepalive = true;
         }
 
-        let raw_hend = records.raw_header_end(hend);
+        // u->buffer after the cache header: the room for the response header
+        let room = match (crate::file_cache::cache_of(&r), crate::upstream_cache::upstream_of(&r)) {
+            (Some(c), Some(u)) => u.buffer_size.saturating_sub(c.borrow().header_start),
+            _ => usize::MAX,
+        };
 
-        return send_response(&r, &lcf, status, status_line, headers, &hin, &records.raw[..raw_hend], &records.stdout[hend..], records.upstream_error).await;
+        let cache_header = records.cache_header(hend, room);
+
+        return send_response(&r, &lcf, status, status_line, headers, &hin, cache_header.as_deref(), &records.stdout[hend..], records.upstream_error).await;
     }
 }
 
@@ -1572,7 +1612,7 @@ async fn send_response(
     status_line: Vec<u8>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     hin: &crate::upstream_cache::CacheHeadersIn,
-    raw_header: &[u8],
+    raw_header: Option<&[u8]>,
     body: &[u8],
     upstream_error: bool,
 ) -> i64 {
@@ -1671,6 +1711,18 @@ async fn send_response(
     // file; p->temp_file with it (p->buf_to_file)
 
     let mut writer: Option<crate::upstream_cache::CacheWriter> = None;
+
+    // a response header which does not fit into u->buffer after the cache
+    // header is not cached ("upstream sent too big header" in C)
+    let raw_header: &[u8] = match raw_header {
+        Some(h) => h,
+        None => {
+            if let Some(u) = crate::upstream_cache::upstream_of(r) {
+                u.cacheable.set(false);
+            }
+            &[]
+        }
+    };
 
     match crate::upstream_cache::send_response(r, status, hin, raw_header.len()) {
         Err(()) => {
