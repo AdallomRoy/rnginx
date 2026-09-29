@@ -432,7 +432,7 @@ fn log_script_write(r: &R, script: &[Part], buf: &[u8]) -> (Vec<u8>, Result<usiz
             (c.open_file_cache.as_option().cloned().flatten(), of)
         };
 
-        if set_disable_symlinks(r, &clcf, &path, &mut of) != NGX_OK {
+        if crate::core_rt::set_disable_symlinks(r, &clcf, &path, &mut of) != NGX_OK {
             // simulate successful logging
             return (Vec::new(), Ok(len));
         }
@@ -479,7 +479,7 @@ fn log_script_write(r: &R, script: &[Part], buf: &[u8]) -> (Vec<u8>, Result<usiz
     // of.directio = NGX_OPEN_FILE_DIRECTIO_OFF
     let mut of = OpenFileInfo { log: true, valid, min_uses, directio: usize::MAX, ..Default::default() };
 
-    if set_disable_symlinks(r, &clcf, &log, &mut of) != NGX_OK {
+    if crate::core_rt::set_disable_symlinks(r, &clcf, &log, &mut of) != NGX_OK {
         // simulate successful logging
         return (log, Ok(len));
     }
@@ -509,48 +509,6 @@ fn log_script_write(r: &R, script: &[Part], buf: &[u8]) -> (Vec<u8>, Result<usiz
     (log, n)
 }
 
-/// ngx_http_set_disable_symlinks
-fn set_disable_symlinks(r: &R, clcf: &Rc<RefCell<CoreLocConf>>, path: &[u8], of: &mut OpenFileInfo) -> i64 {
-    let from = {
-        let c = clcf.borrow();
-
-        of.disable_symlinks = *c.disable_symlinks as u8;
-
-        c.disable_symlinks_from.as_option().cloned().flatten()
-    };
-
-    let from = match from {
-        Some(cv) => cv,
-        None => return NGX_OK,
-    };
-
-    let from = match complex_value(r, &from) {
-        Ok(v) => v,
-        Err(_) => return NGX_ERROR,
-    };
-
-    if from.is_empty() || from.len() > path.len() || path[..from.len()] != from[..] {
-        return NGX_OK;
-    }
-
-    if from.len() == path.len() {
-        of.disable_symlinks = NGX_DISABLE_SYMLINKS_OFF as u8;
-        return NGX_OK;
-    }
-
-    let p = from.len();
-
-    if path[p] == b'/' {
-        of.disable_symlinks_from = from.len();
-        return NGX_OK;
-    }
-
-    if path[p - 1] == b'/' {
-        of.disable_symlinks_from = from.len() - 1;
-    }
-
-    NGX_OK
-}
 
 /// The pool of ngx_http_log_gzip(): zlib's allocations, freed together
 /// (ngx_http_log_gzip_free does nothing).

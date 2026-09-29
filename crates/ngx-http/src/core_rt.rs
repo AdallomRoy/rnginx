@@ -575,6 +575,51 @@ pub async fn output_filter(r: &R, chain: Chain) -> i64 {
 }
 
 /// ngx_http_map_uri_to_path: returns (path, root_length).
+/// ngx_http_set_disable_symlinks: of->disable_symlinks of the location,
+/// and of->disable_symlinks_from when the path starts with the "from"
+/// value (off when it is the whole path)
+pub fn set_disable_symlinks(r: &R, clcf: &Rc<RefCell<CoreLocConf>>, path: &[u8], of: &mut ngx_core::open_file_cache::OpenFileInfo) -> i64 {
+    let from = {
+        let c = clcf.borrow();
+
+        of.disable_symlinks = *c.disable_symlinks as u8;
+
+        c.disable_symlinks_from.as_option().cloned().flatten()
+    };
+
+    let from = match from {
+        Some(cv) => cv,
+        None => return NGX_OK,
+    };
+
+    let from = match crate::script::complex_value(r, &from) {
+        Ok(v) => v,
+        Err(_) => return NGX_ERROR,
+    };
+
+    if from.is_empty() || from.len() > path.len() || path[..from.len()] != from[..] {
+        return NGX_OK;
+    }
+
+    if from.len() == path.len() {
+        of.disable_symlinks = crate::core::NGX_DISABLE_SYMLINKS_OFF as u8;
+        return NGX_OK;
+    }
+
+    let p = from.len();
+
+    if path[p] == b'/' {
+        of.disable_symlinks_from = from.len();
+        return NGX_OK;
+    }
+
+    if path[p - 1] == b'/' {
+        of.disable_symlinks_from = from.len() - 1;
+    }
+
+    NGX_OK
+}
+
 pub fn map_uri_to_path(r: &R, reserved: usize) -> Option<(Vec<u8>, usize)> {
     let clcf = r.clcf();
     let c = clcf.borrow();

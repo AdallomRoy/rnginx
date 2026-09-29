@@ -152,6 +152,9 @@ async fn index_handler(r: R) -> i64 {
             crate::static_module::open_file_info(&r, &c)
         };
         of.test_only = true;
+        if crate::core_rt::set_disable_symlinks(&r, &clcf, &full, &mut of) != NGX_OK {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
         let cache = clcf.borrow().open_file_cache.get().clone();
         match open_cached_file(cache.as_ref(), &full, &mut of, &log) {
             Ok(_h) => {
@@ -226,6 +229,9 @@ async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, dir: &[u8],
     };
     of.test_dir = true;
     of.test_only = true;
+    if crate::core_rt::set_disable_symlinks(r, clcf, &d, &mut of) != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     let cache = clcf.borrow().open_file_cache.get().clone();
     match open_cached_file(cache.as_ref(), &d, &mut of, &log) {
         Ok(_) => {

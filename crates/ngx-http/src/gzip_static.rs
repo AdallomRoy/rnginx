@@ -75,6 +75,9 @@ async fn handler(r: R) -> i64 {
     let log = r.connection.log.clone();
     let clcf = r.clcf();
     let mut of = { let c = clcf.borrow(); open_file_info(&r, &c) };
+    if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     let cache = clcf.borrow().open_file_cache.get().clone();
     let handle = match open_cached_file(cache.as_ref(), &path, &mut of, &log) {
         Ok(h) => h,

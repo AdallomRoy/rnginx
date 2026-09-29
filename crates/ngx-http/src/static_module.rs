@@ -34,7 +34,6 @@ pub fn open_file_info(r: &R, clcf: &CoreLocConf) -> OpenFileInfo {
     of.min_uses = *clcf.open_file_cache_min_uses as u32;
     of.errors = *clcf.open_file_cache_errors;
     of.events = *clcf.open_file_cache_events;
-    of.disable_symlinks = *clcf.disable_symlinks as u8;
     let _ = r;
     of
 }
@@ -57,6 +56,9 @@ pub async fn static_handler(r: R) -> i64 {
         let c = clcf.borrow();
         open_file_info(&r, &c)
     };
+    if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     let cache = clcf.borrow().open_file_cache.get().clone();
     let handle = match open_cached_file(cache.as_ref(), &path, &mut of, &log) {
         Ok(h) => h,

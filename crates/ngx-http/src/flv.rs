@@ -79,10 +79,13 @@ pub async fn flv_handler(r: R) -> i64 {
             min_uses: *c.open_file_cache_min_uses as u32,
             errors: *c.open_file_cache_errors,
             events: *c.open_file_cache_events,
-            disable_symlinks: *c.disable_symlinks as u8,
             ..Default::default()
         }
     };
+
+    if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     let cache = clcf.borrow().open_file_cache.get().clone();
     let handle = match open_cached_file(cache.as_ref(), &path, &mut of, &log) {

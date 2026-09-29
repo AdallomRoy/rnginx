@@ -237,27 +237,43 @@ async fn try_files_handler(r: R) -> i64 {
         };
         path.extend_from_slice(&tail);
 
-        // Stat the candidate. C uses open_file_cache; we simplify to std::fs.
-        let os = std::ffi::OsStr::from_bytes(&path);
-        let md = match std::fs::metadata(os) {
-            Ok(m) => m,
-            Err(e) => {
-                if let Some(errno) = e.raw_os_error() {
-                    if errno != libc::ENOENT && errno != libc::ENOTDIR && errno != libc::ENAMETOOLONG {
-                        ngx_core::ngx_log_error!(
-                            ngx_core::log::NGX_LOG_CRIT,
-                            r.connection.log,
-                            Some(errno),
-                            "stat \"{}\" failed",
-                            ngx_core::string::B(&path)
-                        );
-                    }
-                }
-                continue;
-            }
+        // ngx_open_cached_file(clcf->open_file_cache, &path, &of) with
+        // of.test_only and the disable_symlinks of the location
+        let clcf = r.clcf();
+        let mut of = {
+            let c = clcf.borrow();
+            let mut of = crate::static_module::open_file_info(&r, &c);
+            of.read_ahead = 0;
+            of.test_only = true;
+            of
         };
-        let is_dir = md.is_dir();
-        if is_dir != tf.test_dir {
+
+        if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        let cache = clcf.borrow().open_file_cache.get().clone();
+
+        if ngx_core::open_file_cache::open_cached_file(cache.as_ref(), &path, &mut of, &r.connection.log).is_err() {
+            if of.err == 0 {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            if of.err != libc::ENOENT && of.err != libc::ENOTDIR && of.err != libc::ENAMETOOLONG {
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_CRIT,
+                    r.connection.log,
+                    Some(of.err),
+                    "{} \"{}\" failed",
+                    of.failed,
+                    ngx_core::string::B(&path)
+                );
+            }
+
+            continue;
+        }
+
+        if of.is_dir != tf.test_dir {
             continue;
         }
 
