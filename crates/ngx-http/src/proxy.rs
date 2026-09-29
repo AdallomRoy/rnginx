@@ -165,6 +165,13 @@ pub struct NgxHttpProxyLocConf {
     pub http_version: Val<u32>,
     /// proxy_pass_trailers (upstream.pass_trailers)
     pub pass_trailers: Val<bool>,
+    /// proxy_buffer_size (upstream.buffer_size): the most of a response
+    /// header, and of trailers
+    pub buffer_size: Val<usize>,
+    /// proxy_limit_rate (upstream.limit_rate): a complex value size
+    pub limit_rate: Val<Option<Rc<crate::script::ComplexValue>>>,
+    /// proxy_ignore_client_abort
+    pub ignore_client_abort: Val<bool>,
     /// proxy_hide_header entries (lowercase). `None` = inherit from parent;
     /// `Some(list)` = explicit local list (still merged with defaults).
     pub hide_headers: Option<Vec<Vec<u8>>>,
@@ -317,6 +324,9 @@ impl Default for NgxHttpProxyLocConf {
             cookie_flags: Vec::new(),
             http_version: Val::unset(),
             pass_trailers: Val::unset(),
+            buffer_size: Val::unset(),
+            limit_rate: Val::unset(),
+            ignore_client_abort: Val::unset(),
             hide_headers: None,
             pass_headers: None,
             cache: crate::proxy_cache::ProxyCacheConf::new(),
@@ -335,6 +345,9 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     c.pass_request_headers.merge(&p.pass_request_headers, true);
     c.pass_request_body.merge(&p.pass_request_body, true);
     c.pass_trailers.merge(&p.pass_trailers, false);
+    c.ignore_client_abort.merge(&p.ignore_client_abort, false);
+    c.buffer_size.merge(&p.buffer_size, PROXY_BUFFER_SIZE);
+    crate::upstream_ssl::merge_ptr(&mut c.limit_rate, &p.limit_rate);
     c.request_buffering.merge(&p.request_buffering, true);
     c.buffering.merge(&p.buffering, true);
     c.connect_timeout.merge(&p.connect_timeout, 60000);
@@ -970,6 +983,15 @@ fn proxy_method_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>)
     let mut slot = cell.borrow().method.clone();
     crate::script::set_complex_value_slot(cf, cmd, &mut slot)?;
     cell.borrow_mut().method = slot;
+    Ok(())
+}
+
+/// proxy_limit_rate: ngx_http_set_complex_value_size_slot
+fn proxy_limit_rate_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut slot = cell.borrow().limit_rate.clone();
+    crate::script::set_complex_value_size_slot(cf, cmd, &mut slot)?;
+    cell.borrow_mut().limit_rate = slot;
     Ok(())
 }
 
@@ -1932,32 +1954,34 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     // the peer is freed when the request is done
     let mut g = crate::upstream::PeerGuard::new(&r, peer);
 
+    // u->buffering, which "X-Accel-Buffering" may change
+    let (conf_buffering, change_buffering, read_timeout, store, ignore_client_abort, buffer_size, ignore_xa_redirect, ignore_xa_limit_rate) = {
+        let c = lcf.borrow();
+        (
+            c.buffering.get_or(true),
+            !c.cache.ignore_headers.iter().any(|h| h == b"x-accel-buffering"),
+            c.read_timeout.get_or(60000),
+            matches!(c.store, Some(ProxyStore::On) | Some(ProxyStore::Path(_))),
+            c.ignore_client_abort.get_or(false),
+            c.buffer_size.get_or(PROXY_BUFFER_SIZE),
+            c.cache.ignore_headers.iter().any(|h| h == b"x-accel-redirect"),
+            c.cache.ignore_headers.iter().any(|h| h == b"x-accel-limit-rate"),
+        )
+    };
+
+    // ngx_http_upstream_rd_check_broken_connection: a request that is not
+    // cached is finalized with 499 when the client closes the connection
+    let watch = if !store && !r.post_action.get() && !ignore_client_abort && !cacheable { Some(ClientWatch::new(&r)) } else { None };
+    let watch = watch.as_ref();
+
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
     // free the peer and connect to the next one (ngx_http_upstream_next).
-    let mut upstream: Option<UpstreamSock> = None;
+    let mut sock: UpstreamSock;
     let mut upstream_requests: u64;
     let mut upstream_start_time: u64;
-    let mut addr: String;
-    let mut response: Vec<u8>;
-    let mut status: i64;
-    let mut status_line_end: usize;
-    let mut body_start: usize;
-    let mut bytes_received_from_upstream: i64;
-    let mut bytes_sent_to_upstream: i64;
-    let mut response_keepalive: bool;
-    // u->buffering, which "X-Accel-Buffering" may change
-    let (conf_buffering, change_buffering) = {
-        let c = lcf.borrow();
-        (c.buffering.get_or(true), !c.cache.ignore_headers.iter().any(|h| h == b"x-accel-buffering"))
-    };
-    let mut u_buffering: bool;
-    // the body framing of the response: Content-Length, chunked
-    let mut u_expected_body_len: Option<usize>;
-    let mut u_is_chunked: bool;
-    let mut u_upstream_wants_close: bool;
-    'retry: loop {
-        u_buffering = conf_buffering;
+    let mut resp: UpstreamResponse;
 
+    'retry: loop {
         // ngx_http_upstream_connect
         let rc = g.u.connect(&r);
 
@@ -1973,9 +1997,8 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
 
         let try_started_ms = g.u.start_time;
-        addr = String::from_utf8_lossy(&g.u.pc.name).into_owned();
 
-        upstream = Some(if rc == NGX_DONE {
+        sock = if rc == NGX_DONE {
             // a cached keepalive connection
             let c = g.u.pc.connection.take().unwrap();
             upstream_requests = c.requests;
@@ -1988,7 +2011,17 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                 Some(sa) => sa,
                 None => return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR).await,
             };
-            match connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), Some(&mut g.u), connect_timeout).await {
+
+            let connected = {
+                let connect = connect_upstream(&r, &sockaddr, bind_addr, ssl_setup.as_ref(), Some(&mut g.u), connect_timeout);
+
+                tokio::select! {
+                    res = connect => res,
+                    err = client_closed(watch) => return client_closed_request(&r, err),
+                }
+            };
+
+            match connected {
                 Ok(s) => {
                     upstream_requests = 0;
                     upstream_start_time = ngx_core::times::current_msec();
@@ -2006,7 +2039,8 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                     }
                 }
             }
-        });
+        };
+
         upstream_requests += 1;
 
         // ngx_http_upstream_send_request: the connection is established
@@ -2016,28 +2050,39 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
             }
         }
 
-        // Send request + body in one write so a fast upstream that reads once and
-        // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
+        // the request (u->request_bufs) and, unbuffered, what was read of
+        // the body so far, in one write so a fast upstream that reads once
+        // and closes (e.g. Test::Nginx daemons calling sysread) sees it all
         let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
         wire.extend_from_slice(&request);
-        if !body_bytes.is_empty() {
-            wire.extend_from_slice(&body_bytes);
-        }
+        wire.extend_from_slice(&body_bytes);
+
         g.u.request_sent = true;
-        if let Err(_) = upstream.as_mut().unwrap().write_all(&wire).await {
-            upstream = None;
+
+        let sent = {
+            let write = sock.write_all(&wire);
+
+            tokio::select! {
+                res = write => res,
+                err = client_closed(watch) => return client_closed_request(&r, err),
+            }
+        };
+
+        if sent.is_err() {
             match g.u.next(&r, FT_ERROR) {
                 Ok(()) => continue 'retry,
                 Err(st) => return return_error(&r, st).await,
             }
         }
-        bytes_sent_to_upstream = wire.len() as i64;
+
+        let mut bytes_sent = wire.len() as i64;
+
         if r.reading_body.get() {
             let output = |out: &mut Vec<u8>, bufs: &ngx_core::buf::Chain| body_output_filter(out, bufs, internal_chunked);
-            match send_request_body(&r, upstream.as_mut().unwrap(), &output).await {
-                Ok(n) => bytes_sent_to_upstream += n,
+
+            match send_request_body(&r, &mut sock, &output).await {
+                Ok(n) => bytes_sent += n,
                 Err(rc) => {
-                    upstream = None;
                     if rc == NGX_HTTP_BAD_GATEWAY as i64 {
                         // the upstream write failed
                         match g.u.next(&r, FT_ERROR) {
@@ -2049,343 +2094,82 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                 }
             }
         }
+
         if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.bytes_sent = bytes_sent_to_upstream;
+            st.bytes_sent = bytes_sent;
         }
 
-        response = Vec::new();
-        // Read headers first so header_time is separate from response_time.
-        // read_to_end waits for EOF (proxy Connection: close), so we can't
-        // isolate the moment headers arrive without switching to a chunked
-        // reader. Approximate with two timestamps: read once to grab
-        // whatever the kernel has (that's usually the whole small
-        // response), record header_ms, then continue reading.
-        let mut buf = [0u8; 4096];
-        let mut got_header = false;
-        // Once we see the terminating CRLF pair we parse Content-Length so
-        // we can stop reading at body_start + content_length instead of
-        // waiting for EOF. Without this, upstreams that leave the socket
-        // open after sending the full response (proxy_noclose case) hang
-        // us until the socket is closed by them or the read timeout fires.
-        let mut header_end: Option<usize> = None;
-        let mut expected_body_len: Option<usize> = None;
-        let mut is_chunked = false;
-        let mut upstream_wants_close = false;
-        let mut has_xar = false;
-        let read_timeout = lcf.borrow().read_timeout.get_or(60000);
-        loop {
-            let rd = tokio::time::timeout(std::time::Duration::from_millis(read_timeout), upstream.as_mut().unwrap().read(&mut buf)).await;
-            let rd = match rd {
-                Ok(rd) => rd,
-                Err(_) => {
-                    let log = &r.connection.log;
-                    let action = log.action();
-                    if !got_header {
-                        // ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT)
-                        log.set_action(Some("reading response header from upstream"));
-                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-                        log.set_action(action);
-                        upstream = None;
-                        match g.u.next(&r, FT_TIMEOUT) {
-                            Ok(()) => continue 'retry,
-                            Err(st) => return return_error(&r, st).await,
-                        }
-                    }
-                    log.set_action(Some("reading upstream"));
-                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-                    log.set_action(action);
-                    break;
-                }
-            };
-            match rd {
-                Ok(0) => break,
-                Ok(n) => {
-                    response.extend_from_slice(&buf[..n]);
-                    if !got_header {
-                        let end = find_header_end(&response).map(|(_, bs)| bs);
-                        if let Some(e) = end {
-                            let header_ms = ngx_core::times::current_msec().saturating_sub(try_started_ms);
-                            if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-                                st.header_time = header_ms;
-                            }
-                            // u->headers_in of this response, for the
-                            // balancer's notify ($upstream_cookie_*)
-                            set_upstream_headers_in(&r, &response[..e]);
-                            g.u.notify(&r, crate::upstream::NGX_HTTP_UPSTREAM_NOTIFY_HEADER);
-                            got_header = true;
-                            header_end = Some(e);
-                            // Parse Content-Length from the header block.
-                            let headers = &response[..e];
-                            for line in headers.split(|&b| b == b'\n') {
-                                let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
-                                if line.len() > 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
-                                    let v = &line[15..];
-                                    let v = v.iter().position(|&b| b != b' ' && b != b'\t')
-                                        .map(|s| &v[s..])
-                                        .unwrap_or(v);
-                                    if let Ok(s) = std::str::from_utf8(v) {
-                                        if let Ok(n) = s.trim().parse::<usize>() {
-                                            expected_body_len = Some(n);
-                                        }
-                                    }
-                                }
-                                // Transfer-Encoding: chunked ⇒ still need to
-                                // read until 0-length terminator, which
-                                // signals the same as EOF here. Keep the
-                                // EOF-driven loop for chunked.
-                                if line.len() > 18 && line[..18].eq_ignore_ascii_case(b"transfer-encoding:")
-                                    && line[18..].to_ascii_lowercase().contains(&b'c')
-                                {
-                                    expected_body_len = None;
-                                    is_chunked = true;
-                                }
-                                if line.len() > 11 && line[..11].eq_ignore_ascii_case(b"connection:") {
-                                    if line[11..].to_ascii_lowercase().windows(5).any(|w| w == b"close") {
-                                        upstream_wants_close = true;
-                                    }
-                                }
-                                // ngx_http_upstream_process_buffering
-                                if change_buffering && line.len() > 18 && line[..18].eq_ignore_ascii_case(b"x-accel-buffering:") {
-                                    let v = line[18..].trim_ascii();
-                                    if v.eq_ignore_ascii_case(b"no") {
-                                        u_buffering = false;
-                                    } else if v.eq_ignore_ascii_case(b"yes") {
-                                        u_buffering = true;
-                                    }
-                                }
-                                if line.len() > 17 && line[..17].eq_ignore_ascii_case(b"x-accel-redirect:") {
-                                    // C aborts the upstream request as soon as
-                                    // the header block is processed and issues
-                                    // the internal redirect; the response body
-                                    // never reaches this proxy. Follow suit so
-                                    // an upstream rate-limiter doesn't gate
-                                    // our first byte to the redirected
-                                    // location.
-                                    if !line[17..].iter().all(|&b| b == b' ' || b == b'\t') {
-                                        has_xar = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Status codes 204 / 304 / 1xx carry no body per RFC,
-                    // and neither does a HEAD response — even if the upstream
-                    // sent Content-Length. Break as soon as we have the
-                    // headers so a persistent (keepalive) upstream isn't
-                    // read-blocked waiting for body bytes it will never send.
-                    let bodyless = if got_header {
-                        if r.method.get() == crate::NGX_HTTP_HEAD {
-                            true
-                        } else if let Some(e) = header_end {
-                            let sl = &response[..e.min(response.len())];
-                            let nl = sl.iter().position(|&b| b == b'\n').unwrap_or(sl.len());
-                            let sl = &sl[..nl];
-                            let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
-                            let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
-                            parts.get(1)
-                                .and_then(|p| std::str::from_utf8(p).ok())
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .map(|c| c == 204 || c == 304 || ((100..200).contains(&c) && c != 101))
-                                .unwrap_or(false)
-                        } else { false }
-                    } else { false };
-                    if bodyless || has_xar {
-                        break;
-                    }
-                    // 101 Switching Protocols: stop as soon as headers land so
-                    // the tunnel takes ownership of the socket. The trailing
-                    // bytes (if the upstream started the upgraded protocol
-                    // in the same packet as the headers) get forwarded below.
-                    if got_header {
-                        if let Some(e) = header_end {
-                            let sl = &response[..e.min(response.len())];
-                            let nl = sl.iter().position(|&b| b == b'\n').unwrap_or(sl.len());
-                            let sl = &sl[..nl];
-                            let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
-                            let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
-                            let is_101 = parts.get(1)
-                                .and_then(|p| std::str::from_utf8(p).ok())
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .map(|c| c == 101).unwrap_or(false);
-                            if is_101 { break; }
-                        }
-                    }
-                    // the body of an unbuffered response goes to the client
-                    // as it arrives (ngx_http_upstream_send_response)
-                    if got_header && !u_buffering {
-                        break;
-                    }
-                    if let (Some(e), Some(cl)) = (header_end, expected_body_len) {
-                        if response.len() >= e + cl {
-                            break;
-                        }
-                    }
-                    if is_chunked {
-                        if let Some(e) = header_end {
-                            let body = &response[e..];
-                            if chunked_complete(body) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let read_ok = true;
-        // If we finished this read cleanly (framing terminated: known
-        // Content-Length reached, or chunked-complete saw the 0-chunk),
-        // and the upstream didn't send Connection: close, hand the socket
-        // back to the keepalive pool for the next request to reuse.
-        //
-        // Note: `upstream` is only read from below when we're in an error
-        // path (empty response, retry). On the success path it's simply
-        // dropped when the enclosing scope ends — so it's safe to take it
-        // out here via std::io before we hit that drop.
-        // Compute framing completeness for BOTH the keepalive decision
-        // AND the "should this get cached" check below.
-        let (framing_complete, is_head_g, is_bodyless_g) = if got_header {
-            let is_head = r.method.get() == crate::NGX_HTTP_HEAD;
-            let is_bodyless = if let Some(e) = header_end {
-                let sl = &response[..e.min(response.len())];
-                if let Some(nl) = sl.iter().position(|&b| b == b'\n') {
-                    let sl = &sl[..nl];
-                    let sl = if sl.last() == Some(&b'\r') { &sl[..sl.len()-1] } else { sl };
-                    let parts: Vec<&[u8]> = sl.splitn(3, |&b| b == b' ').collect();
-                    parts.get(1)
-                        .and_then(|p| std::str::from_utf8(p).ok())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .map(|c| c == 204 || c == 304 || ((100..200).contains(&c) && c != 101))
-                        .unwrap_or(false)
-                } else { false }
-            } else { false };
-            let fc = if is_head || is_bodyless {
-                true
-            } else if let Some(cl) = expected_body_len {
-                header_end.map(|e| response.len() >= e + cl).unwrap_or(false)
-            } else if is_chunked {
-                header_end.map(|e| chunked_complete(&response[e..])).unwrap_or(false)
-            } else {
-                false
-            };
-            (fc, is_head, is_bodyless)
-        } else {
-            (false, false, false)
-        };
-        // Signal to proxy_cache::maybe_save that we shouldn't persist
-        // a truncated response. C nginx checks u->length via
-        // ngx_http_upstream_process_non_buffered_downstream and skips
-        // ngx_http_file_cache_update when the response is short.
-        if !framing_complete && got_header && !is_head_g && !is_bodyless_g {
-            // Only mark incomplete when the response HAS a framing
-            // mechanism (Content-Length or chunked). EOF-framed (no
-            // CL, no TE:chunked) is inherently "complete-on-close"
-            // so don't taint the cache path for it.
-            if expected_body_len.is_some() || is_chunked {
-                r.upstream_response_incomplete.set(true);
-            }
-        }
-        u_expected_body_len = expected_body_len;
-        u_is_chunked = is_chunked;
-        u_upstream_wants_close = upstream_wants_close;
-        // u->keepalive: an HTTP/1.1 response without "Connection: close",
-        // read in full, on a request that did not ask to close
-        response_keepalive = got_header
-            && framing_complete
-            && !upstream_wants_close
-            && response.starts_with(b"HTTP/1.1");
-        if !read_ok || response.is_empty() {
-            // the upstream closed the connection without a response:
-            // "upstream prematurely closed connection" (ft error)
-            upstream = None;
-            match g.u.next(&r, FT_ERROR) {
+        // ngx_http_upstream_process_header
+        resp = match process_header(&r, &mut sock, &ctx, buffer_size, read_timeout, watch).await {
+            Ok(h) => h,
+            Err(HeaderError::Next(ft)) => match g.u.next(&r, ft) {
                 Ok(()) => continue 'retry,
                 Err(st) => return return_error(&r, st).await,
-            }
-        }
-        bytes_received_from_upstream = response.len() as i64;
-
-        // Parse status line. Pick the earliest header/body separator.
-        let (sle, bs) = match find_header_end(&response) {
-            Some(e) => e,
-            None => return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await,
+            },
+            Err(HeaderError::ClientClosed(err)) => return client_closed_request(&r, err),
         };
-        status_line_end = sle;
-        body_start = bs;
-        let headers_section_local = &response[..status_line_end];
-        // Status line ends at the first \n. When the response has zero headers
-        // (`HTTP/1.0 200 OK\r\n\r\n`) status_line_end sits at the start of that
-        // trailing CRLF pair, so headers_section_local is exactly the status
-        // line with no LF in it — fall back to the full header separator index
-        // rather than 502ing on a syntactically valid empty-header response.
-        let status_line_end_nl = headers_section_local
-            .iter()
-            .position(|&b| b == b'\n')
-            .unwrap_or(headers_section_local.len());
-        let status_line = &headers_section_local[..status_line_end_nl];
-        let status_line = if status_line.last() == Some(&b'\r') { &status_line[..status_line.len()-1] } else { status_line };
-        let status_line_str = std::str::from_utf8(status_line).unwrap_or("HTTP/1.0 500 Internal Server Error");
-        let parts: Vec<&str> = status_line_str.split_whitespace().collect();
-        status = if parts.len() >= 2 { parts[1].parse().unwrap_or(502) } else { 502 };
 
+        // u->state->header_time
         if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            if st.status == 0 {
-                st.status = status;
-            }
-            st.bytes_received = bytes_received_from_upstream;
-            st.response_length = (bytes_received_from_upstream - body_start as i64).max(0);
+            st.header_time = ngx_core::times::current_msec().saturating_sub(try_started_ms);
         }
+
+        // u->headers_in, for $upstream_http_* and the balancer's notify
+        *r.upstream_headers_in.borrow_mut() = resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
 
         // ngx_http_upstream_test_next: a status proxy_next_upstream names,
         // with tries left
-        let ft = match status {
-            500 => FT_HTTP_500,
-            502 => FT_HTTP_502,
-            503 => FT_HTTP_503,
-            504 => FT_HTTP_504,
-            403 => FT_HTTP_403,
-            404 => FT_HTTP_404,
-            429 => FT_HTTP_429,
-            _ => 0,
-        };
-        if ft != 0 {
-            let mut mask = ft;
-            if g.u.request_sent && matches!(r.method.get(), crate::NGX_HTTP_POST | crate::NGX_HTTP_LOCK | crate::NGX_HTTP_PATCH) {
-                mask |= FT_NON_IDEMPOTENT;
-            }
-            let timeout = next_upstream_timeout;
-            if g.u.pc.tries > 1
-                && next_upstream_mask & mask == mask
-                && !(g.u.request_sent && r.request_body_no_buffering.get())
-                && !(timeout != 0 && ngx_core::times::current_msec().saturating_sub(g.u.pc.start_time) >= timeout)
-            {
-                upstream = None;
-                match g.u.next(&r, ft) {
-                    Ok(()) => continue 'retry,
-                    Err(st) => return return_error(&r, st).await,
+        if resp.status_n >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+            let ft = match resp.status_n {
+                500 => FT_HTTP_500,
+                502 => FT_HTTP_502,
+                503 => FT_HTTP_503,
+                504 => FT_HTTP_504,
+                403 => FT_HTTP_403,
+                404 => FT_HTTP_404,
+                429 => FT_HTTP_429,
+                _ => 0,
+            };
+
+            if ft != 0 {
+                let mut mask = ft;
+
+                if g.u.request_sent && matches!(r.method.get(), crate::NGX_HTTP_POST | crate::NGX_HTTP_LOCK | crate::NGX_HTTP_PATCH) {
+                    mask |= FT_NON_IDEMPOTENT;
+                }
+
+                let timeout = next_upstream_timeout;
+
+                if g.u.pc.tries > 1
+                    && next_upstream_mask & mask == mask
+                    && !(g.u.request_sent && r.request_body_no_buffering.get())
+                    && !(timeout != 0 && ngx_core::times::current_msec().saturating_sub(g.u.pc.start_time) >= timeout)
+                {
+                    match g.u.next(&r, ft) {
+                        Ok(()) => continue 'retry,
+                        Err(st) => return return_error(&r, st).await,
+                    }
                 }
             }
         }
+
         break 'retry;
     }
-    // an unbuffered response body is read while it is sent (below)
-    let stream_body = !u_buffering
-        && !(r.method.get() == NGX_HTTP_HEAD || r.header_only.get())
-        && status != 204
-        && status != 304;
-    // the connection goes back to the keepalive cache when the request is
-    // done, if the response allows
-    if response_keepalive && status != 101 && !stream_body {
-        g.conn = upstream.take().map(|sock| crate::upstream::UpstreamConn {
-            sock,
-            requests: upstream_requests,
-            start_time: upstream_start_time,
-        });
-        g.keepalive = true;
-    }
+
+    let status = resp.status_n;
+
+    // the connection goes back to the keepalive cache if the response
+    // allows it (u->keepalive set by the filters), when the request is done
+    let keep = |g: &mut crate::upstream::PeerGuard, sock: UpstreamSock, keepalive: bool| {
+        if keepalive {
+            g.conn = Some(crate::upstream::UpstreamConn { sock, requests: upstream_requests, start_time: upstream_start_time });
+            g.keepalive = true;
+        }
+    };
+
     // proxy_cache_revalidate: on 304 the upstream is telling us the cached
     // entry is still fresh — repush it with a new expiry and serve HIT so
-    // the client sees REVALIDATED. Matches C's ngx_http_upstream_process_headers
+    // the client sees REVALIDATED. Matches C's ngx_http_upstream_test_next
     // 304-branch.
     if status == 304 {
         if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
@@ -2408,6 +2192,8 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                     .unwrap_or(now);
                 crate::proxy_cache::save(&hints.zone, &hints.key, &cached);
                 crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Revalidated);
+                keep(&mut g, sock, resp.keepalive);
+                g.finalize();
                 return crate::proxy_cache::serve_hit(&r, cached).await;
             }
         }
@@ -2430,29 +2216,60 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                 let bit = crate::proxy_cache::use_stale_status_bit(status as u16);
                 if bit != 0 && cache_conf.use_stale & bit != 0 {
                     crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Stale);
+                    keep(&mut g, sock, resp.keepalive);
+                    g.finalize();
                     return crate::proxy_cache::serve_hit(&r, cached).await;
                 }
             }
         }
     }
-    let headers_section = &response[..status_line_end];
-    let status_line_end_nl = headers_section.iter().position(|&b| b == b'\n').unwrap_or(headers_section.len());
-    let _ = status_line_end_nl;
 
-    // Fresh upstream request: any $upstream_http_* headers left over from a
-    // previous proxy round (e.g. X-Accel-Redirect that triggered this one)
-    // must not leak into the new stash — that would cause a redirect loop
-    // when the second upstream returns without X-Accel-Redirect.
-    r.upstream_headers_in.borrow_mut().clear();
+    // proxy_intercept_errors: hand off to error_page instead of forwarding
+    // the upstream body — but only if the location actually has an
+    // error_page configured for this status (ngx_http_upstream_intercept_errors)
+    if status >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+        let intercept = lcf.borrow().intercept_errors.get_or(false);
 
-    // Set status in response headers and copy upstream headers
-    let mut copied = crate::upstream::CopiedHeaders::default();
+        let has_page = intercept
+            && r.clcf().borrow().error_pages.as_ref().map(|pages| pages.iter().any(|p| p.status == status)).unwrap_or(false);
+
+        if has_page {
+            // Cache the upstream error before handing off to error_page,
+            // so subsequent requests hit the cached error status and
+            // trigger the same intercept path (r->cache->error).
+            let cache_conf = lcf.borrow().cache.clone();
+
+            if cacheable {
+                let hdrs: Vec<(Vec<u8>, Vec<u8>)> = resp.headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect();
+                crate::proxy_cache::maybe_save(&r, &cache_conf, &upstream_uri, status as u16, hdrs, resp.buf[resp.pos..].to_vec());
+            }
+
+            if status == crate::NGX_HTTP_UNAUTHORIZED {
+                // the WWW-Authenticate of the upstream goes with the error page
+                let mut ho = r.headers_out.borrow_mut();
+                for h in resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"www-authenticate") {
+                    let ho_h = crate::request::TableElt::new(&h.key, &h.value.borrow());
+                    ho.headers.push(ho_h.clone());
+                    ho.www_authenticate.push(ho_h);
+                }
+            }
+
+            keep(&mut g, sock, resp.keepalive);
+            g.finalize();
+
+            return status;
+        }
+    }
+
+    // peer.notify(NGX_HTTP_UPSTREAM_NOTIFY_HEADER)
+    g.u.notify(&r, crate::upstream::NGX_HTTP_UPSTREAM_NOTIFY_HEADER);
+
+    // ngx_http_upstream_process_headers
+
     // Effective hide list: default PROXY_HIDE_HEADERS + user's hide_headers,
-    // minus user's pass_headers (pass wins over hide). Precompute once so the
-    // per-header check is a linear scan on a short vec.
+    // minus user's pass_headers (pass wins over hide).
     let effective_hide: Vec<Vec<u8>> = {
-        let lcf_h = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let c = lcf_h.borrow();
+        let c = lcf.borrow();
         let mut set: Vec<Vec<u8>> = PROXY_HIDE_HEADERS.iter().map(|s| s.to_vec()).collect();
         if let Some(hide) = &c.hide_headers {
             for h in hide {
@@ -2464,60 +2281,27 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
         set
     };
-    {
-        let mut ho = r.headers_out.borrow_mut();
-        ho.status = status;
-        // Parse and copy headers from headers_section
-        let mut pos = status_line_end_nl + 1;
-        while pos < headers_section.len() {
-            let line_end = headers_section[pos..].iter().position(|&b| b == b'\n').map(|i| pos + i).unwrap_or(headers_section.len());
-            let line = &headers_section[pos..line_end];
-            let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
-            if line.is_empty() { break; }
-            if let Some(colon) = line.iter().position(|&b| b == b':') {
-                let name = &line[..colon];
-                let mut vstart = colon + 1;
-                while vstart < line.len() && (line[vstart] == b' ' || line[vstart] == b'\t') { vstart += 1; }
-                let value = &line[vstart..];
-                // Stash into upstream_headers_in so $upstream_http_* can read them.
-                r.upstream_headers_in.borrow_mut().push(crate::request::TableElt::new(name, value));
-                let lc = name.to_ascii_lowercase();
-                // proxy_hide_header / default hide: skip emission entirely.
-                // upstream_headers_in above already captured it for
-                // $upstream_http_* variables.
-                if effective_hide.iter().any(|h| h == &lc) {
-                    pos = line_end + 1;
-                    continue;
-                }
-                crate::upstream::copy_header(&mut ho, &mut copied, status, name, value);
+
+    // X-Accel-Buffering (ngx_http_upstream_process_buffering, for each)
+    let mut u_buffering = conf_buffering;
+
+    if change_buffering {
+        for h in resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-buffering") {
+            let v = h.value.borrow();
+            if v.eq_ignore_ascii_case(b"yes") {
+                u_buffering = true;
+            } else if v.eq_ignore_ascii_case(b"no") {
+                u_buffering = false;
             }
-            pos = line_end + 1;
         }
-
-        // "Content-Length" is not copied (ngx_http_upstream_ignore_header_line):
-        // the header filter sends r->headers_out.content_length_n
-        ho.content_length = None;
     }
-
-    // If the upstream sent malformed / duplicate framing headers per C
-    // ngx_http_proxy_process_header semantics, bail with 502 before we send
-    // anything to the client.
-    if copied.invalid
-        || (copied.chunked && copied.saw_content_length)
-    {
-        return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-    }
-    // Suppress duplicate Expires (silently drop the second occurrence).
-    let _ = copied.duplicate_expires;
 
     // X-Accel-Limit-Rate: bytes-per-second cap on the response, matching
     // ngx_http_upstream_process_limit_rate. Applied to r.limit_rate BEFORE
-    // X-Accel-Redirect so the header survives the internal redirect
-    // (C's upstream_process_headers assigns u->headers_in.x_accel_limit_rate
-    // which propagates via r->limit_rate to the redirected request).
-    {
-        let xal_val = r.upstream_headers_in.borrow().iter()
-            .find(|h| h.lowcase_key.eq_ignore_ascii_case(b"x-accel-limit-rate"))
+    // X-Accel-Redirect so the header survives the internal redirect.
+    if !ignore_xa_limit_rate {
+        let xal_val = resp.headers.iter()
+            .find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-limit-rate")
             .map(|h| h.value.borrow().clone());
         if let Some(v) = xal_val {
             if let Ok(s) = std::str::from_utf8(&v) {
@@ -2531,34 +2315,35 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
     }
 
-    // X-Accel-Redirect: if the upstream response carries this header, discard
-    // the response body (we've already read it) and internally redirect. Keep
-    // only the small allow-list of upstream headers marked `redirect=1` in
-    // ngx_http_upstream.c (Content-Type, Set-Cookie, Cache-Control, Expires,
-    // Accept-Ranges, Content-Disposition). Method coerces to GET (unless HEAD).
-    let xar_val = r.upstream_headers_in.borrow().iter()
-        .find(|h| h.lowcase_key.eq_ignore_ascii_case(b"x-accel-redirect"))
-        .map(|h| h.value.borrow().clone());
+    // X-Accel-Redirect: finalize the upstream (NGX_DECLINED) and redirect
+    // internally, keeping only the headers marked `redirect=1` in
+    // ngx_http_upstream.c. The method becomes GET (unless HEAD).
+    let xar_val = resp.headers.iter()
+        .find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-redirect")
+        .map(|h| h.value.borrow().clone())
+        .filter(|_| !ignore_xa_redirect);
     if let Some(xar) = xar_val {
         if !xar.is_empty() {
+            // the headers of ngx_http_upstream_headers_in[] with "redirect"
             const KEEP_LC: &[&[u8]] = &[
                 b"content-type", b"set-cookie", b"content-disposition",
                 b"cache-control", b"expires", b"accept-ranges",
             ];
             {
                 let mut ho = r.headers_out.borrow_mut();
+                for h in resp.headers.iter() {
+                    if h.hash.get() == 0 || !KEEP_LC.iter().any(|k| h.lowcase_key == *k) {
+                        continue;
+                    }
+                    let mut copied = crate::upstream::CopiedHeaders::default();
+                    crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
+                }
                 ho.status = 0;
                 ho.content_length_n = -1;
                 ho.content_length = None;
-                ho.headers.retain(|h| {
-                    KEEP_LC.iter().any(|k| h.lowcase_key.eq_ignore_ascii_case(k))
-                });
-                ho.etag = None;
-                ho.last_modified = None;
-                ho.location = None;
-                ho.content_encoding = None;
             }
             // ngx_http_upstream_finalize_request(r, u, NGX_DECLINED)
+            keep(&mut g, sock, resp.keepalive);
             g.finalize();
             r.upstream_states.borrow_mut().clear();
             if xar.first() == Some(&b'@') {
@@ -2569,7 +2354,6 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
             // then reject unsafe paths (../ etc.) with 404, matching the
             // ngx_http_parse_unsafe_uri gate C runs before internal_redirect.
             let (decoded, _) = ngx_core::string::unescape_uri(&xar, ngx_core::string::NGX_UNESCAPE_URI);
-            // Split at first '?' (unescape stops at '?', so it's the last byte if present).
             let (uri_bytes, args_opt): (Vec<u8>, Option<Vec<u8>>) =
                 if let Some(q) = decoded.iter().position(|&b| b == b'?') {
                     (decoded[..q].to_vec(), Some(decoded[q + 1..].to_vec()))
@@ -2590,15 +2374,55 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
     }
 
-    // Snapshot upstream Content-Length before send_header runs — filters like
-    // addition_filter / sub_filter / gzip clear ho.content_length_n during
-    // their header pass.
-    let upstream_content_length = r.headers_out.borrow().content_length_n;
+    // the headers not hidden go to headers_out
+    let mut copied = crate::upstream::CopiedHeaders::default();
+    {
+        let mut ho = r.headers_out.borrow_mut();
 
+        for h in resp.headers.iter() {
+            if h.hash.get() == 0 {
+                continue;
+            }
+
+            if effective_hide.iter().any(|x| x == &h.lowcase_key) {
+                continue;
+            }
+
+            // ngx_http_upstream_copy_upgrade: not to HTTP/2 and HTTP/3
+            // clients
+            if h.lowcase_key == b"upgrade" && r.http_version.get() >= crate::NGX_HTTP_VERSION_20 {
+                continue;
+            }
+
+            crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
+        }
+
+        // the special empty "Server" and "Date" of
+        // ngx_http_proxy_process_header, passed with proxy_pass_header:
+        // no header of the upstream's nor the server's own
+        if !resp.server && !effective_hide.iter().any(|x| x == b"server") {
+            let h = crate::request::TableElt::new(b"Server", b"");
+            h.hash.set(0);
+            ho.server = Some(h);
+        }
+
+        if !resp.date && !effective_hide.iter().any(|x| x == b"date") {
+            let h = crate::request::TableElt::new(b"Date", b"");
+            h.hash.set(0);
+            ho.date = Some(h);
+        }
+
+        // "Content-Length" is not copied (ngx_http_upstream_ignore_header_line)
+        ho.content_length = None;
+
+        ho.status = status;
+        ho.status_line = resp.status_line.clone();
+        ho.content_length_n = resp.content_length_n;
+    }
 
     // Proxied responses (uncacheable) must skip the not_modified filter —
     // the backend is responsible for handling If-Modified-Since / If-None-Match.
-    // C sets this to `!u->cacheable` in ngx_http_upstream_send_response.
+    // C sets this to `!u->cacheable` in ngx_http_upstream_process_headers.
     r.disable_not_modified.set(true);
 
     // proxy_force_ranges: opt in to server-side range processing even though
@@ -2611,79 +2435,23 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
             r.single_range.set(true);
         }
         // Cached/cacheable responses go through range_filter regardless
-        // of the upstream's Accept-Ranges — C's ngx_http_upstream_send_response
-        // sets r->allow_ranges = 1 when u->cacheable is set.
+        // of the upstream's Accept-Ranges.
         if lcf_fr.borrow().cache.zone.is_some() {
             r.allow_ranges.set(true);
         }
     }
 
-    // Reject 101 Switching Protocols the client didn't ask for BEFORE we
-    // send any headers — an upstream that unilaterally decides to switch
-    // protocols on a plain request must not take over the client's socket.
-    // Matches ngx_http_upstream_process_upgrade's headers_in.upgrade
-    // check.
-    if status == 101 {
-        let client_wanted_upgrade = r.headers_in.borrow().headers.iter()
-            .any(|h| h.hash.get() != 0 && h.lowcase_key == b"upgrade");
-        if !client_wanted_upgrade {
-            // Send a bare 502 status line with no body — matches C's
-            // NGX_HTTP_UPSTREAM_INVALID_HEADER path where the response
-            // is closed without an error page (test expects
-            // body_bytes_sent == 0). Setting header_only makes the
-            // header_filter skip body emission and the default 502
-            // error_page.
-            r.headers_out.borrow_mut().status = NGX_HTTP_BAD_GATEWAY as i64;
-            r.header_only.set(true);
-            r.keepalive.set(false);
-            let _ = crate::core_rt::send_header(&r).await;
-            return crate::NGX_DONE;
-        }
-    }
-    // proxy_intercept_errors: hand off to error_page instead of forwarding the
-    // upstream body — but only if the location actually has an error_page
-    // configured for this status. Matches ngx_http_upstream_intercept_errors.
-    {
-        let lcf2 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let intercept = lcf2.borrow().intercept_errors.get_or(false);
-        if intercept && status >= crate::NGX_HTTP_SPECIAL_RESPONSE {
-            let clcf = r.clcf();
-            let has_page = clcf
-                .borrow()
-                .error_pages
-                .as_ref()
-                .map(|pages| pages.iter().any(|p| p.status == status))
-                .unwrap_or(false);
-            if has_page {
-                // Cache the upstream error before handing off to error_page,
-                // so subsequent requests hit the cached error status and
-                // trigger the same intercept path — matches C's behavior
-                // where u->cache is populated even on intercept.
-                let cache_conf = lcf2.borrow().cache.clone();
-                if cache_conf.zone.is_some() {
-                    let body = if body_start < response.len() {
-                        response[body_start..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    let mut hdrs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                    let ho = r.headers_out.borrow();
-                    if !ho.content_type.is_empty() {
-                        hdrs.push((b"Content-Type".to_vec(), ho.content_type.clone()));
-                    }
-                    for h in &ho.headers {
-                        if h.hash.get() == 0 { continue; }
-                        hdrs.push((h.key.clone(), h.value.borrow().clone()));
-                    }
-                    drop(ho);
-                    crate::proxy_cache::maybe_save(
-                        &r, &cache_conf, &upstream_uri,
-                        status as u16, hdrs, body,
-                    );
-                }
-                return status;
-            }
-        }
+    // 101 Switching Protocols the client did not ask for: rejected before
+    // any header is sent (ngx_http_proxy_process_header: u->upgrade only
+    // with r->headers_in.upgrade)
+    if status == 101 && !resp.upgrade {
+        // Send a bare 502 status line with no body — the response is closed
+        // without an error page (test expects body_bytes_sent == 0).
+        r.headers_out.borrow_mut().status = NGX_HTTP_BAD_GATEWAY as i64;
+        r.header_only.set(true);
+        r.keepalive.set(false);
+        let _ = crate::core_rt::send_header(&r).await;
+        return crate::NGX_DONE;
     }
 
     // proxy_cookie_domain / proxy_cookie_path: rewrite Set-Cookie Domain=
@@ -2693,272 +2461,1147 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     // proxy_redirect: rewrite Location / Refresh (url=...) headers.
     rewrite_redirect_headers(&r);
 
-    // Snapshot cached headers *before* send_header runs — filters
-    // (addition_filter, sub_filter, gzip) rewrite headers_out during the
-    // header pass, and we want the pre-filter view on disk so a later HIT
-    // replays the same response the origin sent.
-    let cache_snapshot_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = {
-        let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        if lcf_c.borrow().cache.zone.is_some() {
-            // Snapshot the raw upstream headers — including the ones the
-            // proxy_hide list keeps from the client (X-Accel-Expires,
-            // Set-Cookie, ...) — so cache TTL decisions and cache_control
-            // parsing see the same view the C code does. `upstream_headers_in`
-            // is populated before the hide filter runs.
-            let uh = r.upstream_headers_in.borrow();
-            let hdrs: Vec<(Vec<u8>, Vec<u8>)> = uh.iter()
-                .map(|h| (h.key.clone(), h.value.borrow().clone()))
-                .collect();
-            Some(hdrs)
-        } else {
-            None
-        }
+    // Snapshot the raw upstream headers — including the ones the proxy_hide
+    // list keeps from the client (X-Accel-Expires, Set-Cookie, ...) — so
+    // cache TTL decisions and cache_control parsing see the same view the C
+    // code does.
+    let cache_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = if cacheable {
+        Some(resp.headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect())
+    } else {
+        None
     };
 
-    // Send status and headers to client
-    let send_hdr_rc = crate::core_rt::send_header(&r).await;
-    if send_hdr_rc != NGX_OK {
-        return NGX_ERROR;
-    }
+    // ngx_http_upstream_send_response
 
-    // 101 Switching Protocols: the client and upstream now speak whatever
-    // protocol the Upgrade negotiation settled on. Copy bytes both ways
-    // until either side closes. This is the minimum implementation
-    // proxy_upgrade.t / proxy_websocket.t / tunnel*.t need — no fancy
-    // half-close handling, no chunked framing.
-    if status == 101 {
-        // The client-wanted-upgrade gate ran before send_header above, so
-        // reaching here always means the client did ask for an upgrade.
-        {
-            if let Some(upstream_stream) = upstream.take() {
-                // Force headers out through the write filter — postpone_output
-                // would otherwise keep the 101 line buffered until the "last"
-                // signal, which never arrives in an upgrade.
-                let mut b = ngx_core::buf::Buf::from_vec(Vec::new());
-                b.flush = true;
-                b.sync = true;
-                let mut chain = ngx_core::buf::Chain::new();
-                chain.push_back(b);
-                let _ = crate::core_rt::output_filter(&r, chain).await;
+    let rc = crate::core_rt::send_header(&r).await;
 
-                // Anything past the header block was already sent by upstream
-                // as part of the upgraded protocol (e.g. a WebSocket server
-                // that started sending frames immediately). Forward that
-                // trailing tail to the client before entering the read loop.
-                if body_start < response.len() {
-                    let tail = &response[body_start..];
-                    let _ = r.connection.send_all(tail).await;
-                }
-                let _ = proxy_upgrade_tunnel(r.clone(), upstream_stream).await;
-                return crate::NGX_DONE;
-            }
-            return crate::NGX_DONE;
-        }
-        return crate::NGX_DONE;
-    }
-
-    // Forward response body. Respect HEAD (no body) and Content-Length (truncate
-    // any extra bytes upstream sent past the declared length — matches C which
-    // reads exactly content_length_n bytes and logs "upstream sent more data
-    // than specified in Content-Length"). We captured upstream_content_length
-    // above BEFORE send_header, because some filters (e.g. addition_filter,
-    // sub_filter, gzip) clear r.headers_out.content_length_n.
-    let head_only = r.method.get() == NGX_HTTP_HEAD || r.header_only.get();
-    if head_only {
-        // Cache HEAD responses too, so a later request (HEAD or GET) can
-        // HIT. In the convert_head=on path we sent GET upstream, so the
-        // real body is in `response`. Skip caching if the upstream sent
-        // fewer bytes than Content-Length declared — matches the
-        // short_response guard on the GET path.
-        if let Some(hdrs) = cache_snapshot_headers {
-            // If we forwarded HEAD → GET upstream (convert_head=on), a
-            // real GET body should be present; treat a partial body as
-            // "short" and skip caching. If the client sent HEAD and we
-            // stayed HEAD upstream, Content-Length describes the notional
-            // GET body — there's no upstream body to be short.
-            let head_upstream = head;
-            let tail_len = response.len().saturating_sub(body_start);
-            let short_response = !head_upstream
-                && upstream_content_length >= 0
-                && (upstream_content_length as usize) > tail_len;
-            if !short_response {
-                let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-                let cache_conf = lcf_s.borrow().cache.clone();
-                let body = if body_start < response.len() {
-                    let tail = &response[body_start..];
-                    let end = if upstream_content_length >= 0 {
-                        (upstream_content_length as usize).min(tail.len())
-                    } else {
-                        tail.len()
-                    };
-                    tail[..end].to_vec()
-                } else {
-                    Vec::new()
-                };
-                crate::proxy_cache::maybe_save(
-                    &r, &cache_conf, &upstream_uri,
-                    status as u16, hdrs, body,
-                );
-            }
-        }
-        return NGX_OK;
-    }
-    if stream_body {
-        let mut sock = match upstream.take() {
-            Some(s) => s,
-            None => return NGX_ERROR,
-        };
-
-        let initial = if body_start < response.len() { response[body_start..].to_vec() } else { Vec::new() };
-
-        let conn_close = u_upstream_wants_close || !response.starts_with(b"HTTP/1.1");
-
-        let (rc, keepalive) = send_non_buffered(&r, &mut sock, &initial, status, u_expected_body_len, u_is_chunked, conn_close).await;
-
-        if keepalive {
-            g.conn = Some(crate::upstream::UpstreamConn { sock, requests: upstream_requests, start_time: upstream_start_time });
-            g.keepalive = true;
-        }
-
+    if rc == NGX_ERROR || rc > NGX_OK || r.post_action.get() {
         return rc;
     }
 
-    // proxy_store: if configured, buffer the whole body and write it out
-    // once we know the final decoded length.
-    let body_snapshot_for_store: Vec<u8>;
-    if body_start < response.len() {
-        let mut short_response = false;
-        let body_owned: Vec<u8>;
-        let body: &[u8] = if copied.chunked {
-            body_owned = decode_chunked(&response[body_start..]);
-            &body_owned
-        } else {
-            let end = if upstream_content_length >= 0 {
-                let want = body_start + upstream_content_length as usize;
-                if want > response.len() {
-                    // Upstream sent fewer bytes than Content-Length promised.
-                    short_response = true;
-                    response.len()
-                } else {
-                    want
-                }
-            } else {
-                response.len()
-            };
-            &response[body_start..end]
-        };
-
-        // Create a buffer chain for the body
-        use ngx_core::buf::{Buf, BufData, Chain};
-        use std::collections::VecDeque;
-
-        let mut chain: Chain = VecDeque::new();
-
-        // Only mark as last_buf when the response is well-formed. A short
-        // response (fewer bytes than Content-Length) has to signal "no more
-        // data" without triggering downstream last_buf handlers like
-        // addition_filter's after_body. C achieves this by never delivering
-        // last_buf to the filter chain in the short case; the client sees the
-        // truncated body via connection close.
-        let final_buf = !short_response;
-
-        let buf = Buf {
-            pos: 0,
-            last: body.len(),
-            file_pos: 0,
-            file_last: 0,
-            tag: 0,
-            num: 0,
-            data: BufData::Memory(body.to_vec()),
-            temporary: true,
-            memory: false,
-            mmap: false,
-            recycled: false,
-            in_file: false,
-            flush: !final_buf,
-            sync: false,
-            last_buf: final_buf,
-            last_in_chain: true,
-            temp_file: false,
-        };
-
-        chain.push_back(buf);
-
-        body_snapshot_for_store = body.to_vec();
-        if crate::core_rt::output_filter(&r, chain).await != NGX_OK {
+    if resp.upgrade {
+        // ngx_http_upstream_upgrade
+        if !r.is_main() {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "connection upgrade in subrequest");
             return NGX_ERROR;
         }
-        if !short_response {
-            maybe_store_body(&r, &body_snapshot_for_store);
-            if let Some(hdrs) = cache_snapshot_headers {
-                let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-                let cache_conf = lcf_s.borrow().cache.clone();
-                crate::proxy_cache::maybe_save(
-                    &r, &cache_conf, &upstream_uri,
-                    status as u16, hdrs, body_snapshot_for_store,
-                );
-            }
-        }
-    } else {
-        if upstream_content_length > 0 {
-            // the response is shorter than its "Content-Length":
-            // ngx_http_upstream_finalize_request with 502 after the header
-            // is sent, a flush and no last buffer
-            r.keepalive.set(false);
-            return NGX_OK;
-        }
 
-        // ngx_http_upstream_finalize_request(r, u, 0): the last buffer
-        let mut b = ngx_core::buf::Buf::special();
-        b.last_buf = r.is_main();
-        b.last_in_chain = true;
+        r.keepalive.set(false);
+
+        // Force headers out through the write filter — postpone_output
+        // would otherwise keep the 101 line buffered until the "last"
+        // signal, which never arrives in an upgrade.
+        let mut b = ngx_core::buf::Buf::from_vec(Vec::new());
+        b.flush = true;
+        b.sync = true;
         let mut chain = ngx_core::buf::Chain::new();
         chain.push_back(b);
-        if crate::core_rt::output_filter(&r, chain).await == NGX_ERROR {
+        let _ = crate::core_rt::output_filter(&r, chain).await;
+
+        // Anything past the header block was already sent by upstream as
+        // part of the upgraded protocol: forwarded first.
+        if resp.pos < resp.buf.len() {
+            let _ = r.connection.send_all(&resp.buf[resp.pos..]).await;
+        }
+
+        let _ = proxy_upgrade_tunnel(r.clone(), sock).await;
+        return crate::NGX_DONE;
+    }
+
+    let header_only = r.header_only.get();
+
+    if header_only {
+        if !u_buffering || (!cacheable && !store) {
+            // ngx_http_upstream_finalize_request(r, u, rc)
+            keep(&mut g, sock, resp.keepalive);
+            return rc;
+        }
+    }
+
+    // p->limit_rate = ngx_http_complex_value_size(r, u->conf->limit_rate, 0)
+    let (limit_rate, capture) = if u_buffering {
+        let lr = lcf.borrow().limit_rate.as_option().cloned().flatten();
+        (crate::script::complex_value_size(&r, &lr, 0), cacheable || store)
+    } else {
+        (0, false)
+    };
+
+    let pass_trailers = lcf.borrow().pass_trailers.get_or(false);
+
+    let body = send_response_body(
+        &r,
+        &mut sock,
+        &mut resp,
+        head,
+        BodyParams { buffering: u_buffering, limit_rate, downstream: !header_only, capture, read_timeout, pass_trailers, buffer_size },
+        watch,
+        &effective_hide,
+    )
+    .await;
+
+    if body.keepalive {
+        keep(&mut g, sock, true);
+    }
+
+    if body.rc == NGX_OK && body.complete {
+        // ngx_http_upstream_process_request: ngx_http_upstream_store() for
+        // a 200 whose body is as long as its "Content-Length" says
+        if store
+            && status == crate::NGX_HTTP_OK
+            && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64)
+        {
+            maybe_store_body(&r, &body.data);
+        }
+
+        if let Some(hdrs) = cache_headers {
+            let cache_conf = lcf.borrow().cache.clone();
+            crate::proxy_cache::maybe_save(&r, &cache_conf, &upstream_uri, status as u16, hdrs, body.data);
+        }
+    } else if cacheable && !body.complete {
+        // Signal to proxy_cache::maybe_save that we shouldn't persist a
+        // truncated response.
+        r.upstream_response_incomplete.set(true);
+    }
+
+    body.rc
+}
+
+/// u->headers_in and u->buffer of an upstream response
+/// (ngx_http_upstream_headers_in_t): what ngx_http_proxy_process_status_line
+/// and ngx_http_proxy_process_header found, the body starting at `pos`.
+struct UpstreamResponse {
+    buf: Vec<u8>,
+    pos: usize,
+    status_n: i64,
+    status_line: Vec<u8>,
+    headers: Vec<crate::request::Header>,
+    content_length: Option<crate::request::Header>,
+    transfer_encoding: Option<crate::request::Header>,
+    content_length_n: i64,
+    chunked: bool,
+    connection_close: bool,
+    /// headers_in.server and headers_in.date were sent
+    server: bool,
+    date: bool,
+    /// u->keepalive, set for a response without a body
+    keepalive: bool,
+    /// u->upgrade
+    upgrade: bool,
+    /// u->headers_in.trailers
+    trailers: Vec<crate::request::Header>,
+}
+
+impl UpstreamResponse {
+    fn new() -> UpstreamResponse {
+        UpstreamResponse {
+            buf: Vec::new(),
+            pos: 0,
+            status_n: 0,
+            status_line: Vec::new(),
+            headers: Vec::new(),
+            content_length: None,
+            transfer_encoding: None,
+            content_length_n: -1,
+            chunked: false,
+            connection_close: false,
+            server: false,
+            date: false,
+            keepalive: false,
+            upgrade: false,
+            trailers: Vec::new(),
+        }
+    }
+
+    /// ngx_memzero(&u->headers_in) of ngx_http_upstream_process_early_hints
+    fn clear_headers(&mut self) {
+        self.status_n = 0;
+        self.status_line.clear();
+        self.headers.clear();
+        self.content_length = None;
+        self.transfer_encoding = None;
+        self.content_length_n = -1;
+        self.chunked = false;
+        self.connection_close = false;
+        self.server = false;
+        self.date = false;
+    }
+}
+
+/// How reading a response header failed.
+enum HeaderError {
+    /// ngx_http_upstream_next() with this failure type
+    Next(u32),
+    /// the client closed the connection (ngx_http_upstream_check_broken_connection)
+    ClientClosed(i32),
+}
+
+/// The default proxy_buffer_size: ngx_pagesize.
+const PROXY_BUFFER_SIZE: usize = 4096;
+
+/// ngx_http_upstream_process_header with ngx_http_proxy_process_status_line
+/// and ngx_http_proxy_process_header: the response header read from the
+/// upstream, the headers checked by the upstream's headers_in handlers.
+async fn process_header(r: &R, sock: &mut UpstreamSock, ctx: &Rc<RefCell<ProxyCtx>>, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>) -> Result<UpstreamResponse, HeaderError> {
+    let log = r.connection.log.clone();
+    let action = log.action();
+
+    log.set_action(Some("reading response header from upstream"));
+
+    let rc = read_header(r, sock, ctx, buffer_size, read_timeout, watch).await;
+
+    log.set_action(action);
+
+    rc
+}
+
+async fn read_header(r: &R, sock: &mut UpstreamSock, ctx: &Rc<RefCell<ProxyCtx>>, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>) -> Result<UpstreamResponse, HeaderError> {
+    use crate::parse::{NGX_HTTP_PARSE_HEADER_DONE, NGX_HTTP_PARSE_INVALID_HEADER};
+
+    let mut u = UpstreamResponse::new();
+
+    // the status line is parsed (process_header is
+    // ngx_http_proxy_process_header)
+    let mut status_done = false;
+    let mut pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
+    let mut pos = 0usize;
+    let mut chunk = vec![0u8; buffer_size.max(1)];
+
+    loop {
+        // c->recv() into what is left of u->buffer
+        let room = buffer_size.saturating_sub(u.buf.len()).clamp(1, chunk.len());
+
+        let res = {
+            let read = tokio::time::timeout(std::time::Duration::from_millis(read_timeout), sock.read(&mut chunk[..room]));
+
+            tokio::select! {
+                res = read => res,
+                err = client_closed(watch) => return Err(HeaderError::ClientClosed(err)),
+            }
+        };
+
+        let n = match res {
+            Err(_) => {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
+                return Err(HeaderError::Next(FT_TIMEOUT));
+            }
+            Ok(Err(e)) => {
+                if let Some(errno) = e.raw_os_error() {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(errno), "recv() failed");
+                }
+                return Err(HeaderError::Next(FT_ERROR));
+            }
+            Ok(Ok(0)) => {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
+                return Err(HeaderError::Next(FT_ERROR));
+            }
+            Ok(Ok(n)) => n,
+        };
+
+        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+            st.bytes_received += n as i64;
+        }
+
+        u.buf.extend_from_slice(&chunk[..n]);
+
+        'again: loop {
+            if !status_done {
+                // ngx_http_proxy_process_status_line
+
+                let mut p = pos;
+                let mut status = crate::parse::Status::default();
+
+                let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
+
+                if rc == NGX_AGAIN {
+                    break 'again;
+                }
+
+                if rc == NGX_ERROR {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent no valid HTTP/1.0 header");
+
+                    r.http_version.set(crate::NGX_HTTP_VERSION_9);
+
+                    if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+                        st.status = crate::NGX_HTTP_OK;
+                    }
+
+                    u.status_n = crate::NGX_HTTP_OK;
+                    u.connection_close = true;
+
+                    // u->buffer.pos = ctx->status.line_start
+                    u.pos = pos;
+
+                    return Ok(u);
+                }
+
+                if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+                    if st.status == 0 {
+                        st.status = status.code as i64;
+                    }
+                }
+
+                u.status_n = status.code as i64;
+                u.status_line = u.buf[status.start..status.end].to_vec();
+
+                ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy status {} \"{}\"", u.status_n, ngx_core::string::B(&u.status_line));
+
+                if status.http_version < crate::NGX_HTTP_VERSION_11 {
+                    if status.code == 103 {
+                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent HTTP/1.0 response with early hints");
+                        return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+                    }
+
+                    u.connection_close = true;
+                }
+
+                pos = p;
+                status_done = true;
+            }
+
+            // ngx_http_proxy_process_header
+
+            loop {
+                let rc = crate::parse::parse_header_line(&mut pr, &u.buf, &mut pos, true);
+
+                if rc == NGX_OK {
+                    // a header line has been parsed successfully
+
+                    let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
+                    let value = u.buf[pr.header_start..pr.header_end].to_vec();
+
+                    let lowcase = if key.len() == pr.lowcase_index {
+                        pr.lowcase_header[..key.len()].to_vec()
+                    } else {
+                        key.to_ascii_lowercase()
+                    };
+
+                    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
+
+                    let h = crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase);
+
+                    u.headers.push(h.clone());
+
+                    if u.status_n == 103 {
+                        continue;
+                    }
+
+                    if let Err(ft) = upstream_process_header_line(r, &mut u, &h) {
+                        return Err(HeaderError::Next(ft));
+                    }
+
+                    continue;
+                }
+
+                if rc == NGX_HTTP_PARSE_HEADER_DONE {
+                    // a whole header has been parsed successfully
+
+                    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header done");
+
+                    if u.status_n == 103 {
+                        // ngx_http_upstream_process_early_hints: the early
+                        // hints filters of ngx_http_send_early_hints() are
+                        // not ported, so the 103 goes nowhere, as without
+                        // the "early_hints" directive
+                        ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream early hints");
+
+                        u.clear_headers();
+                        status_done = false;
+                        pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
+
+                        continue 'again;
+                    }
+
+                    // clear content length if response is chunked
+
+                    if u.chunked {
+                        u.content_length_n = -1;
+                    }
+
+                    // set u->keepalive if response has no body; this
+                    // allows to keep connections alive in case of
+                    // r->header_only or X-Accel-Redirect
+
+                    let head = ctx.borrow().head;
+
+                    if u.status_n == crate::NGX_HTTP_NO_CONTENT as i64
+                        || u.status_n == crate::NGX_HTTP_NOT_MODIFIED as i64
+                        || head
+                        || (!u.chunked && u.content_length_n == 0)
+                    {
+                        u.keepalive = !u.connection_close;
+                    }
+
+                    if u.status_n == 101 {
+                        u.keepalive = false;
+
+                        if !r.headers_in.borrow().upgrade.is_empty() {
+                            u.upgrade = true;
+                        }
+                    }
+
+                    u.pos = pos;
+
+                    return Ok(u);
+                }
+
+                if rc == NGX_AGAIN {
+                    if u.buf.len() >= buffer_size {
+                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent too big header");
+                        return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+                    }
+
+                    break 'again;
+                }
+
+                // rc == NGX_HTTP_PARSE_INVALID_HEADER
+                debug_assert_eq!(rc, NGX_HTTP_PARSE_INVALID_HEADER);
+
+                let end = pr.header_end.min(u.buf.len());
+                let start = pr.header_name_start.min(end);
+                let ch = u.buf.get(end).copied().unwrap_or(0);
+
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_ERR,
+                    r.connection.log,
+                    None,
+                    "upstream sent invalid header: \"{}\\x{:02x}...\"",
+                    ngx_core::string::B(&u.buf[start..end]),
+                    ch
+                );
+
+                return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+            }
+        }
+    }
+}
+
+/// The handlers of ngx_http_upstream_headers_in[] (process, not copy) of
+/// the headers a response is read with, and of the ones only the first of
+/// which counts (a duplicate is ignored: hash 0). Err is the failure of
+/// NGX_HTTP_UPSTREAM_INVALID_HEADER.
+fn upstream_process_header_line(r: &R, u: &mut UpstreamResponse, h: &crate::request::Header) -> Result<(), u32> {
+    let invalid = crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER;
+
+    match h.lowcase_key.as_slice() {
+        b"content-length" => {
+            // ngx_http_upstream_process_content_length
+            if let Some(prev) = &u.content_length {
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_ERR,
+                    r.connection.log,
+                    None,
+                    "upstream sent duplicate header line: \"{}: {}\", previous value: \"{}: {}\"",
+                    ngx_core::string::B(&h.key),
+                    ngx_core::string::B(&h.value.borrow()),
+                    ngx_core::string::B(&prev.key),
+                    ngx_core::string::B(&prev.value.borrow())
+                );
+                return Err(invalid);
+            }
+
+            if u.transfer_encoding.is_some() {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent \"Content-Length\" and \"Transfer-Encoding\" headers at the same time");
+                return Err(invalid);
+            }
+
+            u.content_length = Some(h.clone());
+            u.content_length_n = atoof(&h.value.borrow());
+
+            if u.content_length_n == NGX_ERROR {
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_ERR,
+                    r.connection.log,
+                    None,
+                    "upstream sent invalid \"Content-Length\" header: \"{}: {}\"",
+                    ngx_core::string::B(&h.key),
+                    ngx_core::string::B(&h.value.borrow())
+                );
+                return Err(invalid);
+            }
+        }
+
+        b"transfer-encoding" => {
+            // ngx_http_upstream_process_transfer_encoding
+            if let Some(prev) = &u.transfer_encoding {
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_ERR,
+                    r.connection.log,
+                    None,
+                    "upstream sent duplicate header line: \"{}: {}\", previous value: \"{}: {}\"",
+                    ngx_core::string::B(&h.key),
+                    ngx_core::string::B(&h.value.borrow()),
+                    ngx_core::string::B(&prev.key),
+                    ngx_core::string::B(&prev.value.borrow())
+                );
+                return Err(invalid);
+            }
+
+            if u.content_length.is_some() {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent \"Content-Length\" and \"Transfer-Encoding\" headers at the same time");
+                return Err(invalid);
+            }
+
+            u.transfer_encoding = Some(h.clone());
+
+            let v = h.value.borrow();
+
+            if v.len() == 7 && v.eq_ignore_ascii_case(b"chunked") {
+                u.chunked = true;
+            } else {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent unknown \"Transfer-Encoding\": \"{}\"", ngx_core::string::B(&v));
+                return Err(invalid);
+            }
+        }
+
+        b"connection" => {
+            // ngx_http_upstream_process_connection
+            if ngx_core::string::strcasestr(&h.value.borrow(), b"close").is_some() {
+                u.connection_close = true;
+            }
+        }
+
+        b"status" | b"content-type" | b"date" | b"last-modified" | b"etag" | b"server" | b"location" | b"refresh" | b"expires" | b"x-accel-expires" | b"x-accel-redirect"
+        | b"x-accel-limit-rate" => {
+            // ngx_http_upstream_process_header_line and the like: the
+            // first one, a duplicate is ignored
+            let prev = u.headers.iter().find(|p| !Rc::ptr_eq(p, h) && p.hash.get() != 0 && p.lowcase_key == h.lowcase_key).cloned();
+
+            if let Some(prev) = prev {
+                ngx_core::ngx_log_error!(
+                    ngx_core::log::NGX_LOG_WARN,
+                    r.connection.log,
+                    None,
+                    "upstream sent duplicate header line: \"{}: {}\", previous value: \"{}: {}\", ignored",
+                    ngx_core::string::B(&h.key),
+                    ngx_core::string::B(&h.value.borrow()),
+                    ngx_core::string::B(&prev.key),
+                    ngx_core::string::B(&prev.value.borrow())
+                );
+                h.hash.set(0);
+                return Ok(());
+            }
+
+            if h.lowcase_key == b"server" {
+                u.server = true;
+            } else if h.lowcase_key == b"date" {
+                u.date = true;
+            }
+        }
+
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// ngx_atoof: a non-negative decimal number, NGX_ERROR otherwise.
+fn atoof(v: &[u8]) -> i64 {
+    if v.is_empty() {
+        return NGX_ERROR;
+    }
+
+    let mut n: i64 = 0;
+
+    for &c in v {
+        if !c.is_ascii_digit() {
             return NGX_ERROR;
         }
 
-        // Empty 200 response — still honor proxy_store (writes an empty file).
-        maybe_store_body(&r, &[]);
-        if let Some(hdrs) = cache_snapshot_headers {
-            let lcf_s = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-            let cache_conf = lcf_s.borrow().cache.clone();
-            crate::proxy_cache::maybe_save(
-                &r, &cache_conf, &upstream_uri,
-                status as u16, hdrs, Vec::new(),
-            );
+        let d = (c - b'0') as i64;
+
+        if n > (i64::MAX - d) / 10 {
+            return NGX_ERROR;
+        }
+
+        n = n * 10 + d;
+    }
+
+    n
+}
+
+/// ngx_http_upstream_check_broken_connection, as the Linux build runs it
+/// (epoll with EPOLLRDHUP), on a duplicate of the client socket: its
+/// readiness is its own, so the request's reading of the body and of
+/// pipelined requests is not disturbed. An HTTP/2 or HTTP/3 stream is not
+/// checked.
+struct ClientWatch {
+    afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl ClientWatch {
+    fn new(r: &R) -> ClientWatch {
+        use std::os::fd::FromRawFd;
+
+        if r.stream.borrow().is_some() || r.http_version.get() >= crate::NGX_HTTP_VERSION_20 {
+            return ClientWatch { afd: None };
+        }
+
+        // SAFETY: dup() of the connection's open socket; the duplicate is
+        // owned (and closed) by the OwnedFd.
+        let dup = unsafe { libc::dup(r.connection.fd.get()) };
+
+        if dup < 0 {
+            return ClientWatch { afd: None };
+        }
+
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+
+        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok() }
+    }
+
+    /// Resolves with the pending socket error (0 if none) when the client
+    /// closes the connection; data it sends is left to be read.
+    async fn closed(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+
+        let afd = match &self.afd {
+            Some(a) => a,
+            None => return std::future::pending().await,
+        };
+
+        loop {
+            let mut guard = match afd.readable().await {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+
+            // EPOLLRDHUP: ev->pending_eof
+            if guard.ready().is_read_closed() {
+                break;
+            }
+
+            let mut b = [0u8; 1];
+            // SAFETY: a one byte peek into b on the duplicate socket.
+            let n = unsafe { libc::recv(afd.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+
+            if n == 0 {
+                break;
+            }
+
+            if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+                break;
+            }
+
+            guard.clear_ready();
+        }
+
+        // getsockopt(SO_ERROR): the pending error, if any
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        // SAFETY: err and len are valid for getsockopt to write an int into.
+        unsafe {
+            libc::getsockopt(afd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
+        }
+
+        err
+    }
+}
+
+/// The client's close if watched, else never.
+async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
+    match watch {
+        Some(w) => w.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The end of ngx_http_upstream_check_broken_connection when the client
+/// closed the connection of a request that is not cached: the upstream
+/// connection is closed too, and the request is finalized with 499.
+fn client_closed_request(r: &R, err: i32) -> i64 {
+    r.connection.error.set(true);
+
+    ngx_core::ngx_log_error!(
+        ngx_core::log::NGX_LOG_INFO,
+        r.connection.log,
+        if err != 0 { Some(err) } else { None },
+        "epoll_wait() reported that client prematurely closed connection, so upstream connection is closed too"
+    );
+
+    crate::NGX_HTTP_CLIENT_CLOSED_REQUEST
+}
+
+/// What send_response_body needs of the upstream configuration.
+struct BodyParams {
+    /// u->buffering
+    buffering: bool,
+    /// p->limit_rate (proxy_limit_rate), buffered only
+    limit_rate: usize,
+    /// the body goes to the client (not r->header_only)
+    downstream: bool,
+    /// the body is kept for the cache or proxy_store
+    capture: bool,
+    read_timeout: u64,
+    pass_trailers: bool,
+    /// proxy_buffer_size, the most of trailers kept
+    buffer_size: usize,
+}
+
+/// The end of a response body (ngx_http_upstream_finalize_request).
+struct BodyResult {
+    /// the rc to finalize the request with
+    rc: i64,
+    /// u->keepalive
+    keepalive: bool,
+    /// the body was read in full
+    complete: bool,
+    /// the body, when kept
+    data: Vec<u8>,
+}
+
+/// ngx_http_upstream_send_response after the header is sent: the body read
+/// with the proxy's input filters (ngx_http_proxy_input_filter_init, then
+/// the copy or chunked filter of the event pipe, or their non-buffered
+/// versions) and passed to the client as it arrives, with
+/// proxy_limit_rate on the reading when buffered; then what
+/// ngx_http_upstream_finalize_request sends: the trailers and the last
+/// buffer, or, for a body the upstream cut short, a flush and no keepalive.
+async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>]) -> BodyResult {
+    let log = r.connection.log.clone();
+    let action = log.action();
+
+    log.set_action(Some("reading upstream"));
+
+    let res = read_body(r, sock, u, head, &p, watch, hide).await;
+
+    log.set_action(action);
+
+    res
+}
+
+async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: &BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>]) -> BodyResult {
+    use ngx_core::buf::{Buf, Chain};
+
+    if !p.buffering {
+        // non-buffered responses are not rate limited
+        r.limit_rate.set(0);
+        r.limit_rate_set.set(true);
+    }
+
+    let mut keepalive = u.keepalive;
+
+    // ngx_http_proxy_input_filter_init: u->length and p->length
+
+    ngx_core::ngx_log_debug!(
+        ngx_core::log::NGX_LOG_DEBUG_HTTP,
+        r.connection.log,
+        "http proxy filter init s:{} h:{} c:{} l:{}",
+        u.status_n,
+        head as i32,
+        u.chunked as i32,
+        u.content_length_n
+    );
+
+    let mut length: i64 = if u.status_n == crate::NGX_HTTP_NO_CONTENT as i64 || u.status_n == crate::NGX_HTTP_NOT_MODIFIED as i64 || head {
+        // 1xx, 204, and 304 and replies to HEAD requests
+        keepalive = !u.connection_close;
+        0
+    } else if u.chunked {
+        1
+    } else if u.content_length_n == 0 {
+        // empty body: special case as filter won't be called
+        keepalive = !u.connection_close;
+        0
+    } else {
+        // content length or connection close
+        u.content_length_n
+    };
+
+    let mut chunked = crate::parse::ChunkedState::default();
+
+    // ctx->trailers: the trailer part being read, with its parse state
+    let mut trailers: Option<(Vec<u8>, crate::parse::ParseRequest, usize)> = None;
+
+    let mut downstream = p.downstream;
+    let mut upstream_done = false;
+    let mut eof = false;
+    let mut timedout = false;
+    let mut error = false;
+
+    let mut captured: Vec<u8> = Vec::new();
+
+    // the pre-read part of the body, then what is read
+    let mut data: Vec<u8> = u.buf[u.pos..].to_vec();
+    let preread = !data.is_empty();
+
+    if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+        st.response_length += data.len() as i64;
+    }
+
+    if !p.buffering && !preread && downstream {
+        // ngx_http_send_special(r, NGX_HTTP_FLUSH): the header goes now
+        let mut b = Buf::special();
+        b.flush = true;
+        let mut chain = Chain::new();
+        chain.push_back(b);
+
+        if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
+            return BodyResult { rc: NGX_ERROR, keepalive: false, complete: false, data: captured };
+        }
+    }
+
+    // p->read_length and p->start_sec of proxy_limit_rate
+    let start_sec = ngx_core::times::cached().sec;
+    let mut read_length: i64 = 0;
+
+    let mut chunk = vec![0u8; 16384];
+    let mut delay: u64 = 0;
+
+    if p.limit_rate > 0 && preread {
+        read_length += data.len() as i64;
+        delay = data.len() as u64 * 1000 / p.limit_rate as u64;
+    }
+
+    loop {
+        // u->input_filter / p->input_filter
+
+        let mut out: Vec<u8> = Vec::new();
+
+        if !data.is_empty() && !upstream_done {
+            if !u.chunked {
+                // ngx_http_proxy_copy_filter,
+                // ngx_http_proxy_non_buffered_copy_filter
+                if length == 0 {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
+                    keepalive = false;
+                    upstream_done = true;
+                } else if length == -1 {
+                    out.extend_from_slice(&data);
+                } else if data.len() as i64 > length {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
+                    out.extend_from_slice(&data[..length as usize]);
+                    length = 0;
+                    upstream_done = true;
+                } else {
+                    out.extend_from_slice(&data);
+                    length -= data.len() as i64;
+
+                    if length == 0 {
+                        keepalive = !u.connection_close;
+                    }
+                }
+            } else {
+                // ngx_http_proxy_chunked_filter,
+                // ngx_http_proxy_non_buffered_chunked_filter
+                let mut pos = 0usize;
+
+                if length == 0 {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent data after final chunk");
+                    keepalive = false;
+                    upstream_done = true;
+                } else if trailers.is_some() {
+                    match process_trailer(r, &mut trailers, &data, &mut pos, p.buffer_size, &mut u.trailers) {
+                        NGX_OK => {
+                            // a whole response has been parsed successfully
+                            length = 0;
+                            keepalive = !u.connection_close;
+
+                            if pos != data.len() {
+                                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent data after trailers");
+                                keepalive = false;
+                            }
+                        }
+                        NGX_AGAIN => {}
+                        _ => error = true,
+                    }
+                } else {
+                    loop {
+                        let rc = crate::parse::parse_chunked(&mut chunked, &data, &mut pos, p.pass_trailers);
+
+                        if rc == NGX_OK {
+                            // a chunk has been parsed successfully
+                            let take = (chunked.size as usize).min(data.len() - pos);
+                            out.extend_from_slice(&data[pos..pos + take]);
+                            pos += take;
+                            chunked.size -= take as i64;
+                            continue;
+                        }
+
+                        if rc == NGX_DONE {
+                            if p.pass_trailers {
+                                match process_trailer(r, &mut trailers, &data, &mut pos, p.buffer_size, &mut u.trailers) {
+                                    NGX_OK => {}
+                                    NGX_AGAIN => {
+                                        length = 1;
+                                        break;
+                                    }
+                                    _ => {
+                                        error = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // a whole response has been parsed successfully
+                            length = 0;
+                            keepalive = !u.connection_close;
+
+                            if pos != data.len() {
+                                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent data after final chunk");
+                                keepalive = false;
+                            }
+
+                            break;
+                        }
+
+                        if rc == NGX_AGAIN {
+                            break;
+                        }
+
+                        // invalid response
+                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid chunked response");
+
+                        error = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        data.clear();
+
+        if !out.is_empty() {
+            if p.capture {
+                captured.extend_from_slice(&out);
+            }
+
+            if downstream {
+                let mut b = Buf::from_vec(out);
+                b.memory = true;
+                b.flush = !p.buffering;
+                let mut chain = Chain::new();
+                chain.push_back(b);
+
+                if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
+                    // p->downstream_error: the upstream is read to the end
+                    // only for the cache or proxy_store
+                    if !p.capture {
+                        return BodyResult { rc: NGX_ERROR, keepalive: false, complete: false, data: captured };
+                    }
+
+                    downstream = false;
+                }
+            }
+        }
+
+        if error {
+            // NGX_ERROR of the filter: ngx_http_upstream_finalize_request
+            // with 502 (buffered) or NGX_ERROR, after the header
+            return BodyResult { rc: finalize_after_header(r, downstream).await, keepalive: false, complete: false, data: captured };
+        }
+
+        if length == 0 {
+            upstream_done = true;
+        }
+
+        if upstream_done || (eof && length == -1) {
+            // ngx_http_upstream_finalize_request(r, u, 0): the trailers
+            // (ngx_http_upstream_process_trailers) and the last buffer
+            if p.pass_trailers {
+                let mut ho = r.headers_out.borrow_mut();
+
+                for h in u.trailers.iter() {
+                    if hide.iter().any(|x| x == &h.lowcase_key) {
+                        continue;
+                    }
+
+                    ho.trailers.push(h.clone());
+                }
+            }
+
+            let mut rc = NGX_OK;
+
+            if downstream {
+                let mut b = Buf::special();
+                b.last_buf = r.is_main();
+                b.last_in_chain = true;
+                let mut chain = Chain::new();
+                chain.push_back(b);
+
+                if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
+                    rc = NGX_ERROR;
+                }
+            }
+
+            return BodyResult { rc, keepalive: keepalive && rc != NGX_ERROR, complete: true, data: captured };
+        }
+
+        if eof || timedout {
+            if eof {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
+            }
+
+            return BodyResult { rc: finalize_after_header(r, downstream).await, keepalive: false, complete: false, data: captured };
+        }
+
+        // p->limit_rate: the read is delayed by the time the last one
+        // took at the rate, and limited to what the rate allows so far
+        if delay > 0 {
+            if !sleep_or_client_closed(delay, watch).await {
+                return BodyResult { rc: client_closed_request(r, 0), keepalive: false, complete: false, data: captured };
+            }
+
+            delay = 0;
+        }
+
+        let mut limit = chunk.len();
+
+        if p.limit_rate > 0 {
+            let now = ngx_core::times::cached().sec;
+            let allowed = p.limit_rate as i64 * (now - start_sec + 1) - read_length;
+
+            if allowed <= 0 {
+                delay = (-allowed * 1000 / p.limit_rate as i64 + 1) as u64;
+                continue;
+            }
+
+            limit = limit.min(allowed as usize);
+        }
+
+        let res = {
+            let read = tokio::time::timeout(std::time::Duration::from_millis(p.read_timeout), sock.read(&mut chunk[..limit]));
+
+            tokio::select! {
+                res = read => res,
+                err = client_closed(watch) => {
+                    return BodyResult { rc: client_closed_request(r, err), keepalive: false, complete: false, data: captured };
+                }
+            }
+        };
+
+        match res {
+            Err(_) => {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
+                timedout = true;
+            }
+            Ok(Err(e)) => {
+                if let Some(errno) = e.raw_os_error() {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(errno), "recv() failed");
+                }
+                return BodyResult { rc: finalize_after_header(r, downstream).await, keepalive: false, complete: false, data: captured };
+            }
+            Ok(Ok(0)) => eof = true,
+            Ok(Ok(n)) => {
+                if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
+                    st.bytes_received += n as i64;
+                    st.response_length += n as i64;
+                }
+
+                if p.limit_rate > 0 {
+                    read_length += n as i64;
+                    delay = n as u64 * 1000 / p.limit_rate as u64;
+                }
+
+                data.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+}
+
+/// ngx_http_upstream_finalize_request with an error after the header was
+/// sent: rc becomes NGX_ERROR with a flush, no last buffer, and the client
+/// connection is not kept alive.
+async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
+    r.keepalive.set(false);
+
+    if downstream {
+        let mut b = ngx_core::buf::Buf::special();
+        b.flush = true;
+        let mut chain = ngx_core::buf::Chain::new();
+        chain.push_back(b);
+
+        if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
+            return NGX_ERROR;
         }
     }
 
     NGX_OK
 }
 
-/// The peers of a proxy_pass URL with variables (u->resolved,
-/// ngx_http_upstream_init_request): the upstream its host names, its
-/// address if it is one, or the addresses the resolver finds.
-async fn resolved_peer(
-    r: &R,
-    url: &[u8],
-    next_upstream: u32,
-    next_upstream_tries: u32,
-    next_upstream_timeout: u64,
-    tag: usize,
-) -> Result<crate::upstream::UpstreamPeer, i64> {
-    let (add, port) = if url.len() >= 8 && url[..8].eq_ignore_ascii_case(b"https://") { (8, 443) } else { (7, 80) };
+/// A proxy_limit_rate delay, false if the client closed the connection
+/// (ngx_http_upstream_check_broken_connection) meanwhile.
+async fn sleep_or_client_closed(delay: u64, watch: Option<&ClientWatch>) -> bool {
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay));
 
-    let mut u = ngx_core::inet::Url::new(&url[add.min(url.len())..]);
-    u.default_port = port;
-    u.uri_part = true;
-    u.no_resolve = true;
-
-    if ngx_core::inet::parse_url(&mut u).is_err() {
-        if let Some(err) = u.err {
-            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "{} in upstream \"{}\"", err, ngx_core::string::B(&u.url));
-        }
-        return Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR);
+    tokio::select! {
+        _ = sleep => true,
+        _ = client_closed(watch) => false,
     }
+}
 
-    crate::upstream::UpstreamPeer::resolve(r, &u, next_upstream, next_upstream_tries, next_upstream_timeout, tag).await
+/// ngx_http_proxy_process_trailer: the trailer header lines after the last
+/// chunk, kept in ctx->trailers (at most proxy_buffer_size of them).
+/// NGX_OK with `pos` past them, NGX_AGAIN for more, NGX_ERROR.
+fn process_trailer(
+    r: &R,
+    state: &mut Option<(Vec<u8>, crate::parse::ParseRequest, usize)>,
+    buf: &[u8],
+    pos: &mut usize,
+    buffer_size: usize,
+    trailers: &mut Vec<crate::request::Header>,
+) -> i64 {
+    use crate::parse::{NGX_HTTP_PARSE_HEADER_DONE, ParseRequest};
+
+    let (b, pr, bpos) = state.get_or_insert_with(|| (Vec::with_capacity(buffer_size), ParseRequest { upstream: true, ..Default::default() }, 0));
+
+    let len = (buf.len() - *pos).min(buffer_size - b.len());
+
+    b.extend_from_slice(&buf[*pos..*pos + len]);
+
+    loop {
+        let rc = crate::parse::parse_header_line(pr, b, bpos, true);
+
+        if rc == NGX_OK {
+            // a header line has been parsed successfully
+
+            let key = b[pr.header_name_start..pr.header_name_end].to_vec();
+            let value = b[pr.header_start..pr.header_end].to_vec();
+
+            let lowcase = if key.len() == pr.lowcase_index {
+                pr.lowcase_header[..key.len()].to_vec()
+            } else {
+                key.to_ascii_lowercase()
+            };
+
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy trailer: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
+
+            trailers.push(crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase));
+
+            continue;
+        }
+
+        if rc == NGX_HTTP_PARSE_HEADER_DONE {
+            // a whole header has been parsed successfully
+
+            *pos += len - (b.len() - *bpos);
+
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy trailer done");
+
+            return NGX_OK;
+        }
+
+        if rc == NGX_AGAIN {
+            *pos += len;
+
+            if b.len() == buffer_size {
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent too big trailers");
+                return NGX_ERROR;
+            }
+
+            return NGX_AGAIN;
+        }
+
+        // rc == NGX_HTTP_PARSE_INVALID_HEADER
+
+        let end = pr.header_end.min(b.len());
+        let start = pr.header_name_start.min(end);
+        let ch = b.get(end).copied().unwrap_or(0);
+
+        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid trailer: \"{}\\x{:02x}...\"", ngx_core::string::B(&b[start..end]), ch);
+
+        return NGX_ERROR;
+    }
 }
 
 /// The request body buffers read so far (rb->bufs), taken to be sent.
@@ -3091,207 +3734,78 @@ async fn proxy_upgrade_tunnel(r: R, upstream: UpstreamSock) -> i64 {
         }
     }
 
-    // Two forwarding tasks — one per direction. Whichever finishes first
-    // closes the tunnel by cancelling the other via drop.
+    // ngx_http_upstream_process_upgraded: the data of each side is passed
+    // to the other; the tunnel is done (and both connections closed) when
+    // either side's end is read and what it sent was passed on, or on an
+    // error; proxy_read_timeout without activity: "upstream timed out"
+    let read_timeout = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index()).borrow().read_timeout.get_or(60000);
+    let activity = Rc::new(std::cell::Cell::new(ngx_core::times::current_msec()));
+
     let client_to_up = {
         let client = client.clone();
+        let activity = activity.clone();
         async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 match client.recv(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if up_w.write_all(&buf[..n]).await.is_err() { break; }
+                        activity.set(ngx_core::times::current_msec());
+                        if up_w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-            let _ = up_w.shutdown().await;
         }
     };
+
     let up_to_client = {
         let client = client.clone();
+        let activity = activity.clone();
         async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 match up_r.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if client.send_all(&buf[..n]).await.is_err() { break; }
+                        activity.set(ngx_core::times::current_msec());
+                        if client.send_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
     };
-    tokio::join!(client_to_up, up_to_client);
-    NGX_OK
-}
 
-fn chunked_complete(input: &[u8]) -> bool {
-    let mut i = 0;
-    while i < input.len() {
-        let line_end = match input[i..].iter().position(|&b| b == b'\n') {
-            Some(p) => i + p,
-            None => return false,
-        };
-        let mut size_end = line_end;
-        if size_end > i && input[size_end - 1] == b'\r' {
-            size_end -= 1;
-        }
-        let hex_end = input[i..size_end]
-            .iter()
-            .position(|&b| b == b';' || b == b' ' || b == b'\t')
-            .map(|p| i + p)
-            .unwrap_or(size_end);
-        let hex_str = match std::str::from_utf8(&input[i..hex_end]) {
-            Ok(s) => s.trim(),
-            Err(_) => return false,
-        };
-        let size = match usize::from_str_radix(hex_str, 16) {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        i = line_end + 1;
-        if size == 0 {
-            // Consume trailer headers (if any) up to the final CRLF/blank line.
-            loop {
-                let end = match input[i..].iter().position(|&b| b == b'\n') {
-                    Some(p) => i + p,
-                    None => return false,
-                };
-                let line = &input[i..end];
-                let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
-                i = end + 1;
-                if line.is_empty() {
-                    return true;
-                }
+    let timer = async {
+        loop {
+            let idle = ngx_core::times::current_msec().saturating_sub(activity.get());
+
+            if idle >= read_timeout {
+                return;
             }
-        }
-        if i + size > input.len() { return false; }
-        i += size;
-        if i < input.len() && input[i] == b'\r' { i += 1; }
-        if i < input.len() && input[i] == b'\n' { i += 1; }
-    }
-    false
-}
 
-/// Parse upstream URL of form "http://host:port/path" or "http://host/path" (assumes port 80)
-/// Decode HTTP/1.1 chunked transfer encoding. Malformed input truncates the
-/// output at the first bad chunk rather than erroring — mirrors what a
-/// buffering proxy tends to do when the upstream is misbehaving.
-fn decode_chunked(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        // Find end of chunk size line
-        let line_end = match input[i..].iter().position(|&b| b == b'\n') {
-            Some(p) => i + p,
-            None => break,
-        };
-        let mut size_end = line_end;
-        // Strip trailing \r
-        if size_end > i && input[size_end - 1] == b'\r' {
-            size_end -= 1;
+            tokio::time::sleep(std::time::Duration::from_millis(read_timeout - idle)).await;
         }
-        // Chunk size stops at ';' (chunk extension) or whitespace
-        let hex_end = input[i..size_end]
-            .iter()
-            .position(|&b| b == b';' || b == b' ' || b == b'\t')
-            .map(|p| i + p)
-            .unwrap_or(size_end);
-        let hex_str = match std::str::from_utf8(&input[i..hex_end]) {
-            Ok(s) => s.trim(),
-            Err(_) => break,
-        };
-        let size = match usize::from_str_radix(hex_str, 16) {
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        i = line_end + 1; // move past \n
-        if size == 0 {
-            break;
-        }
-        if i + size > input.len() {
-            out.extend_from_slice(&input[i..]);
-            break;
-        }
-        out.extend_from_slice(&input[i..i + size]);
-        i += size;
-        // Skip trailing \r\n after chunk data
-        if i < input.len() && input[i] == b'\r' { i += 1; }
-        if i < input.len() && input[i] == b'\n' { i += 1; }
-    }
-    out
-}
-
-/// The length of the "http://" or "https://" prefix of a proxy_pass URL.
-fn scheme_len(uri: &str) -> usize {
-    if uri.len() >= 8 && uri[..8].eq_ignore_ascii_case("https://") {
-        8
-    } else {
-        7
-    }
-}
-
-fn parse_upstream_uri(uri: &str) -> Option<(String, u16, String)> {
-    let (rest, default_port) = if let Some(r) = uri.strip_prefix("http://") {
-        (r, 80u16)
-    } else if let Some(r) = uri.strip_prefix("https://") {
-        (r, 443u16)
-    } else {
-        return None;
     };
 
-    // Unix socket form: "unix:/path/to.sock" or "unix:/path/to.sock:/uri"
-    if let Some(rest) = rest.strip_prefix("unix:") {
-        // Sock path ends at the LAST ":" before the URI (which starts with '/').
-        // Simple heuristic: split on ":/", treating everything before as the sock
-        // path and everything from '/' as the URI. If no ":/" found, the whole
-        // rest is the sock path and URI is "/".
-        let (sock, path) = match rest.rfind(":/") {
-            Some(p) => (&rest[..p], rest[p + 1..].to_string()),
-            None => (rest, "/".to_string()),
-        };
-        // Encode "unix:<path>" as the host and return sentinel port 0 so
-        // the caller uses UnixStream rather than TcpStream.
-        return Some((format!("unix:{}", sock), 0, path));
+    let log = r.connection.log.clone();
+    let action = log.action();
+    log.set_action(Some("proxying upgraded connection"));
+
+    tokio::select! {
+        _ = client_to_up => {}
+        _ = up_to_client => {}
+        _ = timer => {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
+        }
     }
 
-    // IPv6 form: [addr]:port/path or [addr]/path
-    if let Some(r) = rest.strip_prefix('[') {
-        let end = r.find(']')?;
-        let host = r[..end].to_string();
-        let after = &r[end + 1..];
-        let (port, path) = if let Some(p) = after.strip_prefix(':') {
-            let slash = p.find('/').unwrap_or(p.len());
-            let port: u16 = p[..slash].parse().ok()?;
-            let path = if slash == p.len() { "/".to_string() } else { p[slash..].to_string() };
-            (port, path)
-        } else if after.is_empty() || after.starts_with('/') {
-            let path = if after.is_empty() { "/".to_string() } else { after.to_string() };
-            (default_port, path)
-        } else {
-            return None;
-        };
-        return Some((host, port, path));
-    }
+    log.set_action(action);
 
-    // Find host:port or just host
-    let (host_port, path) = if let Some(pos) = rest.find('/') {
-        (&rest[..pos], rest[pos..].to_string())
-    } else {
-        (rest, "/".to_string())
-    };
-
-    // Parse host and port
-    let (host, port) = if let Some(pos) = host_port.find(':') {
-        let h = &host_port[..pos];
-        let p: u16 = host_port[pos+1..].parse().ok()?;
-        (h.to_string(), p)
-    } else {
-        (host_port.to_string(), default_port)
-    };
-
-    Some((host, port, path))
+    NGX_OK
 }
 
 /// The values of proxy_ssl_protocols (ngx_http_proxy_ssl_protocols).
@@ -3317,7 +3831,7 @@ pub fn proxy_module() -> ModuleDef {
         cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, proxy_set_header_handler),
         // Additional proxy directives that tests need
         cmd_fn!("proxy_temp_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, buffer_size, set_size),
         cmd_fn!("proxy_buffers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_busy_buffers_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_max_temp_file_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -3364,10 +3878,10 @@ pub fn proxy_module() -> ModuleDef {
         }),
         ngx_core::cmd!("proxy_pass_trailers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_trailers, set_flag),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
-        cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ignore_client_abort, set_flag),
         cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_store_handler),
         cmd_fn!("proxy_store_access", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_limit_rate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_limit_rate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_limit_rate_handler),
         ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
         ngx_core::cmd!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_max_size, set_num),
         ngx_core::cmd!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_bucket_size, set_num),
@@ -3761,214 +4275,6 @@ pub(crate) enum ConnectError {
     Internal,
 }
 
-
-/// ngx_http_upstream_process_non_buffered_request with the proxy's input
-/// filters (ngx_http_proxy_input_filter_init, the non-buffered copy and
-/// chunked filters): the body is passed to the client, flushed, as it is
-/// read from the upstream. Returns the request's rc and whether the
-/// connection may be kept alive (u->keepalive).
-async fn send_non_buffered(
-    r: &R,
-    upstream: &mut UpstreamSock,
-    initial: &[u8],
-    status: i64,
-    content_length: Option<usize>,
-    chunked: bool,
-    connection_close: bool,
-) -> (i64, bool) {
-    use ngx_core::buf::{Buf, Chain};
-
-    // non-buffered responses are not rate limited
-    r.limit_rate.set(0);
-    r.limit_rate_set.set(true);
-
-    // ngx_http_proxy_input_filter_init: u->length
-    let mut length: i64 = if status == 204 || status == 304 {
-        0
-    } else if chunked {
-        1
-    } else if content_length == Some(0) {
-        0
-    } else {
-        content_length.map_or(-1, |l| l as i64)
-    };
-
-    let mut keepalive = length == 0 && !connection_close;
-
-    let mut chunked_state = crate::parse::ChunkedState::default();
-
-    let read_timeout = {
-        let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let t = lcf.borrow().read_timeout.get_or(60000);
-        t
-    };
-
-    let mut data: Vec<u8> = initial.to_vec();
-    let mut eof = false;
-    let mut buf = vec![0u8; 16384];
-
-    loop {
-        // u->input_filter
-        let mut out: Vec<u8> = Vec::new();
-
-        if !data.is_empty() {
-            if length == 0 {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
-            } else if chunked {
-                // ngx_http_proxy_non_buffered_chunked_filter
-                let mut pos = 0usize;
-
-                loop {
-                    let rc = crate::parse::parse_chunked(&mut chunked_state, &data, &mut pos, false);
-
-                    if rc == NGX_OK {
-                        // a chunk
-                        let take = (chunked_state.size as usize).min(data.len() - pos);
-                        out.extend_from_slice(&data[pos..pos + take]);
-                        pos += take;
-                        chunked_state.size -= take as i64;
-                        continue;
-                    }
-
-                    if rc == NGX_DONE {
-                        // a whole response has been parsed successfully
-                        keepalive = !connection_close;
-                        length = 0;
-
-                        if pos < data.len() {
-                            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent data after final chunk");
-                            keepalive = false;
-                        }
-
-                        break;
-                    }
-
-                    if rc == NGX_AGAIN {
-                        break;
-                    }
-
-                    // invalid response
-                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid chunked response");
-
-                    return (NGX_ERROR, false);
-                }
-            } else if length == -1 {
-                out.extend_from_slice(&data);
-            } else if data.len() as i64 > length {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
-                out.extend_from_slice(&data[..length as usize]);
-                length = 0;
-                keepalive = false;
-            } else {
-                out.extend_from_slice(&data);
-                length -= data.len() as i64;
-                if length == 0 {
-                    keepalive = !connection_close;
-                }
-            }
-
-            data.clear();
-        }
-
-        if !out.is_empty() {
-            let mut b = Buf::from_vec(out);
-            b.memory = true;
-            b.flush = true;
-            let mut chain = Chain::new();
-            chain.push_back(b);
-
-            if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
-                return (NGX_ERROR, false);
-            }
-        } else if length != 0 && !eof {
-            // ngx_http_send_special(r, NGX_HTTP_FLUSH)
-            let mut b = Buf::special();
-            b.flush = true;
-            let mut chain = Chain::new();
-            chain.push_back(b);
-            let _ = crate::core_rt::output_filter(r, chain).await;
-        }
-
-        if length == 0 || (eof && length == -1) {
-            // ngx_http_upstream_finalize_request(r, u, 0): the last buffer
-            let mut b = Buf::special();
-            b.last_buf = r.is_main();
-            b.last_in_chain = true;
-            let mut chain = Chain::new();
-            chain.push_back(b);
-            let rc = crate::core_rt::output_filter(r, chain).await;
-
-            return (if rc == NGX_ERROR { NGX_ERROR } else { NGX_OK }, keepalive && rc != NGX_ERROR);
-        }
-
-        if eof {
-            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection while reading upstream");
-
-            return (NGX_ERROR, false);
-        }
-
-        let n = match tokio::time::timeout(std::time::Duration::from_millis(read_timeout), upstream.read(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) => {
-                return (NGX_ERROR, false);
-            }
-            Err(_) => {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out while reading upstream");
-                return (NGX_ERROR, false);
-            }
-        };
-
-        if n == 0 {
-            eof = true;
-            continue;
-        }
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.bytes_received += n as i64;
-            st.response_length += n as i64;
-        }
-
-        data.extend_from_slice(&buf[..n]);
-    }
-}
-
-/// The end of a response header: the empty line after it, as
-/// ngx_http_parse_header_line sees lines ending in LF or CRLF. Returns the
-/// end of the last header line (before its line terminator) and the start
-/// of the body.
-fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n').map(|p| p + i) {
-        let line_end = if p > 0 && buf[p - 1] == b'\r' { p - 1 } else { p };
-        match buf.get(p + 1) {
-            Some(b'\n') => return Some((line_end, p + 2)),
-            Some(b'\r') if buf.get(p + 2) == Some(&b'\n') => return Some((line_end, p + 3)),
-            _ => {}
-        }
-        i = p + 1;
-    }
-    None
-}
-
-/// u->headers_in: the header lines of an upstream response header block
-/// (after the status line).
-fn set_upstream_headers_in(r: &R, block: &[u8]) {
-    let mut h = r.upstream_headers_in.borrow_mut();
-    h.clear();
-    for line in block.split(|&b| b == b'\n').skip(1) {
-        let line = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let mut vstart = colon + 1;
-            while vstart < line.len() && (line[vstart] == b' ' || line[vstart] == b'\t') {
-                vstart += 1;
-            }
-            h.push(crate::request::TableElt::new(&line[..colon], &line[vstart..]));
-        }
-    }
-}
 
 /// Connect to the upstream within proxy_connect_timeout; for https (`ssl`,
 /// with the request's upstream `u`) ngx_event_connect_peer and

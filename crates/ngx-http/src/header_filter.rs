@@ -133,10 +133,14 @@ pub async fn header_filter(r: R) -> i64 {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
         if let Some(sv) = &ho.server {
-            out.extend_from_slice(b"Server: ");
-            out.extend_from_slice(&sv.value.borrow());
-            out.extend_from_slice(b"\r\n");
-            written.push(sv.clone());
+            // a slot with hash 0 is not sent, nor the server's own
+            // (the empty "Server" of ngx_http_upstream_process_headers)
+            if sv.hash.get() != 0 {
+                out.extend_from_slice(b"Server: ");
+                out.extend_from_slice(&sv.value.borrow());
+                out.extend_from_slice(b"\r\n");
+                written.push(sv.clone());
+            }
         } else {
             match *cl.server_tokens {
                 NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
@@ -145,10 +149,12 @@ pub async fn header_filter(r: R) -> i64 {
             }
         }
         if let Some(dt) = &ho.date {
-            out.extend_from_slice(b"Date: ");
-            out.extend_from_slice(&dt.value.borrow());
-            out.extend_from_slice(b"\r\n");
-            written.push(dt.clone());
+            if dt.hash.get() != 0 {
+                out.extend_from_slice(b"Date: ");
+                out.extend_from_slice(&dt.value.borrow());
+                out.extend_from_slice(b"\r\n");
+                written.push(dt.clone());
+            }
         } else {
             out.extend_from_slice(b"Date: ");
             out.extend_from_slice(ngx_core::times::cached_http_time().as_bytes());
