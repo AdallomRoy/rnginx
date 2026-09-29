@@ -141,6 +141,40 @@ async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
     next(r).await
 }
 
+/// One left-to-right pass over `content` with all the (lowercased)
+/// patterns: at each position the longest match is replaced, each pattern
+/// at most once with `once`. Returns the text and whether it replaced.
+fn replace_matches(content: &[u8], compiled: &[(Vec<u8>, Vec<u8>)], once: bool, used: &mut [bool]) -> (Vec<u8>, bool) {
+    let mut processed = Vec::with_capacity(content.len());
+    let mut did_replace = false;
+    let mut pos = 0;
+    while pos < content.len() {
+        // Try each pattern; pick the longest matching one (skip used ones
+        // in once mode).
+        let mut best: Option<(usize, usize)> = None; // (mlen, pair_idx)
+        for (i, (m, _repl)) in compiled.iter().enumerate() {
+            if once && used[i] { continue; }
+            if pos + m.len() > content.len() { continue; }
+            let slice = &content[pos..pos + m.len()];
+            if slice.to_ascii_lowercase() == *m {
+                if best.map_or(true, |(len, _)| m.len() > len) {
+                    best = Some((m.len(), i));
+                }
+            }
+        }
+        if let Some((mlen, i)) = best {
+            processed.extend_from_slice(&compiled[i].1);
+            pos += mlen;
+            did_replace = true;
+            if once { used[i] = true; }
+        } else {
+            processed.push(content[pos]);
+            pos += 1;
+        }
+    }
+    (processed, did_replace)
+}
+
 async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     if input.is_empty() {
         return next(r, input).await;
@@ -223,33 +257,7 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     // Per-pattern "already replaced" tracking for once=on (C's behavior: each
     // pattern replaces at most once, independently, not the whole filter).
     let mut used: Vec<bool> = vec![false; compiled.len()];
-    let mut processed = Vec::with_capacity(full_content.len());
-    let mut did_replace = false;
-    let mut pos = 0;
-    while pos < full_content.len() {
-        // Try each pattern; pick the longest matching one (skip used ones
-        // in once mode).
-        let mut best: Option<(usize, usize)> = None; // (mlen, pair_idx)
-        for (i, (m, _repl)) in compiled.iter().enumerate() {
-            if once && used[i] { continue; }
-            if pos + m.len() > full_content.len() { continue; }
-            let slice = &full_content[pos..pos + m.len()];
-            if slice.to_ascii_lowercase() == *m {
-                if best.map_or(true, |(len, _)| m.len() > len) {
-                    best = Some((m.len(), i));
-                }
-            }
-        }
-        if let Some((mlen, i)) = best {
-            processed.extend_from_slice(&compiled[i].1);
-            pos += mlen;
-            did_replace = true;
-            if once { used[i] = true; }
-        } else {
-            processed.push(full_content[pos]);
-            pos += 1;
-        }
-    }
+    let (processed, did_replace) = replace_matches(&full_content, &compiled, once, &mut used);
 
     // Compute the largest trailing suffix of `processed` that could still
     // be a prefix of one of our patterns. That tail is buffered until the
@@ -313,12 +321,37 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
 mod tests {
     use super::*;
 
+    fn pairs(p: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        p.iter().map(|(m, r)| (m.to_ascii_lowercase(), r.to_vec())).collect()
+    }
+
     #[test]
-    fn test_simple_replace() {
-        let content = b"Hello World";
-        let search = b"world";
-        let replace = b"Rust";
-        let result = simple_replace(content, search, replace);
-        assert_eq!(result, b"Hello Rust");
+    fn replace_matches_case_insensitively() {
+        let compiled = pairs(&[(b"world", b"Rust")]);
+        let mut used = vec![false; 1];
+        let (out, replaced) = replace_matches(b"Hello World, world", &compiled, false, &mut used);
+        assert_eq!(out, b"Hello Rust, Rust");
+        assert!(replaced);
+    }
+
+    #[test]
+    fn replace_matches_once_per_pattern() {
+        let compiled = pairs(&[(b"a", b"1"), (b"b", b"2")]);
+        let mut used = vec![false; 2];
+        let (out, _) = replace_matches(b"abab", &compiled, true, &mut used);
+        assert_eq!(out, b"12ab");
+    }
+
+    #[test]
+    fn replace_matches_longest_first() {
+        let compiled = pairs(&[(b"ab", b"x"), (b"abc", b"y")]);
+        let mut used = vec![false; 2];
+        let (out, _) = replace_matches(b"abcab", &compiled, false, &mut used);
+        assert_eq!(out, b"yx");
+
+        let mut used = vec![false; 2];
+        let (out, replaced) = replace_matches(b"none", &compiled, false, &mut used);
+        assert_eq!(out, b"none");
+        assert!(!replaced);
     }
 }

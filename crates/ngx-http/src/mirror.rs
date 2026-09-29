@@ -134,7 +134,7 @@ mod tests {
             mirror: Val::unset(),
             request_body: Val::unset(),
         };
-        assert!(conf.mirror.is_unset());
-        assert!(conf.request_body.is_unset());
+        assert!(!conf.mirror.is_set());
+        assert!(!conf.request_body.is_set());
     }
 }

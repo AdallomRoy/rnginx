@@ -134,6 +134,6 @@ mod tests {
         let conf = RandomIndexConf {
             enable: Val::unset(),
         };
-        assert!(conf.enable.is_unset());
+        assert!(!conf.enable.is_set());
     }
 }

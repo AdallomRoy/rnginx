@@ -311,9 +311,11 @@ mod tests {
     fn test_try_file_structure() {
         let tf = TryFile {
             name: b"/file.html".to_vec(),
+            value: None,
             test_dir: false,
             code: 0,
         };
         assert!(!tf.test_dir);
+        assert!(tf.value.is_none());
     }
 }

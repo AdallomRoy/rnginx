@@ -194,8 +194,9 @@ mod tests {
         let conf = AdditionLocConf {
             before_body: Val::unset(),
             after_body: Val::unset(),
+            types: None,
         };
-        assert!(conf.before_body.is_unset());
-        assert!(conf.after_body.is_unset());
+        assert!(!conf.before_body.is_set());
+        assert!(!conf.after_body.is_set());
     }
 }

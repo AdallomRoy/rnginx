@@ -1357,18 +1357,41 @@ mod tests {
     #[test]
     fn test_upstream_flags() {
         assert_eq!(NGX_HTTP_UPSTREAM_FT_ERROR, 0x00000002);
+        // NGX_HTTP_UPSTREAM_FT_STATUS of ngx_http_upstream.h
         assert_eq!(
             NGX_HTTP_UPSTREAM_FT_STATUS,
-            NGX_HTTP_UPSTREAM_FT_HTTP_500 | NGX_HTTP_UPSTREAM_FT_HTTP_502
+            NGX_HTTP_UPSTREAM_FT_HTTP_500
+                | NGX_HTTP_UPSTREAM_FT_HTTP_502
+                | NGX_HTTP_UPSTREAM_FT_HTTP_503
+                | NGX_HTTP_UPSTREAM_FT_HTTP_504
+                | NGX_HTTP_UPSTREAM_FT_HTTP_403
+                | NGX_HTTP_UPSTREAM_FT_HTTP_404
+                | NGX_HTTP_UPSTREAM_FT_HTTP_429
         );
     }
 
     #[test]
-    fn test_upstream_ctx_default() {
-        let ctx = UpstreamCtx::default();
-        assert_eq!(ctx.buffer_size, 4096);
-        assert_eq!(ctx.buffering, true);
-        assert!(ctx.pass_request_headers);
+    fn copy_header_content_type_and_length() {
+        let mut ho = crate::request::HeadersOut::new();
+        let mut st = CopiedHeaders::default();
+
+        // ngx_http_upstream_copy_content_type: the charset is split off
+        copy_header(&mut ho, &mut st, 200, b"Content-Type", b"text/html; charset=\"utf-8\"");
+        assert_eq!(&ho.content_type[..ho.content_type_len], b"text/html");
+        assert_eq!(ho.charset, b"utf-8");
+
+        copy_header(&mut ho, &mut st, 200, b"Content-Length", b"42");
+        assert_eq!(ho.content_length_n, 42);
+        assert!(!st.invalid);
+
+        // a second Content-Length is an invalid header
+        copy_header(&mut ho, &mut st, 200, b"Content-Length", b"42");
+        assert!(st.invalid);
+
+        // as is one that is not a number
+        let mut st = CopiedHeaders::default();
+        copy_header(&mut ho, &mut st, 200, b"Content-Length", b"4x");
+        assert!(st.invalid);
     }
 }
 

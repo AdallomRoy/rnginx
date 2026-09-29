@@ -162,6 +162,6 @@ mod tests {
         let conf = DegradationLocConf {
             degrade: Val::unset(),
         };
-        assert!(conf.degrade.is_unset());
+        assert!(!conf.degrade.is_set());
     }
 }
