@@ -998,6 +998,10 @@ pub async fn finalize_request(r: &R, mut rc: i64) {
         return Box::pin(finalize_request(r, rc2)).await;
     }
     if !r.is_main() {
+        // a posted subrequest ends, once c->data, in crate::postpone_filter
+        if crate::postpone_filter::is_posted(r) {
+            return;
+        }
         // subrequest completion
         if !r.logged.get() {
             let clcf = r.clcf();
@@ -1602,9 +1606,6 @@ pub fn subrequest_posted(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps:
     if sr.subrequest_in_memory.get() {
         sr.filter_need_in_memory.set(true);
     }
-    if !sr.background.get() {
-        r.postponed.borrow_mut().push_back(PostponedRequest { request: Some(sr.clone()), out: ngx_core::buf::Chain::new() });
-    }
     sr.internal.set(true);
     sr.discard_body.set(r.discard_body.get());
     sr.expect_tested.set(true);
@@ -1629,24 +1630,25 @@ pub fn subrequest_posted(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps:
         r.realloc_captures.set(true);
         update_location_config(&sr);
     }
+    // the postponed list, c->data, and ngx_http_post_request()
+    crate::postpone_filter::postpone_subrequest(r, &sr);
     Ok(sr)
 }
 
-/// Runs a subrequest made by subrequest_posted() to its end: what its
-/// write_event_handler (ngx_http_handler, or ngx_http_core_run_phases for
-/// a clone, which starts at the parent's phase handler) and the
-/// ngx_http_finalize_request() calls that follow do in C. The subrequest
-/// shares r->variables in C: it gets the values the parent has cached by
-/// now, and the parent gets its values back.
+/// What a subrequest made by subrequest_posted() does when it first runs
+/// (crate::postpone_filter runs it): its write_event_handler,
+/// ngx_http_handler (or ngx_http_core_run_phases for a clone, which starts
+/// at the parent's phase handler), and the ngx_http_finalize_request()
+/// that follows. The subrequest shares r->variables in C: it gets the
+/// values the parent has cached by now, and the parent gets its values
+/// back.
 pub async fn subrequest_run(r: &R, sr: &R) -> i64 {
     *sr.variables.borrow_mut() = r.variables.borrow().clone();
     sr.set_log_request();
-    http_debug!(sr, "http posted request: \"{}?{}\"", B(&sr.uri.borrow()), B(&sr.args.borrow()));
     // only NGX_HTTP_SUBREQUEST_CLONE copies the parent's phase handler
     let clone = sr.phase_handler.get() != 0;
     let rc = if clone { Box::pin(run_phases(sr.clone())).await } else { Box::pin(handler(sr.clone())).await };
     Box::pin(finalize_request(sr, rc)).await;
     *r.variables.borrow_mut() = sr.variables.borrow().clone();
-    r.set_log_request();
     rc
 }

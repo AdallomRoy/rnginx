@@ -1,11 +1,12 @@
 //! ngx_http_ssi_filter_module: Server Side Includes.
 //!
-//! The subrequests of "include" are made with request_rt::subrequest_posted()
-//! and run from postpone_filter::run_posted_requests(): where C returns
-//! NGX_AGAIN to wait for a subrequest (wait="yes", set=, file=), the posted
-//! subrequests run and the parsing goes on; the other ones run when the
-//! body filter is done with its input, which is when C gets back to the
-//! event loop and runs them.
+//! The subrequests of "include" are posted ones
+//! (request_rt::subrequest_posted(), see crate::postpone_filter). Where C
+//! returns NGX_AGAIN to wait for a subrequest (wait="yes", set=, file=) and
+//! the body filter is called again once the request is posted, the filter
+//! here waits for being posted and goes on (ssi_wait()). Where C's handler
+//! returns with subrequests still postponed and the request ends in
+//! ngx_http_writer(), the filter waits for them before it returns.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -741,8 +742,8 @@ async fn ssi_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         return rc;
     }
 
-    // C gets back to the event loop, which runs the subrequests posted
-    // meanwhile (ngx_http_run_posted_requests())
+    // C returns, and the request waits for its postponed subrequests in
+    // ngx_http_writer() once its handler is done
 
     if !r.postponed.borrow().is_empty() && crate::postpone_filter::run_posted_requests(&r).await == NGX_ERROR {
         return NGX_ERROR;
@@ -872,7 +873,7 @@ async fn ssi_command(r: &R, ctx: &Rc<SsiCtx>, next: &BodyFilter) -> SsiCommandRc
         ssi_buffered(r, ctx);
 
         if rc == NGX_AGAIN {
-            if ssi_wait(r, ctx).await == NGX_ERROR {
+            if ssi_wait(r, ctx, next).await == NGX_ERROR {
                 return SsiCommandRc::Return(NGX_ERROR);
             }
 
@@ -885,29 +886,43 @@ async fn ssi_command(r: &R, ctx: &Rc<SsiCtx>, next: &BodyFilter) -> SsiCommandRc
     SsiCommandRc::Error
 }
 
-/// C returns NGX_AGAIN from the body filter here, runs the posted
-/// subrequests, and the subrequest waited for gets the request going on
-/// once done: the body filter is called again by ngx_http_writer() and
-/// finds ctx->wait done. The posted subrequests run now instead.
-async fn ssi_wait(r: &R, ctx: &Rc<SsiCtx>) -> i64 {
-    if crate::postpone_filter::run_posted_requests(r).await == NGX_ERROR {
-        return NGX_ERROR;
-    }
+/// C returns NGX_AGAIN from the body filter here, and the request goes on
+/// in ngx_http_writer() once posted, calling the body filter again, which
+/// then deals with ctx->wait (below) before going on with the parsing.
+/// Here the request waits for being posted and goes on.
+async fn ssi_wait(r: &R, ctx: &Rc<SsiCtx>, next: &BodyFilter) -> i64 {
+    loop {
+        if crate::postpone_filter::wait_posted(r).await == NGX_ERROR {
+            return NGX_ERROR;
+        }
 
-    let wait = ctx.wait.borrow_mut().take();
+        http_debug!(r, "http ssi filter \"{}?{}\"", B(&r.uri.borrow()), B(&r.args.borrow()));
 
-    if let Some(wait) = wait {
+        let wait = match ctx.wait.borrow().clone() {
+            Some(wait) => wait,
+            None => return NGX_OK,
+        };
+
+        if !crate::postpone_filter::is_active(r) {
+            http_debug!(r, "http ssi filter wait \"{}?{}\" non-active", B(&wait.uri.borrow()), B(&wait.args.borrow()));
+            continue;
+        }
+
         if wait.done.get() {
             http_debug!(r, "http ssi filter wait \"{}?{}\" done", B(&wait.uri.borrow()), B(&wait.args.borrow()));
-        } else {
-            // it is over nevertheless: it has been run to its end
-            http_debug!(r, "http ssi filter wait \"{}?{}\"", B(&wait.uri.borrow()), B(&wait.args.borrow()));
+
+            *ctx.wait.borrow_mut() = None;
+
+            return NGX_OK;
+        }
+
+        http_debug!(r, "http ssi filter wait \"{}?{}\"", B(&wait.uri.borrow()), B(&wait.args.borrow()));
+
+        // ngx_http_next_body_filter(r, NULL)
+        if next(r.clone(), Chain::new()).await == NGX_ERROR {
+            return NGX_ERROR;
         }
     }
-
-    ssi_buffered(r, ctx);
-
-    NGX_OK
 }
 
 /// The bytes [start, end) of the data of a buffer.
