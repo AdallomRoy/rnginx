@@ -1210,7 +1210,10 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
 
     crate::variables::add_variables(cf, &vars)?;
 
-    // Prefix variables: $upstream_http_<name> reads from upstream response headers.
+    // the NGX_HTTP_CACHE variables
+    crate::upstream_cache::add_variables(cf)?;
+
+    // Prefix variables: <name> reads from upstream response headers.
     // Registered separately because they use NGX_HTTP_VAR_PREFIX.
     let prefix_vars = vec![
         VarDef {

@@ -255,6 +255,9 @@ async fn set_accept_ranges_and_pass(r: R, next: HeaderFilter) -> i64 {
 async fn range_not_satisfiable(r: R, next: HeaderFilter) -> i64 {
     let content_len = r.headers_out.borrow().content_length_n;
     r.headers_out.borrow_mut().status = NGX_HTTP_RANGE_NOT_SATISFIABLE;
+    // the 416 goes out as ngx_http_send_header() sends r->err_status: the
+    // status line of an upstream response is not used
+    r.headers_out.borrow_mut().status_line.clear();
 
     let content_range_str = format!("bytes */{}", content_len);
     let cr_header = TableElt::new(b"Content-Range", content_range_str.as_bytes());

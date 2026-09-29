@@ -949,6 +949,7 @@ pub async fn process_request(r: &R) -> End {
     let rc = handler(r.clone()).await;
     finalize_request(r, rc).await;
     let _ = c;
+    wait_background_subrequests(r).await;
     finalize_connection(r).await
 }
 
@@ -1666,4 +1667,162 @@ pub async fn subrequest_run(r: &R, sr: &R) -> i64 {
     Box::pin(finalize_request(sr, rc)).await;
     *r.variables.borrow_mut() = sr.variables.borrow().clone();
     rc
+}
+
+
+/// ngx_http_subrequest with NGX_HTTP_SUBREQUEST_BACKGROUND: the subrequest
+/// is set up as subrequest() sets it up, with `header_only` as the callers
+/// of ngx_http_subrequest() set it, but it is posted to run on its own
+/// (r->main->count++) instead of before its parent goes on; the connection
+/// of the main request is finalized once it is done
+/// (wait_background_subrequests).
+pub fn background_subrequest(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, header_only: bool) -> Result<(), ()> {
+    let ps: Option<PostSubrequest> = None;
+    if r.subrequests.get() == 0 {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "subrequests cycle while processing \"{}\"", B(uri));
+        return Err(());
+    }
+    if r.subrequest_in_memory.get() {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "nested in-memory subrequest \"{}\"", B(uri));
+        return Err(());
+    }
+    let c = r.connection.clone();
+    let sr = alloc_request(&c, &r.http_connection, &r.log_ctx);
+    let cscf = r.cscf();
+    let ctx = cscf.borrow().ctx.clone();
+    *sr.main_conf.borrow_mut() = ctx.main.clone().unwrap();
+    *sr.srv_conf.borrow_mut() = ctx.srv.clone().unwrap();
+    *sr.loc_conf.borrow_mut() = ctx.loc.clone().unwrap();
+    // share headers_in
+    {
+        let hin = r.headers_in.borrow();
+        let mut shin = sr.headers_in.borrow_mut();
+        shin.headers = hin.headers.clone();
+        shin.host = hin.host.clone();
+        shin.connection = hin.connection.clone();
+        shin.if_modified_since = hin.if_modified_since.clone();
+        shin.if_unmodified_since = hin.if_unmodified_since.clone();
+        shin.if_match = hin.if_match.clone();
+        shin.if_none_match = hin.if_none_match.clone();
+        shin.user_agent = hin.user_agent.clone();
+        shin.referer = hin.referer.clone();
+        shin.content_length = hin.content_length.clone();
+        shin.content_range = hin.content_range.clone();
+        shin.content_type = hin.content_type.clone();
+        shin.range = hin.range.clone();
+        shin.if_range = hin.if_range.clone();
+        shin.transfer_encoding = hin.transfer_encoding.clone();
+        shin.te = hin.te.clone();
+        shin.expect = hin.expect.clone();
+        shin.upgrade = hin.upgrade.clone();
+        shin.accept_encoding = hin.accept_encoding.clone();
+        shin.via = hin.via.clone();
+        shin.authorization = hin.authorization.clone();
+        shin.proxy_authorization = hin.proxy_authorization.clone();
+        shin.keep_alive = hin.keep_alive.clone();
+        shin.x_forwarded_for = hin.x_forwarded_for.clone();
+        shin.x_real_ip = hin.x_real_ip.clone();
+        shin.accept = hin.accept.clone();
+        shin.accept_language = hin.accept_language.clone();
+        shin.depth = hin.depth.clone();
+        shin.destination = hin.destination.clone();
+        shin.overwrite = hin.overwrite.clone();
+        shin.date = hin.date.clone();
+        shin.cookie = hin.cookie.clone();
+        shin.user = hin.user.clone();
+        shin.user_tested = hin.user_tested;
+        shin.passwd = hin.passwd.clone();
+        shin.server = hin.server.clone();
+        shin.content_length_n = hin.content_length_n;
+        shin.keep_alive_n = hin.keep_alive_n;
+        shin.connection_type = hin.connection_type;
+        shin.chunked = hin.chunked;
+        shin.msie = hin.msie;
+        shin.msie6 = hin.msie6;
+        shin.opera = hin.opera;
+        shin.gecko = hin.gecko;
+        shin.chrome = hin.chrome;
+        shin.safari = hin.safari;
+        shin.konqueror = hin.konqueror;
+        shin.count = hin.count;
+    }
+    sr.clear_content_length();
+    sr.clear_accept_ranges();
+    sr.clear_last_modified();
+    *sr.request_body.borrow_mut() = r.request_body.borrow().clone();
+    *sr.stream.borrow_mut() = r.stream.borrow().clone();
+    sr.method.set(NGX_HTTP_GET);
+    sr.http_version.set(r.http_version.get());
+    sr.port.set(r.port.get());
+    *sr.request_line.borrow_mut() = r.request_line.borrow().clone();
+    *sr.uri.borrow_mut() = uri.to_vec();
+    if let Some(a) = args {
+        *sr.args.borrow_mut() = a.to_vec();
+    }
+    http_debug!(r, "http subrequest \"{}?{}\"", B(uri), B(&sr.args.borrow()));
+    sr.subrequest_in_memory.set(flags & NGX_HTTP_SUBREQUEST_IN_MEMORY != 0);
+    sr.waited.set(flags & NGX_HTTP_SUBREQUEST_WAITED != 0);
+    sr.background.set(flags & NGX_HTTP_SUBREQUEST_BACKGROUND != 0);
+    *sr.unparsed_uri.borrow_mut() = r.unparsed_uri.borrow().clone();
+    *sr.method_name.borrow_mut() = b"GET".to_vec();
+    *sr.http_protocol.borrow_mut() = r.http_protocol.borrow().clone();
+    *sr.schema.borrow_mut() = r.schema.borrow().clone();
+    set_exten(&sr);
+    *sr.main.borrow_mut() = Some(Rc::downgrade(&r.main()));
+    *sr.parent.borrow_mut() = Some(Rc::downgrade(r));
+    *sr.post_subrequest.borrow_mut() = ps;
+    *sr.variables.borrow_mut() = r.variables.borrow().clone();
+    if sr.subrequest_in_memory.get() {
+        sr.filter_need_in_memory.set(true);
+    }
+    sr.internal.set(true);
+    sr.discard_body.set(r.discard_body.get());
+    sr.expect_tested.set(true);
+    sr.main_filter_need_in_memory.set(r.main_filter_need_in_memory.get());
+    sr.uri_changes.set(NGX_HTTP_MAX_URI_CHANGES + 1);
+    sr.subrequests.set(r.subrequests.get() - 1);
+    let now = ngx_core::times::cached();
+    sr.start_sec.set(now.sec);
+    sr.start_msec.set(now.msec);
+    if flags & NGX_HTTP_SUBREQUEST_CLONE != 0 {
+        sr.method.set(r.method.get());
+        *sr.method_name.borrow_mut() = r.method_name.borrow().clone();
+        *sr.loc_conf.borrow_mut() = r.loc_conf.borrow().clone();
+        sr.valid_location.set(r.valid_location.get());
+        sr.valid_unparsed_uri.set(r.valid_unparsed_uri.get());
+        *sr.content_handler.borrow_mut() = r.content_handler.borrow().clone();
+        sr.phase_handler.set(r.phase_handler.get());
+        sr.ncaptures.set(r.ncaptures.get());
+        *sr.captures.borrow_mut() = r.captures.borrow().clone();
+        *sr.captures_data.borrow_mut() = r.captures_data.borrow().clone();
+        update_location_config(&sr);
+    }
+    sr.header_only.set(header_only);
+    // ngx_http_post_request(sr, NULL): it runs once the parent waits
+    let main = r.main();
+    let handle = ngx_core::event::spawn(async move {
+        sr.set_log_request();
+        let rc = if flags & NGX_HTTP_SUBREQUEST_CLONE != 0 { Box::pin(run_phases(sr.clone())).await } else { Box::pin(handler(sr.clone())).await };
+        Box::pin(finalize_request(&sr, rc)).await;
+        if let Some(p) = sr.parent() {
+            p.set_log_request();
+        }
+    });
+    main.background_subrequests.borrow_mut().push(handle);
+    Ok(())
+}
+
+/// The r->main->count of background subrequests: the connection of a main
+/// request is not finalized (closed, kept alive) before its background
+/// subrequests are done.
+pub async fn wait_background_subrequests(r: &R) {
+    loop {
+        let handles: Vec<tokio::task::JoinHandle<()>> = std::mem::take(&mut *r.background_subrequests.borrow_mut());
+        if handles.is_empty() {
+            return;
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
 }

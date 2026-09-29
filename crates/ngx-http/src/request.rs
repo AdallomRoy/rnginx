@@ -540,6 +540,10 @@ pub struct Request {
     pub postponed: RefCell<std::collections::VecDeque<PostponedRequest>>,
     /// the post_subrequest handler of the subrequest when it sends output
     pub post_subrequest_async: RefCell<Option<PostSubrequestAsync>>,
+    /// The background subrequests of a main request, running on their own
+    /// (r->main->count of NGX_HTTP_SUBREQUEST_BACKGROUND): the connection
+    /// is finalized once they are done.
+    pub background_subrequests: RefCell<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Request {
@@ -823,6 +827,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         weak_self: RefCell::new(Weak::new()),
         postponed: RefCell::new(std::collections::VecDeque::new()),
         post_subrequest_async: RefCell::new(None),
+        background_subrequests: RefCell::new(Vec::new()),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is

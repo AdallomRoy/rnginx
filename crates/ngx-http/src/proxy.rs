@@ -179,9 +179,17 @@ pub struct NgxHttpProxyLocConf {
     /// hide_headers. Pass overrides any hide (default or explicit) for the
     /// named header.
     pub pass_headers: Option<Vec<Vec<u8>>>,
-    /// proxy_cache*: nested container so cache directives don't push the
-    /// per-request runtime through the whole conf when caching is off.
-    pub cache: crate::proxy_cache::ProxyCacheConf,
+    /// The cache fields of plcf->upstream (proxy_cache, proxy_cache_*,
+    /// proxy_no_cache, proxy_ignore_headers) and plcf->cache_key.
+    pub cache: crate::upstream_cache::UpstreamCacheConf,
+    /// proxy_temp_path (upstream.temp_path)
+    pub temp_path: Val<Rc<PathConf>>,
+}
+
+impl crate::upstream_cache::UpstreamCacheLocConf for NgxHttpProxyLocConf {
+    fn upstream_cache(&mut self) -> &mut crate::upstream_cache::UpstreamCacheConf {
+        &mut self.cache
+    }
 }
 
 /// Default list of upstream response headers that nginx hides. See
@@ -242,6 +250,23 @@ pub const FT_MAX_WAITING: u32    = 0x00002000;
 pub const FT_NON_IDEMPOTENT: u32 = 0x00004000;
 pub const FT_NOLIVE: u32         = 0x40000000;
 pub const FT_OFF: u32            = 0x80000000;
+
+/// ngx_http_proxy_next_upstream_masks
+const PROXY_NEXT_UPSTREAM_MASKS: &[(&str, u32)] = &[
+    ("error", FT_ERROR),
+    ("timeout", FT_TIMEOUT),
+    ("invalid_header", FT_INVALID_HEADER),
+    ("non_idempotent", FT_NON_IDEMPOTENT),
+    ("http_500", FT_HTTP_500),
+    ("http_502", FT_HTTP_502),
+    ("http_503", FT_HTTP_503),
+    ("http_504", FT_HTTP_504),
+    ("http_403", FT_HTTP_403),
+    ("http_404", FT_HTTP_404),
+    ("http_429", FT_HTTP_429),
+    ("updating", FT_UPDATING),
+    ("off", FT_OFF),
+];
 
 
 #[derive(Clone)]
@@ -329,7 +354,8 @@ impl Default for NgxHttpProxyLocConf {
             ignore_client_abort: Val::unset(),
             hide_headers: None,
             pass_headers: None,
-            cache: crate::proxy_cache::ProxyCacheConf::new(),
+            cache: crate::upstream_cache::UpstreamCacheConf::default(),
+            temp_path: Val::unset(),
         }
     }
 }
@@ -361,6 +387,12 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     if c.local_bind.is_none() {
         c.local_bind = p.local_bind.clone();
     }
+    if matches!(c.store, Some(ProxyStore::On) | Some(ProxyStore::Path(_))) {
+        c.cache.cache = Val::set(false);
+    }
+    if c.cache.cache.get_or(false) {
+        c.store = Some(ProxyStore::Off);
+    }
     if c.store.is_none() {
         c.store = p.store.clone();
     }
@@ -372,26 +404,13 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     c.next_upstream_tries.merge(&p.next_upstream_tries, 0);
     c.next_upstream_timeout.merge(&p.next_upstream_timeout, 0);
     c.read_timeout.merge(&p.read_timeout, 60000);
-    // proxy_cache_* inheritance — location-level overrides win, otherwise
-    // pull each field from the parent (matches C's per-field
-    // ngx_conf_merge_ptr_value / merge_str_value pattern).
-    if c.cache.zone.is_none() && !c.cache.explicitly_off {
-        c.cache.zone = p.cache.zone.clone();
-        c.cache.zone_cv = p.cache.zone_cv.clone();
+    {
+        let mut slot = std::mem::take(&mut c.temp_path);
+        merge_path_value(cf, &mut slot, &p.temp_path, ngx_core::NGX_HTTP_PROXY_TEMP_PATH, [1, 2, 0])?;
+        c.temp_path = slot;
     }
-    if c.cache.key.is_none() { c.cache.key = p.cache.key.clone(); }
-    if c.cache.valid.is_empty() { c.cache.valid = p.cache.valid.clone(); }
-    if c.cache.bypass.is_empty() { c.cache.bypass = p.cache.bypass.clone(); }
-    if c.cache.no_cache.is_empty() { c.cache.no_cache = p.cache.no_cache.clone(); }
-    if c.cache.ignore_headers.is_empty() { c.cache.ignore_headers = p.cache.ignore_headers.clone(); }
-    if !c.cache.lock { c.cache.lock = p.cache.lock; }
-    if c.cache.lock_timeout_ms == 5000 { c.cache.lock_timeout_ms = p.cache.lock_timeout_ms; }
-    if c.cache.lock_age_ms == 5000 { c.cache.lock_age_ms = p.cache.lock_age_ms; }
-    if !c.cache.revalidate { c.cache.revalidate = p.cache.revalidate; }
-    if c.cache.use_stale == 0 { c.cache.use_stale = p.cache.use_stale; }
-    if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
-    if c.cache.max_range_offset.is_none() { c.cache.max_range_offset = p.cache.max_range_offset; }
-    if c.cache.min_uses == 1 { c.cache.min_uses = p.cache.min_uses; }
+
+    c.cache.merge(cf, &p.cache, "proxy", true)?;
 
     merge_ssl(cf, &mut p, &mut c)?;
 
@@ -477,7 +496,7 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
 
     init_headers(cf, &mut c, false, PROXY_HEADERS)?;
 
-    if c.cache.zone.is_some() {
+    if c.cache.enabled() {
         init_headers(cf, &mut c, true, PROXY_CACHE_HEADERS)?;
     }
 
@@ -1376,11 +1395,6 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
 
     crate::variables::add_variables(cf, &vars)?;
 
-    // $upstream_cache_status is defined by the proxy_cache module so it lives
-    // wherever caching does — register it during proxy preconfiguration so
-    // access_log and rewrite scripts can see it.
-    crate::proxy_cache::add_variables(cf)?;
-
     Ok(())
 }
 
@@ -1397,7 +1411,15 @@ struct ProxyUpstream {
 async fn proxy_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
 
-    // ngx_http_upstream_create, the ctx
+    // ngx_http_upstream_create, the ctx; u->conf (the cache fields), and
+    // u->caches of the main configuration
+
+    {
+        let plcf = lcf.borrow();
+        let pmcf = r.main_conf::<crate::upstream_cache::UpstreamCacheMainConf>(ctx_index());
+        let caches = Rc::new(pmcf.borrow().caches.clone());
+        crate::upstream_cache::upstream_create(&r, plcf.cache.clone(), caches, "proxy", plcf.buffer_size.get_or(PROXY_BUFFER_SIZE));
+    }
 
     let ctx = r.set_ctx(ctx_index(), ProxyCtx::default());
 
@@ -1771,117 +1793,173 @@ fn request_body_bytes(r: &R, plcf: &NgxHttpProxyLocConf, internal_chunked: bool)
     out
 }
 
-/// ngx_http_upstream_cache_check_range: NGX_DECLINED (the response is not
-/// cached, and the request goes without the cache headers) for a range
-/// starting at proxy_cache_max_range_offset or later, or at the end.
-fn cache_check_range(r: &R, conf: &crate::proxy_cache::ProxyCacheConf) -> i64 {
-    let h = match r.headers_in.borrow().range.first() {
-        Some(h) => h.value.borrow().clone(),
-        None => return NGX_OK,
+/// ngx_http_proxy_create_key: proxy_cache_key, or the URL of proxy_pass
+/// (ctx->vars.key_start) and the URI of the request as the upstream
+/// request has it.
+fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+    let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
+    let plcf = lcf.borrow();
+
+    let ctx = match proxy_ctx(r) {
+        Some(c) => c,
+        None => return NGX_ERROR,
     };
 
-    let max_range_offset = match conf.max_range_offset {
-        Some(o) => o as i64,
-        None => return NGX_OK,
-    };
+    let ctx = ctx.borrow();
 
-    if max_range_offset == 0 {
-        return NGX_DECLINED;
-    }
+    if let Some(cv) = &plcf.cache.cache_key {
+        match crate::script::complex_value(r, cv) {
+            Ok(k) => keys.push(k),
+            Err(_) => return NGX_ERROR,
+        }
 
-    if h.len() < 7 || !h[..6].eq_ignore_ascii_case(b"bytes=") {
         return NGX_OK;
     }
 
-    let mut p = 6;
+    keys.push(ctx.vars.key_start.clone());
 
-    while p < h.len() && h[p] == b' ' {
-        p += 1;
+    if plcf.proxy_values.is_some() && !ctx.vars.uri.is_empty() {
+        keys.push(ctx.vars.uri.clone());
+
+        return NGX_OK;
+    } else if ctx.vars.uri.is_empty() && r.valid_unparsed_uri.get() {
+        keys.push(r.unparsed_uri.borrow().clone());
+
+        return NGX_OK;
     }
 
-    if p < h.len() && h[p] == b'-' {
-        return NGX_DECLINED;
+    let uri = r.uri.borrow();
+
+    let loc_len = if r.valid_location.get() && !ctx.vars.uri.is_empty() { plcf.location.len().min(uri.len()) } else { 0 };
+
+    let mut key = ctx.vars.uri.clone();
+
+    if r.quoted_uri.get() || r.internal.get() {
+        ngx_core::string::escape_uri_into(&mut key, &uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
+    } else {
+        key.extend_from_slice(&uri[loc_len..]);
     }
 
-    let start = p;
+    let args = r.args.borrow();
 
-    while p < h.len() && h[p].is_ascii_digit() {
-        p += 1;
+    if !args.is_empty() {
+        key.push(b'?');
+        key.extend_from_slice(&args);
     }
 
-    // ngx_atoof(): NGX_ERROR (-1) for no digits or an overflow
-    let offset = std::str::from_utf8(&h[start..p]).ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
-
-    if offset >= max_range_offset {
-        return NGX_DECLINED;
-    }
+    keys.push(key);
 
     NGX_OK
 }
 
+/// ngx_http_upstream_cache_send with ngx_http_proxy_process_status_line,
+/// ngx_http_proxy_process_header and ngx_http_upstream_process_headers:
+/// the response from the cache.
+async fn cache_send(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, ctx: &Rc<RefCell<ProxyCtx>>) -> i64 {
+    crate::upstream_cache::upstream_cache_send(r, |buf| async move {
+        let mut resp = UpstreamResponse::new();
+
+        resp.buf = buf;
+
+        let mut state = HeaderParse::default();
+
+        match parse_header(r, ctx, &mut resp, &mut state, true) {
+            Ok(true) => {}
+            Ok(false) => return NGX_AGAIN,
+            Err(_) => return crate::upstream_cache::NGX_HTTP_UPSTREAM_INVALID_HEADER,
+        }
+
+        // u->headers_in, for $upstream_http_*
+        *r.upstream_headers_in.borrow_mut() = resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
+
+        match process_headers(r, lcf, &resp).await {
+            Processed::Ok(_) => NGX_OK,
+            Processed::Redirect(xar) => {
+                // ngx_http_upstream_finalize_request(r, u, NGX_DECLINED)
+                crate::upstream_cache::finalize(r, NGX_DECLINED, None);
+                accel_redirect(r, &xar).await
+            }
+            Processed::Finalize(rc) => {
+                crate::upstream_cache::finalize(r, rc, None);
+                rc
+            }
+        }
+    })
+    .await
+}
+
+/// The stale response of ngx_http_upstream_next, when there is no next
+/// upstream to try, or the error status the request is finalized with.
+async fn next_failed(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, ctx: &Rc<RefCell<ProxyCtx>>, ft_type: u32, status: i64) -> i64 {
+    if crate::upstream_cache::next_stale(r, ft_type) {
+        // u->reinit_request(r): the status line and chunked state are
+        // parsed anew
+
+        if let Some(u) = crate::upstream_cache::upstream_of(r) {
+            u.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_STALE);
+        }
+
+        let mut rc = cache_send(r, lcf, ctx).await;
+
+        if rc == NGX_DONE {
+            return NGX_DONE;
+        }
+
+        if rc == crate::upstream_cache::NGX_HTTP_UPSTREAM_INVALID_HEADER {
+            rc = crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        crate::upstream_cache::finalize(r, rc, None);
+
+        return rc;
+    }
+
+    return_error(r, status).await
+}
+
+
 /// ngx_http_upstream_init_request with the proxy module's callbacks, and
 /// what follows up to the response.
 async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx: Rc<RefCell<ProxyCtx>>, u: ProxyUpstream) -> i64 {
-    let upstream_uri = u.url.clone();
+    let _ = &u.url;
 
-    // ngx_http_upstream_cache: u->cacheable, and the HEAD method changed
-    // to GET (u->method)
+    // ngx_http_upstream_init_request: ngx_http_upstream_cache, then
+    // ngx_http_upstream_cache_send for a response from the cache
 
-    let mut cacheable = false;
-    let mut u_method: Option<&'static [u8]> = None;
-
-    let cache_conf = {
-        let plcf = lcf.borrow();
-        if plcf.cache.zone.is_some() && (r.method.get() & plcf.cache.methods) != 0 {
-            Some(plcf.cache.clone())
-        } else {
-            None
-        }
+    let ucache = match crate::upstream_cache::upstream_of(&r) {
+        Some(uc) => uc,
+        None => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
     };
 
-    if let Some(cache_conf) = cache_conf {
-        let zone = crate::proxy_cache::resolve_zone_name(&r, &cache_conf);
+    if ucache.conf.enabled() {
+        let mut rc = crate::upstream_cache::upstream_cache_wait(&r, &ucache, &create_key).await;
 
-        let mut bypass = false;
-
-        if let Some(Ok(_)) = &zone {
-            cacheable = true;
-
-            if r.method.get() == NGX_HTTP_HEAD && cache_conf.convert_head {
-                u_method = Some(b"GET");
-            }
-
-            bypass = crate::proxy_cache::is_bypass(&r, &cache_conf);
+        if rc == NGX_ERROR {
+            return crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        // proxy_cache lookup — happens *before* we open the upstream.
-        // `try_serve` returns `Some(rc)` for a hit (already sent to
-        // client) or an error; `None` means MISS/EXPIRED/BYPASS and we
-        // continue to upstream.
-        if let Some(rc) = crate::proxy_cache::try_serve(&r, &cache_conf, &upstream_uri).await {
+        if rc == NGX_OK {
+            rc = cache_send(&r, &lcf, &ctx).await;
+
+            if rc == NGX_DONE {
+                return NGX_DONE;
+            }
+
+            if rc == crate::upstream_cache::NGX_HTTP_UPSTREAM_INVALID_HEADER {
+                rc = NGX_DECLINED;
+                r.cached.set(false);
+                ucache.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_MISS);
+            }
+        }
+
+        if rc != NGX_DECLINED {
             return rc;
         }
-
-        if cacheable && !bypass {
-            // NGX_HTTP_CACHE_SCARCE: proxy_cache_min_uses not reached
-            if cache_conf.min_uses > 1 {
-                if let Some(Ok(zn)) = &zone {
-                    let base_key = match &cache_conf.key {
-                        Some(cv) => crate::script::complex_value(&r, cv).unwrap_or_default(),
-                        None => crate::proxy_cache::default_cache_key(&r, &upstream_uri),
-                    };
-
-                    if crate::proxy_cache::get_hits(zn, &base_key) < cache_conf.min_uses {
-                        cacheable = false;
-                    }
-                }
-            }
-
-            if cache_check_range(&r, &cache_conf) == NGX_DECLINED {
-                cacheable = false;
-            }
-        }
     }
+
+    // u->cacheable, and the HEAD method changed to GET (u->method)
+    let cacheable = ucache.cacheable.get();
+    let u_method: Option<&'static [u8]> = *ucache.method.borrow();
 
     // u->create_request
 
@@ -1951,17 +2029,15 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     let mut g = crate::upstream::PeerGuard::new(&r, peer);
 
     // u->buffering, which "X-Accel-Buffering" may change
-    let (conf_buffering, change_buffering, read_timeout, store, ignore_client_abort, buffer_size, ignore_xa_redirect, ignore_xa_limit_rate) = {
+    let (conf_buffering, change_buffering, read_timeout, store, ignore_client_abort, buffer_size) = {
         let c = lcf.borrow();
         (
             c.buffering.get_or(true),
-            !c.cache.ignore_headers.iter().any(|h| h == b"x-accel-buffering"),
+            !c.cache.ignores(crate::upstream::NGX_HTTP_UPSTREAM_IGN_XA_BUFFERING),
             c.read_timeout.get_or(60000),
             matches!(c.store, Some(ProxyStore::On) | Some(ProxyStore::Path(_))),
             c.ignore_client_abort.get_or(false),
             c.buffer_size.get_or(PROXY_BUFFER_SIZE),
-            c.cache.ignore_headers.iter().any(|h| h == b"x-accel-redirect"),
-            c.cache.ignore_headers.iter().any(|h| h == b"x-accel-limit-rate"),
         )
     };
 
@@ -1969,6 +2045,13 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     // cached is finalized with 499 when the client closes the connection
     let watch = if !store && !r.post_action.get() && !ignore_client_abort && !cacheable { Some(ClientWatch::new(&r)) } else { None };
     let watch = watch.as_ref();
+
+    // u->buffer.pos += r->cache->header_start: the header of the cache file
+    // goes before the response header in u->buffer
+    let header_buffer_size = match crate::file_cache::cache_of(&r) {
+        Some(c) => buffer_size.saturating_sub(c.borrow().header_start),
+        None => buffer_size,
+    };
 
     // proxy_next_upstream retry loop: on connect error / matching HTTP status,
     // free the peer and connect to the next one (ngx_http_upstream_next).
@@ -1988,7 +2071,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         if rc == NGX_BUSY {
             match g.u.next(&r, crate::upstream::NGX_HTTP_UPSTREAM_FT_NOLIVE) {
                 Ok(()) => continue 'retry,
-                Err(st) => return return_error(&r, st).await,
+                Err(st) => return next_failed(&r, &lcf, &ctx, crate::upstream::NGX_HTTP_UPSTREAM_FT_NOLIVE, st).await,
             }
         }
 
@@ -2031,7 +2114,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                     };
                     match g.u.next(&r, ft) {
                         Ok(()) => continue 'retry,
-                        Err(st) => return return_error(&r, st).await,
+                        Err(st) => return next_failed(&r, &lcf, &ctx, ft, st).await,
                     }
                 }
             }
@@ -2067,7 +2150,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         if sent.is_err() {
             match g.u.next(&r, FT_ERROR) {
                 Ok(()) => continue 'retry,
-                Err(st) => return return_error(&r, st).await,
+                Err(st) => return next_failed(&r, &lcf, &ctx, FT_ERROR, st).await,
             }
         }
 
@@ -2083,7 +2166,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                         // the upstream write failed
                         match g.u.next(&r, FT_ERROR) {
                             Ok(()) => continue 'retry,
-                            Err(st) => return return_error(&r, st).await,
+                            Err(st) => return next_failed(&r, &lcf, &ctx, FT_ERROR, st).await,
                         }
                     }
                     return return_error(&r, rc).await;
@@ -2096,11 +2179,11 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
 
         // ngx_http_upstream_process_header
-        resp = match process_header(&r, &mut sock, &ctx, buffer_size, read_timeout, watch).await {
+        resp = match process_header(&r, &mut sock, &ctx, header_buffer_size, read_timeout, watch).await {
             Ok(h) => h,
             Err(HeaderError::Next(ft)) => match g.u.next(&r, ft) {
                 Ok(()) => continue 'retry,
-                Err(st) => return return_error(&r, st).await,
+                Err(st) => return next_failed(&r, &lcf, &ctx, ft, st).await,
             },
             Err(HeaderError::ClientClosed(err)) => return client_closed_request(&r, err),
         };
@@ -2143,7 +2226,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                 {
                     match g.u.next(&r, ft) {
                         Ok(()) => continue 'retry,
-                        Err(st) => return return_error(&r, st).await,
+                        Err(st) => return next_failed(&r, &lcf, &ctx, ft, st).await,
                     }
                 }
             }
@@ -2163,83 +2246,82 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
     };
 
-    // proxy_cache_revalidate: on 304 the upstream is telling us the cached
-    // entry is still fresh — repush it with a new expiry and serve HIT so
-    // the client sees REVALIDATED. Matches C's ngx_http_upstream_test_next
-    // 304-branch.
-    if status == 304 {
-        if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
-            if let Some(mut cached) = hints.cached.clone() {
-                let cache_conf = {
-                    let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-                    let c = lcf_c.borrow();
-                    c.cache.clone()
-                };
-                // Compute new expires from the SAME headers already on the
-                // cached entry (upstream only signals freshness; the TTL
-                // comes from the response's Cache-Control / Expires /
-                // X-Accel-Expires / proxy_cache_valid, same precedence
-                // as the initial save).
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                cached.expires_epoch = crate::proxy_cache::compute_expires_from_cached(&cache_conf, &cached, now)
-                    .unwrap_or(now);
-                crate::proxy_cache::save(&hints.zone, &hints.key, &cached);
-                crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Revalidated);
-                keep(&mut g, sock, resp.keepalive);
-                g.finalize();
-                return crate::proxy_cache::serve_hit(&r, cached).await;
-            }
-        }
-    }
-    // stale-if-error: upstream returned 5xx but the cached response had
-    // Cache-Control: stale-if-error=N and we're still within [expires,
-    // expires+N]. Serve the cached body as STALE — matches C's
-    // ngx_http_upstream_cache_send returning STALE on ngx_http_upstream_next
-    // when u->cache_status is EXPIRED and the entry is stale-if-error-ok.
-    if status >= 400 {
-        if let Some(hints) = crate::proxy_cache::get_revalidate(&r) {
-            if let Some(cached) = hints.cached.clone() {
-                let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-                let cache_conf = lcf_c.borrow().cache.clone();
-                // For status-based failures (5xx / 4xx from upstream) C's
-                // ngx_http_upstream_test_next only serves stale when
-                // cache_use_stale matches the specific status bit —
-                // stale-if-error from Cache-Control alone does not apply
-                // (that's for connection-level errors only).
-                let bit = crate::proxy_cache::use_stale_status_bit(status as u16);
-                if bit != 0 && cache_conf.use_stale & bit != 0 {
-                    crate::proxy_cache::set_status(&r, crate::proxy_cache::CacheStatus::Stale);
-                    keep(&mut g, sock, resp.keepalive);
-                    g.finalize();
-                    return crate::proxy_cache::serve_hit(&r, cached).await;
-                }
-            }
-        }
-    }
-
-    // proxy_intercept_errors: hand off to error_page instead of forwarding
-    // the upstream body — but only if the location actually has an
-    // error_page configured for this status (ngx_http_upstream_intercept_errors)
     if status >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+        // ngx_http_upstream_test_next: the stale response instead of the
+        // status *_cache_use_stale names
+
+        let ft = match status {
+            500 => FT_HTTP_500,
+            502 => FT_HTTP_502,
+            503 => FT_HTTP_503,
+            504 => FT_HTTP_504,
+            403 => FT_HTTP_403,
+            404 => FT_HTTP_404,
+            429 => FT_HTTP_429,
+            _ => 0,
+        };
+
+        if ft != 0 && crate::upstream_cache::test_next_stale(&r, ft) {
+            // u->reinit_request(r)
+
+            keep(&mut g, sock, resp.keepalive);
+            g.finalize();
+
+            ucache.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_STALE);
+
+            let mut rc = cache_send(&r, &lcf, &ctx).await;
+
+            if rc == NGX_DONE {
+                return NGX_DONE;
+            }
+
+            if rc == crate::upstream_cache::NGX_HTTP_UPSTREAM_INVALID_HEADER {
+                rc = crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            crate::upstream_cache::finalize(&r, rc, None);
+
+            return rc;
+        }
+
+        // the expired response was revalidated
+
+        if crate::upstream_cache::test_next_not_modified(&r, status) {
+            let saved = crate::upstream_cache::not_modified_start(&r);
+
+            // u->reinit_request(r)
+
+            keep(&mut g, sock, resp.keepalive);
+            g.finalize();
+
+            let mut rc = cache_send(&r, &lcf, &ctx).await;
+
+            if rc == NGX_DONE {
+                return NGX_DONE;
+            }
+
+            if rc == crate::upstream_cache::NGX_HTTP_UPSTREAM_INVALID_HEADER {
+                rc = crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            // u->headers_in.status_n: that of the cached response now
+            let cached_status = r.headers_out.borrow().status;
+
+            crate::upstream_cache::not_modified_finish(&r, saved, cached_status);
+
+            crate::upstream_cache::finalize(&r, rc, None);
+
+            return rc;
+        }
+
+        // ngx_http_upstream_intercept_errors: the error_page of the status
+        // instead of the response
+
         let intercept = lcf.borrow().intercept_errors.get_or(false);
 
-        let has_page = intercept
-            && r.clcf().borrow().error_pages.as_ref().map(|pages| pages.iter().any(|p| p.status == status)).unwrap_or(false);
+        let has_page = intercept && r.clcf().borrow().error_pages.as_ref().map(|pages| pages.iter().any(|p| p.status == status)).unwrap_or(false);
 
         if has_page {
-            // Cache the upstream error before handing off to error_page,
-            // so subsequent requests hit the cached error status and
-            // trigger the same intercept path (r->cache->error).
-            let cache_conf = lcf.borrow().cache.clone();
-
-            if cacheable {
-                let hdrs: Vec<(Vec<u8>, Vec<u8>)> = resp.headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect();
-                crate::proxy_cache::maybe_save(&r, &cache_conf, &upstream_uri, status as u16, hdrs, resp.buf[resp.pos..].to_vec());
-            }
-
             if status == crate::NGX_HTTP_UNAUTHORIZED {
                 // the WWW-Authenticate of the upstream goes with the error page
                 let mut ho = r.headers_out.borrow_mut();
@@ -2249,6 +2331,9 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
                     ho.www_authenticate.push(ho_h);
                 }
             }
+
+            // the status is cached as an error of the keys zone
+            crate::upstream_cache::intercept_errors(&r, status, &resp.cache);
 
             keep(&mut g, sock, resp.keepalive);
             g.finalize();
@@ -2262,190 +2347,30 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
 
     // ngx_http_upstream_process_headers
 
-    // Effective hide list: default PROXY_HIDE_HEADERS + user's hide_headers,
-    // minus user's pass_headers (pass wins over hide).
-    let effective_hide: Vec<Vec<u8>> = {
-        let c = lcf.borrow();
-        let mut set: Vec<Vec<u8>> = PROXY_HIDE_HEADERS.iter().map(|s| s.to_vec()).collect();
-        if let Some(hide) = &c.hide_headers {
-            for h in hide {
-                if !set.iter().any(|x| x == h) { set.push(h.clone()); }
-            }
-        }
-        if let Some(pass) = &c.pass_headers {
-            set.retain(|h| !pass.iter().any(|p| p == h));
-        }
-        set
-    };
-
-    // X-Accel-Buffering (ngx_http_upstream_process_buffering, for each)
     let mut u_buffering = conf_buffering;
 
-    if change_buffering {
-        for h in resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-buffering") {
-            let v = h.value.borrow();
-            if v.eq_ignore_ascii_case(b"yes") {
-                u_buffering = true;
-            } else if v.eq_ignore_ascii_case(b"no") {
-                u_buffering = false;
-            }
-        }
-    }
-
-    // X-Accel-Limit-Rate: bytes-per-second cap on the response, matching
-    // ngx_http_upstream_process_limit_rate. Applied to r.limit_rate BEFORE
-    // X-Accel-Redirect so the header survives the internal redirect.
-    if !ignore_xa_limit_rate {
-        let xal_val = resp.headers.iter()
-            .find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-limit-rate")
-            .map(|h| h.value.borrow().clone());
-        if let Some(v) = xal_val {
-            if let Ok(s) = std::str::from_utf8(&v) {
-                if let Ok(n) = s.trim().parse::<i64>() {
-                    if n >= 0 {
-                        r.limit_rate.set(n as usize);
-                        r.limit_rate_set.set(true);
-                    }
+    match process_headers(&r, &lcf, &resp).await {
+        Processed::Ok(buffering) => {
+            if change_buffering {
+                if let Some(b) = buffering {
+                    u_buffering = b;
                 }
             }
         }
-    }
 
-    // X-Accel-Charset (ngx_http_upstream_process_charset, for each):
-    // r->headers_out.override_charset, unless ignored
-    let ignore_xa_charset = lcf.borrow().cache.ignore_headers.iter().any(|h| h == b"x-accel-charset");
-
-    if !ignore_xa_charset {
-        let xac = resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-charset").last().map(|h| h.value.borrow().clone());
-
-        if let Some(v) = xac {
-            r.headers_out.borrow_mut().override_charset = Some(v);
-        }
-    }
-
-    // X-Accel-Redirect: finalize the upstream (NGX_DECLINED) and redirect
-    // internally, keeping only the headers marked `redirect=1` in
-    // ngx_http_upstream.c. The method becomes GET (unless HEAD).
-    let xar_val = resp.headers.iter()
-        .find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-redirect")
-        .map(|h| h.value.borrow().clone())
-        .filter(|_| !ignore_xa_redirect);
-    if let Some(xar) = xar_val {
-        if !xar.is_empty() {
-            // the headers of ngx_http_upstream_headers_in[] with "redirect"
-            const KEEP_LC: &[&[u8]] = &[
-                b"content-type", b"set-cookie", b"content-disposition",
-                b"cache-control", b"expires", b"accept-ranges",
-            ];
-            {
-                let mut ho = r.headers_out.borrow_mut();
-                for h in resp.headers.iter() {
-                    if h.hash.get() == 0 || !KEEP_LC.iter().any(|k| h.lowcase_key == *k) {
-                        continue;
-                    }
-                    let mut copied = crate::upstream::CopiedHeaders::default();
-                    crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
-                }
-                ho.status = 0;
-                ho.content_length_n = -1;
-                ho.content_length = None;
-            }
+        Processed::Redirect(xar) => {
             // ngx_http_upstream_finalize_request(r, u, NGX_DECLINED)
             keep(&mut g, sock, resp.keepalive);
             g.finalize();
+            crate::upstream_cache::finalize(&r, NGX_DECLINED, None);
             r.upstream_states.borrow_mut().clear();
-            if xar.first() == Some(&b'@') {
-                let _ = crate::core_rt::named_location(&r, &xar).await;
-                return NGX_DONE;
-            }
-            // Non-named: unescape the URI (splitting off any query at '?'),
-            // then reject unsafe paths (../ etc.) with 404, matching the
-            // ngx_http_parse_unsafe_uri gate C runs before internal_redirect.
-            let (decoded, _) = ngx_core::string::unescape_uri(&xar, ngx_core::string::NGX_UNESCAPE_URI);
-            let (uri_bytes, args_opt): (Vec<u8>, Option<Vec<u8>>) =
-                if let Some(q) = decoded.iter().position(|&b| b == b'?') {
-                    (decoded[..q].to_vec(), Some(decoded[q + 1..].to_vec()))
-                } else {
-                    (decoded, None)
-                };
-            let mut flags = 0u32;
-            let empty: [u8; 0] = [];
-            if crate::parse::parse_unsafe_uri(&uri_bytes, &empty, &mut flags) != NGX_OK {
-                return return_error(&r, crate::NGX_HTTP_NOT_FOUND).await;
-            }
-            if r.method.get() != crate::NGX_HTTP_HEAD {
-                r.method.set(crate::NGX_HTTP_GET);
-                *r.method_name.borrow_mut() = b"GET".to_vec();
-            }
-            let _ = crate::core_rt::internal_redirect(&r, &uri_bytes, args_opt.as_deref()).await;
-            return NGX_DONE;
-        }
-    }
 
-    // the headers not hidden go to headers_out
-    let mut copied = crate::upstream::CopiedHeaders::default();
-    {
-        let mut ho = r.headers_out.borrow_mut();
-
-        for h in resp.headers.iter() {
-            if h.hash.get() == 0 {
-                continue;
-            }
-
-            if effective_hide.iter().any(|x| x == &h.lowcase_key) {
-                continue;
-            }
-
-            // ngx_http_upstream_copy_upgrade: not to HTTP/2 and HTTP/3
-            // clients
-            if h.lowcase_key == b"upgrade" && r.http_version.get() >= crate::NGX_HTTP_VERSION_20 {
-                continue;
-            }
-
-            crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
+            return accel_redirect(&r, &xar).await;
         }
 
-        // the special empty "Server" and "Date" of
-        // ngx_http_proxy_process_header, passed with proxy_pass_header:
-        // no header of the upstream's nor the server's own
-        if !resp.server && !effective_hide.iter().any(|x| x == b"server") {
-            let h = crate::request::TableElt::new(b"Server", b"");
-            h.hash.set(0);
-            ho.server = Some(h);
-        }
-
-        if !resp.date && !effective_hide.iter().any(|x| x == b"date") {
-            let h = crate::request::TableElt::new(b"Date", b"");
-            h.hash.set(0);
-            ho.date = Some(h);
-        }
-
-        // "Content-Length" is not copied (ngx_http_upstream_ignore_header_line)
-        ho.content_length = None;
-
-        ho.status = status;
-        ho.status_line = resp.status_line.clone();
-        ho.content_length_n = resp.content_length_n;
-    }
-
-    // Proxied responses (uncacheable) must skip the not_modified filter —
-    // the backend is responsible for handling If-Modified-Since / If-None-Match.
-    // (ngx_http_upstream_process_headers)
-    r.disable_not_modified.set(!cacheable);
-
-    // proxy_force_ranges: opt in to server-side range processing even though
-    // the upstream response isn't file-backed. Matches C's `u->conf->force_ranges`
-    // setting `r->allow_ranges = 1; r->single_range = 1;`.
-    {
-        let lcf_fr = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        if lcf_fr.borrow().force_ranges.get_or(false) {
-            r.allow_ranges.set(true);
-            r.single_range.set(true);
-        }
-        // Cached/cacheable responses go through range_filter regardless
-        // of the upstream's Accept-Ranges.
-        if lcf_fr.borrow().cache.zone.is_some() {
-            r.allow_ranges.set(true);
+        Processed::Finalize(rc) => {
+            crate::upstream_cache::finalize(&r, rc, None);
+            return rc;
         }
     }
 
@@ -2459,35 +2384,22 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         r.header_only.set(true);
         r.keepalive.set(false);
         let _ = crate::core_rt::send_header(&r).await;
+        crate::upstream_cache::free(&r, None);
         return crate::NGX_DONE;
     }
-
-    // proxy_cookie_domain / proxy_cookie_path: rewrite Set-Cookie Domain=
-    // and Path= attributes before the header filter serializes them.
-    rewrite_set_cookies(&r);
-
-    // proxy_redirect: rewrite Location / Refresh (url=...) headers.
-    rewrite_redirect_headers(&r);
-
-    // Snapshot the raw upstream headers — including the ones the proxy_hide
-    // list keeps from the client (X-Accel-Expires, Set-Cookie, ...) — so
-    // cache TTL decisions and cache_control parsing see the same view the C
-    // code does.
-    let cache_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = if cacheable {
-        Some(resp.headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect())
-    } else {
-        None
-    };
 
     // ngx_http_upstream_send_response
 
     let rc = crate::core_rt::send_header(&r).await;
 
     if rc == NGX_ERROR || rc > NGX_OK || r.post_action.get() {
+        crate::upstream_cache::finalize(&r, rc, None);
         return rc;
     }
 
     if resp.upgrade {
+        crate::upstream_cache::free(&r, None);
+
         // ngx_http_upstream_upgrade
         if !r.is_main() {
             ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "connection upgrade in subrequest");
@@ -2519,12 +2431,50 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     let header_only = r.header_only.get();
 
     if header_only {
-        if !u_buffering || (!cacheable && !store) {
+        if !u_buffering || (!ucache.cacheable.get() && !store) {
             // ngx_http_upstream_finalize_request(r, u, rc)
             keep(&mut g, sock, resp.keepalive);
+            crate::upstream_cache::finalize(&r, rc, None);
             return rc;
         }
     }
+
+    // the cache: *_no_cache, the valid time, the header of the cache file;
+    // p->temp_file with it (p->buf_to_file)
+
+    let mut writer: Option<crate::upstream_cache::CacheWriter> = None;
+
+    if !u_buffering {
+        crate::upstream_cache::free(&r, None);
+    } else {
+        match crate::upstream_cache::send_response(&r, status, &resp.cache, resp.pos) {
+            Err(()) => {
+                crate::upstream_cache::finalize(&r, NGX_ERROR, None);
+                return NGX_ERROR;
+            }
+
+            Ok(Some(header)) => {
+                let temp_path = lcf.borrow().temp_path.as_option().cloned();
+
+                writer = crate::upstream_cache::CacheWriter::new(&r, temp_path.as_deref(), &header, &resp.buf[..resp.pos]);
+
+                if writer.is_none() {
+                    crate::upstream_cache::finalize(&r, NGX_ERROR, None);
+                    return NGX_ERROR;
+                }
+            }
+
+            Ok(None) => {}
+        }
+
+        if header_only && !ucache.cacheable.get() && !store {
+            keep(&mut g, sock, resp.keepalive);
+            crate::upstream_cache::finalize(&r, 0, None);
+            return 0;
+        }
+    }
+
+    let cacheable = ucache.cacheable.get();
 
     // p->limit_rate = ngx_http_complex_value_size(r, u->conf->limit_rate, 0)
     let (limit_rate, capture) = if u_buffering {
@@ -2536,14 +2486,17 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
 
     let pass_trailers = lcf.borrow().pass_trailers.get_or(false);
 
+    let hide = hide_headers(&lcf);
+
     let body = send_response_body(
         &r,
         &mut sock,
         &mut resp,
         head,
-        BodyParams { buffering: u_buffering, limit_rate, downstream: !header_only, capture, read_timeout, pass_trailers, buffer_size },
+        BodyParams { buffering: u_buffering, limit_rate, downstream: !header_only, capture, store, read_timeout, pass_trailers, buffer_size },
         watch,
-        &effective_hide,
+        &hide,
+        &mut writer,
     )
     .await;
 
@@ -2551,27 +2504,259 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         keep(&mut g, sock, true);
     }
 
-    if body.rc == NGX_OK && body.complete {
-        // ngx_http_upstream_process_request: ngx_http_upstream_store() for
-        // a 200 whose body is as long as its "Content-Length" says
-        if store
-            && status == crate::NGX_HTTP_OK
-            && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64)
-        {
-            maybe_store_body(&r, &body.data);
-        }
-
-        if let Some(hdrs) = cache_headers {
-            let cache_conf = lcf.borrow().cache.clone();
-            crate::proxy_cache::maybe_save(&r, &cache_conf, &upstream_uri, status as u16, hdrs, body.data);
-        }
-    } else if cacheable && !body.complete {
-        // Signal to proxy_cache::maybe_save that we shouldn't persist a
-        // truncated response.
-        r.upstream_response_incomplete.set(true);
+    // ngx_http_upstream_process_request: ngx_http_upstream_store() for a
+    // 200 whose body is as long as its "Content-Length" says, and the
+    // cache file
+    if body.complete && store && status == crate::NGX_HTTP_OK && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64) {
+        maybe_store_body(&r, &body.data);
     }
 
+    if let Some(w) = writer {
+        let tf_done = body.complete;
+        w.finish(&r, tf_done, false, resp.content_length_n);
+    }
+
+    // ngx_http_upstream_finalize_request
+    crate::upstream_cache::finalize(&r, body.rc, None);
+
     body.rc
+}
+
+/// The hide headers of the location (ngx_http_upstream_hide_headers_hash):
+/// ngx_http_proxy_hide_headers and proxy_hide_header, but proxy_pass_header.
+fn hide_headers(lcf: &Rc<RefCell<NgxHttpProxyLocConf>>) -> Vec<Vec<u8>> {
+    let c = lcf.borrow();
+    let mut set: Vec<Vec<u8>> = PROXY_HIDE_HEADERS.iter().map(|s| s.to_vec()).collect();
+    if let Some(hide) = &c.hide_headers {
+        for h in hide {
+            if !set.iter().any(|x| x == h) {
+                set.push(h.clone());
+            }
+        }
+    }
+    if let Some(pass) = &c.pass_headers {
+        set.retain(|h| !pass.iter().any(|p| p == h));
+    }
+    set
+}
+
+/// What ngx_http_upstream_process_headers ends with.
+enum Processed {
+    /// the headers are in headers_out, with u->buffering as X-Accel-Buffering
+    /// set it, if it did
+    Ok(Option<bool>),
+    /// X-Accel-Redirect: the upstream is finalized (NGX_DECLINED), then the
+    /// request redirected
+    Redirect(Vec<u8>),
+    /// the request is finalized with the status
+    Finalize(i64),
+}
+
+/// ngx_http_upstream_process_headers, with the headers_in handlers of the
+/// X-Accel-* headers (ngx_http_upstream_process_buffering, _limit_rate,
+/// _charset) and the copy handlers of the proxy (proxy_redirect,
+/// proxy_cookie_*): for a response of the upstream and for one from the
+/// cache.
+async fn process_headers(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, resp: &UpstreamResponse) -> Processed {
+    let status = resp.status_n;
+
+    // u->headers_in.no_cache || u->headers_in.expired
+    crate::upstream_cache::process_headers_cacheable(r, &resp.cache);
+
+    let (ignore_xa_buffering, ignore_xa_limit_rate, ignore_xa_charset, ignore_xa_redirect, force_ranges) = {
+        let c = lcf.borrow();
+        (
+            c.cache.ignores(crate::upstream::NGX_HTTP_UPSTREAM_IGN_XA_BUFFERING),
+            c.cache.ignores(crate::upstream::NGX_HTTP_UPSTREAM_IGN_XA_LIMIT_RATE),
+            c.cache.ignores(crate::upstream::NGX_HTTP_UPSTREAM_IGN_XA_CHARSET),
+            c.cache.ignores(crate::upstream::NGX_HTTP_UPSTREAM_IGN_XA_REDIRECT),
+            c.force_ranges.get_or(false),
+        )
+    };
+
+    // Effective hide list: default PROXY_HIDE_HEADERS + user's hide_headers,
+    // minus user's pass_headers (pass wins over hide).
+    let effective_hide = hide_headers(lcf);
+
+    // X-Accel-Buffering (ngx_http_upstream_process_buffering, for each)
+    let mut u_buffering = None;
+
+    if !ignore_xa_buffering {
+        for h in resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-buffering") {
+            let v = h.value.borrow();
+            if v.eq_ignore_ascii_case(b"yes") {
+                u_buffering = Some(true);
+            } else if v.eq_ignore_ascii_case(b"no") {
+                u_buffering = Some(false);
+            }
+        }
+    }
+
+    // X-Accel-Limit-Rate: bytes-per-second cap on the response, matching
+    // ngx_http_upstream_process_limit_rate. Applied to r.limit_rate BEFORE
+    // X-Accel-Redirect so the header survives the internal redirect.
+    if !ignore_xa_limit_rate {
+        let xal_val = resp.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-limit-rate").map(|h| h.value.borrow().clone());
+        if let Some(v) = xal_val {
+            if let Ok(s) = std::str::from_utf8(&v) {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    if n >= 0 {
+                        r.limit_rate.set(n as usize);
+                        r.limit_rate_set.set(true);
+                    }
+                }
+            }
+        }
+    }
+
+    // X-Accel-Charset (ngx_http_upstream_process_charset, for each):
+    // r->headers_out.override_charset, unless ignored
+    if !ignore_xa_charset {
+        let xac = resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-charset").last().map(|h| h.value.borrow().clone());
+
+        if let Some(v) = xac {
+            r.headers_out.borrow_mut().override_charset = Some(v);
+        }
+    }
+
+    // X-Accel-Redirect: finalize the upstream (NGX_DECLINED) and redirect
+    // internally, keeping only the headers marked `redirect=1` in
+    // ngx_http_upstream.c. The method becomes GET (unless HEAD).
+    let xar_val = resp.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == b"x-accel-redirect").map(|h| h.value.borrow().clone()).filter(|_| !ignore_xa_redirect);
+
+    if let Some(xar) = xar_val {
+        if !xar.is_empty() {
+            // the headers of ngx_http_upstream_headers_in[] with "redirect"
+            const KEEP_LC: &[&[u8]] = &[b"content-type", b"set-cookie", b"content-disposition", b"cache-control", b"expires", b"accept-ranges"];
+            {
+                let mut ho = r.headers_out.borrow_mut();
+                for h in resp.headers.iter() {
+                    if h.hash.get() == 0 || !KEEP_LC.iter().any(|k| h.lowcase_key == *k) {
+                        continue;
+                    }
+                    let mut copied = crate::upstream::CopiedHeaders::default();
+                    crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
+                }
+                ho.status = 0;
+                ho.content_length_n = -1;
+                ho.content_length = None;
+            }
+
+            return Processed::Redirect(xar);
+        }
+    }
+
+    let cacheable = crate::upstream_cache::cacheable(r);
+
+    // the headers not hidden go to headers_out
+    let mut copied = crate::upstream::CopiedHeaders::default();
+    {
+        let mut ho = r.headers_out.borrow_mut();
+
+        for h in resp.headers.iter() {
+            if h.hash.get() == 0 {
+                continue;
+            }
+
+            if effective_hide.iter().any(|x| x == &h.lowcase_key) {
+                continue;
+            }
+
+            // ngx_http_upstream_copy_upgrade: not to HTTP/2 and HTTP/3
+            // clients
+            if h.lowcase_key == b"upgrade" && r.http_version.get() >= crate::NGX_HTTP_VERSION_20 {
+                continue;
+            }
+
+            // ngx_http_upstream_copy_allow_ranges
+            if h.lowcase_key == b"accept-ranges" {
+                if force_ranges {
+                    continue;
+                }
+
+                if r.cached.get() {
+                    r.allow_ranges.set(true);
+                    continue;
+                }
+
+                if cacheable {
+                    r.allow_ranges.set(true);
+                    r.single_range.set(true);
+                    continue;
+                }
+            }
+
+            crate::upstream::copy_header(&mut ho, &mut copied, status, &h.key, &h.value.borrow());
+        }
+
+        // the special empty "Server" and "Date" of
+        // ngx_http_proxy_process_header, passed with proxy_pass_header:
+        // no header of the upstream's nor the server's own
+        if !resp.server && !effective_hide.iter().any(|x| x == b"server") {
+            let h = crate::request::TableElt::new(b"Server", b"");
+            h.hash.set(0);
+            ho.server = Some(h);
+        }
+
+        if !resp.date && !effective_hide.iter().any(|x| x == b"date") {
+            let h = crate::request::TableElt::new(b"Date", b"");
+            h.hash.set(0);
+            ho.date = Some(h);
+        }
+
+        // "Content-Length" is not copied (ngx_http_upstream_ignore_header_line)
+        ho.content_length = None;
+
+        ho.status = status;
+        ho.status_line = resp.status_line.clone();
+        ho.content_length_n = resp.content_length_n;
+    }
+
+    r.disable_not_modified.set(!cacheable);
+
+    if force_ranges {
+        r.allow_ranges.set(true);
+        r.single_range.set(true);
+
+        if r.cached.get() {
+            r.single_range.set(false);
+        }
+    }
+
+    // proxy_cookie_domain / proxy_cookie_path: rewrite Set-Cookie Domain=
+    // and Path= attributes before the header filter serializes them.
+    rewrite_set_cookies(r);
+
+    // proxy_redirect: rewrite Location / Refresh (url=...) headers.
+    rewrite_redirect_headers(r);
+
+    Processed::Ok(u_buffering)
+}
+
+/// The X-Accel-Redirect of ngx_http_upstream_process_headers: a named
+/// location, or the URI (with its arguments) for an internal redirect.
+async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
+    if xar.first() == Some(&b'@') {
+        let _ = crate::core_rt::named_location(r, xar).await;
+        return NGX_DONE;
+    }
+
+    // Non-named: unescape the URI (splitting off any query at '?'),
+    // then reject unsafe paths (../ etc.) with 404, matching the
+    // ngx_http_parse_unsafe_uri gate C runs before internal_redirect.
+    let (decoded, _) = ngx_core::string::unescape_uri(xar, ngx_core::string::NGX_UNESCAPE_URI);
+    let (uri_bytes, args_opt): (Vec<u8>, Option<Vec<u8>>) = if let Some(q) = decoded.iter().position(|&b| b == b'?') { (decoded[..q].to_vec(), Some(decoded[q + 1..].to_vec())) } else { (decoded, None) };
+    let mut flags = 0u32;
+    let empty: [u8; 0] = [];
+    if crate::parse::parse_unsafe_uri(&uri_bytes, &empty, &mut flags) != NGX_OK {
+        return return_error(r, crate::NGX_HTTP_NOT_FOUND).await;
+    }
+    if r.method.get() != crate::NGX_HTTP_HEAD {
+        r.method.set(crate::NGX_HTTP_GET);
+        *r.method_name.borrow_mut() = b"GET".to_vec();
+    }
+    let _ = crate::core_rt::internal_redirect(r, &uri_bytes, args_opt.as_deref()).await;
+    NGX_DONE
 }
 
 /// u->headers_in and u->buffer of an upstream response
@@ -2597,6 +2782,8 @@ struct UpstreamResponse {
     upgrade: bool,
     /// u->headers_in.trailers
     trailers: Vec<crate::request::Header>,
+    /// the fields of u->headers_in the cache handlers set
+    cache: crate::upstream_cache::CacheHeadersIn,
 }
 
 impl UpstreamResponse {
@@ -2617,6 +2804,7 @@ impl UpstreamResponse {
             keepalive: false,
             upgrade: false,
             trailers: Vec::new(),
+            cache: crate::upstream_cache::CacheHeadersIn::new(),
         }
     }
 
@@ -2632,6 +2820,7 @@ impl UpstreamResponse {
         self.connection_close = false;
         self.server = false;
         self.date = false;
+        self.cache = crate::upstream_cache::CacheHeadersIn::new();
     }
 }
 
@@ -2663,15 +2852,9 @@ async fn process_header(r: &R, sock: &mut UpstreamSock, ctx: &Rc<RefCell<ProxyCt
 }
 
 async fn read_header(r: &R, sock: &mut UpstreamSock, ctx: &Rc<RefCell<ProxyCtx>>, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>) -> Result<UpstreamResponse, HeaderError> {
-    use crate::parse::{NGX_HTTP_PARSE_HEADER_DONE, NGX_HTTP_PARSE_INVALID_HEADER};
-
     let mut u = UpstreamResponse::new();
 
-    // the status line is parsed (process_header is
-    // ngx_http_proxy_process_header)
-    let mut status_done = false;
-    let mut pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
-    let mut pos = 0usize;
+    let mut state = HeaderParse::default();
     let mut chunk = vec![0u8; buffer_size.max(1)];
 
     loop {
@@ -2711,174 +2894,213 @@ async fn read_header(r: &R, sock: &mut UpstreamSock, ctx: &Rc<RefCell<ProxyCtx>>
 
         u.buf.extend_from_slice(&chunk[..n]);
 
-        'again: loop {
-            if !status_done {
-                // ngx_http_proxy_process_status_line
+        // rc = u->process_header(r)
 
-                let mut p = pos;
-                let mut status = crate::parse::Status::default();
+        match parse_header(r, ctx, &mut u, &mut state, false) {
+            Ok(true) => return Ok(u),
 
-                let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
-
-                if rc == NGX_AGAIN {
-                    break 'again;
+            Ok(false) => {
+                // NGX_AGAIN
+                if u.buf.len() >= buffer_size {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent too big header");
+                    return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
                 }
-
-                if rc == NGX_ERROR {
-                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent no valid HTTP/1.0 header");
-
-                    r.http_version.set(crate::NGX_HTTP_VERSION_9);
-
-                    if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-                        st.status = crate::NGX_HTTP_OK;
-                    }
-
-                    u.status_n = crate::NGX_HTTP_OK;
-                    u.connection_close = true;
-
-                    // u->buffer.pos = ctx->status.line_start
-                    u.pos = pos;
-
-                    return Ok(u);
-                }
-
-                if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-                    if st.status == 0 {
-                        st.status = status.code as i64;
-                    }
-                }
-
-                u.status_n = status.code as i64;
-                u.status_line = u.buf[status.start..status.end].to_vec();
-
-                ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy status {} \"{}\"", u.status_n, ngx_core::string::B(&u.status_line));
-
-                if status.http_version < crate::NGX_HTTP_VERSION_11 {
-                    if status.code == 103 {
-                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent HTTP/1.0 response with early hints");
-                        return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
-                    }
-
-                    u.connection_close = true;
-                }
-
-                pos = p;
-                status_done = true;
             }
 
-            // ngx_http_proxy_process_header
+            Err(ft) => return Err(HeaderError::Next(ft)),
+        }
+    }
+}
 
-            loop {
-                let rc = crate::parse::parse_header_line(&mut pr, &u.buf, &mut pos, true);
+/// The state of ngx_http_proxy_process_status_line and
+/// ngx_http_proxy_process_header between reads: whether the status line
+/// was parsed, the header line parser, and where parsing goes on in
+/// u->buffer.
+struct HeaderParse {
+    status_done: bool,
+    pr: crate::parse::ParseRequest,
+    pos: usize,
+}
 
-                if rc == NGX_OK {
-                    // a header line has been parsed successfully
+impl Default for HeaderParse {
+    fn default() -> HeaderParse {
+        HeaderParse { status_done: false, pr: crate::parse::ParseRequest { upstream: true, ..Default::default() }, pos: 0 }
+    }
+}
 
-                    let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
-                    let value = u.buf[pr.header_start..pr.header_end].to_vec();
+/// u->process_header on what u->buffer has: ngx_http_proxy_process_status_line,
+/// then ngx_http_proxy_process_header with the headers_in handlers.
+/// Ok(true) when the header is done (the body from u.pos), Ok(false) when
+/// more is needed (NGX_AGAIN), Err with the failure of
+/// NGX_HTTP_UPSTREAM_INVALID_HEADER otherwise. `cached` is a header of a
+/// cache file (ngx_http_upstream_cache_send): early hints are an invalid
+/// header there.
+fn parse_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, u: &mut UpstreamResponse, st: &mut HeaderParse, cached: bool) -> Result<bool, u32> {
+    use crate::parse::{NGX_HTTP_PARSE_HEADER_DONE, NGX_HTTP_PARSE_INVALID_HEADER};
 
-                    let lowcase = if key.len() == pr.lowcase_index {
-                        pr.lowcase_header[..key.len()].to_vec()
-                    } else {
-                        key.to_ascii_lowercase()
-                    };
+    loop {
+        if !st.status_done {
+            // ngx_http_proxy_process_status_line
 
-                    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
+            let mut p = st.pos;
+            let mut status = crate::parse::Status::default();
 
-                    let h = crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase);
+            let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
 
-                    u.headers.push(h.clone());
+            if rc == NGX_AGAIN {
+                return Ok(false);
+            }
 
-                    if u.status_n == 103 {
-                        continue;
-                    }
+            if rc == NGX_ERROR {
+                if r.cache.borrow().is_some() {
+                    r.http_version.set(crate::NGX_HTTP_VERSION_9);
 
-                    if let Err(ft) = upstream_process_header_line(r, &mut u, &h) {
-                        return Err(HeaderError::Next(ft));
-                    }
+                    // u->buffer.pos = ctx->status.line_start
+                    u.pos = st.pos;
 
+                    return Ok(true);
+                }
+
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent no valid HTTP/1.0 header");
+
+                r.http_version.set(crate::NGX_HTTP_VERSION_9);
+
+                if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+                    state.status = crate::NGX_HTTP_OK;
+                }
+
+                u.status_n = crate::NGX_HTTP_OK;
+                u.connection_close = true;
+
+                // u->buffer.pos = ctx->status.line_start
+                u.pos = st.pos;
+
+                return Ok(true);
+            }
+
+            if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+                if state.status == 0 {
+                    state.status = status.code as i64;
+                }
+            }
+
+            u.status_n = status.code as i64;
+            u.status_line = u.buf[status.start..status.end].to_vec();
+
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy status {} \"{}\"", u.status_n, ngx_core::string::B(&u.status_line));
+
+            if status.http_version < crate::NGX_HTTP_VERSION_11 {
+                if status.code == 103 {
+                    ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent HTTP/1.0 response with early hints");
+                    return Err(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER);
+                }
+
+                u.connection_close = true;
+            }
+
+            st.pos = p;
+            st.status_done = true;
+        }
+
+        // ngx_http_proxy_process_header
+
+        loop {
+            let rc = crate::parse::parse_header_line(&mut st.pr, &u.buf, &mut st.pos, true);
+
+            if rc == NGX_OK {
+                // a header line has been parsed successfully
+
+                let pr = &st.pr;
+
+                let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
+                let value = u.buf[pr.header_start..pr.header_end].to_vec();
+
+                let lowcase = if key.len() == pr.lowcase_index { pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
+
+                ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
+
+                let h = crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase);
+
+                u.headers.push(h.clone());
+
+                if u.status_n == 103 {
                     continue;
                 }
 
-                if rc == NGX_HTTP_PARSE_HEADER_DONE {
-                    // a whole header has been parsed successfully
+                upstream_process_header_line(r, u, &h)?;
 
-                    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header done");
-
-                    if u.status_n == 103 {
-                        // ngx_http_upstream_process_early_hints: the early
-                        // hints filters of ngx_http_send_early_hints() are
-                        // not ported, so the 103 goes nowhere, as without
-                        // the "early_hints" directive
-                        ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream early hints");
-
-                        u.clear_headers();
-                        status_done = false;
-                        pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
-
-                        continue 'again;
-                    }
-
-                    // clear content length if response is chunked
-
-                    if u.chunked {
-                        u.content_length_n = -1;
-                    }
-
-                    // set u->keepalive if response has no body; this
-                    // allows to keep connections alive in case of
-                    // r->header_only or X-Accel-Redirect
-
-                    let head = ctx.borrow().head;
-
-                    if u.status_n == crate::NGX_HTTP_NO_CONTENT as i64
-                        || u.status_n == crate::NGX_HTTP_NOT_MODIFIED as i64
-                        || head
-                        || (!u.chunked && u.content_length_n == 0)
-                    {
-                        u.keepalive = !u.connection_close;
-                    }
-
-                    if u.status_n == 101 {
-                        u.keepalive = false;
-
-                        if !r.headers_in.borrow().upgrade.is_empty() {
-                            u.upgrade = true;
-                        }
-                    }
-
-                    u.pos = pos;
-
-                    return Ok(u);
-                }
-
-                if rc == NGX_AGAIN {
-                    if u.buf.len() >= buffer_size {
-                        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent too big header");
-                        return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
-                    }
-
-                    break 'again;
-                }
-
-                // rc == NGX_HTTP_PARSE_INVALID_HEADER
-                debug_assert_eq!(rc, NGX_HTTP_PARSE_INVALID_HEADER);
-
-                let end = pr.header_end.min(u.buf.len());
-                let start = pr.header_name_start.min(end);
-                let ch = u.buf.get(end).copied().unwrap_or(0);
-
-                ngx_core::ngx_log_error!(
-                    ngx_core::log::NGX_LOG_ERR,
-                    r.connection.log,
-                    None,
-                    "upstream sent invalid header: \"{}\\x{:02x}...\"",
-                    ngx_core::string::B(&u.buf[start..end]),
-                    ch
-                );
-
-                return Err(HeaderError::Next(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+                continue;
             }
+
+            if rc == NGX_HTTP_PARSE_HEADER_DONE {
+                // a whole header has been parsed successfully
+
+                ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header done");
+
+                if u.status_n == 103 {
+                    if cached {
+                        // NGX_HTTP_UPSTREAM_EARLY_HINTS
+                        return Err(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER);
+                    }
+
+                    // ngx_http_upstream_process_early_hints: the early
+                    // hints filters of ngx_http_send_early_hints() are
+                    // not ported, so the 103 goes nowhere, as without
+                    // the "early_hints" directive
+                    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream early hints");
+
+                    u.clear_headers();
+                    st.status_done = false;
+                    st.pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
+
+                    break;
+                }
+
+                // clear content length if response is chunked
+
+                if u.chunked {
+                    u.content_length_n = -1;
+                }
+
+                // set u->keepalive if response has no body; this
+                // allows to keep connections alive in case of
+                // r->header_only or X-Accel-Redirect
+
+                let head = ctx.borrow().head;
+
+                if u.status_n == crate::NGX_HTTP_NO_CONTENT as i64 || u.status_n == crate::NGX_HTTP_NOT_MODIFIED as i64 || head || (!u.chunked && u.content_length_n == 0) {
+                    u.keepalive = !u.connection_close;
+                }
+
+                if u.status_n == 101 {
+                    u.keepalive = false;
+
+                    if !r.headers_in.borrow().upgrade.is_empty() {
+                        u.upgrade = true;
+                    }
+                }
+
+                u.pos = st.pos;
+
+                return Ok(true);
+            }
+
+            if rc == NGX_AGAIN {
+                return Ok(false);
+            }
+
+            // rc == NGX_HTTP_PARSE_INVALID_HEADER
+            debug_assert_eq!(rc, NGX_HTTP_PARSE_INVALID_HEADER);
+
+            let pr = &st.pr;
+
+            let end = pr.header_end.min(u.buf.len());
+            let start = pr.header_name_start.min(end);
+            let ch = u.buf.get(end).copied().unwrap_or(0);
+
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid header: \"{}\\x{:02x}...\"", ngx_core::string::B(&u.buf[start..end]), ch);
+
+            return Err(crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER);
         }
     }
 }
@@ -2994,6 +3216,15 @@ fn upstream_process_header_line(r: &R, u: &mut UpstreamResponse, h: &crate::requ
             } else if h.lowcase_key == b"date" {
                 u.date = true;
             }
+
+            // the cache handlers: ngx_http_upstream_process_expires,
+            // _accel_expires, _last_modified, and the etag
+            crate::upstream_cache::process_header_line(r, &mut u.cache, &h.lowcase_key, &h.value.borrow());
+        }
+
+        b"set-cookie" | b"cache-control" | b"vary" => {
+            // ngx_http_upstream_process_set_cookie, _cache_control, _vary
+            crate::upstream_cache::process_header_line(r, &mut u.cache, &h.lowcase_key, &h.value.borrow());
         }
 
         _ => {}
@@ -3138,8 +3369,11 @@ struct BodyParams {
     limit_rate: usize,
     /// the body goes to the client (not r->header_only)
     downstream: bool,
-    /// the body is kept for the cache or proxy_store
+    /// the response is read in full for the cache or proxy_store
+    /// (p->cacheable)
     capture: bool,
+    /// the body is kept for proxy_store
+    store: bool,
     read_timeout: u64,
     pass_trailers: bool,
     /// proxy_buffer_size, the most of trailers kept
@@ -3165,20 +3399,20 @@ struct BodyResult {
 /// proxy_limit_rate on the reading when buffered; then what
 /// ngx_http_upstream_finalize_request sends: the trailers and the last
 /// buffer, or, for a body the upstream cut short, a flush and no keepalive.
-async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>]) -> BodyResult {
+async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>], cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
     let log = r.connection.log.clone();
     let action = log.action();
 
     log.set_action(Some("reading upstream"));
 
-    let res = read_body(r, sock, u, head, &p, watch, hide).await;
+    let res = read_body(r, sock, u, head, &p, watch, hide, cache).await;
 
     log.set_action(action);
 
     res
 }
 
-async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: &BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>]) -> BodyResult {
+async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, head: bool, p: &BodyParams, watch: Option<&ClientWatch>, hide: &[Vec<u8>], cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
     use ngx_core::buf::{Buf, Chain};
 
     if !p.buffering {
@@ -3370,8 +3604,13 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, hea
         data.clear();
 
         if !out.is_empty() {
-            if p.capture {
+            if p.store {
                 captured.extend_from_slice(&out);
+            }
+
+            // ngx_event_pipe_write_chain_to_temp_file()
+            if let Some(w) = cache.as_mut() {
+                w.write(r, &out);
             }
 
             if downstream {
@@ -3706,6 +3945,10 @@ async fn return_error(r: &R, status: i64) -> i64 {
             ..Default::default()
         });
     }
+    // ngx_http_upstream_finalize_request: a 502 or 504 of the upstream is
+    // cached for its proxy_cache_valid time
+    crate::upstream_cache::finalize(r, status, None);
+
     // Return the status; finalize_request will invoke special_response_handler
     // which builds the default error body AND runs the header filter chain
     // (so headers_more / add_header 'always' apply).
@@ -3838,7 +4081,13 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, read_timeout, set_msec),
         cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, proxy_set_header_handler),
         // Additional proxy directives that tests need
-        cmd_fn!("proxy_temp_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_temp_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::Loc, |cf: &mut Conf, cmd, conf: Option<Rc<dyn Any>>| {
+            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+            let mut slot = std::mem::take(&mut cell.borrow_mut().temp_path);
+            let rc = set_path(cf, cmd, &mut slot);
+            cell.borrow_mut().temp_path = slot;
+            rc
+        }),
         ngx_core::cmd!("proxy_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, buffer_size, set_size),
         cmd_fn!("proxy_buffers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_busy_buffers_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -3877,13 +4126,7 @@ pub fn proxy_module() -> ModuleDef {
             if !list.iter().any(|x| x == &name) { list.push(name); }
             Ok(())
         }),
-        cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            for a in cf.args[1..].to_vec() {
-                cell.borrow_mut().cache.ignore_headers.push(a.to_ascii_lowercase());
-            }
-            Ok(())
-        }),
+        cmd_fn!("proxy_ignore_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, crate::upstream_cache::ignore_headers_slot::<NgxHttpProxyLocConf>),
         ngx_core::cmd!("proxy_pass_trailers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_trailers, set_flag),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         ngx_core::cmd!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, ignore_client_abort, set_flag),
@@ -3893,107 +4136,27 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
         ngx_core::cmd!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_max_size, set_num),
         ngx_core::cmd!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_bucket_size, set_num),
-        cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::None, |cf, _cmd, _conf| crate::proxy_cache::parse_proxy_cache_path(cf)),
-        cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+        cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_cache_handler),
+        cmd_fn!("proxy_cache_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, crate::upstream_cache::cache_key_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::Main, |cf, cmd, conf| crate::upstream_cache::cache_path_slot(cf, cmd, conf, "ngx_http_proxy_module")),
+        cmd_fn!("proxy_cache_bypass", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, crate::upstream_cache::cache_bypass_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, crate::upstream_cache::no_cache_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_valid", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, crate::upstream_cache::cache_valid_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_min_uses", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, crate::upstream_cache::cache_min_uses_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, crate::upstream_cache::cache_max_range_offset_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_use_stale", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            if cf.args[1] == b"off" {
-                let mut c = cell.borrow_mut();
-                c.cache.zone = None;
-                c.cache.zone_cv = None;
-                c.cache.explicitly_off = true;
-            } else if cf.args[1].contains(&b'$') {
-                let cv = crate::script::compile_complex_value(cf, &cf.args[1].clone(), 0)?;
-                let mut c = cell.borrow_mut();
-                c.cache.zone = Some(cf.args[1].clone());
-                c.cache.zone_cv = Some(Rc::new(cv));
-            } else {
-                let mut c = cell.borrow_mut();
-                c.cache.zone = Some(cf.args[1].clone());
-                c.cache.zone_cv = None;
-            }
-            Ok(())
+            let mut c = cell.borrow_mut();
+            crate::upstream_cache::cache_use_stale_slot(cf, cmd, &mut c.cache, PROXY_NEXT_UPSTREAM_MASKS)
         }),
-        cmd_fn!("proxy_cache_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let cv = crate::script::compile_complex_value(cf, &cf.args[1].clone(), 0)?;
-            cell.borrow_mut().cache.key = Some(Rc::new(cv));
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_valid", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let cv = crate::proxy_cache::parse_cache_valid(&cf.args[1..])?;
-            cell.borrow_mut().cache.valid.push(cv);
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_bypass", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            for a in cf.args[1..].to_vec() {
-                let cv = crate::script::compile_complex_value(cf, &a, 0)?;
-                cell.borrow_mut().cache.bypass.push(Rc::new(cv));
-            }
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_use_stale", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let bits = crate::proxy_cache::parse_use_stale_flags(&cf.args[1..].to_vec())?;
-            cell.borrow_mut().cache.use_stale = bits;
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_lock", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            cell.borrow_mut().cache.lock = cf.args[1] == b"on";
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_lock_age", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let t = ngx_core::parse::parse_time(&cf.args[1], false).ok_or_else(|| ngx_core::conf::msg("invalid time"))?;
-            cell.borrow_mut().cache.lock_age_ms = t as u64;
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_lock_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let t = ngx_core::parse::parse_time(&cf.args[1], false).ok_or_else(|| ngx_core::conf::msg("invalid time"))?;
-            cell.borrow_mut().cache.lock_timeout_ms = t as u64;
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_min_uses", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let n = ngx_core::string::atoi(&cf.args[1]).ok_or_else(|| ngx_core::conf::msg("invalid number"))?;
-            cell.borrow_mut().cache.min_uses = n as u32;
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_revalidate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            cell.borrow_mut().cache.revalidate = cf.args[1] == b"on";
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_max_range_offset", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let n = ngx_core::string::atoi(&cf.args[1]).ok_or_else(|| ngx_core::conf::msg("invalid number"))?;
-            cell.borrow_mut().cache.max_range_offset = Some(n as u64);
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_methods", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        cmd_fn!("proxy_cache_methods", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, crate::upstream_cache::cache_methods_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_lock", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, crate::upstream_cache::cache_lock_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_lock_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, crate::upstream_cache::cache_lock_timeout_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_lock_age", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, crate::upstream_cache::cache_lock_age_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_revalidate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, crate::upstream_cache::cache_revalidate_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, crate::upstream_cache::cache_convert_head_slot::<NgxHttpProxyLocConf>),
+        cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, crate::upstream_cache::cache_background_update_slot::<NgxHttpProxyLocConf>),
         cmd_fn!("proxy_cache_purge", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_cache_convert_head", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let v = &cf.args[1];
-            cell.borrow_mut().cache.convert_head = v == b"on";
-            Ok(())
-        }),
-        cmd_fn!("proxy_cache_background_update", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            cell.borrow_mut().cache.background_update = cf.args[1] == b"on";
-            Ok(())
-        }),
-        cmd_fn!("proxy_no_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
-            let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            for a in cf.args[1..].to_vec() {
-                let cv = crate::script::compile_complex_value(cf, &a, 0)?;
-                cell.borrow_mut().cache.no_cache.push(Rc::new(cv));
-            }
-            Ok(())
-        }),
         cmd_fn!("proxy_ssl_session_reuse", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, proxy_ssl_flag_handler),
         cmd_fn!("proxy_ssl_protocols", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, proxy_ssl_protocols_handler),
         ngx_core::cmd!("proxy_ssl_ciphers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, ssl_ciphers, set_str),
@@ -4012,6 +4175,7 @@ pub fn proxy_module() -> ModuleDef {
 
     let def = HttpModuleDef {
         preconfiguration: Some(preconfiguration),
+        create_main_conf: Some(crate::upstream_cache::create_main_conf),
         create_loc_conf: Some(create_loc_conf),
         merge_loc_conf: Some(merge_loc_conf),
         ..Default::default()
@@ -4470,6 +4634,9 @@ fn proxy_store_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
     if args.len() != 2 {
         return Err(msg("invalid number of arguments"));
     }
+    if args[1] != b"off" && cell.borrow().cache.cache.get_or(false) {
+        return Err(msg("is incompatible with \"proxy_cache\""));
+    }
     let store = if args[1] == b"on" {
         ProxyStore::On
     } else if args[1] == b"off" {
@@ -4480,6 +4647,29 @@ fn proxy_store_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
     };
     cell.borrow_mut().store = Some(store);
     Ok(())
+}
+
+/// ngx_http_proxy_cache: "proxy_cache zone | off"
+fn proxy_cache_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+
+    if cell.borrow().cache.cache.is_set() {
+        return Err(msg("is duplicate"));
+    }
+
+    if cf.args[1] == b"off" {
+        cell.borrow_mut().cache.cache = Val::set(false);
+        return Ok(());
+    }
+
+    if matches!(cell.borrow().store, Some(ProxyStore::On) | Some(ProxyStore::Path(_))) {
+        return Err(msg("is incompatible with \"proxy_store\""));
+    }
+
+    let mut ucf = std::mem::take(&mut cell.borrow_mut().cache);
+    let rc = crate::upstream_cache::cache_slot(cf, &mut ucf, "ngx_http_proxy_module");
+    cell.borrow_mut().cache = ucf;
+    rc
 }
 
 /// Write the just-received upstream body to disk as configured by proxy_store.
