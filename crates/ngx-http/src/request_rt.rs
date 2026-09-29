@@ -1500,13 +1500,12 @@ pub async fn subrequest(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps: 
     Ok((sr, rc))
 }
 
-/// ngx_http_subrequest as C has it: the subrequest is created and, unless
-/// it is a background one, appended to r->postponed. It runs when
-/// crate::postpone_filter::run_posted_requests() gets to it, which stands
-/// for ngx_http_run_posted_requests() and the postpone filter waking the
-/// subrequest up; until then r keeps its own output postponed after it
-/// (C: c->data moved to the subrequest). subrequest() above creates a
-/// subrequest and runs it at once instead.
+/// ngx_http_subrequest as C has it: the subrequest is created, appended to
+/// r->postponed unless it is a background one, and posted: it runs as a
+/// task of its own once the running request waits (see
+/// crate::postpone_filter, which also keeps c->data), and the caller may
+/// still set it up before (header_only, a post_subrequest_async handler).
+/// subrequest() above creates a subrequest and runs it at once instead.
 pub fn subrequest_posted(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps: Option<PostSubrequest>) -> Result<R, ()> {
     if r.subrequests.get() == 0 {
         ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "subrequests cycle while processing \"{}\"", B(uri));
