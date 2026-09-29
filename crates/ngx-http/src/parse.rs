@@ -1855,7 +1855,8 @@ fn case_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-/// Find argument in query string
+/// Find argument in query string (ngx_http_arg: the name is matched
+/// case-insensitively, as ngx_strlcasestrn() does)
 pub fn arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     if args.is_empty() {
         return None;
@@ -1869,7 +1870,7 @@ pub fn arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         if p == 0 || args[p - 1] == b'&' {
             let mut i = 0;
             while i < name.len() && p + i < last {
-                if args[p + i] != name[i] {
+                if !args[p + i].eq_ignore_ascii_case(&name[i]) {
                     break;
                 }
                 i += 1;
