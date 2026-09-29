@@ -500,10 +500,26 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
     let c2 = cycle.clone();
     local.block_on(&rt, async move {
         spawn(control_task(c2.clone(), false));
-        if data == 0 {
-            // manager: run every path manager on its schedule
-            tokio::time::sleep(std::time::Duration::from_millis(0)).await;
-            loop {
+        let notify = flags_notify();
+        // ngx_add_timer(&ev, ctx->delay): the manager at once, the loader
+        // after a minute
+        let mut timer = tokio::time::Instant::now() + std::time::Duration::from_millis(if data == 0 { 0 } else { 60000 });
+        loop {
+            if SIG_TERMINATE.load(Ordering::SeqCst) || SIG_QUIT.load(Ordering::SeqCst) {
+                ngx_log_error!(NGX_LOG_NOTICE, c2.log, None, "exiting");
+                std::process::exit(0);
+            }
+            if SIG_REOPEN.swap(false, Ordering::SeqCst) {
+                ngx_log_error!(NGX_LOG_NOTICE, c2.log, None, "reopening logs");
+                c2.reopen_files(None);
+            }
+            // ngx_process_events_and_timers
+            tokio::select! {
+                _ = notify.notified() => continue,
+                _ = tokio::time::sleep_until(timer) => {}
+            }
+            if data == 0 {
+                // ngx_cache_manager_process_handler: every path manager
                 let mut next: u64 = 60 * 60 * 1000;
                 for p in c2.paths.iter() {
                     let m = p.manager.borrow().clone();
@@ -511,33 +527,33 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
                         let d = p.data.borrow().clone();
                         if let Some(d) = d {
                             let n = m(&d);
-                            if n < next {
+                            if n <= next {
                                 next = n;
                             }
                         }
+                        crate::times::update();
                     }
-                    crate::times::update();
                 }
                 if next == 0 {
                     next = 1;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(next)).await;
-            }
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(60000)).await;
-            for p in c2.paths.iter() {
-                if SIG_TERMINATE.load(Ordering::SeqCst) || SIG_QUIT.load(Ordering::SeqCst) {
-                    break;
-                }
-                let l = p.loader.borrow().clone();
-                if let Some(l) = l {
-                    if let Some(d) = p.data.borrow().clone() {
-                        l(&d);
+                timer = tokio::time::Instant::now() + std::time::Duration::from_millis(next);
+            } else {
+                // ngx_cache_loader_process_handler: every path loader, once
+                for p in c2.paths.iter() {
+                    if SIG_TERMINATE.load(Ordering::SeqCst) || SIG_QUIT.load(Ordering::SeqCst) {
+                        break;
                     }
-                    crate::times::update();
+                    let l = p.loader.borrow().clone();
+                    if let Some(l) = l {
+                        if let Some(d) = p.data.borrow().clone() {
+                            l(&d);
+                        }
+                        crate::times::update();
+                    }
                 }
+                std::process::exit(0);
             }
-            std::process::exit(0);
         }
     });
     std::process::exit(0);
