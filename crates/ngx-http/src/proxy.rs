@@ -1002,11 +1002,7 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
     {
         let plcf = cell.borrow();
 
-        // The "if" blocks of rewrite.rs do not have a location (and proxy
-        // configuration) of their own yet, so a proxy_pass inside one
-        // lands on the enclosing location's; in C it cannot be a
-        // duplicate there.
-        if (plcf.upstream.is_some() || plcf.proxy_values.is_some()) && cf.cmd_type != crate::NGX_HTTP_LIF_CONF {
+        if plcf.upstream.is_some() || plcf.proxy_values.is_some() {
             return Err(msg("is duplicate"));
         }
     }
