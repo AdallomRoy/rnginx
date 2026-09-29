@@ -1001,11 +1001,14 @@ pub fn set_access(cf: &Conf, _cmd: &Command, slot: &mut Val<u32>) -> ConfResult 
     }
     let mut right: u32 = 0;
     let mut shift: u32;
+    // the owner has "rw" unless "user:" says otherwise
+    let mut user: u32 = 0o600;
     for v in &cf.args[1..] {
         let mut p: &[u8] = v;
         if p.starts_with(b"user:") {
             shift = 6;
             p = &p[5..];
+            user = 0;
         } else if p.starts_with(b"group:") {
             shift = 3;
             p = &p[6..];
@@ -1013,17 +1016,18 @@ pub fn set_access(cf: &Conf, _cmd: &Command, slot: &mut Val<u32>) -> ConfResult 
             shift = 0;
             p = &p[4..];
         } else {
-            return Err(msg("invalid value"));
+            return Err(cf.emerg(format_args!("invalid value \"{}\"", B(v))));
         }
         let mode = if p == b"rw" {
             6
         } else if p == b"r" {
             4
         } else {
-            return Err(msg("invalid value"));
+            return Err(cf.emerg(format_args!("invalid value \"{}\"", B(v))));
         };
         right |= mode << shift;
     }
+    right |= user;
     *slot = Val::set(right);
     Ok(())
 }
@@ -1040,18 +1044,24 @@ pub fn set_path(cf: &mut Conf, _cmd: &Command, slot: &mut Val<Rc<PathConf>>) -> 
     let name = cf.full_name(&name, false);
     let mut level = [0usize; 3];
     let mut n = 0;
+    let mut nlevels = 0;
     for (i, v) in cf.args.iter().skip(2).enumerate() {
         if i >= 3 {
             break;
         }
         let l = atoi(v);
         match l {
-            Some(l) if l == 1 || l == 2 => level[i] = l as usize,
+            Some(l) if l > 0 => level[i] = l as usize,
             _ => return Err(msg("invalid value")),
         }
         n += level[i] + 1;
+        nlevels = i + 1;
     }
-    let _ = n;
+    // path->len > 10 + i: the levels take at most the 10 digits of a
+    // temporary file name
+    if n > 10 + nlevels {
+        return Err(msg("invalid value"));
+    }
     let mut path = PathConf::new(name, level);
     path.conf_file = cf.conf_file_name();
     path.line = cf.conf_line();

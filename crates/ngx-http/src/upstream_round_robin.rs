@@ -518,7 +518,8 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
     // an upstream implicitly defined by proxy_pass, etc.
 
     if us.port.get() == 0 {
-        return Err(cf.emerg(format_args!("no port in upstream \"{}\" in {}:{}", B(&us.host), B(&us.file_name), us.line)));
+        ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "no port in upstream \"{}\" in {}:{}", B(&us.host), B(&us.file_name), us.line);
+        return Err(ConfError::Logged);
     }
 
     let mut u = Url::default();
@@ -527,7 +528,8 @@ pub fn init_round_robin(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
 
     if ngx_core::inet::inet_resolve_host(&mut u).is_err() {
         if let Some(err) = u.err {
-            return Err(cf.emerg(format_args!("{} in upstream \"{}\" in {}:{}", err, B(&us.host), B(&us.file_name), us.line)));
+            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "{} in upstream \"{}\" in {}:{}", err, B(&us.host), B(&us.file_name), us.line);
+            return Err(ConfError::Logged);
         }
         return Err(ConfError::Logged);
     }

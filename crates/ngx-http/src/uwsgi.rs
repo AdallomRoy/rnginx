@@ -962,6 +962,10 @@ fn finalize(r: &R, rc: i64) -> i64 {
 
     crate::upstream_cache::finalize(r, rc, None);
 
+    if rc != NGX_DECLINED {
+        r.connection.log.set_action(Some("sending to client"));
+    }
+
     rc
 }
 
@@ -972,10 +976,8 @@ fn finalize(r: &R, rc: i64) -> i64 {
 /// ngx_http_upstream_next (FT_ERROR, FT_TIMEOUT: the connection is closed
 /// without "close notify") or 500.
 async fn connect_peer(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, opts: &PeerOpts, ssl: Option<&SslSetup>) -> Result<UpstreamSock, ConnectError> {
+    // the action is "connecting to upstream" (ngx_http_upstream_connect)
     let log = r.connection.log.clone();
-    let action = log.action();
-
-    log.set_action(Some("connecting to upstream"));
 
     let name = u.pc.name.clone();
 
@@ -995,14 +997,8 @@ async fn connect_peer(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, opts: &P
     let (c, again) = match res {
         PeerConnect::Ok(c) => (c, false),
         PeerConnect::Again(c) => (c, true),
-        PeerConnect::Declined => {
-            log.set_action(action);
-            return Err(ConnectError::Error);
-        }
-        PeerConnect::Error => {
-            log.set_action(action);
-            return Err(ConnectError::Internal);
-        }
+        PeerConnect::Declined => return Err(ConnectError::Error),
+        PeerConnect::Error => return Err(ConnectError::Internal),
     };
 
     let pc = PeerConn { c: c.clone() };
@@ -1020,7 +1016,6 @@ async fn connect_peer(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, opts: &P
             // ngx_http_upstream_send_request_handler: c->write->timedout,
             // ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT)
             ngx_log_error!(NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-            log.set_action(action);
             pc.set_no_shutdown();
             return Err(ConnectError::Timeout);
         }
@@ -1040,8 +1035,6 @@ async fn connect_peer(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, opts: &P
             }
         }
     };
-
-    log.set_action(action);
 
     match rc {
         Ok(()) => Ok(UpstreamSock::Conn(pc)),
@@ -1217,6 +1210,8 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
     'retry: loop {
         // ngx_http_upstream_connect
 
+        r.connection.log.set_action(Some("connecting to upstream"));
+
         let rc = g.u.connect(&r);
 
         if rc == NGX_ERROR {
@@ -1248,7 +1243,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
 
                 tokio::select! {
                     res = connect => res,
-                    err = crate::proxy::client_closed(watch) => return crate::proxy::client_closed_request(&r, err),
+                    err = crate::proxy::client_closed(watch) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
                 }
             };
 
@@ -1300,20 +1295,14 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
             }
         }
 
-        let log = r.connection.log.clone();
-        let action = log.action();
-
-        log.set_action(Some("sending request to upstream"));
+        r.connection.log.set_action(Some("sending request to upstream"));
 
         let written = {
             let write = tokio::time::timeout(Duration::from_millis(send_timeout), sock.write_all(&wire));
 
             tokio::select! {
                 res = write => res,
-                err = crate::proxy::client_closed(watch) => {
-                    log.set_action(action);
-                    return crate::proxy::client_closed_request(&r, err);
-                }
+                err = crate::proxy::client_closed(watch) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
             }
         };
 
@@ -1330,8 +1319,6 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
                 Some(NGX_HTTP_UPSTREAM_FT_TIMEOUT)
             }
         };
-
-        log.set_action(action);
 
         if let Some(ft) = failure {
             match g.u.next(&r, ft) {
@@ -1374,7 +1361,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
                 Ok(()) => continue 'retry,
                 Err(st) => return next_failed(&r, &lcf, ft, st).await,
             },
-            Err(HeaderError::ClientClosed(err)) => return crate::proxy::client_closed_request(&r, err),
+            Err(HeaderError::ClientClosed(err)) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
         };
 
         // u->state->header_time
@@ -1617,14 +1604,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
     }
 
     // ngx_http_upstream_finalize_request
-
-    http_debug!(r, "finalize http upstream request: {}", body.rc);
-
-    finalize_request(&r, body.rc);
-
-    crate::upstream_cache::finalize(&r, body.rc, None);
-
-    body.rc
+    finalize(&r, body.rc)
 }
 
 /// The failure type of ngx_http_upstream_next_errors[] for a status.
@@ -1642,22 +1622,12 @@ fn status_failure(status: i64) -> u32 {
 }
 
 /// ngx_http_upstream_process_header: the response header read into
-/// u->buffer and parsed by u->process_header.
+/// u->buffer and parsed by u->process_header. The action stays "reading
+/// response header from upstream" while the response is processed.
 async fn read_header(r: &R, sock: &mut UpstreamSock, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>, flags: &mut HeaderFlags) -> Result<UpstreamResponse, HeaderError> {
-    let log = r.connection.log.clone();
-    let action = log.action();
-
-    log.set_action(Some("reading response header from upstream"));
-
-    let rc = read_header_inner(r, sock, buffer_size, read_timeout, watch, flags).await;
-
-    log.set_action(action);
-
-    rc
-}
-
-async fn read_header_inner(r: &R, sock: &mut UpstreamSock, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>, flags: &mut HeaderFlags) -> Result<UpstreamResponse, HeaderError> {
     http_debug!(r, "http upstream process header");
+
+    r.connection.log.set_action(Some("reading response header from upstream"));
 
     let mut u = UpstreamResponse::new();
 
@@ -2023,6 +1993,9 @@ async fn upgrade(r: &R, sock: UpstreamSock, u: &UpstreamResponse, read_timeout: 
 
     let _ = crate::proxy::upgrade_tunnel(r.clone(), sock, read_timeout).await;
 
+    // ngx_http_upstream_finalize_request(r, u, 0) when the tunnel is done
+    finalize(r, 0);
+
     NGX_DONE
 }
 
@@ -2062,20 +2035,25 @@ struct BodyResult {
 /// what ngx_http_upstream_process_request and
 /// ngx_http_upstream_finalize_request do at its end: the last buffer, or,
 /// for a body the upstream cut short, a flush and no keepalive.
+///
+/// The actions are those of C: "reading upstream" for the pipe
+/// (ngx_http_upstream_process_upstream) and the reads of an unbuffered
+/// response; the preread part of an unbuffered response is filtered while
+/// "reading response header from upstream" and sent while "sending to
+/// client" (ngx_http_upstream_process_non_buffered_downstream);
+/// ngx_http_upstream_finalize_request sends the end while "sending to
+/// client".
 async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length: i64, p: BodyParams, watch: Option<&ClientWatch>, cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
-    let log = r.connection.log.clone();
-    let action = log.action();
+    if p.buffering {
+        r.connection.log.set_action(Some("reading upstream"));
+    }
 
-    log.set_action(Some("reading upstream"));
-
-    let res = read_body(r, sock, u, length, &p, watch, cache).await;
-
-    log.set_action(action);
-
-    res
+    read_body(r, sock, u, length, &p, watch, cache).await
 }
 
 async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length: i64, p: &BodyParams, watch: Option<&ClientWatch>, cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
+    let log = r.connection.log.clone();
+
     let mut length = length;
 
     if !p.buffering {
@@ -2123,6 +2101,10 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
     let read_size = if p.buffering { 16384 } else { p.buffer_size.max(1) };
     let mut chunk = vec![0u8; read_size];
 
+    // the preread part of an unbuffered response is sent by
+    // ngx_http_upstream_process_non_buffered_downstream
+    let mut sending_preread = !p.buffering && preread;
+
     loop {
         // u->input_filter / p->input_filter
 
@@ -2147,6 +2129,11 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
         }
 
         data.clear();
+
+        if sending_preread {
+            log.set_action(Some("sending to client"));
+            sending_preread = false;
+        }
 
         if !out.is_empty() {
             if p.store {
@@ -2183,6 +2170,8 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
         if upstream_done || (eof && length == -1) {
             // ngx_http_upstream_finalize_request(r, u, 0): the last buffer
+            log.set_action(Some("sending to client"));
+
             let mut rc = NGX_OK;
 
             if downstream {
@@ -2207,6 +2196,8 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
             // ngx_http_upstream_finalize_request(r, u, NGX_HTTP_BAD_GATEWAY)
             // after the header
+            log.set_action(Some("sending to client"));
+
             return BodyResult { rc: crate::proxy::finalize_after_header(r, downstream).await, upstream_done, eof, data: captured };
         }
 
@@ -2234,6 +2225,9 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
             limit = limit.min(allowed as usize);
         }
 
+        // ngx_http_upstream_process_non_buffered_upstream, and the pipe
+        log.set_action(Some("reading upstream"));
+
         let res = {
             let read = tokio::time::timeout(Duration::from_millis(p.read_timeout), sock.read(&mut chunk[..limit]));
 
@@ -2257,6 +2251,8 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
                 // upstream->read->error, p->upstream_error: 502 after the
                 // header
+                log.set_action(Some("sending to client"));
+
                 return BodyResult { rc: crate::proxy::finalize_after_header(r, downstream).await, upstream_done, eof, data: captured };
             }
             Ok(Ok(0)) => eof = true,
