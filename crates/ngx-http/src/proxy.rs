@@ -4018,8 +4018,114 @@ mod tests {
 
     #[test]
     fn test_create_proxy_conf() {
-        let mut cf = Conf::default();
-        let _slot = create_loc_conf(&mut cf);
+        // ngx_http_proxy_create_loc_conf: unset until merged
+        let c = NgxHttpProxyLocConf::default();
+        assert!(!c.http_version.is_set());
+        assert!(!c.headers_source.is_set());
+        assert!(c.headers.is_none() && c.headers_cache.is_none());
+        assert!(c.proxy_values.is_none() && c.upstream.is_none());
+    }
+
+    fn vars_of(url: &[u8]) -> ProxyVars {
+        let (add, port) = if url.starts_with(b"https://") { (8, 443) } else { (7, 80) };
+        let mut u = ngx_core::inet::Url::new(&url[add..]);
+        u.default_port = port;
+        u.uri_part = true;
+        u.no_resolve = true;
+        ngx_core::inet::parse_url(&mut u).unwrap();
+        let mut v = ProxyVars { schema: url[..add].to_vec(), key_start: url[..add].to_vec(), ..Default::default() };
+        set_vars(&u, &mut v, url);
+        v
+    }
+
+    #[test]
+    fn test_set_vars() {
+        // ngx_http_proxy_set_vars: the port only when not the default
+        let v = vars_of(b"http://127.0.0.1:8080/x/");
+        assert_eq!(v.host_header, b"127.0.0.1:8080");
+        assert_eq!(v.port, b"8080");
+        assert_eq!(v.uri, b"/x/");
+        assert_eq!(v.key_start, b"http://127.0.0.1:8080");
+
+        let v = vars_of(b"http://backend");
+        assert_eq!(v.host_header, b"backend");
+        assert_eq!(v.port, b"80");
+        assert_eq!(v.uri, b"");
+
+        let v = vars_of(b"https://example.com:443/");
+        assert_eq!(v.host_header, b"example.com");
+        assert_eq!(v.port, b"443");
+
+        let v = vars_of(b"http://[::1]:8081");
+        assert_eq!(v.host_header, b"[::1]:8081");
+        assert_eq!(v.key_start, b"http://[::1]:8081");
+
+        let v = vars_of(b"http://unix:/tmp/s.sock:/p");
+        assert_eq!(v.host_header, b"localhost");
+        assert_eq!(v.port, b"");
+        assert_eq!(v.uri, b"/p");
+        assert_eq!(v.key_start, b"http://unix:/tmp/s.sock:");
+    }
+
+    #[test]
+    fn test_atoof() {
+        assert_eq!(atoof(b"0"), 0);
+        assert_eq!(atoof(b"12345"), 12345);
+        assert_eq!(atoof(b""), NGX_ERROR);
+        assert_eq!(atoof(b"12a"), NGX_ERROR);
+        assert_eq!(atoof(b" 1"), NGX_ERROR);
+        assert_eq!(atoof(b"99999999999999999999"), NGX_ERROR);
+    }
+
+    fn chain_of(parts: &[&[u8]], last: bool) -> ngx_core::buf::Chain {
+        let mut c = ngx_core::buf::Chain::new();
+        for p in parts {
+            c.push_back(ngx_core::buf::Buf::from_vec(p.to_vec()));
+        }
+        if last {
+            if let Some(b) = c.back_mut() {
+                b.last_buf = true;
+            } else {
+                let mut b = ngx_core::buf::Buf::special();
+                b.last_buf = true;
+                c.push_back(b);
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn test_body_output_filter() {
+        // ngx_http_proxy_body_output_filter: one chunk for the buffers
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &chain_of(&[b"abc", b"de"], false), true);
+        assert_eq!(out, b"5\r\nabcde\r\n");
+
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &chain_of(&[b"0123456789abcdef"], true), true);
+        assert_eq!(out, b"10\r\n0123456789abcdef\r\n0\r\n\r\n");
+
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &chain_of(&[], true), true);
+        assert_eq!(out, b"0\r\n\r\n");
+
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &chain_of(&[b"abc"], true), false);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn test_same_headers_source() {
+        let a: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>> = Val::set(Some(Rc::new(vec![(b"X".to_vec(), b"1".to_vec())])));
+        let b = a.clone();
+        let c: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>> = Val::set(Some(Rc::new(vec![(b"X".to_vec(), b"1".to_vec())])));
+        let null: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>> = Val::set(None);
+        let unset: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>> = Val::unset();
+
+        assert!(same_headers_source(&a, &b));
+        assert!(!same_headers_source(&a, &c));
+        assert!(same_headers_source(&null, &null.clone()));
+        assert!(!same_headers_source(&null, &unset));
     }
 }
 
