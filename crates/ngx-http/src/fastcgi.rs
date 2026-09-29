@@ -118,15 +118,10 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 }
 
 /// ngx_http_fastcgi_merge_loc_conf
-fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
+fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let p = conf_cell::<NgxHttpFastcgiLocConf>(prev).borrow();
     let mut c = conf_cell::<NgxHttpFastcgiLocConf>(conf).borrow_mut();
 
-    if c.pass.is_none() && c.pass_cv.is_none() {
-        c.pass = p.pass.clone();
-        c.pass_cv = p.pass_cv.clone();
-        c.upstream = p.upstream.clone();
-    }
     if c.params.is_none() {
         c.params = p.params.clone();
     }
@@ -149,6 +144,27 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
     if c.pass_headers.is_none() {
         c.pass_headers = p.pass_headers.clone();
     }
+
+    // the fastcgi_pass of the enclosing location is inherited by the "if"
+    // and "limit_except" blocks only (conf->upstream.upstream and
+    // fastcgi_lengths/values), not by nested locations
+    let clcf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
+
+    if clcf.borrow().noname && c.upstream.is_none() && c.pass_cv.is_none() {
+        c.upstream = p.upstream.clone();
+        c.pass = p.pass.clone();
+        c.pass_cv = p.pass_cv.clone();
+    }
+
+    let lmt_excpt_no_handler = {
+        let l = clcf.borrow();
+        l.lmt_excpt && l.handler.is_none()
+    };
+
+    if lmt_excpt_no_handler && (c.upstream.is_some() || c.pass_cv.is_some()) {
+        clcf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(fastcgi_handler(r))));
+    }
+
     c.next_upstream.merge(&p.next_upstream, FT_ERROR | FT_TIMEOUT);
     if *c.next_upstream.get() & FT_OFF != 0 {
         c.next_upstream = Val::set(FT_OFF);
@@ -790,7 +806,11 @@ async fn fastcgi_handler(r: R) -> i64 {
                     Err(_) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
                 }
             }
-            (None, None) => return NGX_DECLINED,
+            (None, None) => {
+                // ngx_http_upstream_init_request: no u->conf->upstream
+                ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
         }
     };
 
