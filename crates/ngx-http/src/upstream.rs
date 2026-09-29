@@ -1464,11 +1464,11 @@ pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, 
             // Populate the typed slot so header_filter's "if
             // ho.date.is_none()" branch does NOT then also emit
             // its own Date, which would give two Date lines.
-            let h = crate::request::TableElt::new(name, value);
+            let h = ho.add(name, value);
             ho.date = Some(h);
         }
         b"server" => {
-            let h = crate::request::TableElt::new(name, value);
+            let h = ho.add(name, value);
             ho.server = Some(h);
         }
         b"location" => {
@@ -1476,7 +1476,7 @@ pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, 
             ho.location = Some(h);
         }
         b"last-modified" => {
-            let h = crate::request::TableElt::new(name, value);
+            let h = ho.add(name, value);
             ho.last_modified = Some(h);
             // Also parse into last_modified_time so If-Range and
             // If-Modified-Since date comparisons work.
@@ -1485,7 +1485,7 @@ pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, 
             }
         }
         b"etag" => {
-            let h = crate::request::TableElt::new(name, value);
+            let h = ho.add(name, value);
             ho.etag = Some(h);
         }
         b"content-encoding" => {

@@ -417,7 +417,7 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
                     if let Some(old) = ho.last_modified.take() {
                         old.hash.set(0);
                     }
-                    let h = crate::request::TableElt::new(name, &v);
+                    let h = ho.add(name, &v);
                     ho.last_modified = Some(h);
                     ho.last_modified_time = ngx_core::parse::parse_http_time(&v).unwrap_or(-1);
                 }
@@ -426,7 +426,7 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
                     if let Some(old) = ho.etag.take() {
                         old.hash.set(0);
                     }
-                    let h = crate::request::TableElt::new(name, &v);
+                    let h = ho.add(name, &v);
                     ho.etag = Some(h);
                 }
                 // ngx_http_add_multi_header_lines

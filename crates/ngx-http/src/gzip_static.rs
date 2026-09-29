@@ -99,7 +99,11 @@ async fn handler(r: R) -> i64 {
     // filter may still decompress downstream. Matches C's
     // ngx_http_gzip_static_handler which sets the header unconditionally.
     let h = TableElt::new(b"Content-Encoding", b"gzip");
-    r.headers_out.borrow_mut().content_encoding = Some(h);
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        ho.headers.push(h.clone());
+        ho.content_encoding = Some(h);
+    }
     let _ = accept_gzip;
     r.allow_ranges.set(true);
     let rc = crate::core_rt::send_header(&r).await;

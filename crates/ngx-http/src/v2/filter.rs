@@ -307,6 +307,10 @@ async fn header_filter(r: &R) -> i64 {
         ]
     };
 
+    // those also in the list are skipped there and keep their hash, as
+    // the list entries C writes in place do ($sent_http_etag etc.)
+    let mut written: Vec<Header> = Vec::new();
+
     for (name, h) in typed {
         if let Some(h) = h {
             if h.hash.get() == 0 {
@@ -317,14 +321,14 @@ async fn header_filter(r: &R) -> i64 {
             pos.push(0);
             write_name(&mut pos, name);
             write_value(&mut pos, &value);
-            h.hash.set(0);
+            written.push(h);
         }
     }
 
     let headers: Vec<Header> = r.headers_out.borrow().headers.clone();
 
     for h in headers.iter() {
-        if h.hash.get() == 0 {
+        if h.hash.get() == 0 || written.iter().any(|w| Rc::ptr_eq(w, h)) {
             continue;
         }
 

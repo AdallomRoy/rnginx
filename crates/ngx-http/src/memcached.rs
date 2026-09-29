@@ -302,6 +302,7 @@ async fn handler(r: R) -> i64 {
         // _header). Enables gunzip_static-style downstream decoding.
         if gzip_flag != 0 && (flags & gzip_flag) != 0 {
             let h = crate::request::TableElt::new(b"Content-Encoding", b"gzip");
+            ho.headers.push(h.clone());
             ho.content_encoding = Some(h);
         }
     }

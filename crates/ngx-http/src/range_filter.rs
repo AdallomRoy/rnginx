@@ -159,7 +159,11 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
                     ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
                 }
                 let cr_header = TableElt::new(b"Content-Range", content_range_str.as_bytes());
-                r.headers_out.borrow_mut().content_range = Some(cr_header);
+                {
+                    let mut ho = r.headers_out.borrow_mut();
+                    ho.headers.push(cr_header.clone());
+                    ho.content_range = Some(cr_header);
+                }
 
                 // Remove Content-Length header from list (will be set by core)
                 if let Some(h) = r.headers_out.borrow_mut().content_length.take() {
@@ -240,6 +244,7 @@ async fn range_not_satisfiable(r: R, next: HeaderFilter) -> i64 {
         h.hash.set(0);
     }
     ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
+    ho.headers.push(cr_header.clone());
     ho.content_range = Some(cr_header);
     drop(ho);
 

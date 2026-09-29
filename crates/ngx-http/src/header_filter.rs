@@ -125,6 +125,10 @@ pub async fn header_filter(r: R) -> i64 {
         out.extend_from_slice(b"\r\n");
     }
     let mut content_type: Option<Vec<u8>> = None;
+    // The headers kept in typed slots are written here; the ones that are
+    // also in the headers list are skipped there, and keep their hash as
+    // the list entries C writes in place do ($sent_http_etag etc.)
+    let mut written: Vec<Header> = Vec::new();
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
@@ -132,6 +136,7 @@ pub async fn header_filter(r: R) -> i64 {
             out.extend_from_slice(b"Server: ");
             out.extend_from_slice(&sv.value.borrow());
             out.extend_from_slice(b"\r\n");
+            written.push(sv.clone());
         } else {
             match *cl.server_tokens {
                 NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
@@ -143,6 +148,7 @@ pub async fn header_filter(r: R) -> i64 {
             out.extend_from_slice(b"Date: ");
             out.extend_from_slice(&dt.value.borrow());
             out.extend_from_slice(b"\r\n");
+            written.push(dt.clone());
         } else {
             out.extend_from_slice(b"Date: ");
             out.extend_from_slice(ngx_core::times::cached_http_time().as_bytes());
@@ -167,14 +173,14 @@ pub async fn header_filter(r: R) -> i64 {
             out.extend_from_slice(b"Content-Range: ");
             out.extend_from_slice(&cr.value.borrow());
             out.extend_from_slice(b"\r\n");
-            cr.hash.set(0);
+            written.push(cr.clone());
         }
         if let Some(ce) = &ho.content_encoding {
             if ce.hash.get() != 0 {
                 out.extend_from_slice(b"Content-Encoding: ");
                 out.extend_from_slice(&ce.value.borrow());
                 out.extend_from_slice(b"\r\n");
-                ce.hash.set(0);
+                written.push(ce.clone());
             }
         }
         if let Some(lm) = &ho.last_modified {
@@ -182,7 +188,7 @@ pub async fn header_filter(r: R) -> i64 {
                 out.extend_from_slice(b"Last-Modified: ");
                 out.extend_from_slice(&lm.value.borrow());
                 out.extend_from_slice(b"\r\n");
-                lm.hash.set(0);
+                written.push(lm.clone());
             }
         } else if ho.last_modified_time != -1 {
             out.extend_from_slice(b"Last-Modified: ");
@@ -194,7 +200,7 @@ pub async fn header_filter(r: R) -> i64 {
                 out.extend_from_slice(b"ETag: ");
                 out.extend_from_slice(&et.value.borrow());
                 out.extend_from_slice(b"\r\n");
-                et.hash.set(0);
+                written.push(et.clone());
             }
         }
     }
@@ -282,7 +288,7 @@ pub async fn header_filter(r: R) -> i64 {
             out.extend_from_slice(b"Connection: close\r\n");
         }
         for h in ho.headers.iter() {
-            if h.hash.get() == 0 {
+            if h.hash.get() == 0 || written.iter().any(|w| Rc::ptr_eq(w, h)) {
                 continue;
             }
             out.extend_from_slice(&h.key);

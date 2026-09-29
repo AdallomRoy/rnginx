@@ -800,13 +800,15 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
                     ho.content_type_len = v.len();
                 }
                 b"content-encoding" => {
-                    ho.content_encoding = Some(crate::request::TableElt::new(k, v));
+                    let h = ho.add(k, v);
+                    ho.content_encoding = Some(h);
                 }
                 b"location" => {
                     ho.location = Some(crate::request::TableElt::new(k, v));
                 }
                 b"last-modified" => {
-                    ho.last_modified = Some(crate::request::TableElt::new(k, v));
+                    let h = ho.add(k, v);
+                    ho.last_modified = Some(h);
                     // Parse into last_modified_time so not_modified_filter
                     // can compare against If-Modified-Since / If-Unmodified-Since.
                     if let Some(t) = ngx_core::parse::parse_http_time(v) {
@@ -814,7 +816,8 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
                     }
                 }
                 b"etag" => {
-                    ho.etag = Some(crate::request::TableElt::new(k, v));
+                    let h = ho.add(k, v);
+                    ho.etag = Some(h);
                 }
                 // ngx_http_upstream_copy_multi_header_lines
                 b"cache-control" => {

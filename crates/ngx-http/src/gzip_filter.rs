@@ -264,7 +264,11 @@ async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     r.set_ctx(ctx_index(), GzipCtx::new(level));
     // Content-Encoding: gzip
     let ce = TableElt::new(b"Content-Encoding", b"gzip");
-    r.headers_out.borrow_mut().content_encoding = Some(ce);
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        ho.headers.push(ce.clone());
+        ho.content_encoding = Some(ce);
+    }
     // Remove Content-Length — output size unknown
     r.clear_content_length();
     // Weaken ETag
