@@ -1581,6 +1581,9 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
     // u->input_filter_init(): p->length, u->length
     let length = input_filter_init(&r, &resp);
 
+    // uwsgi_store is of the pipe of a buffered response
+    let store = store && buffering;
+
     let body = send_response_body(
         &r,
         &mut sock,
@@ -1604,7 +1607,43 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
     }
 
     // ngx_http_upstream_finalize_request
-    finalize(&r, body.rc)
+    let rc = finalize_body(&r, &body).await;
+
+    finalize(&r, rc)
+}
+
+/// The end of ngx_http_upstream_finalize_request after the header was sent,
+/// while "sending to client": the last buffer of a complete response; for
+/// an error of the upstream (rc >= NGX_HTTP_SPECIAL_RESPONSE) NGX_ERROR,
+/// with a flush and no keepalive; nothing more when the client connection
+/// failed (p->downstream_error) or for a header only response.
+async fn finalize_body(r: &R, body: &BodyResult) -> i64 {
+    r.connection.log.set_action(Some("sending to client"));
+
+    match body.end {
+        BodyEnd::Done => {
+            if r.header_only.get() || !body.downstream {
+                return NGX_OK;
+            }
+
+            // ngx_http_upstream_process_trailers: uwsgi passes none
+            crate::special_response::send_special(r, true).await
+        }
+
+        BodyEnd::UpstreamError => {
+            if r.header_only.get() || !body.downstream {
+                return NGX_ERROR;
+            }
+
+            r.keepalive.set(false);
+
+            crate::special_response::send_special(r, false).await
+        }
+
+        BodyEnd::Error => NGX_ERROR,
+
+        BodyEnd::Status(rc) => rc,
+    }
 }
 
 /// The failure type of ngx_http_upstream_next_errors[] for a status.
@@ -2017,32 +2056,45 @@ struct BodyParams {
     buffer_size: usize,
 }
 
+/// How the body of a response ended.
+enum BodyEnd {
+    /// p->upstream_done, or the end of a response without a length
+    /// (ngx_http_upstream_finalize_request(r, u, 0))
+    Done,
+    /// the upstream closed the connection early, timed out or failed: 502
+    /// or 504 after the header
+    UpstreamError,
+    /// the client connection failed and the response is not read for the
+    /// cache or uwsgi_store (NGX_ERROR)
+    Error,
+    /// the request is finalized with this status (499: the client closed
+    /// the connection)
+    Status(i64),
+}
+
 /// The end of a response body.
 struct BodyResult {
-    /// the rc ngx_http_upstream_finalize_request finalizes the request with
-    rc: i64,
+    end: BodyEnd,
     /// p->upstream_done (u->length reached 0)
     upstream_done: bool,
     /// p->upstream_eof: the upstream closed the connection
     eof: bool,
+    /// the body goes to the client (no p->downstream_error)
+    downstream: bool,
     /// the body, kept for uwsgi_store
     data: Vec<u8>,
 }
 
 /// ngx_http_upstream_send_response after the header is sent: the body read
 /// with ngx_event_pipe_copy_input_filter (buffered, with uwsgi_limit_rate)
-/// or ngx_http_upstream_non_buffered_filter and passed to the client, then
-/// what ngx_http_upstream_process_request and
-/// ngx_http_upstream_finalize_request do at its end: the last buffer, or,
-/// for a body the upstream cut short, a flush and no keepalive.
+/// or ngx_http_upstream_non_buffered_filter and passed to the client, up
+/// to what ngx_http_upstream_process_request finds at its end.
 ///
 /// The actions are those of C: "reading upstream" for the pipe
 /// (ngx_http_upstream_process_upstream) and the reads of an unbuffered
 /// response; the preread part of an unbuffered response is filtered while
 /// "reading response header from upstream" and sent while "sending to
-/// client" (ngx_http_upstream_process_non_buffered_downstream);
-/// ngx_http_upstream_finalize_request sends the end while "sending to
-/// client".
+/// client" (ngx_http_upstream_process_non_buffered_downstream).
 async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length: i64, p: BodyParams, watch: Option<&ClientWatch>, cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
     if p.buffering {
         r.connection.log.set_action(Some("reading upstream"));
@@ -2068,6 +2120,12 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
     let mut captured: Vec<u8> = Vec::new();
 
+    macro_rules! end {
+        ($end:expr) => {
+            return BodyResult { end: $end, upstream_done, eof, downstream, data: captured }
+        };
+    }
+
     // the preread part of the body in u->buffer, then what is read
     let mut data: Vec<u8> = u.buf[u.pos..].to_vec();
     let preread = !data.is_empty();
@@ -2078,13 +2136,8 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
     if !p.buffering && !preread && downstream {
         // ngx_http_send_special(r, NGX_HTTP_FLUSH): the header goes now
-        let mut b = Buf::special();
-        b.flush = true;
-        let mut chain = Chain::new();
-        chain.push_back(b);
-
-        if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
-            return BodyResult { rc: NGX_ERROR, upstream_done, eof, data: captured };
+        if crate::special_response::send_special(r, false).await == NGX_ERROR {
+            end!(BodyEnd::Error);
         }
     }
 
@@ -2155,11 +2208,11 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
                 if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
                     // p->downstream_error: the upstream is read to the end
                     // only for the cache or uwsgi_store
-                    if !p.capture {
-                        return BodyResult { rc: NGX_ERROR, upstream_done, eof, data: captured };
-                    }
-
                     downstream = false;
+
+                    if !p.capture {
+                        end!(BodyEnd::Error);
+                    }
                 }
             }
         }
@@ -2169,24 +2222,7 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
         }
 
         if upstream_done || (eof && length == -1) {
-            // ngx_http_upstream_finalize_request(r, u, 0): the last buffer
-            log.set_action(Some("sending to client"));
-
-            let mut rc = NGX_OK;
-
-            if downstream {
-                let mut b = Buf::special();
-                b.last_buf = r.is_main();
-                b.last_in_chain = true;
-                let mut chain = Chain::new();
-                chain.push_back(b);
-
-                if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
-                    rc = NGX_ERROR;
-                }
-            }
-
-            return BodyResult { rc, upstream_done, eof, data: captured };
+            end!(BodyEnd::Done);
         }
 
         if eof || timedout {
@@ -2194,18 +2230,14 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
                 ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
             }
 
-            // ngx_http_upstream_finalize_request(r, u, NGX_HTTP_BAD_GATEWAY)
-            // after the header
-            log.set_action(Some("sending to client"));
-
-            return BodyResult { rc: crate::proxy::finalize_after_header(r, downstream).await, upstream_done, eof, data: captured };
+            end!(BodyEnd::UpstreamError);
         }
 
         // p->limit_rate: the read is delayed by the time the last one
         // took at the rate, and limited to what the rate allows so far
         if delay > 0 {
             if !crate::proxy::sleep_or_client_closed(delay, watch).await {
-                return BodyResult { rc: crate::proxy::client_closed_request(r, 0), upstream_done, eof, data: captured };
+                end!(BodyEnd::Status(crate::proxy::client_closed_request(r, 0)));
             }
 
             delay = 0;
@@ -2233,9 +2265,7 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
 
             tokio::select! {
                 res = read => res,
-                err = crate::proxy::client_closed(watch) => {
-                    return BodyResult { rc: crate::proxy::client_closed_request(r, err), upstream_done, eof, data: captured };
-                }
+                err = crate::proxy::client_closed(watch) => end!(BodyEnd::Status(crate::proxy::client_closed_request(r, err))),
             }
         };
 
@@ -2249,11 +2279,8 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length:
                     ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
                 }
 
-                // upstream->read->error, p->upstream_error: 502 after the
-                // header
-                log.set_action(Some("sending to client"));
-
-                return BodyResult { rc: crate::proxy::finalize_after_header(r, downstream).await, upstream_done, eof, data: captured };
+                // upstream->read->error, p->upstream_error
+                end!(BodyEnd::UpstreamError);
             }
             Ok(Ok(0)) => eof = true,
             Ok(Ok(n)) => {
