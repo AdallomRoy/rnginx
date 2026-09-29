@@ -237,17 +237,21 @@ impl Cidr {
         }
     }
 
-    /// ngx_cidr_match for a single cidr.
+    /// ngx_cidr_match for a single cidr: an IPv4-mapped IPv6 address is
+    /// AF_INET, it matches IPv4 cidrs only.
     pub fn matches(&self, sa: &SockAddr) -> bool {
+        if let SockAddr::V6(a) = sa {
+            // IN6_IS_ADDR_V4MAPPED
+            if let Some(v4) = a.ip().to_ipv4_mapped() {
+                return match self {
+                    Cidr::V4 { addr, mask } => (u32::from(v4) & mask) == *addr,
+                    _ => false,
+                };
+            }
+        }
+
         match (self, sa) {
             (Cidr::V4 { addr, mask }, SockAddr::V4(a)) => (u32::from(*a.ip()) & mask) == *addr,
-            (Cidr::V4 { addr, mask }, SockAddr::V6(a)) => {
-                if let Some(v4) = a.ip().to_ipv4_mapped() {
-                    (u32::from(v4) & mask) == *addr
-                } else {
-                    false
-                }
-            }
             (Cidr::V6 { addr, mask }, SockAddr::V6(a)) => {
                 let o = a.ip().octets();
                 (0..16).all(|i| (o[i] & mask[i]) == addr[i])
@@ -761,6 +765,30 @@ mod tests {
         assert_eq!(parse_addr_port(b"[]"), None);
         assert_eq!(parse_addr_port(b",192.0.2.1"), None);
         assert_eq!(parse_addr_port(b"localhost:80"), None);
+    }
+
+    #[test]
+    fn cidr_match() {
+        let v4 = |s: &str| SockAddr::v4(s.parse().unwrap(), 0);
+        let v6 = |s: &str| SockAddr::v6(s.parse().unwrap(), 0);
+        let cidr = |s: &[u8]| match ptocidr(s) {
+            CidrParse::Ok(c) => c,
+            _ => panic!("cidr"),
+        };
+
+        assert!(cidr(b"10.0.0.0/8").matches(&v4("10.1.2.3")));
+        assert!(!cidr(b"10.0.0.0/8").matches(&v4("11.1.2.3")));
+        assert!(cidr(b"2001:db8::/32").matches(&v6("2001:db8::1")));
+        assert!(cidr(b"::/0").matches(&v6("::1")));
+
+        // an IPv4-mapped address is AF_INET in ngx_cidr_match
+        assert!(cidr(b"10.0.0.0/8").matches(&v6("::ffff:10.0.0.1")));
+        assert!(!cidr(b"::/0").matches(&v6("::ffff:10.0.0.1")));
+        assert!(!cidr(b"::ffff:0.0.0.0/96").matches(&v6("::ffff:10.0.0.1")));
+
+        assert!(!cidr(b"10.0.0.0/8").matches(&SockAddr::Unix(b"/tmp/x".to_vec())));
+        assert!(Cidr::Unix.matches(&SockAddr::Unix(b"/tmp/x".to_vec())));
+        assert!(!Cidr::Unix.matches(&v4("10.0.0.1")));
     }
 
     #[test]

@@ -511,7 +511,7 @@ fn debug_accepted_connection(c: &Connection, log: &Log) {
 
     let peer = c.sockaddr.borrow().clone();
 
-    if cidrs.iter().any(|ci| ci.matches(&peer)) {
+    if cidrs.iter().any(|ci| crate::event::debug_connection_match(ci, &peer)) {
         c.log.set_level(NGX_LOG_DEBUG_CONNECTION | NGX_LOG_DEBUG_ALL);
     }
 }

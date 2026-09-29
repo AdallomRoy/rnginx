@@ -79,6 +79,24 @@ pub fn debug_connection_cidrs() -> Vec<Cidr> {
     event_conf().map(|c| c.borrow().debug_connection.clone()).unwrap_or_default()
 }
 
+/// The test of a debug_connection cidr in ngx_debug_accepted_connection:
+/// the family of the address must be the one of the cidr, an IPv4-mapped
+/// IPv6 address is AF_INET6 there (unlike in ngx_cidr_match).
+pub fn debug_connection_match(cidr: &Cidr, sa: &crate::inet::SockAddr) -> bool {
+    use crate::inet::SockAddr;
+
+    match (cidr, sa) {
+        (Cidr::V6 { addr, mask }, SockAddr::V6(a)) => {
+            let s6_addr = a.ip().octets();
+            (0..16).all(|n| (s6_addr[n] & mask[n]) == addr[n])
+        }
+        (Cidr::Unix, SockAddr::Unix(_)) => true,
+        // AF_INET
+        (Cidr::V4 { addr, mask }, SockAddr::V4(a)) => (u32::from(*a.ip()) & mask) == *addr,
+        _ => false,
+    }
+}
+
 // --- events {} block -------------------------------------------------------
 
 fn events_block(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
@@ -675,7 +693,7 @@ async fn accept_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                 let cidrs = debug_connection_cidrs();
                 if !cidrs.is_empty() {
                     let peer = c.sockaddr.borrow().clone();
-                    if cidrs.iter().any(|ci| ci.matches(&peer)) {
+                    if cidrs.iter().any(|ci| debug_connection_match(ci, &peer)) {
                         c.log.set_level(NGX_LOG_DEBUG_CONNECTION | NGX_LOG_DEBUG_ALL);
                     }
                 }
