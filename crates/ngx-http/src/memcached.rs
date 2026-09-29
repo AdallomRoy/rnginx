@@ -253,8 +253,13 @@ async fn handler(r: R) -> i64 {
         break (UpstreamConn { sock: stream, requests: requests + 1, start_time }, buf);
     };
 
-    // the response was read in full: u->keepalive
-    let complete = buf.ends_with(b"END\r\n");
+    // u->keepalive: set by ngx_http_memcached_process_header for "END"
+    // (not found), and by ngx_http_memcached_filter at the end of a value,
+    // which does not run for a header only request: its connection is
+    // closed, as the value is not read
+    // (r->header_only, set for HEAD by the header filter)
+    let header_only = r.header_only.get() || r.method.get() == NGX_HTTP_HEAD;
+    let complete = buf.ends_with(b"END\r\n") && !(header_only && buf.starts_with(b"VALUE "));
     u.finalize(&r, Some(conn), complete, true);
 
     if buf.starts_with(b"END\r\n") {
