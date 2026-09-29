@@ -231,6 +231,11 @@ impl UpstreamCacheLocConf for NgxHttpUwsgiLocConf {
 
 /// ngx_http_uwsgi_create_loc_conf
 fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
+    make_slot(new_loc_conf())
+}
+
+/// The location configuration of ngx_http_uwsgi_create_loc_conf.
+fn new_loc_conf() -> NgxHttpUwsgiLocConf {
     // set by ngx_pcalloc(): bufs.num = 0, ignore_headers = 0,
     // next_upstream = 0, cache_zone = NULL, cache_use_stale = 0,
     // cache_methods = 0, temp_path = NULL, hide_headers_hash = { NULL, 0 },
@@ -240,7 +245,7 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     //
     // "uwsgi_cyclic_temp_file" is disabled: upstream.cyclic_temp_file = 0,
     // upstream.change_buffering = 1, upstream.module = "uwsgi"
-    make_slot(NgxHttpUwsgiLocConf {
+    NgxHttpUwsgiLocConf {
         upstream: None,
         store: Val::unset(),
         store_values: None,
@@ -292,7 +297,7 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
         ssl_trusted_certificate: Val::unset(),
         ssl_crl: Val::unset(),
         ssl_conf_commands: Val::unset(),
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +462,57 @@ fn header_hash_key(name: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// The start of the packet: modifier1, the 16-bit little-endian size of
+/// the data, modifier2.
+fn packet_header(modifier1: i64, len: usize, modifier2: i64) -> [u8; 4] {
+    [modifier1 as u8, (len & 0xff) as u8, ((len >> 8) & 0xff) as u8, modifier2 as u8]
+}
+
+/// The request headers as params: ngx_http_link_multi_headers() links the
+/// headers of a name (compared case-insensitively) to the first one, which
+/// is sent with the values of all, joined with "; " for "Cookie" and ", "
+/// otherwise; a header is not sent when `hidden` says so of its name in
+/// lower case with '-' as '_' (the params hash).
+fn header_params(headers: &[Header], hidden: &dyn Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+
+    // the headers of the params hash, and the linked ones
+    let mut ignored = vec![false; headers.len()];
+
+    for i in 0..headers.len() {
+        if ignored[i] {
+            continue;
+        }
+
+        let h = &headers[i];
+
+        if hidden(&header_hash_key(&h.key)) {
+            ignored[i] = true;
+            continue;
+        }
+
+        let mut value = h.value.borrow().clone();
+
+        let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
+
+        for j in i + 1..headers.len() {
+            let hn = &headers[j];
+
+            if hn.key.len() == h.key.len() && hn.key.eq_ignore_ascii_case(&h.key) {
+                ignored[j] = true;
+
+                value.push(sep);
+                value.push(b' ');
+                value.extend_from_slice(&hn.value.borrow());
+            }
+        }
+
+        out.push((header_param_key(&h.key), value));
+    }
+
+    out
+}
+
 /// A param as the packet has it: the 16-bit little-endian length and the
 /// key, the 16-bit little-endian length and the value.
 fn push_param(b: &mut Vec<u8>, key: &[u8], value: &[u8]) {
@@ -506,52 +562,18 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
 
     len += params_len;
 
-    // the request headers: ngx_http_link_multi_headers() links the headers
-    // of a name to the first one; the ignored ones are those of the params
-    // hash, and the linked ones
-
-    let mut header_params: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    if *uwcf.pass_request_headers {
+    let header_params = if *uwcf.pass_request_headers {
         let headers = r.headers_in.borrow().headers.clone();
-        let mut ignored = vec![false; headers.len()];
 
-        for i in 0..headers.len() {
-            if ignored[i] {
-                continue;
-            }
+        let hidden = |lowcase_key: &[u8]| params.number != 0 && params.hash.find(hash_key(lowcase_key), lowcase_key).is_some();
 
-            let h = &headers[i];
+        header_params(&headers, &hidden)
+    } else {
+        Vec::new()
+    };
 
-            if params.number != 0 {
-                let lowcase_key = header_hash_key(&h.key);
-
-                if params.hash.find(hash_key(&lowcase_key), &lowcase_key).is_some() {
-                    ignored[i] = true;
-                    continue;
-                }
-            }
-
-            let mut value = h.value.borrow().clone();
-
-            let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
-
-            for j in i + 1..headers.len() {
-                let hn = &headers[j];
-
-                if hn.key.len() == h.key.len() && hn.key.eq_ignore_ascii_case(&h.key) {
-                    ignored[j] = true;
-
-                    value.push(sep);
-                    value.push(b' ');
-                    value.extend_from_slice(&hn.value.borrow());
-                }
-            }
-
-            len += 2 + "HTTP_".len() + h.key.len() + 2 + value.len();
-
-            header_params.push((header_param_key(&h.key), value));
-        }
+    for (key, value) in header_params.iter() {
+        len += 2 + key.len() + 2 + value.len();
     }
 
     let uwsgi_string = uwcf.uwsgi_string.get();
@@ -565,10 +587,7 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
 
     let mut b: Vec<u8> = Vec::with_capacity(len + 4);
 
-    b.push(*uwcf.modifier1 as u8);
-    b.push((len & 0xff) as u8);
-    b.push(((len >> 8) & 0xff) as u8);
-    b.push(*uwcf.modifier2 as u8);
+    b.extend_from_slice(&packet_header(*uwcf.modifier1, len, *uwcf.modifier2));
 
     // the values of the params (the lengths were those of these values:
     // "uwsgi request length mismatch" cannot happen)
@@ -793,9 +812,7 @@ fn process_header(r: &R, u: &mut UpstreamResponse, st: &mut HeaderParse, flags: 
 
                     // ngx_atoi(status_line->data, 3): the value is
                     // null-terminated
-                    let status = if status_line.len() >= 3 { ngx_core::string::atoi(&status_line[..3]) } else { None };
-
-                    let status = match status {
+                    let status = match cgi_status(&status_line) {
                         Some(s) => s,
                         None => {
                             ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid status \"{}\"", B(&status_line));
@@ -902,13 +919,30 @@ fn upstream_process_accel(r: &R, h: &Header, flags: &mut HeaderFlags) {
 fn input_filter_init(r: &R, u: &UpstreamResponse) -> i64 {
     http_debug!(r, "http uwsgi filter init s:{} l:{}", u.status_n, u.content_length_n);
 
-    if u.status_n == NGX_HTTP_NO_CONTENT || u.status_n == NGX_HTTP_NOT_MODIFIED {
+    input_length(u.status_n, r.method.get() == NGX_HTTP_HEAD, u.content_length_n)
+}
+
+/// The length of ngx_http_uwsgi_input_filter_init: none for 204 and 304,
+/// up to the end of the connection for HEAD, else the "Content-Length"
+/// (-1 if none).
+fn input_length(status_n: i64, head: bool, content_length_n: i64) -> i64 {
+    if status_n == NGX_HTTP_NO_CONTENT || status_n == NGX_HTTP_NOT_MODIFIED {
         0
-    } else if r.method.get() == NGX_HTTP_HEAD {
+    } else if head {
         -1
     } else {
-        u.content_length_n
+        content_length_n
     }
+}
+
+/// The status of a "Status" header: ngx_atoi() of its first 3 characters
+/// (the value is null-terminated: a shorter one is invalid).
+fn cgi_status(value: &[u8]) -> Option<i64> {
+    if value.len() < 3 {
+        return None;
+    }
+
+    ngx_core::string::atoi(&value[..3])
 }
 
 // ngx_http_uwsgi_abort_request is not ported: ngx_http_upstream.c never
@@ -1744,6 +1778,57 @@ enum Processed {
 /// before an X-Accel-Redirect.
 const REDIRECT_HEADERS: &[&[u8]] = &[b"content-type", b"set-cookie", b"content-disposition", b"cache-control", b"expires", b"accept-ranges"];
 
+/// The charset of ngx_http_upstream_copy_content_type: the length of the
+/// type before the ";" of a "charset=" parameter, and the charset without
+/// quotes. As the C loop does, the character after the spaces that follow
+/// a ";" is not looked at as a ";" again.
+fn content_type_charset(value: &[u8]) -> Option<(usize, Vec<u8>)> {
+    let mut p = 0;
+
+    while p < value.len() {
+        if value[p] != b';' {
+            p += 1;
+            continue;
+        }
+
+        let last = p;
+
+        p += 1;
+
+        while p < value.len() && value[p] == b' ' {
+            p += 1;
+        }
+
+        if p == value.len() {
+            return None;
+        }
+
+        if value.len() - p < 8 || !value[p..p + 8].eq_ignore_ascii_case(b"charset=") {
+            // the p++ of the for loop
+            p += 1;
+            continue;
+        }
+
+        p += 8;
+
+        if p < value.len() && value[p] == b'"' {
+            p += 1;
+        }
+
+        let mut end = value.len();
+
+        if end > p && value[end - 1] == b'"' {
+            end -= 1;
+        }
+
+        let charset = if end > p { value[p..end].to_vec() } else { Vec::new() };
+
+        return Some((last, charset));
+    }
+
+    None
+}
+
 /// The copy handlers of ngx_http_upstream_headers_in[] (of a module
 /// without u->rewrite_redirect and u->rewrite_cookie), and
 /// ngx_http_upstream_copy_header_line for the other headers: the header
@@ -1760,47 +1845,9 @@ fn copy_header(r: &R, u: &UpstreamResponse, h: &Header, force_ranges: bool) {
             ho.content_type = value.clone();
             ho.content_type_lowcase = None;
 
-            let mut p = 0;
-
-            while p < value.len() {
-                if value[p] != b';' {
-                    p += 1;
-                    continue;
-                }
-
-                let last = p;
-
-                p += 1;
-
-                while p < value.len() && value[p] == b' ' {
-                    p += 1;
-                }
-
-                if p == value.len() {
-                    return;
-                }
-
-                if value.len() - p < 8 || !value[p..p + 8].eq_ignore_ascii_case(b"charset=") {
-                    continue;
-                }
-
-                p += 8;
-
-                ho.content_type_len = last;
-
-                if p < value.len() && value[p] == b'"' {
-                    p += 1;
-                }
-
-                let mut end = value.len();
-
-                if end > p && value[end - 1] == b'"' {
-                    end -= 1;
-                }
-
-                ho.charset = if end > p { value[p..end].to_vec() } else { Vec::new() };
-
-                return;
+            if let Some((len, charset)) = content_type_charset(&value) {
+                ho.content_type_len = len;
+                ho.charset = charset;
             }
         }
 
@@ -2675,18 +2722,7 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
 /// the HTTP_* ones go to the hash (the request headers of these names are
 /// not sent), and the params with a value are compiled.
 fn init_params(cf: &mut Conf, params_source: Option<&Rc<Vec<ParamSource>>>, default_params: &[(&[u8], &[u8])]) -> Result<Rc<UwsgiParams>, ConfError> {
-    let mut src: Vec<ParamSource> = match params_source {
-        Some(s) => s.as_ref().clone(),
-        None => Vec::new(),
-    };
-
-    for (key, value) in default_params {
-        if src.iter().any(|s| s.key.eq_ignore_ascii_case(key)) {
-            continue;
-        }
-
-        src.push(ParamSource { key: key.to_vec(), value: value.to_vec(), skip_empty: true });
-    }
+    let src = merge_params(params_source.map(|s| s.as_slice()).unwrap_or(&[]), default_params);
 
     let mut headers_names: Vec<HashKey<()>> = Vec::new();
     let mut params: Vec<UwsgiParam> = Vec::new();
@@ -2726,6 +2762,23 @@ fn init_params(cf: &mut Conf, params_source: Option<&Rc<Vec<ParamSource>>>, defa
     Ok(Rc::new(UwsgiParams { flushes, params, number, hash }))
 }
 
+/// params_merged of ngx_http_uwsgi_init_params: the params of uwsgi_param,
+/// then the default params of names they do not have (compared
+/// case-insensitively), sent only if not empty.
+fn merge_params(source: &[ParamSource], default_params: &[(&[u8], &[u8])]) -> Vec<ParamSource> {
+    let mut src: Vec<ParamSource> = source.to_vec();
+
+    for (key, value) in default_params {
+        if src.iter().any(|s| s.key.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+
+        src.push(ParamSource { key: key.to_vec(), value: value.to_vec(), skip_empty: true });
+    }
+
+    src
+}
+
 /// Two lists of upstream.hide_headers or pass_headers are the same one
 /// (both NGX_CONF_UNSET_PTR, or the same array).
 fn same_list(a: &Val<Rc<Vec<Vec<u8>>>>, b: &Val<Rc<Vec<Vec<u8>>>>) -> bool {
@@ -2734,6 +2787,34 @@ fn same_list(a: &Val<Rc<Vec<Vec<u8>>>>, b: &Val<Rc<Vec<Vec<u8>>>>) -> bool {
         (Some(x), Some(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// The names of the hide headers hash: the default hide headers, those of
+/// uwsgi_hide_header not among them, then for each uwsgi_pass_header the
+/// first of them of its name removed (the names compare
+/// case-insensitively).
+fn hide_headers_names(default_hide_headers: &[&[u8]], hide: &[Vec<u8>], pass: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    // None for the names of uwsgi_pass_header (key.data = NULL)
+    let mut hide_headers: Vec<Option<Vec<u8>>> = default_hide_headers.iter().map(|h| Some(h.to_vec())).collect();
+
+    for h in hide.iter() {
+        if hide_headers.iter().flatten().any(|k| k.eq_ignore_ascii_case(h)) {
+            continue;
+        }
+
+        hide_headers.push(Some(h.clone()));
+    }
+
+    for h in pass.iter() {
+        for k in hide_headers.iter_mut() {
+            if k.as_ref().is_some_and(|k| k.eq_ignore_ascii_case(h)) {
+                *k = None;
+                break;
+            }
+        }
+    }
+
+    hide_headers.into_iter().flatten().collect()
 }
 
 /// ngx_http_upstream_hide_headers_hash: the default hide headers and those
@@ -2759,31 +2840,13 @@ fn hide_headers_hash(cf: &mut Conf, conf: &mut NgxHttpUwsgiLocConf, prev: &mut N
         }
     }
 
-    // the names, None for those of uwsgi_pass_header (key.data = NULL)
-    let mut hide_headers: Vec<Option<Vec<u8>>> = default_hide_headers.iter().map(|h| Some(h.to_vec())).collect();
+    let hide = conf.hide_headers.as_option().map(|l| l.as_slice()).unwrap_or(&[]);
+    let pass = conf.pass_headers.as_option().map(|l| l.as_slice()).unwrap_or(&[]);
 
-    if let Some(hh) = conf.hide_headers.as_option() {
-        for h in hh.iter() {
-            if hide_headers.iter().flatten().any(|k| k.eq_ignore_ascii_case(h)) {
-                continue;
-            }
-
-            hide_headers.push(Some(h.clone()));
-        }
-    }
-
-    if let Some(ph) = conf.pass_headers.as_option() {
-        for h in ph.iter() {
-            for k in hide_headers.iter_mut() {
-                if k.as_ref().is_some_and(|k| k.eq_ignore_ascii_case(h)) {
-                    *k = None;
-                    break;
-                }
-            }
-        }
-    }
-
-    let names: Vec<HashKey<()>> = hide_headers.into_iter().flatten().map(|k| HashKey { key_hash: hash_key_lc(&k), key: k.to_ascii_lowercase(), value: () }).collect();
+    let names: Vec<HashKey<()>> = hide_headers_names(default_hide_headers, hide, pass)
+        .into_iter()
+        .map(|k| HashKey { key_hash: hash_key_lc(&k), key: k.to_ascii_lowercase(), value: () })
+        .collect();
 
     let hinit = HashInit { name: "uwsgi_hide_headers_hash", max_size: 512, bucket_size: 64, log: &cf.log };
 
@@ -3417,4 +3480,159 @@ pub fn uwsgi_module() -> ModuleDef {
     };
 
     http_module_def("ngx_http_uwsgi_module", def, commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_packet_header() {
+        // modifier1, the size little-endian, modifier2
+        assert_eq!(packet_header(5, 0x1234, 255), [5, 0x34, 0x12, 255]);
+        assert_eq!(packet_header(0, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(packet_header(0, 65535, 0), [0, 0xff, 0xff, 0]);
+    }
+
+    #[test]
+    fn test_push_param() {
+        let mut b = Vec::new();
+        push_param(&mut b, b"AB", b"xyz");
+        assert_eq!(b, b"\x02\x00AB\x03\x00xyz");
+
+        // 16-bit little-endian lengths
+        let key = vec![b'K'; 300];
+        let mut b = Vec::new();
+        push_param(&mut b, &key, b"");
+        assert_eq!(&b[..2], &[44, 1]);
+        assert_eq!(&b[302..], &[0, 0]);
+    }
+
+    #[test]
+    fn test_header_keys() {
+        // "HTTP_" and the name in upper case with '-' as '_', other bytes
+        // as they are
+        assert_eq!(header_param_key(b"x-foo.Bar"), b"HTTP_X_FOO.BAR");
+        assert_eq!(header_param_key(b"Cookie"), b"HTTP_COOKIE");
+
+        // the params hash: lower case, '-' as '_'
+        assert_eq!(header_hash_key(b"X-Foo_Bar"), b"x_foo_bar");
+    }
+
+    #[test]
+    fn test_header_params() {
+        let headers = vec![
+            TableElt::new(b"Host", b"a"),
+            TableElt::new(b"Cookie", b"a=1"),
+            TableElt::new(b"X-Foo", b"1"),
+            TableElt::new(b"cookie", b"b=2"),
+            TableElt::new(b"X-Blah", b"hidden"),
+            TableElt::new(b"x-foo", b"2"),
+            TableElt::new(b"X-blah", b"hidden too"),
+        ];
+
+        let hidden = |k: &[u8]| k == b"x_blah";
+
+        let params = header_params(&headers, &hidden);
+
+        // the headers of a name are sent as the first one, "; " joins
+        // cookies and ", " the others; those of the hash are not sent
+        assert_eq!(
+            params,
+            vec![
+                (b"HTTP_HOST".to_vec(), b"a".to_vec()),
+                (b"HTTP_COOKIE".to_vec(), b"a=1; b=2".to_vec()),
+                (b"HTTP_X_FOO".to_vec(), b"1, 2".to_vec()),
+            ]
+        );
+
+        let none = |_: &[u8]| false;
+        assert_eq!(header_params(&headers, &none).len(), 4);
+    }
+
+    #[test]
+    fn test_cgi_status() {
+        assert_eq!(cgi_status(b"200 OK"), Some(200));
+        assert_eq!(cgi_status(b"404"), Some(404));
+        // only the first 3 characters count
+        assert_eq!(cgi_status(b"2000"), Some(200));
+        // shorter than 3, or not digits: "upstream sent invalid status"
+        assert_eq!(cgi_status(b"20"), None);
+        assert_eq!(cgi_status(b"abc"), None);
+        assert_eq!(cgi_status(b" 200"), None);
+    }
+
+    #[test]
+    fn test_input_length() {
+        assert_eq!(input_length(204, false, 5), 0);
+        assert_eq!(input_length(304, true, 5), 0);
+        // HEAD: up to the end of the connection
+        assert_eq!(input_length(200, true, 5), -1);
+        assert_eq!(input_length(200, false, 5), 5);
+        assert_eq!(input_length(200, false, -1), -1);
+    }
+
+    #[test]
+    fn test_content_type_charset() {
+        assert_eq!(content_type_charset(b"text/html; charset=utf-8"), Some((9, b"utf-8".to_vec())));
+        assert_eq!(content_type_charset(b"text/html;charset=\"koi8-r\""), Some((9, b"koi8-r".to_vec())));
+        assert_eq!(content_type_charset(b"text/html; CHARSET=x"), Some((9, b"x".to_vec())));
+        assert_eq!(content_type_charset(b"text/html; foo=bar"), None);
+        assert_eq!(content_type_charset(b"text/html;   "), None);
+        assert_eq!(content_type_charset(b"text/plain"), None);
+        // the ";" after another parameter is found
+        assert_eq!(content_type_charset(b"a; x; charset=y"), Some((4, b"y".to_vec())));
+        // the character after the spaces is not looked at as a ";"
+        assert_eq!(content_type_charset(b"text/html; ;charset=x"), None);
+    }
+
+    #[test]
+    fn test_merge_params() {
+        let source = vec![ParamSource { key: b"http_host".to_vec(), value: b"override".to_vec(), skip_empty: false }];
+
+        let merged = merge_params(&source, UWSGI_CACHE_HEADERS);
+
+        // uwsgi_param first, then the defaults it does not set
+        assert_eq!(merged.len(), UWSGI_CACHE_HEADERS.len());
+        assert_eq!(merged[0].key, b"http_host");
+        assert!(!merged[0].skip_empty);
+        assert_eq!(merged[1].key, b"HTTP_IF_MODIFIED_SINCE");
+        assert!(merged[1..].iter().all(|p| p.skip_empty));
+
+        let merged = merge_params(&[], UWSGI_HEADERS);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value, b"$host$is_request_port$request_port");
+    }
+
+    #[test]
+    fn test_hide_headers_names() {
+        let hide = vec![b"X-Other".to_vec(), b"x-accel-expires".to_vec()];
+        let pass = vec![b"X-Accel-Charset".to_vec(), b"X-Unknown".to_vec()];
+
+        let names = hide_headers_names(UWSGI_HIDE_HEADERS, &hide, &pass);
+
+        assert_eq!(names, vec![b"X-Accel-Expires".to_vec(), b"X-Accel-Redirect".to_vec(), b"X-Accel-Limit-Rate".to_vec(), b"X-Accel-Buffering".to_vec(), b"X-Other".to_vec()]);
+    }
+
+    #[test]
+    fn test_status_failure() {
+        assert_eq!(status_failure(500), NGX_HTTP_UPSTREAM_FT_HTTP_500);
+        assert_eq!(status_failure(404), NGX_HTTP_UPSTREAM_FT_HTTP_404);
+        assert_eq!(status_failure(429), NGX_HTTP_UPSTREAM_FT_HTTP_429);
+        assert_eq!(status_failure(501), 0);
+    }
+
+    #[test]
+    fn test_new_loc_conf_unset() {
+        // ngx_http_uwsgi_create_loc_conf: all unset until merged
+        let c = new_loc_conf();
+
+        assert!(!c.modifier1.is_set() && !c.modifier2.is_set());
+        assert!(!c.store.is_set() && !c.buffering.is_set());
+        assert!(c.params_source.is_none() && c.params.is_none());
+        assert!(!c.local.is_set() && !c.hide_headers.is_set());
+        assert_eq!(c.next_upstream, 0);
+        assert_eq!(c.bufs.num, 0);
+        assert!(!c.ssl);
+    }
 }
