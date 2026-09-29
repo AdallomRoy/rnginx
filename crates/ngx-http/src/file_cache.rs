@@ -1816,10 +1816,11 @@ impl Drop for CacheTempFile {
 }
 
 impl CacheTempFile {
-    /// ngx_create_temp_file(&p->temp_file->file, path, r->pool, 1, 0, 0600)
-    /// with file.name preset to the cache file name when the cache does not
-    /// use the temp path.
-    pub fn create(r: &R, temp_path: Option<&PathConf>, cache_file: Option<&[u8]>) -> Result<CacheTempFile, ()> {
+    /// ngx_create_temp_file(&p->temp_file->file, path, r->pool, 1, 0, 0600):
+    /// in the temp path of the module with its levels, or, with file.name
+    /// preset to the cache file name when the cache does not use the temp
+    /// path, next to it ("name.NNNNNNNNNN").
+    pub fn create(r: &R, path: &PathConf, cache_file: Option<&[u8]>) -> Result<CacheTempFile, ()> {
         let log = &r.connection.log;
 
         let stats = ngx_core::connection::stats();
@@ -1827,15 +1828,14 @@ impl CacheTempFile {
         let mut n = stats.temp_number.fetch_add(1, Ordering::Relaxed) as u32;
 
         loop {
-            let name = match (cache_file, temp_path) {
-                (Some(prefix), _) => {
+            let name = match cache_file {
+                Some(prefix) => {
                     let mut name = prefix.to_vec();
                     name.push(b'.');
                     name.extend_from_slice(format!("{:010}", n).as_bytes());
                     name
                 }
-                (None, Some(path)) => path.hashed_filename(format!("{:010}", n).as_bytes()),
-                (None, None) => return Err(()),
+                None => path.hashed_filename(format!("{:010}", n).as_bytes()),
             };
 
             ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "hashed path: {}", B(&name));
@@ -1851,21 +1851,13 @@ impl CacheTempFile {
                     continue;
                 }
                 Err(err) => {
-                    if (err == libc::ENOENT || err == libc::ENOTDIR) && cache_file.is_none() {
-                        // ngx_create_path(): the level directories
-                        if let Some(path) = temp_path {
-                            if create_path(&name, path, log).is_ok() {
-                                continue;
-                            }
-                        }
-                    } else if err == libc::ENOENT && cache_file.is_some() {
-                        if create_full_path(&name, dir_access(NGX_FILE_OWNER_ACCESS)).is_ok() {
-                            continue;
-                        }
+                    if path.level[0] == 0 || err != libc::ENOENT {
+                        ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "open() \"{}\" failed", B(&name));
+                        return Err(());
                     }
 
-                    ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "open() \"{}\" failed", B(&name));
-                    return Err(());
+                    // ngx_create_path(): the level directories
+                    create_path(&name, path, log)?;
                 }
             }
         }

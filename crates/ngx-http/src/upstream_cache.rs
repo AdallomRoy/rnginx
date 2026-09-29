@@ -1394,15 +1394,21 @@ impl CacheWriter {
     /// the cache does not use the temp path; the header (`header` and the
     /// response header as the upstream sent it) written to it.
     pub fn new(r: &R, temp_path: Option<&ngx_core::conf::PathConf>, header: &[u8], raw_header: &[u8]) -> Option<CacheWriter> {
-        let (use_temp_path, file_name) = match cache_of(r) {
+        let (file_cache, file_name) = match cache_of(r) {
             Some(c) => {
                 let c = c.borrow();
-                (c.file_cache.as_ref().map(|fc| fc.use_temp_path).unwrap_or(true), c.file_name.clone())
+                (c.file_cache.clone()?, c.file_name.clone())
             }
             None => return None,
         };
 
-        let tf = if use_temp_path { CacheTempFile::create(r, temp_path, None) } else { CacheTempFile::create(r, None, Some(&file_name)) };
+        // p->temp_file->path: u->conf->temp_path, or the path of the cache
+        // with file.name the cache file name
+        let tf = if file_cache.use_temp_path {
+            CacheTempFile::create(r, temp_path?, None)
+        } else {
+            CacheTempFile::create(r, &file_cache.path, Some(&file_name))
+        };
 
         let mut tf = tf.ok()?;
 
