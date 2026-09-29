@@ -26,7 +26,7 @@ use crate::request::*;
 use crate::upstream::*;
 use crate::variables::VarDef;
 use crate::get_loc_conf;
-use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, NGX_HTTP_BAD_GATEWAY, NGX_HTTP_OK, NGX_HTTP_HEAD, HttpModuleDef, http_module_def};
+use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, NGX_HTTP_BAD_GATEWAY, NGX_HTTP_OK, HttpModuleDef, http_module_def};
 
 crate::http_module_index!("ngx_http_proxy_module");
 
@@ -1879,10 +1879,6 @@ async fn cache_send(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, ctx: &Rc<RefC
                 crate::upstream_cache::finalize(r, NGX_DECLINED, None);
                 accel_redirect(r, &xar).await
             }
-            Processed::Finalize(rc) => {
-                crate::upstream_cache::finalize(r, rc, None);
-                rc
-            }
         }
     })
     .await
@@ -2371,10 +2367,6 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
             return accel_redirect(&r, &xar).await;
         }
 
-        Processed::Finalize(rc) => {
-            crate::upstream_cache::finalize(&r, rc, None);
-            return rc;
-        }
     }
 
     // 101 Switching Protocols the client did not ask for: rejected before
@@ -2551,8 +2543,6 @@ enum Processed {
     /// X-Accel-Redirect: the upstream is finalized (NGX_DECLINED), then the
     /// request redirected
     Redirect(Vec<u8>),
-    /// the request is finalized with the status
-    Finalize(i64),
 }
 
 /// ngx_http_upstream_process_headers, with the headers_in handlers of the
