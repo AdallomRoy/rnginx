@@ -2510,7 +2510,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
     // ngx_http_upstream_process_request: ngx_http_upstream_store() for a
     // 200 whose body is as long as its "Content-Length" says, and the
     // cache file
-    if body.complete && store && status == crate::NGX_HTTP_OK && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64) {
+    if body.rc == NGX_OK && body.complete && store && status == crate::NGX_HTTP_OK && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64) {
         maybe_store_body(&r, &body.data);
     }
 
