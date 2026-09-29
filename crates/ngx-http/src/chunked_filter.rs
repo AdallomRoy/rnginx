@@ -32,6 +32,7 @@ async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
         if r.http_version.get() >= NGX_HTTP_VERSION_11 && *clcf.borrow().chunked_transfer_encoding {
             if r.expect_trailers.get() {
                 // trailers only allowed in chunked
+                r.clear_content_length();
             }
             r.chunked.set(true);
             r.set_ctx(ctx_index(), ChunkedCtx { done: false });

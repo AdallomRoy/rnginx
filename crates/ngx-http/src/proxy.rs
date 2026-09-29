@@ -2422,8 +2422,8 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
 
     // Proxied responses (uncacheable) must skip the not_modified filter —
     // the backend is responsible for handling If-Modified-Since / If-None-Match.
-    // C sets this to `!u->cacheable` in ngx_http_upstream_process_headers.
-    r.disable_not_modified.set(true);
+    // (ngx_http_upstream_process_headers)
+    r.disable_not_modified.set(!cacheable);
 
     // proxy_force_ranges: opt in to server-side range processing even though
     // the upstream response isn't file-backed. Matches C's `u->conf->force_ranges`
