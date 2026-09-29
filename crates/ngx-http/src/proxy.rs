@@ -1079,9 +1079,10 @@ async fn proxy_handler(r: R) -> i64 {
     let forwarded_uri: Vec<u8> = if is_variable_pass {
         upstream_path.as_bytes().to_vec()
     } else if !conf_borrowed.vars_uri.is_empty() {
-        // ngx_http_proxy_create_request: vars.uri, then the request URI
-        // past the location
-        let mut u = conf_borrowed.vars_uri.clone();
+        // ngx_http_proxy_create_request: vars.uri (unless the URI was
+        // rewritten with "break", r->valid_location reset), then the
+        // request URI past the location
+        let mut u = if r.valid_location.get() { conf_borrowed.vars_uri.clone() } else { Vec::new() };
         let loc_len = if r.valid_location.get() && request_uri.starts_with(loc_name.as_slice()) { loc_name.len() } else { 0 };
         u.extend_from_slice(&request_uri[loc_len..]);
         u
