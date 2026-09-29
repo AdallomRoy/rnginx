@@ -81,6 +81,8 @@ pub fn proxy_module() -> ModuleDef {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_proxy_conf_default() {
         let conf = ProxyConf::default();

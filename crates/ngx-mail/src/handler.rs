@@ -157,11 +157,3 @@ pub fn send(c: &Rc<Connection>, out: &[u8]) {
         let _ = c.send(&data).await;
     });
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_mail_session_new() {
-        assert_eq!(0, 0); // placeholder
-    }
-}

@@ -45,6 +45,8 @@ pub fn imap_module() -> ModuleDef {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_imap_conf_default() {
         let conf = ImapConf::default();

@@ -37,6 +37,8 @@ pub fn pop3_module() -> ModuleDef {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_pop3_conf_default() {
         let conf = Pop3Conf::default();

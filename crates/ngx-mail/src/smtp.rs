@@ -52,6 +52,8 @@ pub fn smtp_module() -> ModuleDef {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_smtp_conf_default() {
         let conf = SmtpConf::default();
