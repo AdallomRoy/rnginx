@@ -180,7 +180,10 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         vars[index] = vv.clone();
         return Some(vv);
     }
+    // the get handler fills r->variables[index] itself in C: what it has
+    // set before failing (e.g. no_cacheable) stays
     let mut vars = r.variables.borrow_mut();
+    vars[index] = vv;
     vars[index].valid = false;
     vars[index].not_found = true;
     None
