@@ -114,7 +114,7 @@ pub fn gzip_filter_module() -> ModuleDef {
         ..Default::default()
     };
     let commands = vec![
-        ngx_core::cmd_fn!("gzip", F | NGX_CONF_FLAG, ConfLevel::Loc, set_gzip),
+        ngx_core::cmd_fn!("gzip", F | NGX_HTTP_LIF_CONF | NGX_CONF_FLAG, ConfLevel::Loc, set_gzip),
         ngx_core::cmd_fn!("gzip_comp_level", F | NGX_CONF_TAKE1, ConfLevel::Loc, set_level),
         ngx_core::cmd_fn!("gzip_min_length", F | NGX_CONF_TAKE1, ConfLevel::Loc, set_min_length),
         ngx_core::cmd_fn!("gzip_types", F | NGX_CONF_1MORE, ConfLevel::Loc, set_types),
