@@ -751,6 +751,23 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
             let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
             conf.borrow_mut().upstream = Some(uscf);
             conf.borrow_mut().vars_uri = u.uri.clone();
+
+            let clcf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
+            let no_location = {
+                let l = clcf.borrow();
+                l.named || l.regex.is_some() || l.predicate != 0 || l.noname
+            };
+
+            if no_location && !u.uri.is_empty() {
+                return Err(cf.emerg(format_args!(
+                    "\"proxy_pass\" cannot have URI part in \
+                     location given by regular expression, \
+                     or inside predicate location, \
+                     or inside named location, \
+                     or inside \"if\" statement, \
+                     or inside \"limit_except\" block"
+                )));
+            }
         }
         conf.borrow_mut().upstream_uri = Some(uri);
     }
