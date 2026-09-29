@@ -681,7 +681,7 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
     }
 
     let fd = if of.log {
-        open_file_wrapper(name, of, libc::O_APPEND, libc::O_CREAT | libc::O_WRONLY, 0o644, log)
+        open_file_wrapper(name, of, libc::O_WRONLY | libc::O_APPEND, libc::O_CREAT, 0o644, log)
     } else {
         // Use non-blocking open() not to hang on FIFO files, etc.
         // This flag has no effect on a regular files.
@@ -732,28 +732,216 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
     }
 }
 
-fn open_file_wrapper(
-    name: &[u8],
-    of: &mut OpenFileInfo,
-    flags: i32,
-    create_flags: i32,
-    mode: u32,
-    _log: &Log,
-) -> i32 {
-    let mut open_flags = flags;
+/// NGX_FILE_SEARCH (O_PATH | O_RDONLY | NGX_FILE_DIRECTORY on Linux)
+const FILE_SEARCH: i32 = libc::O_PATH | libc::O_RDONLY | libc::O_DIRECTORY;
 
-    if of.disable_symlinks != 0 {
-        open_flags |= libc::O_NOFOLLOW;
-    }
+/// NGX_DISABLE_SYMLINKS_NOTOWNER
+const DISABLE_SYMLINKS_NOTOWNER: u8 = 2;
 
-    match os::open(name, open_flags | create_flags, mode) {
-        Ok(fd) => fd,
-        Err(err) => {
-            of.err = err;
-            of.failed = "open()";
-            NGX_INVALID_FILE
+fn set_errno(err: i32) {
+    unsafe { *libc::__errno_location() = err };
+}
+
+/// ngx_openat_file: openat(at_fd, name, mode | create, access)
+fn openat_file(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32) -> i32 {
+    let cname = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => {
+            set_errno(libc::EINVAL);
+            return NGX_INVALID_FILE;
         }
+    };
+
+    unsafe { libc::openat(at_fd, cname.as_ptr(), mode | create | libc::O_CLOEXEC, access as libc::c_uint) }
+}
+
+/// ngx_openat_file_owner: to allow symlinks with the same owner, openat()
+/// (followed by fstat()) and fstatat(AT_SYMLINK_NOFOLLOW), and the uids
+/// compared, even when fstatat() reports the component isn't a symlink
+/// (there is a race between openat() and fstatat()).
+fn openat_file_owner(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32, log: &Log) -> i32 {
+    let fd = openat_file(at_fd, name, mode, create, access);
+
+    if fd == NGX_INVALID_FILE {
+        return NGX_INVALID_FILE;
     }
+
+    let err = 'failed: {
+        let cname = std::ffi::CString::new(name).expect("name");
+
+        let mut atfi: libc::stat = unsafe { std::mem::zeroed() };
+
+        if unsafe { libc::fstatat(at_fd, cname.as_ptr(), &mut atfi, libc::AT_SYMLINK_NOFOLLOW) } == -1 {
+            break 'failed os::errno();
+        }
+
+        let mut fi: libc::stat = unsafe { std::mem::zeroed() };
+
+        if file_o_path_info(fd, &mut fi, log).is_err() {
+            break 'failed os::errno();
+        }
+
+        if fi.st_uid != atfi.st_uid {
+            break 'failed libc::ELOOP;
+        }
+
+        return fd;
+    };
+
+    if let Err(e) = close_file(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
+    }
+
+    set_errno(err);
+
+    NGX_INVALID_FILE
+}
+
+thread_local! {
+    /// use_fstat of ngx_file_o_path_info
+    static USE_FSTAT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// ngx_file_o_path_info: fstat() of an O_PATH descriptor, or fstatat()
+/// with AT_EMPTY_PATH on kernels before 3.6
+fn file_o_path_info(fd: i32, fi: &mut libc::stat, log: &Log) -> Result<(), ()> {
+    if USE_FSTAT.with(|u| u.get()) {
+        if unsafe { libc::fstat(fd, fi) } != -1 {
+            return Ok(());
+        }
+
+        if os::errno() != libc::EBADF {
+            return Err(());
+        }
+
+        ngx_log_error!(crate::log::NGX_LOG_NOTICE, log, None, "fstat(O_PATH) failed with EBADF, switching to fstatat(AT_EMPTY_PATH)");
+
+        USE_FSTAT.with(|u| u.set(false));
+    }
+
+    if unsafe { libc::fstatat(fd, b"\0".as_ptr() as *const libc::c_char, fi, libc::AT_EMPTY_PATH) } != -1 {
+        return Ok(());
+    }
+
+    Err(())
+}
+
+/// ngx_open_file_wrapper: without disable_symlinks, open(); with it, the
+/// path walked component by component with openat(O_NOFOLLOW) from "/",
+/// the current directory, or the disable_symlinks "from" part opened as a
+/// whole; with if_not_owner, a symlink is followed when its owner is the
+/// owner of what it points to.
+fn open_file_wrapper(name: &[u8], of: &mut OpenFileInfo, mode: i32, create: i32, access: u32, log: &Log) -> i32 {
+    if of.disable_symlinks == 0 {
+        return match os::open(name, mode | create, access) {
+            Ok(fd) => fd,
+            Err(err) => {
+                of.err = err;
+                of.failed = "open()";
+                NGX_INVALID_FILE
+            }
+        };
+    }
+
+    let end = name.len();
+    let mut p: usize;
+    let mut at_fd: i32;
+
+    // at_name: the part of the name at_fd is, for the close() message
+    let mut at_name_len: usize = name.len();
+
+    if of.disable_symlinks_from != 0 {
+        let cp = of.disable_symlinks_from;
+
+        at_fd = match os::open(&name[..cp], FILE_SEARCH | libc::O_NONBLOCK, 0) {
+            Ok(fd) => fd,
+            Err(err) => {
+                of.err = err;
+                of.failed = "open()";
+                return NGX_INVALID_FILE;
+            }
+        };
+
+        at_name_len = of.disable_symlinks_from;
+        p = cp + 1;
+    } else if name.first() == Some(&b'/') {
+        at_fd = match os::open(b"/", FILE_SEARCH | libc::O_NONBLOCK, 0) {
+            Ok(fd) => fd,
+            Err(err) => {
+                of.err = err;
+                of.failed = "openat()";
+                return NGX_INVALID_FILE;
+            }
+        };
+
+        at_name_len = 1;
+        p = 1;
+    } else {
+        at_fd = libc::AT_FDCWD;
+        p = 0;
+    }
+
+    let close_at = |at_fd: i32, at_name_len: usize| {
+        if at_fd != libc::AT_FDCWD {
+            if let Err(e) = close_file(at_fd) {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(&name[..at_name_len.min(name.len())]));
+            }
+        }
+    };
+
+    loop {
+        let cp = match memchr::memchr(b'/', &name[p.min(end)..end]) {
+            Some(i) => p + i,
+            None => break,
+        };
+
+        if cp == p {
+            p += 1;
+            continue;
+        }
+
+        let fd = if of.disable_symlinks == DISABLE_SYMLINKS_NOTOWNER {
+            openat_file_owner(at_fd, &name[p..cp], FILE_SEARCH | libc::O_NONBLOCK, 0, 0, log)
+        } else {
+            openat_file(at_fd, &name[p..cp], FILE_SEARCH | libc::O_NONBLOCK | libc::O_NOFOLLOW, 0, 0)
+        };
+
+        if fd == NGX_INVALID_FILE {
+            of.err = os::errno();
+            of.failed = "openat()";
+            close_at(at_fd, at_name_len);
+            return NGX_INVALID_FILE;
+        }
+
+        close_at(at_fd, at_name_len);
+
+        p = cp + 1;
+        at_fd = fd;
+        at_name_len = cp;
+    }
+
+    let fd = if p >= end {
+        /*
+         * If pathname ends with a trailing slash, assume the last path
+         * component is a directory and reopen it with requested flags;
+         * if not, fail with ENOTDIR as per POSIX.
+         */
+
+        openat_file(at_fd, b".", mode, create, access)
+    } else if of.disable_symlinks == DISABLE_SYMLINKS_NOTOWNER && create & (libc::O_CREAT | libc::O_TRUNC) == 0 {
+        openat_file_owner(at_fd, &name[p..end], mode, create, access, log)
+    } else {
+        openat_file(at_fd, &name[p..end], mode | libc::O_NOFOLLOW, create, access)
+    };
+
+    if fd == NGX_INVALID_FILE {
+        of.err = os::errno();
+        of.failed = "openat()";
+    }
+
+    close_at(at_fd, at_name_len);
+
+    fd
 }
 
 /// ngx_file_info_wrapper: with disable_symlinks, the file is opened with
