@@ -1957,6 +1957,9 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx:
         }
     }
 
+    // the cache is freed when the upstream is done (finalize_request)
+    let _cache_guard = crate::upstream_cache::CacheGuard::new(&r);
+
     // u->cacheable, and the HEAD method changed to GET (u->method)
     let cacheable = ucache.cacheable.get();
     let u_method: Option<&'static [u8]> = *ucache.method.borrow();

@@ -1334,6 +1334,28 @@ pub fn free(r: &R, tf: Option<&CacheTempFile>) {
     }
 }
 
+/// The cache free of ngx_http_upstream_finalize_request on the ways out of
+/// an upstream request which do not call finalize() (the request finalized
+/// before a response, the client closing the connection): the cache of the
+/// request when the upstream starts.
+pub struct CacheGuard(Option<Rc<RefCell<HttpCache>>>);
+
+impl CacheGuard {
+    pub fn new(r: &R) -> CacheGuard {
+        CacheGuard(cache_of(r))
+    }
+}
+
+impl Drop for CacheGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            if let Ok(mut c) = c.try_borrow_mut() {
+                file_cache_free(&mut c, None);
+            }
+        }
+    }
+}
+
 /// The cache part of ngx_http_upstream_finalize_request: an error of the
 /// upstream (502, 504) is cached for its *_cache_valid time.
 pub fn finalize(r: &R, rc: i64, tf: Option<&CacheTempFile>) {
