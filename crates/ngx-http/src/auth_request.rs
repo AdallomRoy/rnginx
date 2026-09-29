@@ -182,12 +182,34 @@ async fn auth_request_handler(r: R) -> i64 {
     // Create new context
     let uri_bytes = uri.clone();
 
-    // Suppress subrequest body: C sets sr->header_only=1 before dispatching. We can't do
-    // that with our current inline-subrequest API, so use IN_MEMORY which collects body
-    // into a buffer instead of forwarding to the client.
-    let flags = NGX_HTTP_SUBREQUEST_WAITED | NGX_HTTP_SUBREQUEST_IN_MEMORY;
-    match subrequest(&r, &uri_bytes, None, flags, None).await {
-        Ok((sr, _rc)) => {
+    // ngx_http_subrequest(r, &arcf->uri, NULL, &sr, ps, NGX_HTTP_SUBREQUEST_WAITED),
+    // then, before it runs, a fake request body (so that the subrequest does not
+    // read the client's, nor its upstream close the body file) and
+    // sr->header_only = 1
+    let sr = match subrequest_posted(&r, &uri_bytes, None, NGX_HTTP_SUBREQUEST_WAITED, None) {
+        Ok(sr) => {
+            *sr.request_body.borrow_mut() = Some(Rc::new(RefCell::new(RequestBody {
+                temp_file: None,
+                bufs: ngx_core::buf::Chain::new(),
+                buf: None,
+                rest: 0,
+                received: 0,
+                chunked: None,
+                filter_need_buffering: false,
+                last_sent: false,
+                last_saved: false,
+                buf_size: 0,
+                buf_last: 0,
+            })));
+            sr.header_only.set(true);
+            // the handler returns NGX_AGAIN in C, and the posted subrequest runs
+            crate::postpone_filter::run_posted_requests(&r).await;
+            Ok(sr)
+        }
+        Err(()) => Err(()),
+    };
+    match sr {
+        Ok(sr) => {
             // Use the HTTP status the subrequest produced, not the subrequest rc.
             let http_status = sr.headers_out.borrow().status;
             let status = if http_status >= NGX_HTTP_OK && http_status < NGX_HTTP_SPECIAL_RESPONSE {
