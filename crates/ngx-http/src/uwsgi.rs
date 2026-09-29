@@ -1332,7 +1332,7 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
         r.connection.log.set_action(Some("sending request to upstream"));
 
         let written = {
-            let write = tokio::time::timeout(Duration::from_millis(send_timeout), sock.write_all(&wire));
+            let write = write_request(&mut sock, &wire, send_timeout);
 
             tokio::select! {
                 res = write => res,
@@ -1341,14 +1341,14 @@ async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: U
         };
 
         let failure: Option<u32> = match written {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => {
+            Ok(()) => None,
+            Err(Some(e)) => {
                 if plain(&sock) {
                     ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "writev() failed");
                 }
                 Some(NGX_HTTP_UPSTREAM_FT_ERROR)
             }
-            Err(_) => {
+            Err(None) => {
                 ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
                 Some(NGX_HTTP_UPSTREAM_FT_TIMEOUT)
             }
@@ -1680,6 +1680,24 @@ async fn finalize_body(r: &R, body: &BodyResult) -> i64 {
     }
 }
 
+/// The request written as ngx_http_upstream_send_request writes it: the
+/// uwsgi_send_timeout timer is armed while a write waits, and again after
+/// each write that made progress. Err(None) when it expires.
+async fn write_request(sock: &mut UpstreamSock, data: &[u8], send_timeout: u64) -> Result<(), Option<std::io::Error>> {
+    let mut off = 0;
+
+    while off < data.len() {
+        match tokio::time::timeout(Duration::from_millis(send_timeout), sock.write(&data[off..])).await {
+            Err(_) => return Err(None),
+            Ok(Err(e)) => return Err(Some(e)),
+            Ok(Ok(0)) => return Err(Some(std::io::Error::from(std::io::ErrorKind::WriteZero))),
+            Ok(Ok(n)) => off += n,
+        }
+    }
+
+    Ok(())
+}
+
 /// The failure type of ngx_http_upstream_next_errors[] for a status.
 fn status_failure(status: i64) -> u32 {
     match status {
@@ -1696,11 +1714,15 @@ fn status_failure(status: i64) -> u32 {
 
 /// ngx_http_upstream_process_header: the response header read into
 /// u->buffer and parsed by u->process_header. The action stays "reading
-/// response header from upstream" while the response is processed.
+/// response header from upstream" while the response is processed. The
+/// uwsgi_read_timeout timer is that ngx_http_upstream_send_request armed
+/// once the request was sent: the reads of the header do not arm it again.
 async fn read_header(r: &R, sock: &mut UpstreamSock, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>, flags: &mut HeaderFlags) -> Result<UpstreamResponse, HeaderError> {
     http_debug!(r, "http upstream process header");
 
     r.connection.log.set_action(Some("reading response header from upstream"));
+
+    let deadline = Instant::now() + Duration::from_millis(read_timeout);
 
     let mut u = UpstreamResponse::new();
 
@@ -1714,7 +1736,7 @@ async fn read_header(r: &R, sock: &mut UpstreamSock, buffer_size: usize, read_ti
         let room = buffer_size.saturating_sub(u.buf.len()).clamp(1, chunk.len());
 
         let res = {
-            let read = tokio::time::timeout(Duration::from_millis(read_timeout), sock.read(&mut chunk[..room]));
+            let read = tokio::time::timeout_at(deadline, sock.read(&mut chunk[..room]));
 
             tokio::select! {
                 res = read => res,
