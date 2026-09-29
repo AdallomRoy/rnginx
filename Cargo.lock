@@ -262,6 +262,7 @@ dependencies = [
  "flate2",
  "foreign-types",
  "libc",
+ "libz-sys",
  "md-5",
  "memchr",
  "ngx-core",

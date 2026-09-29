@@ -269,4 +269,174 @@ pub fn test_required_predicates(r: &R, preds: &Option<Rc<Vec<ComplexValue>>>) ->
     NGX_OK
 }
 
+/// ngx_http_script_compile() of the lengths and values programs run by
+/// script_run() (sc->complete_lengths and sc->complete_values, without
+/// sc->flushes; the args, zero and prefix codes are not used by the
+/// callers): Part::Literal is ngx_http_script_copy_code, Part::Var
+/// ngx_http_script_copy_var_code and Part::Capture(2 * n) the
+/// ngx_http_script_copy_capture_code of $1..$9.
+pub fn script_compile(cf: &mut Conf, source: &[u8]) -> Result<Vec<Part>, ConfError> {
+    let mut codes = Vec::new();
+
+    let invalid_variable = |cf: &Conf| cf.emerg(format_args!("invalid variable name"));
+
+    let mut i = 0;
+
+    while i < source.len() {
+        if source[i] == b'$' {
+            i += 1;
+
+            if i == source.len() {
+                return Err(invalid_variable(cf));
+            }
+
+            if (b'1'..=b'9').contains(&source[i]) {
+                let n = (source[i] - b'0') as usize;
+
+                codes.push(Part::Capture(2 * n));
+
+                i += 1;
+
+                continue;
+            }
+
+            let mut bracket = false;
+
+            if source[i] == b'{' {
+                bracket = true;
+
+                i += 1;
+
+                if i == source.len() {
+                    return Err(invalid_variable(cf));
+                }
+            }
+
+            let start = i;
+            let mut len = 0;
+
+            while i < source.len() {
+                let ch = source[i];
+
+                if ch == b'}' && bracket {
+                    i += 1;
+                    bracket = false;
+                    break;
+                }
+
+                if ch.is_ascii_alphanumeric() || ch == b'_' {
+                    i += 1;
+                    len += 1;
+                    continue;
+                }
+
+                break;
+            }
+
+            if bracket {
+                return Err(cf.emerg(format_args!("the closing bracket in \"{}\" variable is missing", B(&source[start..start + len]))));
+            }
+
+            if len == 0 {
+                return Err(invalid_variable(cf));
+            }
+
+            let index = get_variable_index(cf, &source[start..start + len])?;
+
+            codes.push(Part::Var(index));
+
+            continue;
+        }
+
+        let start = i;
+
+        while i < source.len() && source[i] != b'$' {
+            i += 1;
+        }
+
+        codes.push(Part::Literal(source[start..i].to_vec()));
+    }
+
+    Ok(codes)
+}
+
+/// ngx_http_script_run: the value of the codes of script_compile(), the
+/// no cacheable variables are flushed first and the variables are taken
+/// with ngx_http_get_indexed_variable() (e.flushed = 1)
+pub fn script_run(r: &R, codes: &[Part]) -> Option<Vec<u8>> {
+    {
+        let mut vars = r.variables.borrow_mut();
+
+        for v in vars.iter_mut() {
+            if v.no_cacheable {
+                v.valid = false;
+                v.not_found = false;
+            }
+        }
+    }
+
+    let mut value = Vec::new();
+
+    for code in codes {
+        match code {
+            Part::Literal(data) => {
+                value.extend_from_slice(data);
+
+                http_debug!(r, "http script copy: \"{}\"", B(data));
+            }
+
+            Part::Var(index) => {
+                if let Some(v) = get_indexed_variable(r, *index) {
+                    if !v.not_found {
+                        value.extend_from_slice(&v.data);
+
+                        http_debug!(r, "http script var: \"{}\"", B(&v.data));
+                    }
+                }
+            }
+
+            Part::Capture(n) => {
+                let n = *n;
+                let pos = value.len();
+
+                if n < r.ncaptures.get() {
+                    let cap = r.captures.borrow();
+
+                    if n + 1 < cap.len() {
+                        let (a, b) = (cap[n], cap[n + 1]);
+
+                        if a >= 0 && b >= a {
+                            let data = r.captures_data.borrow();
+
+                            if (b as usize) <= data.len() {
+                                value.extend_from_slice(&data[a as usize..b as usize]);
+                            }
+                        }
+                    }
+                }
+
+                http_debug!(r, "http script capture: \"{}\"", B(&value[pos..]));
+            }
+        }
+    }
+
+    Some(value)
+}
+
+/// ngx_http_script_flush_no_cacheable_variables
+pub fn script_flush_no_cacheable_variables(r: &R, indices: Option<&[usize]>) {
+    if let Some(indices) = indices {
+        let mut vars = r.variables.borrow_mut();
+
+        for index in indices {
+            if let Some(v) = vars.get_mut(*index) {
+                if v.no_cacheable {
+                    v.valid = false;
+                    v.not_found = false;
+                }
+            }
+        }
+    }
+}
+
 pub fn _unused(_: &dyn Any) {}

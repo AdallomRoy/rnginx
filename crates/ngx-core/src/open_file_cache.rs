@@ -1,13 +1,13 @@
 //! Open file cache, ported from ngx_open_file_cache.c.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use crate::log::{Log, NGX_LOG_DEBUG_CORE};
+use crate::log::{Log, NGX_LOG_ALERT, NGX_LOG_CRIT, NGX_LOG_DEBUG_CORE};
 use crate::os;
 use crate::string::B;
-use crate::ngx_log_debug;
+use crate::{ngx_log_debug, ngx_log_error};
 
 const NGX_INVALID_FILE: i32 = -1;
 const NGX_MIN_READ_AHEAD: usize = 128 * 1024;
@@ -70,8 +70,9 @@ impl Default for OpenFileInfo {
     }
 }
 
-#[derive(Clone)]
-struct CachedFile {
+/// ngx_cached_open_file_t (without the vnode events of kqueue:
+/// file->event is NULL and file->use_event is 0)
+pub struct CachedFile {
     name: Vec<u8>,
     created: i64,
     accessed: i64,
@@ -92,20 +93,24 @@ struct CachedFile {
     is_directio: bool,
 }
 
-/// LRU cache of open files.
+type CachedFileRef = Rc<RefCell<CachedFile>>;
+
+/// ngx_open_file_cache_t: the rbtree of the files by name and the expire
+/// queue (the head is the most recently used file).
 pub struct OpenFileCache {
-    files: RefCell<BTreeMap<Vec<u8>, Rc<RefCell<CachedFile>>>>,
-    lru_queue: RefCell<Vec<Vec<u8>>>,
+    files: RefCell<BTreeMap<Vec<u8>, CachedFileRef>>,
+    expire_queue: RefCell<VecDeque<CachedFileRef>>,
     current: RefCell<usize>,
     max: usize,
     inactive: i64,
 }
 
 impl OpenFileCache {
+    /// ngx_open_file_cache_init
     pub fn new(max: usize, inactive_secs: i64) -> Rc<Self> {
         Rc::new(OpenFileCache {
             files: RefCell::new(BTreeMap::new()),
-            lru_queue: RefCell::new(Vec::new()),
+            expire_queue: RefCell::new(VecDeque::new()),
             current: RefCell::new(0),
             max,
             inactive: inactive_secs,
@@ -116,105 +121,178 @@ impl OpenFileCache {
         *self.current.borrow()
     }
 
+    /// Expires the inactive files, ngx_expire_old_cached_files() without the
+    /// limit of two files.
     pub fn cleanup_expired(&self, log: &Log) {
         let now = current_time();
-        let mut to_remove = Vec::new();
 
-        let files = self.files.borrow();
-        for (name, file_rc) in files.iter() {
-            let file = file_rc.borrow();
-            if file.count == 0 && now - file.accessed > self.inactive {
-                to_remove.push(name.clone());
+        loop {
+            let file = match self.expire_queue.borrow().back() {
+                Some(f) => f.clone(),
+                None => return,
+            };
+
+            if now - file.borrow().accessed <= self.inactive {
+                return;
             }
-        }
-        drop(files);
 
-        for name in to_remove {
-            if let Some(file_rc) = self.files.borrow_mut().remove(&name) {
-                let file = file_rc.borrow();
-                if file.fd >= 0 {
-                    os::close(file.fd);
-                }
-                *self.current.borrow_mut() -= 1;
-                ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "expire cached open file: {}", B(&name));
-            }
+            self.expire(&file, log);
         }
-
-        let mut queue = self.lru_queue.borrow_mut();
-        queue.retain(|n| self.files.borrow().contains_key(n));
     }
 
-    fn lookup(&self, name: &[u8]) -> Option<Rc<RefCell<CachedFile>>> {
+    /// ngx_open_file_lookup
+    fn lookup(&self, name: &[u8]) -> Option<CachedFileRef> {
         self.files.borrow().get(name).cloned()
     }
 
-    fn insert(&self, file: CachedFile) -> Rc<RefCell<CachedFile>> {
-        let rc = Rc::new(RefCell::new(file.clone()));
-        self.files.borrow_mut().insert(file.name.clone(), rc.clone());
-        *self.current.borrow_mut() += 1;
-        self.lru_queue.borrow_mut().insert(0, file.name.clone());
-        rc
+    /// ngx_rbtree_insert(&cache->rbtree, &file->node)
+    fn tree_insert(&self, file: &CachedFileRef) {
+        let name = file.borrow().name.clone();
+        self.files.borrow_mut().insert(name, file.clone());
     }
 
-    fn update_lru(&self, name: &[u8]) {
-        let mut queue = self.lru_queue.borrow_mut();
-        if let Some(pos) = queue.iter().position(|n| n == name) {
-            queue.remove(pos);
-        }
-        queue.insert(0, name.to_vec());
-    }
-
-    fn expire_if_full(&self, log: &Log) {
-        if *self.current.borrow() >= self.max {
-            self.expire_lru(log);
-        }
-    }
-
-    fn expire_lru(&self, log: &Log) {
-        let mut queue = self.lru_queue.borrow_mut();
+    /// ngx_rbtree_delete(&cache->rbtree, &file->node)
+    fn tree_delete(&self, file: &CachedFileRef) {
+        let name = file.borrow().name.clone();
         let mut files = self.files.borrow_mut();
 
-        let mut expired = 0;
-        while expired < 3 && !queue.is_empty() {
-            let name = queue.pop().unwrap();
-            if let Some(file_rc) = files.remove(&name) {
-                let file = file_rc.borrow();
-                if file.fd >= 0 {
-                    os::close(file.fd);
-                }
-                *self.current.borrow_mut() -= 1;
-                ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "expire cached open file: {}", B(&name));
-                expired += 1;
-            }
+        if files.get(&name).is_some_and(|f| Rc::ptr_eq(f, file)) {
+            files.remove(&name);
         }
+    }
+
+    /// ngx_queue_remove(&file->queue)
+    fn queue_remove(&self, file: &CachedFileRef) {
+        let mut q = self.expire_queue.borrow_mut();
+
+        if let Some(pos) = q.iter().position(|f| Rc::ptr_eq(f, file)) {
+            q.remove(pos);
+        }
+    }
+
+    /// ngx_queue_insert_head(&cache->expire_queue, &file->queue)
+    fn queue_insert_head(&self, file: &CachedFileRef) {
+        self.expire_queue.borrow_mut().push_front(file.clone());
+    }
+
+    /// The expiration of a file of ngx_expire_old_cached_files().
+    fn expire(&self, file: &CachedFileRef, log: &Log) {
+        self.queue_remove(file);
+
+        self.tree_delete(file);
+
+        *self.current.borrow_mut() -= 1;
+
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "expire cached open file: {}", B(&file.borrow().name));
+
+        let (err, is_dir) = {
+            let f = file.borrow();
+            (f.err, f.is_dir)
+        };
+
+        if err == 0 && !is_dir {
+            file.borrow_mut().close = true;
+            close_cached_file(self, file, 0, log);
+        }
+
+        // ngx_free(file): the last reference goes with the handles
     }
 }
 
-/// Guard for a file opened via `open_cached_file`.
+/// ngx_expire_old_cached_files: n == 1 deletes one or two inactive files,
+/// n == 0 deletes least recently used file by force and one or two
+/// inactive files
+fn expire_old_cached_files(cache: &OpenFileCache, mut n: u32, log: &Log) {
+    let now = current_time();
+
+    while n < 3 {
+        let file = match cache.expire_queue.borrow().back() {
+            Some(f) => f.clone(),
+            None => return,
+        };
+
+        let forced = n == 0;
+
+        n += 1;
+
+        if !forced && now - file.borrow().accessed <= cache.inactive {
+            return;
+        }
+
+        cache.expire(&file, log);
+    }
+}
+
+/// ngx_close_cached_file
+fn close_cached_file(cache: &OpenFileCache, file: &CachedFileRef, min_uses: u32, log: &Log) {
+    {
+        let f = file.borrow();
+
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "close cached open file: {}, fd:{}, c:{}, u:{}, {}", B(&f.name), f.fd, f.count, f.uses, f.close as u32);
+    }
+
+    if !file.borrow().close {
+        file.borrow_mut().accessed = current_time();
+
+        cache.queue_remove(file);
+
+        cache.queue_insert_head(file);
+
+        let f = file.borrow();
+
+        if f.uses >= min_uses || f.count != 0 {
+            return;
+        }
+    }
+
+    // ngx_open_file_del_event(file): no events
+
+    let mut f = file.borrow_mut();
+
+    if f.count != 0 {
+        return;
+    }
+
+    if f.fd != NGX_INVALID_FILE {
+        if let Err(e) = close_file(f.fd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(&f.name));
+        }
+
+        f.fd = NGX_INVALID_FILE;
+    }
+
+    // if (!file->close) return; else ngx_free(file): the memory goes with
+    // the last reference
+}
+
+/// Guard for a file opened via `open_cached_file`: its drop is the pool
+/// cleanup of C.
 ///
-/// When cached (`Cached`), drop decrements the reference count in the cache and
-/// closes the fd only if the cache marked it for close and no other users remain.
-/// When uncached (`Owned` — no `open_file_cache` configured), drop closes the fd
-/// unconditionally, since nothing else owns it.
+/// When cached (`Cached`), drop is ngx_open_file_cleanup: the file is
+/// released and closed unless it is used often enough (min_uses) to stay
+/// open, then one or two expired files are dropped. When uncached (`Owned`
+/// — no `open_file_cache` configured), drop closes the fd unconditionally
+/// (ngx_pool_cleanup_file), since nothing else owns it.
 pub enum CachedFileHandle {
-    Cached { cache: Rc<OpenFileCache>, name: Vec<u8> },
+    Cached { cache: Rc<OpenFileCache>, name: Vec<u8>, file: CachedFileRef, min_uses: u32, log: Log },
     Owned { fd: i32 },
 }
 
 impl Drop for CachedFileHandle {
     fn drop(&mut self) {
         match self {
-            CachedFileHandle::Cached { cache, name } => {
-                if let Some(file_rc) = cache.files.borrow().get(name) {
-                    let mut file = file_rc.borrow_mut();
-                    if file.count > 0 {
-                        file.count -= 1;
-                    }
-                    if file.close && file.count == 0 && file.fd >= 0 {
-                        os::close(file.fd);
-                        file.fd = NGX_INVALID_FILE;
-                    }
+            CachedFileHandle::Cached { cache, file, min_uses, log, .. } => {
+                // ngx_open_file_cleanup
+
+                {
+                    let mut f = file.borrow_mut();
+                    f.count = f.count.saturating_sub(1);
                 }
+
+                close_cached_file(cache, file, *min_uses, log);
+
+                // drop one or two expired open files
+                expire_old_cached_files(cache, 1, log);
             }
             CachedFileHandle::Owned { fd } => {
                 if *fd >= 0 {
@@ -226,7 +304,18 @@ impl Drop for CachedFileHandle {
     }
 }
 
-/// Open a file with optional caching. Returns a guard on success; errors set of.err/of.failed.
+/// The labels of ngx_open_cached_file() after the lookup.
+enum Next {
+    Failed(Option<CachedFileRef>),
+    Create,
+    AddEvent(CachedFileRef),
+    Update(CachedFileRef),
+    Found(CachedFileRef),
+}
+
+/// ngx_open_cached_file: Ok(Some(handle)) for an open file, Ok(None) for a
+/// directory or a test_only lookup without a cache (NGX_OK), Err(()) with
+/// of.err (0 if the error is not to be reported) otherwise.
 pub fn open_cached_file(
     cache: Option<&Rc<OpenFileCache>>,
     name: &[u8],
@@ -236,198 +325,357 @@ pub fn open_cached_file(
     of.fd = NGX_INVALID_FILE;
     of.err = 0;
 
-    if cache.is_none() {
-        open_and_stat_file(name, of, log)?;
-        if of.is_dir || of.fd == NGX_INVALID_FILE {
-            return Ok(None);
-        }
-        return Ok(Some(Rc::new(CachedFileHandle::Owned { fd: of.fd })));
-    }
+    let cache = match cache {
+        Some(c) => c,
 
-    let cache = cache.unwrap();
+        None => {
+            if of.test_only {
+                match file_info_wrapper(name, of) {
+                    Ok(st) => {
+                        let _ = fill_info_from_stat(&st, of);
+                        return Ok(None);
+                    }
+                    Err((err, failed)) => {
+                        of.err = err;
+                        of.failed = failed;
+                        return Err(());
+                    }
+                }
+            }
+
+            open_and_stat_file(name, of, log)?;
+
+            if of.is_dir || of.fd == NGX_INVALID_FILE {
+                return Ok(None);
+            }
+
+            return Ok(Some(Rc::new(CachedFileHandle::Owned { fd: of.fd })));
+        }
+    };
+
     let now = current_time();
 
-    if let Some(file_rc) = cache.lookup(name) {
-        let should_return_cached = {
-            let mut file = file_rc.borrow_mut();
-            file.uses += 1;
+    let next = match cache.lookup(name) {
+        Some(file) => lookup_found(cache, file, name, of, now, log),
 
-            if file.fd == NGX_INVALID_FILE && file.err == 0 && !file.is_dir {
-                false
-            } else if file.err == 0 || file.fd >= 0 {
-                if now - file.created < of.valid {
-                    if file.err == 0 {
-                        of.fd = file.fd;
-                        of.uniq = file.uniq;
-                        of.mtime = file.mtime;
-                        of.size = file.size;
-                        of.is_dir = file.is_dir;
-                        of.is_file = file.is_file;
-                        of.is_link = file.is_link;
-                        of.is_exec = file.is_exec;
-                        of.is_directio = file.is_directio;
+        None => {
+            // not found
 
-                        if !file.is_dir {
-                            file.count += 1;
-                        }
-                    } else {
-                        of.err = file.err;
-                        of.failed = "open()";
-                    }
+            let rc = open_and_stat_file(name, of, log);
 
-                    file.accessed = now;
-                    cache.update_lru(name);
-                    ngx_log_debug!(
-                        NGX_LOG_DEBUG_CORE,
-                        log,
-                        "cached open file: {}, fd:{}, c:{}, e:{}, u:{}",
-                        B(name),
-                        file.fd,
-                        file.count,
-                        file.err,
-                        file.uses
-                    );
-                    true
-                } else {
-                    false
-                }
+            if rc.is_err() && (of.err == 0 || !of.errors) {
+                Next::Failed(None)
             } else {
-                false
-            }
-        };
-
-        if should_return_cached {
-            if of.err == 0 && !of.is_dir {
-                return Ok(Some(Rc::new(CachedFileHandle::Cached {
-                    cache: cache.clone(),
-                    name: name.to_vec(),
-                })));
-            } else {
-                return Err(());
+                Next::Create
             }
         }
+    };
 
-        // Need to retest
-        {
-            let file = file_rc.borrow();
-            ngx_log_debug!(
-                NGX_LOG_DEBUG_CORE,
-                log,
-                "retest open file: {}, fd:{}, c:{}, e:{}",
-                B(name),
-                file.fd,
-                file.count,
-                file.err
-            );
+    let file = match next {
+        Next::Failed(file) => return open_failed(cache, file, name, of, log),
 
-            if file.is_dir {
-                of.test_dir = true;
+        Next::Create => {
+            // create:
+
+            if *cache.current.borrow() >= cache.max {
+                expire_old_cached_files(cache, 0, log);
             }
-            of.fd = file.fd;
-            of.uniq = file.uniq;
-        }
 
-        open_and_stat_file(name, of, log)?;
-
-        let mut file = file_rc.borrow_mut();
-        update_cache_entry(&mut file, of, now);
-    } else {
-        open_and_stat_file(name, of, log)?;
-
-        cache.expire_if_full(log);
-
-        let file = CachedFile {
-            name: name.to_vec(),
-            created: now,
-            accessed: now,
-            fd: of.fd,
-            uniq: of.uniq,
-            mtime: of.mtime,
-            size: of.size,
-            err: of.err,
-            uses: 1,
-            disable_symlinks: of.disable_symlinks,
-            disable_symlinks_from: of.disable_symlinks_from,
-            count: if !of.is_dir { 1 } else { 0 },
-            close: false,
-            is_dir: of.is_dir,
-            is_file: of.is_file,
-            is_link: of.is_link,
-            is_exec: of.is_exec,
-            is_directio: of.is_directio,
-        };
-
-        let _ = cache.insert(file);
-        ngx_log_debug!(
-            NGX_LOG_DEBUG_CORE,
-            log,
-            "cached open file: {}, fd:{}, c:{}, e:{}, u:{}",
-            B(name),
-            of.fd,
-            if !of.is_dir { 1 } else { 0 },
-            of.err,
-            1
-        );
-
-        if of.err == 0 && !of.is_dir {
-            return Ok(Some(Rc::new(CachedFileHandle::Cached {
-                cache: cache.clone(),
+            let file = Rc::new(RefCell::new(CachedFile {
                 name: name.to_vec(),
-            })));
+                created: now,
+                accessed: now,
+                fd: NGX_INVALID_FILE,
+                uniq: 0,
+                mtime: 0,
+                size: 0,
+                err: 0,
+                uses: 1,
+                disable_symlinks: 0,
+                disable_symlinks_from: 0,
+                count: 0,
+                close: false,
+                is_dir: false,
+                is_file: false,
+                is_link: false,
+                is_exec: false,
+                is_directio: false,
+            }));
+
+            cache.tree_insert(&file);
+
+            *cache.current.borrow_mut() += 1;
+
+            update(&file, of, now);
+
+            file
+        }
+
+        // add_event: ngx_open_file_add_event() does nothing without events
+        Next::AddEvent(file) | Next::Update(file) => {
+            update(&file, of, now);
+            file
+        }
+
+        Next::Found(file) => file,
+    };
+
+    // found:
+
+    file.borrow_mut().accessed = now;
+
+    cache.queue_insert_head(&file);
+
+    {
+        let f = file.borrow();
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "cached open file: {}, fd:{}, c:{}, e:{}, u:{}", B(&f.name), f.fd, f.count, f.err, f.uses);
+    }
+
+    if of.err == 0 {
+        if !of.is_dir {
+            return Ok(Some(Rc::new(CachedFileHandle::Cached { cache: cache.clone(), name: name.to_vec(), file, min_uses: of.min_uses, log: log.clone() })));
+        }
+
+        return Ok(None);
+    }
+
+    Err(())
+}
+
+/// ngx_open_cached_file() for a file found in the cache.
+fn lookup_found(cache: &OpenFileCache, file: CachedFileRef, name: &[u8], of: &mut OpenFileInfo, now: i64, log: &Log) -> Next {
+    file.borrow_mut().uses += 1;
+
+    cache.queue_remove(&file);
+
+    let (fd, err, is_dir) = {
+        let f = file.borrow();
+        (f.fd, f.err, f.is_dir)
+    };
+
+    if fd == NGX_INVALID_FILE && err == 0 && !is_dir {
+        // file was not used often enough to keep open
+
+        let rc = open_and_stat_file(name, of, log);
+
+        if rc.is_err() && (of.err == 0 || !of.errors) {
+            return Next::Failed(Some(file));
+        }
+
+        return Next::AddEvent(file);
+    }
+
+    let valid = {
+        let f = file.borrow();
+
+        (of.uniq == 0 || of.uniq == f.uniq)
+            && now - f.created < of.valid
+            && of.disable_symlinks == f.disable_symlinks
+            && of.disable_symlinks_from == f.disable_symlinks_from
+    };
+
+    if valid {
+        let mut f = file.borrow_mut();
+
+        if f.err == 0 {
+            of.fd = f.fd;
+            of.uniq = f.uniq;
+            of.mtime = f.mtime;
+            of.size = f.size;
+
+            of.is_dir = f.is_dir;
+            of.is_file = f.is_file;
+            of.is_link = f.is_link;
+            of.is_exec = f.is_exec;
+            of.is_directio = f.is_directio;
+
+            if !f.is_dir {
+                f.count += 1;
+            }
         } else {
-            return Err(());
+            of.err = f.err;
+            of.failed = if f.disable_symlinks != 0 { "openat()" } else { "open()" };
+        }
+
+        drop(f);
+
+        return Next::Found(file);
+    }
+
+    {
+        let f = file.borrow();
+
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "retest open file: {}, fd:{}, c:{}, e:{}", B(&f.name), f.fd, f.count, f.err);
+
+        if f.is_dir {
+            // chances that directory became file are very small
+            // so test_dir flag allows to use a single syscall
+            // in ngx_file_info() instead of three syscalls
+
+            of.test_dir = true;
+        }
+
+        of.fd = f.fd;
+        of.uniq = f.uniq;
+    }
+
+    let rc = open_and_stat_file(name, of, log);
+
+    if rc.is_err() && (of.err == 0 || !of.errors) {
+        return Next::Failed(Some(file));
+    }
+
+    let (f_is_dir, f_err, f_uniq, f_is_directio) = {
+        let f = file.borrow();
+        (f.is_dir, f.err, f.uniq, f.is_directio)
+    };
+
+    if of.is_dir {
+        if f_is_dir || f_err != 0 {
+            return Next::Update(file);
+        }
+
+        // file became directory
+    } else if of.err == 0 {
+        // file
+
+        if f_is_dir || f_err != 0 {
+            return Next::AddEvent(file);
+        }
+
+        if of.uniq == f_uniq {
+            of.is_directio = f_is_directio;
+
+            return Next::Update(file);
+        }
+
+        // file was changed
+    } else {
+        // error to cache
+
+        if f_err != 0 || f_is_dir {
+            return Next::Update(file);
+        }
+
+        // file was removed, etc.
+    }
+
+    if file.borrow().count == 0 {
+        // ngx_open_file_del_event(file): no events
+
+        let f = file.borrow();
+
+        if let Err(e) = close_file(f.fd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
+        }
+
+        drop(f);
+
+        return Next::AddEvent(file);
+    }
+
+    cache.tree_delete(&file);
+
+    *cache.current.borrow_mut() -= 1;
+
+    file.borrow_mut().close = true;
+
+    Next::Create
+}
+
+/// The update: label of ngx_open_cached_file().
+fn update(file: &CachedFileRef, of: &OpenFileInfo, now: i64) {
+    let mut f = file.borrow_mut();
+
+    f.fd = of.fd;
+    f.err = of.err;
+    f.disable_symlinks = of.disable_symlinks;
+    f.disable_symlinks_from = of.disable_symlinks_from;
+
+    if of.err == 0 {
+        f.uniq = of.uniq;
+        f.mtime = of.mtime;
+        f.size = of.size;
+
+        f.close = false;
+
+        f.is_dir = of.is_dir;
+        f.is_file = of.is_file;
+        f.is_link = of.is_link;
+        f.is_exec = of.is_exec;
+        f.is_directio = of.is_directio;
+
+        if !of.is_dir {
+            f.count += 1;
+        }
+    }
+
+    f.created = now;
+}
+
+/// The failed: label of ngx_open_cached_file().
+fn open_failed(cache: &OpenFileCache, file: Option<CachedFileRef>, name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<Option<Rc<CachedFileHandle>>, ()> {
+    if let Some(file) = file {
+        cache.tree_delete(&file);
+
+        *cache.current.borrow_mut() -= 1;
+
+        let mut f = file.borrow_mut();
+
+        if f.count == 0 {
+            if f.fd != NGX_INVALID_FILE {
+                if let Err(e) = close_file(f.fd) {
+                    ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(&f.name));
+                }
+
+                f.fd = NGX_INVALID_FILE;
+            }
+
+            // ngx_free(file)
+        } else {
+            f.close = true;
+        }
+    }
+
+    if of.fd != NGX_INVALID_FILE {
+        if let Err(e) = close_file(of.fd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
         }
     }
 
     Err(())
 }
 
-fn update_cache_entry(file: &mut CachedFile, of: &OpenFileInfo, now: i64) {
-    file.fd = of.fd;
-    file.err = of.err;
-    file.disable_symlinks = of.disable_symlinks;
-    file.disable_symlinks_from = of.disable_symlinks_from;
-    file.accessed = now;
-
-    if of.err == 0 {
-        file.uniq = of.uniq;
-        file.mtime = of.mtime;
-        file.size = of.size;
-        file.close = false;
-        file.is_dir = of.is_dir;
-        file.is_file = of.is_file;
-        file.is_link = of.is_link;
-        file.is_exec = of.is_exec;
-        file.is_directio = of.is_directio;
-
-        if !of.is_dir {
-            file.count += 1;
-        }
-    }
-}
-
+/// ngx_open_and_stat_file
 fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(), ()> {
     if of.fd != NGX_INVALID_FILE {
-        if let Ok(st) = os::fstat(of.fd) {
-            if stat_uniq(&st) == of.uniq {
-                return fill_info_from_stat(&st, of);
-            }
-        }
-    } else if of.test_dir {
-        if let Ok(st) = os::stat(name) {
-            if os::is_dir(&st) {
-                return fill_info_from_stat(&st, of);
-            }
-        }
-    }
-
-    if of.test_only {
         match file_info_wrapper(name, of) {
-            Ok(st) => return fill_info_from_stat(&st, of),
             Err((err, failed)) => {
                 of.err = err;
                 of.failed = failed;
+                of.fd = NGX_INVALID_FILE;
                 return Err(());
+            }
+
+            Ok(st) => {
+                if of.uniq == stat_uniq(&st) {
+                    return fill_info_from_stat(&st, of);
+                }
+            }
+        }
+    } else if of.test_dir {
+        match file_info_wrapper(name, of) {
+            Err((err, failed)) => {
+                of.err = err;
+                of.failed = failed;
+                of.fd = NGX_INVALID_FILE;
+                return Err(());
+            }
+
+            Ok(st) => {
+                if os::is_dir(&st) {
+                    return fill_info_from_stat(&st, of);
+                }
             }
         }
     }
@@ -435,6 +683,8 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
     let fd = if of.log {
         open_file_wrapper(name, of, libc::O_APPEND, libc::O_CREAT | libc::O_WRONLY, 0o644, log)
     } else {
+        // Use non-blocking open() not to hang on FIFO files, etc.
+        // This flag has no effect on a regular files.
         open_file_wrapper(name, of, libc::O_RDONLY | libc::O_NONBLOCK, 0, 0, log)
     };
 
@@ -446,7 +696,10 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
     match os::fstat(fd) {
         Ok(st) => {
             if os::is_dir(&st) {
-                os::close(fd);
+                if let Err(e) = close_file(fd) {
+                    ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
+                }
+
                 of.fd = NGX_INVALID_FILE;
             } else {
                 of.fd = fd;
@@ -464,11 +717,16 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
 
             fill_info_from_stat(&st, of)
         }
+
         Err(err) => {
-            os::close(fd);
+            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "fstat() \"{}\" failed", B(name));
+
+            if let Err(e) = close_file(fd) {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
+            }
+
             of.fd = NGX_INVALID_FILE;
-            of.err = err;
-            of.failed = "fstat()";
+
             Err(())
         }
     }
@@ -516,6 +774,16 @@ fn fill_info_from_stat(st: &libc::stat, of: &mut OpenFileInfo) -> Result<(), ()>
     of.is_link = os::is_link(st);
     of.is_exec = os::is_exec(st);
     Ok(())
+}
+
+/// ngx_close_file
+fn close_file(fd: i32) -> Result<(), i32> {
+    // SAFETY: closing a descriptor owned by the cache or the caller.
+    if unsafe { libc::close(fd) } == -1 {
+        Err(os::errno())
+    } else {
+        Ok(())
+    }
 }
 
 fn stat_uniq(st: &libc::stat) -> u64 {

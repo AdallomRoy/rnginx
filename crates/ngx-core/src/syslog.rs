@@ -7,7 +7,7 @@ use crate::conf::{Conf, ConfError, ConfResult};
 use crate::inet::{parse_url, SockAddr, Url};
 use crate::log::*;
 use crate::string::{eq_ignore_case, B};
-use crate::{ngx_log_error, os, times};
+use crate::{ngx_log_debug, ngx_log_error, os, times};
 
 pub const NGX_SYSLOG_MAX_STR: usize = NGX_MAX_ERROR_STR + 512;
 
@@ -27,6 +27,22 @@ pub struct SyslogPeer {
     pub fd: Cell<i32>,
     pub busy: Cell<bool>,
     pub log: RefCell<Option<Log>>,
+    /// peer->server.name
+    pub server_name: Vec<u8>,
+}
+
+/// ngx_syslog_log_error: the handler of peer->log, whose action is
+/// "logging to syslog"
+struct SyslogLogCtx {
+    server: Vec<u8>,
+}
+
+impl LogContext for SyslogLogCtx {
+    fn write_context(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(b" while logging to syslog");
+        buf.extend_from_slice(b", server: ");
+        buf.extend_from_slice(&self.server);
+    }
 }
 
 fn facility_index(name: &[u8]) -> Option<u32> {
@@ -50,6 +66,7 @@ pub fn process_conf(cf: &Conf, arg: &[u8]) -> Result<Rc<SyslogPeer>, ConfError> 
     let mut tag: Option<Vec<u8>> = None;
     let mut nohostname = false;
     let mut server: Option<SockAddr> = None;
+    let mut server_name = Vec::new();
 
     let mut p = &arg[7..]; // skip "syslog:"
     while !p.is_empty() {
@@ -71,6 +88,7 @@ pub fn process_conf(cf: &Conf, arg: &[u8]) -> Result<Rc<SyslogPeer>, ConfError> 
                 return Err(ConfError::Logged);
             }
             server = Some(u.addrs[0].sockaddr.clone());
+            server_name = u.addrs[0].name.clone();
         } else if item.starts_with(b"facility=") {
             if facility.is_some() {
                 return Err(cf.emerg(format_args!("duplicate syslog \"facility\"")));
@@ -128,6 +146,7 @@ pub fn process_conf(cf: &Conf, arg: &[u8]) -> Result<Rc<SyslogPeer>, ConfError> 
         fd: Cell::new(-1),
         busy: Cell::new(false),
         log: RefCell::new(None),
+        server_name,
     }))
 }
 
@@ -177,20 +196,62 @@ impl SyslogPeer {
         if self.fd.get() == -1 && self.init(&log).is_err() {
             return -1;
         }
-        let n = unsafe { libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
-        if n == -1 {
-            let e = os::errno();
-            if e != libc::EAGAIN {
-                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "send() failed");
+        // ngx_unix_send
+        loop {
+            let n = unsafe { libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
+
+            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "send: fd:{} {} of {}", self.fd.get(), n, buf.len());
+
+            if n > 0 {
+                return n;
             }
+
+            let err = os::errno();
+
+            if n == 0 {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "send() returned zero");
+                return n;
+            }
+
+            if err == libc::EAGAIN || err == libc::EINTR {
+                if log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+                    log.error(NGX_LOG_DEBUG, Some(err), format_args!("send() not ready"));
+                }
+
+                if err == libc::EAGAIN {
+                    // NGX_AGAIN
+                    return -2;
+                }
+
+                continue;
+            }
+
+            // ngx_connection_error(c, err, "send() failed") with c->log_error
+            // NGX_ERROR_ALERT
+            let level = match err {
+                libc::ECONNRESET | libc::EPIPE | libc::ENOTCONN | libc::ETIMEDOUT | libc::ECONNREFUSED | libc::ENETDOWN | libc::ENETUNREACH | libc::EHOSTDOWN | libc::EHOSTUNREACH => NGX_LOG_ERR,
+                _ => NGX_LOG_ALERT,
+            };
+
+            ngx_log_error!(level, log, Some(err), "send() failed");
+
+            // n == NGX_ERROR
             os::close(self.fd.get());
             self.fd.set(-1);
+
+            return -1;
         }
-        n
     }
 
     /// Set the log used for reporting send errors (avoids recursion: cycle log with syslog stripped).
+    /// As ngx_syslog_send() with peer->logp: a copy of the log with the
+    /// ngx_syslog_log_error handler and the "logging to syslog" action.
     pub fn set_log(&self, log: Log) {
+        let log = log.fork();
+
+        log.set_action(Some("logging to syslog"));
+        log.set_context(Some(Rc::new(SyslogLogCtx { server: self.server_name.clone() })));
+
         *self.log.borrow_mut() = Some(log);
     }
 }
