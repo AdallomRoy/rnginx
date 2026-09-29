@@ -30,18 +30,69 @@ use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_L
 
 crate::http_module_index!("ngx_http_proxy_module");
 
+/// ngx_http_proxy_vars_t
+#[derive(Clone, Default, Debug)]
+pub struct ProxyVars {
+    pub key_start: Vec<u8>,
+    pub schema: Vec<u8>,
+    pub host_header: Vec<u8>,
+    pub port: Vec<u8>,
+    pub uri: Vec<u8>,
+}
+
+/// ngx_http_proxy_headers_t: the request headers of proxy_set_header and
+/// the defaults, as ngx_http_proxy_init_headers() compiles them.
+pub struct ProxyHeaders {
+    /// headers->flushes: the variables of the values
+    pub flushes: Vec<usize>,
+    /// headers->lengths and headers->values: the name and the value codes
+    /// of each header with a value that is not empty in the configuration
+    pub lines: Vec<(Vec<u8>, Vec<crate::script::Part>)>,
+    /// headers->hash: the names of all of them (the client's headers of
+    /// these names are not passed)
+    pub hash: ngx_core::hash::Hash<()>,
+}
+
+/// ngx_http_proxy_ctx_t
+#[derive(Default)]
+pub struct ProxyCtx {
+    pub vars: ProxyVars,
+    pub internal_body_length: i64,
+    /// the request sent is a HEAD one
+    pub head: bool,
+    pub internal_chunked: bool,
+    /// ngx_http_proxy_body_output_filter: the header was sent
+    pub header_sent: bool,
+}
+
 /// Proxy location configuration
 pub struct NgxHttpProxyLocConf {
-    pub upstream_uri: Option<Vec<u8>>,  // proxy_pass URL (literal, for static parsing)
-    /// If the proxy_pass URI contains `$variable` references, we compile it
-    /// as a ComplexValue at config time and expand at request time. Matches
-    /// C's ngx_http_proxy_eval path: parse the expanded string as a URL,
-    /// resolve host/port, and forward the rest as the upstream path.
-    pub upstream_uri_cv: Option<crate::script::ComplexValue>,
-    /// proxy_method: overrides the request method sent to upstream. Supports
-    /// variable interpolation via ComplexValue. Defaults to forwarding the
-    /// client's method.
-    pub method: Option<crate::script::ComplexValue>,
+    /// plcf->url: the URL of proxy_pass without variables
+    pub url: Vec<u8>,
+    /// plcf->location
+    pub location: Vec<u8>,
+    /// plcf->vars
+    pub vars: ProxyVars,
+    /// plcf->proxy_lengths / proxy_values: the codes of a proxy_pass URL
+    /// with variables (ngx_http_proxy_eval)
+    pub proxy_values: Option<Rc<Vec<crate::script::Part>>>,
+    /// proxy_method (ngx_http_set_complex_value_slot)
+    pub method: Val<Option<Rc<crate::script::ComplexValue>>>,
+    /// proxy_set_body (ngx_conf_set_str_slot)
+    pub body_source: Option<Vec<u8>>,
+    /// plcf->body_lengths / body_values, and body_flushes
+    pub body_values: Option<Rc<Vec<crate::script::Part>>>,
+    pub body_flushes: Rc<Vec<usize>>,
+    /// proxy_set_header (ngx_conf_set_keyval_slot): unset, NULL or the list
+    pub headers_source: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>>,
+    /// plcf->headers and plcf->headers_cache, once built (hash.buckets)
+    pub headers: Option<Rc<ProxyHeaders>>,
+    pub headers_cache: Option<Rc<ProxyHeaders>>,
+    /// plcf->host_value: the value of "proxy_set_header Host"
+    pub host_value: Option<Rc<crate::script::ComplexValue>>,
+    /// proxy_headers_hash_max_size, proxy_headers_hash_bucket_size
+    pub headers_hash_max_size: Val<i64>,
+    pub headers_hash_bucket_size: Val<i64>,
     /// proxy_intercept_errors: if on, upstream >= 400 responses are handled by
     /// the local error_page instead of being forwarded to the client.
     pub intercept_errors: Val<bool>,
@@ -76,12 +127,6 @@ pub struct NgxHttpProxyLocConf {
     /// proxy_ssl_certificate, proxy_ssl_certificate_key,
     /// proxy_ssl_certificate_cache, proxy_ssl_password_file, and the context.
     pub upstream_ssl: crate::upstream_ssl::UpstreamSslConf,
-    /// proxy_set_body: overrides the request body sent upstream (complex value).
-    pub set_body: Option<crate::script::ComplexValue>,
-    /// proxy_set_header entries: (name, complex value). Empty value drops the
-    /// header. Overrides same-name client headers. Matches C's list-of-entries
-    /// semantic though we keep it simple (no upstream defaults inheritance).
-    pub set_headers: Vec<(Vec<u8>, crate::script::ComplexValue)>,
     /// proxy_force_ranges: force range processing on non-file proxy responses.
     pub force_ranges: Val<bool>,
     /// proxy_cookie_domain rewrites (applied to Domain= attributes of Set-Cookie).
@@ -107,20 +152,19 @@ pub struct NgxHttpProxyLocConf {
     /// the upstream of a proxy_pass URL without variables
     /// (ngx_http_upstream_add)
     pub upstream: Option<Rc<crate::upstream::UpstreamSrvConf>>,
-    /// plcf->vars.uri: the URI part of a proxy_pass URL without variables
-    pub vars_uri: Vec<u8>,
-    /// proxy_redirect entries. Reuses CookieRewrite because the substitution
-    /// machinery is the same (literal, complex or regex pattern → replacement).
-    pub redirects: Vec<CookieRewrite>,
-    /// Set by `proxy_redirect off;` to disable inheritance and any rewrites.
-    pub redirect_off: bool,
-    /// Set by `proxy_redirect default` — resolved at first-request time by
-    /// combining the proxy_pass URL and the location name.
-    pub redirect_default: bool,
+    /// plcf->redirects: the proxy_redirect entries (NULL when None). Reuses
+    /// CookieRewrite because the substitution machinery is the same
+    /// (literal, complex or regex pattern → replacement).
+    pub redirects: Option<Vec<CookieRewrite>>,
+    /// plcf->redirect: "proxy_redirect off" sets it to 0
+    pub redirect: Val<bool>,
     /// proxy_cookie_flags entries.
     pub cookie_flags: Vec<CookieFlagsRule>,
-    /// proxy_http_version: 0 = 1.0 (default), 1 = 1.1.
+    /// proxy_http_version: NGX_HTTP_VERSION_10 or NGX_HTTP_VERSION_11
+    /// (the default).
     pub http_version: Val<u32>,
+    /// proxy_pass_trailers (upstream.pass_trailers)
+    pub pass_trailers: Val<bool>,
     /// proxy_hide_header entries (lowercase). `None` = inherit from parent;
     /// `Some(list)` = explicit local list (still merged with defaults).
     pub hide_headers: Option<Vec<Vec<u8>>>,
@@ -230,9 +274,20 @@ pub struct CookieRewrite {
 impl Default for NgxHttpProxyLocConf {
     fn default() -> Self {
         NgxHttpProxyLocConf {
-            upstream_uri: None,
-            upstream_uri_cv: None,
-            method: None,
+            url: Vec::new(),
+            location: Vec::new(),
+            vars: ProxyVars::default(),
+            proxy_values: None,
+            method: Val::unset(),
+            body_source: None,
+            body_values: None,
+            body_flushes: Rc::new(Vec::new()),
+            headers_source: Val::unset(),
+            headers: None,
+            headers_cache: None,
+            host_value: None,
+            headers_hash_max_size: Val::unset(),
+            headers_hash_bucket_size: Val::unset(),
             intercept_errors: Val::unset(),
             pass_request_headers: Val::unset(),
             pass_request_body: Val::unset(),
@@ -247,8 +302,6 @@ impl Default for NgxHttpProxyLocConf {
             ssl_crl: Val::unset(),
             ssl_conf_commands: Val::unset(),
             upstream_ssl: crate::upstream_ssl::UpstreamSslConf::default(),
-            set_body: None,
-            set_headers: Vec::new(),
             force_ranges: Val::unset(),
             cookie_domains: Vec::new(),
             cookie_paths: Vec::new(),
@@ -259,12 +312,11 @@ impl Default for NgxHttpProxyLocConf {
             next_upstream_timeout: Val::unset(),
             read_timeout: Val::unset(),
             upstream: None,
-            vars_uri: Vec::new(),
-            redirects: Vec::new(),
-            redirect_off: false,
-            redirect_default: false,
+            redirects: None,
+            redirect: Val::unset(),
             cookie_flags: Vec::new(),
             http_version: Val::unset(),
+            pass_trailers: Val::unset(),
             hide_headers: None,
             pass_headers: None,
             cache: crate::proxy_cache::ProxyCacheConf::new(),
@@ -279,22 +331,13 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let mut p = conf_cell::<NgxHttpProxyLocConf>(prev).borrow_mut();
     let mut c = conf_cell::<NgxHttpProxyLocConf>(conf).borrow_mut();
-    merge_ssl(cf, &mut p, &mut c)?;
-    if c.method.is_none() {
-        c.method = p.method.clone();
-    }
     c.intercept_errors.merge(&p.intercept_errors, false);
     c.pass_request_headers.merge(&p.pass_request_headers, true);
     c.pass_request_body.merge(&p.pass_request_body, true);
+    c.pass_trailers.merge(&p.pass_trailers, false);
     c.request_buffering.merge(&p.request_buffering, true);
     c.buffering.merge(&p.buffering, true);
     c.connect_timeout.merge(&p.connect_timeout, 60000);
-    if c.set_body.is_none() {
-        c.set_body = p.set_body.clone();
-    }
-    if c.set_headers.is_empty() {
-        c.set_headers = p.set_headers.clone();
-    }
     c.force_ranges.merge(&p.force_ranges, false);
     if c.cookie_domains.is_empty() {
         c.cookie_domains = p.cookie_domains.clone();
@@ -316,53 +359,6 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     c.next_upstream_tries.merge(&p.next_upstream_tries, 0);
     c.next_upstream_timeout.merge(&p.next_upstream_timeout, 0);
     c.read_timeout.merge(&p.read_timeout, 60000);
-    // Inherit redirect rules unless this location explicitly disabled them
-    // with `proxy_redirect off;` or already set its own rules.
-    if !c.redirect_off && c.redirects.is_empty() && !c.redirect_default {
-        c.redirects = p.redirects.clone();
-        c.redirect_default = p.redirect_default;
-    }
-    // Match ngx_http_proxy_module: with no proxy_redirect directive at all,
-    // the effective mode is `default` (implicit). We only turn it off if the
-    // user explicitly wrote `proxy_redirect off;`.
-    if !c.redirect_off && c.redirects.is_empty() && !c.redirect_default {
-        c.redirect_default = true;
-    }
-    // Inherit cookie_flags unless this location listed its own.
-    if c.cookie_flags.is_empty() {
-        c.cookie_flags = p.cookie_flags.clone();
-    }
-    c.http_version.merge(&p.http_version, 0);
-    // Inherit hide/pass lists independently: if child didn't set its own,
-    // inherit from parent. Matches ngx_http_upstream_hide_headers_hash
-    // which pulls each list from prev when NGX_CONF_UNSET_PTR.
-    if c.hide_headers.is_none() { c.hide_headers = p.hide_headers.clone(); }
-    if c.pass_headers.is_none() { c.pass_headers = p.pass_headers.clone(); }
-
-    // the proxy_pass of the enclosing location is inherited by the "if"
-    // and "limit_except" blocks only (conf->upstream.upstream, location,
-    // vars, proxy_lengths/values and ssl), not by nested locations
-    let clcf = get_loc_conf::<CoreLocConf>(cf, crate::core::ctx_index());
-
-    if clcf.borrow().noname && c.upstream.is_none() && c.upstream_uri_cv.is_none() {
-        c.upstream = p.upstream.clone();
-        c.upstream_uri = p.upstream_uri.clone();
-        c.vars_uri = p.vars_uri.clone();
-
-        c.upstream_uri_cv = p.upstream_uri_cv.clone();
-
-        c.ssl = p.ssl;
-    }
-
-    let lmt_excpt_no_handler = {
-        let l = clcf.borrow();
-        l.lmt_excpt && l.handler.is_none()
-    };
-
-    if lmt_excpt_no_handler && (c.upstream.is_some() || c.upstream_uri_cv.is_some()) {
-        clcf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
-    }
-
     // proxy_cache_* inheritance — location-level overrides win, otherwise
     // pull each field from the parent (matches C's per-field
     // ngx_conf_merge_ptr_value / merge_str_value pattern).
@@ -383,7 +379,258 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     if !c.cache.background_update { c.cache.background_update = p.cache.background_update; }
     if c.cache.max_range_offset.is_none() { c.cache.max_range_offset = p.cache.max_range_offset; }
     if c.cache.min_uses == 1 { c.cache.min_uses = p.cache.min_uses; }
+
+    merge_ssl(cf, &mut p, &mut c)?;
+
+    crate::upstream_ssl::merge_ptr(&mut c.method, &p.method);
+
+    c.redirect.merge(&p.redirect, true);
+
+    if *c.redirect.get() {
+        if c.redirects.is_none() {
+            c.redirects = p.redirects.clone();
+        }
+
+        if c.redirects.is_none() && !c.url.is_empty() {
+            let pr = default_redirect(&c);
+            c.redirects = Some(vec![pr]);
+        }
+    }
+
+    // Inherit cookie_flags unless this location listed its own.
+    if c.cookie_flags.is_empty() {
+        c.cookie_flags = p.cookie_flags.clone();
+    }
+
+    c.http_version.merge(&p.http_version, crate::NGX_HTTP_VERSION_11);
+
+    c.headers_hash_max_size.merge(&p.headers_hash_max_size, 512);
+    c.headers_hash_bucket_size.merge(&p.headers_hash_bucket_size, 64);
+
+    // ngx_align(conf->headers_hash_bucket_size, ngx_cacheline_size)
+    let bucket_size = *c.headers_hash_bucket_size.get();
+    c.headers_hash_bucket_size = Val::set((bucket_size + 63) & !63);
+
+    // Inherit hide/pass lists independently: if child didn't set its own,
+    // inherit from parent. Matches ngx_http_upstream_hide_headers_hash
+    // which pulls each list from prev when NGX_CONF_UNSET_PTR.
+    if c.hide_headers.is_none() { c.hide_headers = p.hide_headers.clone(); }
+    if c.pass_headers.is_none() { c.pass_headers = p.pass_headers.clone(); }
+
+    let clcf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
+
+    let (noname, lmt_excpt, has_handler) = {
+        let l = clcf.borrow();
+        (l.noname, l.lmt_excpt, l.handler.is_some())
+    };
+
+    if noname && c.upstream.is_none() && c.proxy_values.is_none() {
+        c.upstream = p.upstream.clone();
+        c.location = p.location.clone();
+        c.vars = p.vars.clone();
+
+        c.proxy_values = p.proxy_values.clone();
+
+        c.ssl = p.ssl;
+    }
+
+    if lmt_excpt && !has_handler && (c.upstream.is_some() || c.proxy_values.is_some()) {
+        clcf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
+    }
+
+    if c.body_source.is_none() {
+        c.body_flushes = p.body_flushes.clone();
+        c.body_source = p.body_source.clone();
+        c.body_values = p.body_values.clone();
+    }
+
+    if c.body_values.is_none() {
+        if let Some(source) = c.body_source.clone() {
+            let codes = crate::script::script_compile(cf, &source)?;
+            c.body_flushes = Rc::new(script_flushes(&codes));
+            c.body_values = Some(Rc::new(codes));
+        }
+    }
+
+    crate::upstream_ssl::merge_ptr(&mut c.headers_source, &p.headers_source);
+
+    let same_source = same_headers_source(&c.headers_source, &p.headers_source);
+
+    if same_source {
+        c.headers = p.headers.clone();
+        c.headers_cache = p.headers_cache.clone();
+        c.host_value = p.host_value.clone();
+    }
+
+    init_headers(cf, &mut c, false, PROXY_HEADERS)?;
+
+    if c.cache.zone.is_some() {
+        init_headers(cf, &mut c, true, PROXY_CACHE_HEADERS)?;
+    }
+
+    // special handling to preserve conf->headers in the "http" section
+    // to inherit it to all servers
+
+    if p.headers.is_none() && same_source {
+        p.headers = c.headers.clone();
+        p.headers_cache = c.headers_cache.clone();
+        p.host_value = c.host_value.clone();
+    }
+
     Ok(())
+}
+
+/// ngx_http_proxy_headers: the request headers set by default.
+const PROXY_HEADERS: &[(&[u8], &[u8])] = &[
+    (b"Host", b""),
+    (b"Connection", b""),
+    (b"Proxy-Connection", b""),
+    (b"Content-Length", b"$proxy_internal_body_length"),
+    (b"Transfer-Encoding", b"$proxy_internal_chunked"),
+    (b"TE", b""),
+    (b"Keep-Alive", b""),
+    (b"Expect", b""),
+    (b"Upgrade", b""),
+];
+
+/// ngx_http_proxy_cache_headers: the defaults of a cacheable request.
+const PROXY_CACHE_HEADERS: &[(&[u8], &[u8])] = &[
+    (b"Host", b""),
+    (b"Connection", b""),
+    (b"Proxy-Connection", b""),
+    (b"Content-Length", b"$proxy_internal_body_length"),
+    (b"Transfer-Encoding", b"$proxy_internal_chunked"),
+    (b"TE", b""),
+    (b"Keep-Alive", b""),
+    (b"Expect", b""),
+    (b"Upgrade", b""),
+    (b"If-Modified-Since", b"$upstream_cache_last_modified"),
+    (b"If-Unmodified-Since", b""),
+    (b"If-None-Match", b"$upstream_cache_etag"),
+    (b"If-Match", b""),
+    (b"Range", b""),
+    (b"If-Range", b""),
+];
+
+/// sc->flushes of ngx_http_script_compile(): the variables of the codes.
+fn script_flushes(codes: &[crate::script::Part]) -> Vec<usize> {
+    codes
+        .iter()
+        .filter_map(|c| match c {
+            crate::script::Part::Var(index) => Some(*index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// conf->headers_source == prev->headers_source after
+/// ngx_conf_merge_ptr_value(): both NULL (or unset), or the same list.
+fn same_headers_source(a: &Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>>, b: &Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>>) -> bool {
+    match (&a.0, &b.0) {
+        (None, None) => true,
+        (Some(None), Some(None)) => true,
+        (Some(Some(x)), Some(Some(y))) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// ngx_http_proxy_init_headers: the headers of proxy_set_header (all but
+/// Host, whose value becomes conf->host_value), then the defaults the
+/// configuration does not set; the names go to the hash, the headers with
+/// a value are compiled.
+fn init_headers(cf: &mut Conf, conf: &mut NgxHttpProxyLocConf, cache: bool, default_headers: &[(&[u8], &[u8])]) -> ConfResult {
+    let built = if cache { conf.headers_cache.is_some() } else { conf.headers.is_some() };
+
+    if built {
+        return Ok(());
+    }
+
+    let mut headers_merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    if let Some(src) = conf.headers_source.as_option().cloned().flatten() {
+        for (key, value) in src.iter() {
+            if key.len() == 4 && key.eq_ignore_ascii_case(b"Host") {
+                let cv = crate::script::compile_complex_value(cf, value, 0)?;
+                conf.host_value = Some(Rc::new(cv));
+                continue;
+            }
+
+            headers_merged.push((key.clone(), value.clone()));
+        }
+    }
+
+    for (key, value) in default_headers {
+        if headers_merged.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+
+        headers_merged.push((key.to_vec(), value.to_vec()));
+    }
+
+    let mut headers_names = Vec::with_capacity(headers_merged.len());
+    let mut flushes = Vec::new();
+    let mut lines = Vec::new();
+
+    for (key, value) in headers_merged {
+        // the hash keys are lowercased by ngx_hash_init()
+        headers_names.push(ngx_core::hash::HashKey { key: key.to_ascii_lowercase(), key_hash: ngx_core::hash::hash_key_lc(&key), value: () });
+
+        if value.is_empty() {
+            continue;
+        }
+
+        let codes = crate::script::script_compile(cf, &value)?;
+
+        flushes.extend(script_flushes(&codes));
+
+        lines.push((key, codes));
+    }
+
+    let hinit = ngx_core::hash::HashInit {
+        name: "proxy_headers_hash",
+        max_size: *conf.headers_hash_max_size.get() as usize,
+        bucket_size: *conf.headers_hash_bucket_size.get() as usize,
+        log: &cf.log,
+    };
+
+    let hash = match ngx_core::hash::Hash::init(&hinit, headers_names) {
+        Ok(h) => h,
+        Err(e) => {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_EMERG, cf.log, None, "{}", e);
+            return Err(ConfError::Logged);
+        }
+    };
+
+    let headers = Some(Rc::new(ProxyHeaders { flushes, lines, hash }));
+
+    if cache {
+        conf.headers_cache = headers;
+    } else {
+        conf.headers = headers;
+    }
+
+    Ok(())
+}
+
+/// The redirect of "proxy_redirect default", and of no proxy_redirect
+/// (ngx_http_proxy_redirect, ngx_http_proxy_merge_loc_conf): the URL of
+/// proxy_pass to the location, or the URL with "/" to "/" when the URL has
+/// no URI part.
+fn default_redirect(plcf: &NgxHttpProxyLocConf) -> CookieRewrite {
+    if !plcf.vars.uri.is_empty() {
+        CookieRewrite {
+            pattern: CookieRewritePattern::Path(crate::script::ComplexValue::constant(&plcf.url)),
+            replacement: crate::script::ComplexValue::constant(&plcf.location),
+        }
+    } else {
+        let mut pattern = plcf.url.clone();
+        pattern.push(b'/');
+
+        CookieRewrite {
+            pattern: CookieRewritePattern::Path(crate::script::ComplexValue::constant(&pattern)),
+            replacement: crate::script::ComplexValue::constant(b"/"),
+        }
+    }
 }
 
 /// The proxy_ssl_* part of ngx_http_proxy_merge_loc_conf, with
@@ -703,110 +950,208 @@ fn proxy_ssl_flag_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>
     set_flag(cf, cmd, slot)
 }
 
+/// proxy_set_body: ngx_conf_set_str_slot
 fn proxy_set_body_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-    let args = cf.args.clone();
-    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
-    cell.borrow_mut().set_body = Some(cv);
+    let mut c = cell.borrow_mut();
+
+    if c.body_source.is_some() {
+        return Err(msg("is duplicate"));
+    }
+
+    c.body_source = Some(cf.args[1].clone());
+
     Ok(())
 }
 
-fn proxy_method_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+/// proxy_method: ngx_http_set_complex_value_slot
+fn proxy_method_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-    let args = cf.args.clone();
-    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
-    cell.borrow_mut().method = Some(cv);
+    let mut slot = cell.borrow().method.clone();
+    crate::script::set_complex_value_slot(cf, cmd, &mut slot)?;
+    cell.borrow_mut().method = slot;
     Ok(())
 }
 
+/// ngx_http_proxy_pass
 fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 2 {
-        return Err(msg("no proxy_pass URI specified"));
-    }
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
 
-    if let Some(c) = conf {
-        let conf = conf_rc::<NgxHttpProxyLocConf>(&c);
-        let uri = cf.args[1].clone();
-        // If it contains a `$`, compile as ComplexValue for per-request
-        // expansion. Otherwise keep the literal (fast path — matches C
-        // where only URLs with variables go through the eval branch).
-        if uri.contains(&b'$') {
-            let cv = crate::script::compile_complex_value(cf, &uri, 0)?;
-            conf.borrow_mut().upstream_uri_cv = Some(cv);
-            conf.borrow_mut().ssl = true;
-        } else {
-            // ngx_http_proxy_pass: the upstream of the URL
-            let add = if uri.len() >= 7 && uri[..7].eq_ignore_ascii_case(b"http://") {
-                (7, 80)
-            } else if uri.len() >= 8 && uri[..8].eq_ignore_ascii_case(b"https://") {
-                conf.borrow_mut().ssl = true;
-                (8, 443)
-            } else {
-                return Err(cf.emerg(format_args!("invalid URL prefix in \"{}\"", ngx_core::string::B(&uri))));
-            };
-            let mut u = ngx_core::inet::Url::new(&uri[add.0..]);
-            u.default_port = add.1;
-            u.uri_part = true;
-            u.no_resolve = true;
-            let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
-            conf.borrow_mut().upstream = Some(uscf);
-            conf.borrow_mut().vars_uri = u.uri.clone();
+    {
+        let plcf = cell.borrow();
 
-            let clcf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
-            let no_location = {
-                let l = clcf.borrow();
-                l.named || l.regex.is_some() || l.predicate != 0 || l.noname
-            };
-
-            if no_location && !u.uri.is_empty() {
-                return Err(cf.emerg(format_args!(
-                    "\"proxy_pass\" cannot have URI part in \
-                     location given by regular expression, \
-                     or inside predicate location, \
-                     or inside named location, \
-                     or inside \"if\" statement, \
-                     or inside \"limit_except\" block"
-                )));
-            }
+        // The "if" blocks of rewrite.rs do not have a location (and proxy
+        // configuration) of their own yet, so a proxy_pass inside one
+        // lands on the enclosing location's; in C it cannot be a
+        // duplicate there.
+        if (plcf.upstream.is_some() || plcf.proxy_values.is_some()) && cf.cmd_type != crate::NGX_HTTP_LIF_CONF {
+            return Err(msg("is duplicate"));
         }
-        conf.borrow_mut().upstream_uri = Some(uri);
     }
 
-    // Set the location handler to our proxy_handler and mark auto_redirect for `/xxx/` locs.
-    let loc_conf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
-    let mut lc = loc_conf.borrow_mut();
-    lc.handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
-    if lc.name.last() == Some(&b'/') {
-        lc.auto_redirect = true;
+    let clcf = get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
+
+    {
+        let mut lc = clcf.borrow_mut();
+
+        lc.handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
+
+        if lc.name.last() == Some(&b'/') {
+            lc.auto_redirect = true;
+        }
     }
+
+    let url = cf.args[1].clone();
+
+    let n = crate::script::script_variables_count(&url);
+
+    if n != 0 {
+        let codes = crate::script::script_compile(cf, &url)?;
+
+        let mut plcf = cell.borrow_mut();
+        plcf.proxy_values = Some(Rc::new(codes));
+        plcf.ssl = true;
+
+        return Ok(());
+    }
+
+    let (add, port) = if url.len() >= 7 && url[..7].eq_ignore_ascii_case(b"http://") {
+        (7, 80)
+    } else if url.len() >= 8 && url[..8].eq_ignore_ascii_case(b"https://") {
+        cell.borrow_mut().ssl = true;
+        (8, 443)
+    } else {
+        return Err(cf.emerg(format_args!("invalid URL prefix")));
+    };
+
+    let mut u = ngx_core::inet::Url::new(&url[add..]);
+    u.default_port = port;
+    u.uri_part = true;
+    u.no_resolve = true;
+
+    let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
+
+    let mut plcf = cell.borrow_mut();
+
+    plcf.upstream = Some(uscf);
+
+    plcf.vars.schema = url[..add].to_vec();
+    plcf.vars.key_start = plcf.vars.schema.clone();
+
+    set_vars(&u, &mut plcf.vars, &url);
+
+    let lc = clcf.borrow();
+
+    plcf.location = lc.name.clone();
+
+    if lc.named || lc.regex.is_some() || lc.predicate != 0 || lc.noname {
+        if !plcf.vars.uri.is_empty() {
+            return Err(cf.emerg(format_args!(
+                "\"proxy_pass\" cannot have URI part in location given by regular expression, or inside predicate location, or inside named location, or inside \"if\" statement, or inside \"limit_except\" block"
+            )));
+        }
+
+        plcf.location.clear();
+    }
+
+    plcf.url = url;
 
     Ok(())
 }
 
+/// ngx_http_proxy_set_vars: the Host header and $proxy_port of the parsed
+/// URL `u` of `url`, the start of the cache key (v->key_start, the schema
+/// on entry), and the URI part.
+fn set_vars(u: &ngx_core::inet::Url, v: &mut ProxyVars, url: &[u8]) {
+    let key_start_len;
+
+    if u.family != libc::AF_UNIX {
+        if u.no_port || u.port == u.default_port {
+            v.host_header = u.host.clone();
+
+            v.port = if u.default_port == 80 { b"80".to_vec() } else { b"443".to_vec() };
+        } else {
+            let mut h = u.host.clone();
+            h.push(b':');
+            h.extend_from_slice(&u.port_text);
+            v.host_header = h;
+            v.port = u.port_text.clone();
+        }
+
+        key_start_len = v.key_start.len() + v.host_header.len();
+    } else {
+        v.host_header = b"localhost".to_vec();
+        v.port = Vec::new();
+        key_start_len = v.key_start.len() + "unix:".len() + u.host.len() + 1;
+    }
+
+    // the key starts at the URL: the schema, then the host part
+    v.key_start = url[..key_start_len.min(url.len())].to_vec();
+
+    v.uri = u.uri.clone();
+}
+
+/// proxy_set_header: ngx_conf_set_keyval_slot
+fn proxy_set_header_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
+    let mut c = cell.borrow_mut();
+
+    let mut list: Vec<(Vec<u8>, Vec<u8>)> = match c.headers_source.as_option() {
+        Some(Some(a)) => a.as_ref().clone(),
+        _ => Vec::new(),
+    };
+
+    list.push((cf.args[1].clone(), cf.args[2].clone()));
+
+    c.headers_source = Val::set(Some(Rc::new(list)));
+
+    Ok(())
+}
+
+/// ngx_http_proxy_redirect
 fn proxy_redirect_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-    let args = cf.args.clone();
-    if args.len() < 2 {
-        return Err(msg("invalid number of arguments"));
+
+    if cell.borrow().redirect.as_option() == Some(&false) {
+        return Ok(());
     }
+
+    cell.borrow_mut().redirect = Val::set(true);
+
+    let args = cf.args.clone();
+
     if args.len() == 2 {
         if args[1] == b"off" {
             let mut c = cell.borrow_mut();
-            c.redirect_off = true;
-            c.redirects.clear();
-            c.redirect_default = false;
+
+            if c.redirects.is_some() {
+                return Err(msg("is duplicate"));
+            }
+
+            c.redirect = Val::set(false);
             return Ok(());
         }
-        if args[1] == b"default" {
-            cell.borrow_mut().redirect_default = true;
-            return Ok(());
+
+        if args[1] != b"default" {
+            return Err(cf.emerg(format_args!("invalid parameter \"{}\"", ngx_core::string::B(&args[1]))));
         }
-        return Err(cf.emerg(format_args!("invalid parameter \"{}\"",
-            ngx_core::string::B(&args[1]))));
+
+        let mut c = cell.borrow_mut();
+
+        if c.proxy_values.is_some() {
+            return Err(cf.emerg(format_args!("\"proxy_redirect default\" cannot be used with \"proxy_pass\" directive with variables")));
+        }
+
+        if c.url.is_empty() {
+            return Err(cf.emerg(format_args!("\"proxy_redirect default\" should be placed after the \"proxy_pass\" directive")));
+        }
+
+        let pr = default_redirect(&c);
+        c.redirects.get_or_insert_with(Vec::new).push(pr);
+
+        return Ok(());
     }
-    if args.len() != 3 {
-        return Err(msg("invalid number of arguments"));
-    }
+
     let pattern_src = &args[1];
     let replacement_src = &args[2];
     let (pattern, replacement) = if !pattern_src.is_empty() && pattern_src[0] == b'~' {
@@ -828,7 +1173,7 @@ fn proxy_redirect_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any
         let repl = crate::script::compile_complex_value(cf, replacement_src, 0)?;
         (CookieRewritePattern::Path(pat), repl)
     };
-    cell.borrow_mut().redirects.push(CookieRewrite { pattern, replacement });
+    cell.borrow_mut().redirects.get_or_insert_with(Vec::new).push(CookieRewrite { pattern, replacement });
     Ok(())
 }
 
@@ -854,114 +1199,160 @@ fn proxy_send_timeout_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dy
     Ok(())
 }
 
-fn proxy_set_header_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    if cf.args.len() < 3 {
-        return Err(cf.emerg(format_args!("invalid number of arguments")));
-    }
-    let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-    let args = cf.args.clone();
-    let name = args[1].clone();
-    let cv = crate::script::compile_complex_value(cf, &args[2], 0)?;
-    cell.borrow_mut().set_headers.push((name, cv));
-    Ok(())
+/// The request's ngx_http_proxy_ctx_t, if the proxy handles it.
+fn proxy_ctx(r: &R) -> Option<Rc<RefCell<ProxyCtx>>> {
+    r.get_ctx::<ProxyCtx>(ctx_index())
 }
 
-fn proxy_target_hostport(r: &R) -> Option<(String, u16)> {
-    let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-    let uri = conf.borrow().upstream_uri.clone()?;
-    let s = std::str::from_utf8(&uri).ok()?;
-    parse_upstream_uri(s).map(|(h, p, _)| (h, p))
-}
-
+/// ngx_http_proxy_host_variable
 fn proxy_host_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // C: $proxy_host = ctx->vars.host_header. When the URL uses an explicit
-    // non-default port, host_header includes ":<port>"; else just the hostname.
-    // See ngx_http_proxy_set_vars.
-    let hp = proxy_target_hostport(r);
-    let scheme_is_https = {
-        let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let uri = conf.borrow().upstream_uri.clone();
-        uri.as_deref().map(|u| u.starts_with(b"https://")).unwrap_or(false)
-    };
-    match hp {
-        Some((h, p)) => {
-            let default = if scheme_is_https { 443 } else { 80 };
-            let out = if p == default { h } else { format!("{}:{}", h, p) };
-            v.data = out.into_bytes();
-            v.valid = true;
+    let ctx = match proxy_ctx(r) {
+        Some(c) => c,
+        None => {
+            v.not_found = true;
+            return NGX_OK;
         }
-        None => { v.not_found = true; }
-    }
-    NGX_OK
-}
+    };
 
-fn proxy_port_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    let hp = proxy_target_hostport(r);
-    let scheme_is_https = {
-        let conf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let uri = conf.borrow().upstream_uri.clone();
-        uri.as_deref().map(|u| u.starts_with(b"https://")).unwrap_or(false)
-    };
-    match hp {
-        Some((_, p)) => {
-            // C behavior: if no explicit port or port==default, return "80"/"443"
-            // depending on scheme. My parse_upstream_uri always returns a port,
-            // so we can't tell "no port" from "port explicitly = default". Since
-            // the emitted value is the same either way (default-string), no bug.
-            v.data = p.to_string().into_bytes();
-            v.valid = true;
-            let _ = scheme_is_https;
-        }
-        None => { v.not_found = true; }
-    }
-    NGX_OK
-}
-
-fn proxy_add_x_forwarded_for_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // C: if the client sent X-Forwarded-For, append ", $remote_addr"; else just
-    // $remote_addr. Multi-value X-Forwarded-For entries are comma-joined.
-    let existing: Vec<u8> = {
-        let hin = r.headers_in.borrow();
-        let mut parts: Vec<Vec<u8>> = Vec::new();
-        for h in hin.x_forwarded_for.iter() {
-            parts.push(h.value.borrow().clone());
-        }
-        parts.join(&b", "[..])
-    };
-    let remote = r.connection.addr_text.borrow().clone();
-    let mut out = Vec::new();
-    if !existing.is_empty() {
-        out.extend_from_slice(&existing);
-        out.extend_from_slice(b", ");
-    }
-    out.extend_from_slice(&remote);
-    v.data = out;
+    v.data = ctx.borrow().vars.host_header.clone();
     v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
     NGX_OK
 }
 
+/// ngx_http_proxy_port_variable
+fn proxy_port_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let ctx = match proxy_ctx(r) {
+        Some(c) => c,
+        None => {
+            v.not_found = true;
+            return NGX_OK;
+        }
+    };
+
+    v.data = ctx.borrow().vars.port.clone();
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    NGX_OK
+}
+
+/// ngx_http_proxy_add_x_forwarded_for_variable
+fn proxy_add_x_forwarded_for_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    let hin = r.headers_in.borrow();
+    let addr_text = r.connection.addr_text.borrow();
+
+    let mut len = 0;
+
+    for h in hin.x_forwarded_for.iter() {
+        len += h.value.borrow().len() + ", ".len();
+    }
+
+    if len == 0 {
+        v.data = addr_text.clone();
+        return NGX_OK;
+    }
+
+    let mut p = Vec::with_capacity(len + addr_text.len());
+
+    for h in hin.x_forwarded_for.iter() {
+        p.extend_from_slice(&h.value.borrow());
+        p.extend_from_slice(b", ");
+    }
+
+    p.extend_from_slice(&addr_text);
+
+    v.data = p;
+
+    NGX_OK
+}
+
+/// ngx_http_proxy_internal_body_length_variable
+fn proxy_internal_body_length_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let ctx = proxy_ctx(r);
+    let length = ctx.as_ref().map(|c| c.borrow().internal_body_length);
+
+    let length = match length {
+        Some(l) if l >= 0 => l,
+        _ => {
+            v.not_found = true;
+            return NGX_OK;
+        }
+    };
+
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    v.data = length.to_string().into_bytes();
+
+    NGX_OK
+}
+
+/// ngx_http_proxy_internal_chunked_variable
+fn proxy_internal_chunked_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    let chunked = proxy_ctx(r).map(|c| c.borrow().internal_chunked).unwrap_or(false);
+
+    if !chunked {
+        v.not_found = true;
+        return NGX_OK;
+    }
+
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    v.data = b"chunked".to_vec();
+
+    NGX_OK
+}
+
+/// ngx_http_proxy_add_variables
 fn preconfiguration(cf: &mut Conf) -> ConfResult {
+    use crate::variables::{NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH};
+
     let vars = vec![
         VarDef {
             name: "proxy_host",
             get: Some(proxy_host_variable),
             set: None,
             data: 0,
-            flags: crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
+            flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
         },
         VarDef {
             name: "proxy_port",
             get: Some(proxy_port_variable),
             set: None,
             data: 0,
-            flags: crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
+            flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
         },
         VarDef {
             name: "proxy_add_x_forwarded_for",
             get: Some(proxy_add_x_forwarded_for_variable),
             set: None,
             data: 0,
-            flags: crate::variables::NGX_HTTP_VAR_NOHASH,
+            flags: NGX_HTTP_VAR_NOHASH,
+        },
+        VarDef {
+            name: "proxy_internal_body_length",
+            get: Some(proxy_internal_body_length_variable),
+            set: None,
+            data: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
+        },
+        VarDef {
+            name: "proxy_internal_chunked",
+            get: Some(proxy_internal_chunked_variable),
+            set: None,
+            data: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
         },
     ];
 
@@ -975,122 +1366,525 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
+/// u->ssl and u->resolved of the request's upstream, with the URL of
+/// proxy_pass (as configured, or evaluated) the proxy_cache code keys on.
+#[derive(Default)]
+struct ProxyUpstream {
+    ssl: bool,
+    resolved: Option<ngx_core::inet::Url>,
+    url: Vec<u8>,
+}
+
+/// ngx_http_proxy_handler
 async fn proxy_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-    let conf_borrowed = lcf.borrow();
 
-    // ngx_http_proxy_handler: read the client request body before the
-    // upstream is set up; unbuffered, only what is there now, and the rest
-    // is sent on as it arrives (send_request_body).
-    if !conf_borrowed.request_buffering.get_or(true)
-        && conf_borrowed.set_body.is_none()
-        && conf_borrowed.pass_request_body.get_or(true)
-        && (!r.headers_in.borrow().chunked || *conf_borrowed.http_version == 1)
-    {
-        r.request_body_no_buffering.set(true);
-    }
-    drop(conf_borrowed);
-    let rc = crate::request_body::read_client_request_body(&r).await;
-    if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
-        return rc;
-    }
-    let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-    let conf_borrowed = lcf.borrow();
+    // ngx_http_upstream_create, the ctx
 
-    // Check if this location has proxy_pass configured
-    let upstream_uri = if let Some(cv) = &conf_borrowed.upstream_uri_cv {
-        // Variable-based proxy_pass: expand per request. Fallback to the
-        // stored literal on failure so a bad variable expansion doesn't
-        // panic — matches C's fallback of returning NGX_ERROR from
-        // ngx_http_proxy_eval on complex_value failure.
-        let cv_cloned = cv.clone();
-        drop(conf_borrowed);
-        let expanded = match crate::script::complex_value(&r, &cv_cloned) {
-            Ok(v) => v,
-            Err(_) => return return_error(&r, crate::NGX_HTTP_INTERNAL_SERVER_ERROR as i64).await,
-        };
-        // Prepend scheme if missing: `$arg_b` typically expands to host:port.
-        let mut u = if expanded.starts_with(b"http://") || expanded.starts_with(b"https://") {
-            expanded
-        } else {
-            let mut prefixed = b"http://".to_vec();
-            prefixed.extend_from_slice(&expanded);
-            prefixed
-        };
-        // Ensure a trailing slash for path so parse_upstream_uri finds "/".
-        if !u.contains(&b'/') || (u.starts_with(b"http://") && !u[7..].contains(&b'/')) || (u.starts_with(b"https://") && !u[8..].contains(&b'/')) {
-            u.push(b'/');
+    let ctx = r.set_ctx(ctx_index(), ProxyCtx::default());
+
+    let mut u = ProxyUpstream::default();
+
+    let proxy_values = lcf.borrow().proxy_values.clone();
+
+    match proxy_values {
+        None => {
+            let plcf = lcf.borrow();
+            ctx.borrow_mut().vars = plcf.vars.clone();
+            u.ssl = plcf.ssl;
+            u.url = plcf.url.clone();
         }
-        u
-    } else {
-        match &conf_borrowed.upstream_uri {
-            Some(uri) => uri.clone(),
-            None => {
-                // ngx_http_upstream_init_request: no u->conf->upstream,
-                // e.g. the proxy_pass handler of an "if" block used with
-                // the configuration of another "if" block
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
+        Some(codes) => {
+            if proxy_eval(&r, &ctx, &codes, &mut u) != NGX_OK {
                 return crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         }
-    };
-    let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-    let conf_borrowed = lcf.borrow();
+    }
 
-    // proxy_cache lookup — happens *before* we open the upstream. `try_serve`
-    // returns `Some(rc)` for a hit (already sent to client) or a bypass
-    // decision; `None` means MISS/EXPIRED and we continue to upstream.
-    if conf_borrowed.cache.zone.is_some() {
-        let cache_conf = conf_borrowed.cache.clone();
-        let upstream_uri_snap = upstream_uri.clone();
-        drop(conf_borrowed);
-        if let Some(rc) = crate::proxy_cache::try_serve(&r, &cache_conf, &upstream_uri_snap).await {
+    {
+        let plcf = lcf.borrow();
+
+        if !plcf.request_buffering.get_or(true)
+            && plcf.body_values.is_none()
+            && plcf.pass_request_body.get_or(true)
+            && (!r.headers_in.borrow().chunked || plcf.http_version.get_or(crate::NGX_HTTP_VERSION_11) == crate::NGX_HTTP_VERSION_11)
+        {
+            r.request_body_no_buffering.set(true);
+        }
+    }
+
+    // ngx_http_read_client_request_body(r, ngx_http_upstream_init):
+    // unbuffered, only what is there now, and the rest is sent on as it
+    // arrives (send_request_body)
+
+    let rc = crate::request_body::read_client_request_body(&r).await;
+
+    if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
+        return rc;
+    }
+
+    upstream_init_request(r, lcf, ctx, u).await
+}
+
+/// ngx_http_proxy_eval: the URL of proxy_pass with variables, its vars and
+/// the upstream it names (u->resolved).
+fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::script::Part], u: &mut ProxyUpstream) -> i64 {
+    let proxy = match crate::script::script_run(r, codes) {
+        Some(p) => p,
+        None => return NGX_ERROR,
+    };
+
+    let (add, port) = if proxy.len() > 7 && proxy[..7].eq_ignore_ascii_case(b"http://") {
+        (7, 80)
+    } else if proxy.len() > 8 && proxy[..8].eq_ignore_ascii_case(b"https://") {
+        u.ssl = true;
+        (8, 443)
+    } else {
+        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "invalid URL prefix in \"{}\"", ngx_core::string::B(&proxy));
+        return NGX_ERROR;
+    };
+
+    let mut url = ngx_core::inet::Url::new(&proxy[add..]);
+    url.default_port = port;
+    url.uri_part = true;
+    url.no_resolve = true;
+
+    if ngx_core::inet::parse_url(&mut url).is_err() {
+        if let Some(err) = url.err {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "{} in upstream \"{}\"", err, ngx_core::string::B(&url.url));
+        }
+
+        return NGX_ERROR;
+    }
+
+    if url.uri.first() == Some(&b'?') {
+        url.uri.insert(0, b'/');
+    }
+
+    {
+        let mut c = ctx.borrow_mut();
+
+        // ctx->vars.key_start = u->schema
+        c.vars.key_start = proxy[..add].to_vec();
+
+        set_vars(&url, &mut c.vars, &proxy);
+    }
+
+    u.url = proxy;
+    u.resolved = Some(url);
+
+    NGX_OK
+}
+
+/// The values of header or body codes compiled by ngx_http_script_compile()
+/// as ngx_http_proxy_create_request() runs them: the variables with
+/// ngx_http_get_indexed_variable() (e.flushed = 1), the no cacheable ones
+/// having been flushed.
+fn run_codes(r: &R, codes: &[crate::script::Part]) -> Vec<u8> {
+    let mut value = Vec::new();
+
+    for code in codes {
+        match code {
+            crate::script::Part::Literal(data) => value.extend_from_slice(data),
+
+            crate::script::Part::Var(index) => {
+                if let Some(v) = crate::variables::get_indexed_variable(r, *index) {
+                    if !v.not_found {
+                        value.extend_from_slice(&v.data);
+                    }
+                }
+            }
+
+            crate::script::Part::Capture(n) => {
+                let n = *n;
+
+                if n < r.ncaptures.get() {
+                    let cap = r.captures.borrow();
+
+                    if n + 1 < cap.len() {
+                        let (a, b) = (cap[n], cap[n + 1]);
+
+                        if a >= 0 && b >= a {
+                            let data = r.captures_data.borrow();
+
+                            if (b as usize) <= data.len() {
+                                value.extend_from_slice(&data[a as usize..b as usize]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    value
+}
+
+/// ngx_http_proxy_create_request: the request line, the Host header, the
+/// headers of proxy_set_header and the defaults with a value, the client's
+/// headers not among them, and the body of proxy_set_body. Returns the
+/// header buffer and u->uri.
+fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>, cacheable: bool, u_method: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    let headers = if cacheable { plcf.headers_cache.clone() } else { plcf.headers.clone() };
+
+    let headers = match headers {
+        Some(h) => h,
+        None => return Err(()),
+    };
+
+    let method: Vec<u8> = if let Some(m) = u_method {
+        // HEAD was changed to GET to cache response
+        m.to_vec()
+    } else if let Some(Some(cv)) = plcf.method.as_option() {
+        crate::script::complex_value(r, cv).map_err(|_| ())?
+    } else {
+        r.method_name.borrow().clone()
+    };
+
+    let http_version = plcf.http_version.get_or(crate::NGX_HTTP_VERSION_11);
+
+    let mut host: Vec<u8> = Vec::new();
+
+    if let Some(hv) = &plcf.host_value {
+        host = crate::script::complex_value(r, hv).map_err(|_| ())?;
+    }
+
+    if plcf.host_value.is_none() || (host.is_empty() && http_version == crate::NGX_HTTP_VERSION_11) {
+        host = ctx.borrow().vars.host_header.clone();
+    }
+
+    if method.len() == 4 && method.eq_ignore_ascii_case(b"HEAD") {
+        ctx.borrow_mut().head = true;
+    }
+
+    let vars_uri = ctx.borrow().vars.uri.clone();
+
+    let mut escape = false;
+    let mut loc_len = 0;
+    let mut unparsed_uri = false;
+
+    let uri_len = if plcf.proxy_values.is_some() && !vars_uri.is_empty() {
+        vars_uri.len()
+    } else if vars_uri.is_empty() && r.valid_unparsed_uri.get() {
+        unparsed_uri = true;
+        r.unparsed_uri.borrow().len()
+    } else {
+        let r_uri = r.uri.borrow();
+
+        loc_len = if r.valid_location.get() && !vars_uri.is_empty() { plcf.location.len().min(r_uri.len()) } else { 0 };
+
+        let mut n = 0;
+
+        if r.quoted_uri.get() || r.internal.get() {
+            n = 2 * ngx_core::string::escape_uri_count(&r_uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
+            escape = n != 0;
+        }
+
+        vars_uri.len() + r_uri.len() - loc_len + n + "?".len() + r.args.borrow().len()
+    };
+
+    if uri_len == 0 {
+        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "zero length URI to proxy");
+        return Err(());
+    }
+
+    crate::script::script_flush_no_cacheable_variables(r, Some(&plcf.body_flushes));
+    crate::script::script_flush_no_cacheable_variables(r, Some(&headers.flushes));
+
+    let mut body: Option<Vec<u8>> = None;
+
+    if let Some(codes) = &plcf.body_values {
+        let b = run_codes(r, codes);
+        ctx.borrow_mut().internal_body_length = b.len() as i64;
+        body = Some(b);
+    } else if r.headers_in.borrow().chunked && r.reading_body.get() {
+        let mut c = ctx.borrow_mut();
+        c.internal_body_length = -1;
+        c.internal_chunked = true;
+    } else {
+        ctx.borrow_mut().internal_body_length = r.headers_in.borrow().content_length_n;
+    }
+
+    let mut b: Vec<u8> = Vec::with_capacity(method.len() + uri_len + 256);
+
+    // the request line
+
+    b.extend_from_slice(&method);
+    b.push(b' ');
+
+    let uri_start = b.len();
+
+    if plcf.proxy_values.is_some() && !vars_uri.is_empty() {
+        b.extend_from_slice(&vars_uri);
+    } else if unparsed_uri {
+        b.extend_from_slice(&r.unparsed_uri.borrow());
+    } else {
+        if r.valid_location.get() {
+            b.extend_from_slice(&vars_uri);
+        }
+
+        let r_uri = r.uri.borrow();
+
+        if escape {
+            ngx_core::string::escape_uri_into(&mut b, &r_uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
+        } else {
+            b.extend_from_slice(&r_uri[loc_len..]);
+        }
+
+        let args = r.args.borrow();
+
+        if !args.is_empty() {
+            b.push(b'?');
+            b.extend_from_slice(&args);
+        }
+    }
+
+    let u_uri = b[uri_start..].to_vec();
+
+    if http_version == crate::NGX_HTTP_VERSION_11 {
+        b.extend_from_slice(b" HTTP/1.1\r\n");
+    } else {
+        b.extend_from_slice(b" HTTP/1.0\r\n");
+    }
+
+    if !host.is_empty() {
+        b.extend_from_slice(b"Host: ");
+        b.extend_from_slice(&host);
+        b.extend_from_slice(b"\r\n");
+    }
+
+    for (key, codes) in headers.lines.iter() {
+        let value = run_codes(r, codes);
+
+        if value.is_empty() {
+            continue;
+        }
+
+        b.extend_from_slice(key);
+        b.extend_from_slice(b": ");
+        b.extend_from_slice(&value);
+        b.extend_from_slice(b"\r\n");
+    }
+
+    if plcf.pass_request_headers.get_or(true) {
+        let hin = r.headers_in.borrow();
+
+        for h in hin.headers.iter() {
+            if headers.hash.find(ngx_core::hash::hash_key(&h.lowcase_key), &h.lowcase_key).is_some() {
+                continue;
+            }
+
+            let value = h.value.borrow();
+
+            b.extend_from_slice(&h.key);
+            b.extend_from_slice(b": ");
+            b.extend_from_slice(&value);
+            b.extend_from_slice(b"\r\n");
+
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&h.key), ngx_core::string::B(&value));
+        }
+    }
+
+    // add "\r\n" at the header end
+    b.extend_from_slice(b"\r\n");
+
+    if let Some(body) = body {
+        b.extend_from_slice(&body);
+    }
+
+    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header:\n\"{}\"", ngx_core::string::B(&b));
+
+    Ok((b, u_uri))
+}
+
+/// The request body that follows the header when the request is sent
+/// first (u->request_bufs after ngx_http_proxy_create_request): the client
+/// body read so far, as the output filter sends it (unbuffered), the
+/// client body (buffered, if passed), or nothing (proxy_set_body, or
+/// proxy_pass_request_body off).
+fn request_body_bytes(r: &R, plcf: &NgxHttpProxyLocConf, internal_chunked: bool) -> Vec<u8> {
+    if r.request_body_no_buffering.get() {
+        let bufs = take_request_body_bufs(r);
+        let mut out = Vec::new();
+        body_output_filter(&mut out, &bufs, internal_chunked);
+        return out;
+    }
+
+    if plcf.body_values.is_some() || !plcf.pass_request_body.get_or(true) {
+        return Vec::new();
+    }
+
+    let rb = r.request_body.borrow();
+    let mut out = Vec::new();
+
+    if let Some(body) = rb.as_ref() {
+        let bod = body.borrow();
+
+        for b in bod.bufs.iter() {
+            if let ngx_core::buf::BufData::Memory(m) = &b.data {
+                let end = b.last.min(m.len());
+                if b.pos < end {
+                    out.extend_from_slice(&m[b.pos..end]);
+                }
+            }
+
+            if b.in_file {
+                if let ngx_core::buf::BufData::File(f) = &b.data {
+                    let sz = (b.file_last - b.file_pos) as usize;
+                    let mut buf = vec![0u8; sz];
+                    let mut off = 0usize;
+
+                    while off < sz {
+                        // SAFETY: buf has sz bytes, off < sz, and f.fd is
+                        // the open temporary file of the request body.
+                        let n = unsafe { libc::pread(f.fd, buf[off..].as_mut_ptr() as *mut _, sz - off, b.file_pos + off as i64) };
+                        if n <= 0 {
+                            break;
+                        }
+                        off += n as usize;
+                    }
+
+                    out.extend_from_slice(&buf[..off]);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// ngx_http_upstream_cache_check_range: NGX_DECLINED (the response is not
+/// cached, and the request goes without the cache headers) for a range
+/// starting at proxy_cache_max_range_offset or later, or at the end.
+fn cache_check_range(r: &R, conf: &crate::proxy_cache::ProxyCacheConf) -> i64 {
+    let h = match r.headers_in.borrow().range.first() {
+        Some(h) => h.value.borrow().clone(),
+        None => return NGX_OK,
+    };
+
+    let max_range_offset = match conf.max_range_offset {
+        Some(o) => o as i64,
+        None => return NGX_OK,
+    };
+
+    if max_range_offset == 0 {
+        return NGX_DECLINED;
+    }
+
+    if h.len() < 7 || !h[..6].eq_ignore_ascii_case(b"bytes=") {
+        return NGX_OK;
+    }
+
+    let mut p = 6;
+
+    while p < h.len() && h[p] == b' ' {
+        p += 1;
+    }
+
+    if p < h.len() && h[p] == b'-' {
+        return NGX_DECLINED;
+    }
+
+    let start = p;
+
+    while p < h.len() && h[p].is_ascii_digit() {
+        p += 1;
+    }
+
+    // ngx_atoof(): NGX_ERROR (-1) for no digits or an overflow
+    let offset = std::str::from_utf8(&h[start..p]).ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+
+    if offset >= max_range_offset {
+        return NGX_DECLINED;
+    }
+
+    NGX_OK
+}
+
+/// ngx_http_upstream_init_request with the proxy module's callbacks, and
+/// what follows up to the response.
+async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpProxyLocConf>>, ctx: Rc<RefCell<ProxyCtx>>, u: ProxyUpstream) -> i64 {
+    let upstream_uri = u.url.clone();
+
+    // ngx_http_upstream_cache: u->cacheable, and the HEAD method changed
+    // to GET (u->method)
+
+    let mut cacheable = false;
+    let mut u_method: Option<&'static [u8]> = None;
+
+    let cache_conf = {
+        let plcf = lcf.borrow();
+        if plcf.cache.zone.is_some() && (r.method.get() & plcf.cache.methods) != 0 {
+            Some(plcf.cache.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(cache_conf) = cache_conf {
+        let zone = crate::proxy_cache::resolve_zone_name(&r, &cache_conf);
+
+        let mut bypass = false;
+
+        if let Some(Ok(_)) = &zone {
+            cacheable = true;
+
+            if r.method.get() == NGX_HTTP_HEAD && cache_conf.convert_head {
+                u_method = Some(b"GET");
+            }
+
+            bypass = crate::proxy_cache::is_bypass(&r, &cache_conf);
+        }
+
+        // proxy_cache lookup — happens *before* we open the upstream.
+        // `try_serve` returns `Some(rc)` for a hit (already sent to
+        // client) or an error; `None` means MISS/EXPIRED/BYPASS and we
+        // continue to upstream.
+        if let Some(rc) = crate::proxy_cache::try_serve(&r, &cache_conf, &upstream_uri).await {
             return rc;
         }
-        let _ = lcf.borrow();
+
+        if cacheable && !bypass {
+            // NGX_HTTP_CACHE_SCARCE: proxy_cache_min_uses not reached
+            if cache_conf.min_uses > 1 {
+                if let Some(Ok(zn)) = &zone {
+                    let base_key = match &cache_conf.key {
+                        Some(cv) => crate::script::complex_value(&r, cv).unwrap_or_default(),
+                        None => crate::proxy_cache::default_cache_key(&r, &upstream_uri),
+                    };
+
+                    if crate::proxy_cache::get_hits(zn, &base_key) < cache_conf.min_uses {
+                        cacheable = false;
+                    }
+                }
+            }
+
+            if cache_check_range(&r, &cache_conf) == NGX_DECLINED {
+                cacheable = false;
+            }
+        }
     }
+
+    // u->create_request
+
+    let (request, _u_uri) = {
+        let plcf = lcf.borrow();
+
+        match create_request(&r, &plcf, &ctx, cacheable, u_method) {
+            Ok(x) => x,
+            Err(()) => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
+        }
+    };
+
+    let internal_chunked = ctx.borrow().internal_chunked;
+    let head = ctx.borrow().head;
+
+    let body_bytes = {
+        let plcf = lcf.borrow();
+        request_body_bytes(&r, &plcf, internal_chunked)
+    };
+
     let conf_borrowed = lcf.borrow();
-
-    // Parse upstream URI
-    let upstream_uri_str = match std::str::from_utf8(&upstream_uri) {
-        Ok(s) => s,
-        Err(_) => {
-            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-        }
-    };
-
-    let (mut host, mut port, upstream_path) = match parse_upstream_uri(upstream_uri_str) {
-        Some(p) => p,
-        None => {
-            return return_error(&r, NGX_HTTP_BAD_GATEWAY as i64).await;
-        }
-    };
-
-    // If proxy_pass URL includes a URI (e.g. "http://backend/local/"), rewrite:
-    //   forwarded = upstream_path + (request_uri - location_prefix)
-    // Else forward the request URI as-is.
-    let clcf = r.clcf();
-    let loc_name = clcf.borrow().name.clone();
-    let request_uri = r.uri.borrow().clone();
-    // Variable-based proxy_pass: use the expanded URL's URI verbatim,
-    // matching C's `if (proxy_lengths && vars.uri.len) u->uri = vars.uri;`
-    // — the client's request URI is NOT appended.
-    let is_variable_pass = conf_borrowed.upstream_uri_cv.is_some();
-    let forwarded_uri: Vec<u8> = if is_variable_pass {
-        upstream_path.as_bytes().to_vec()
-    } else if !conf_borrowed.vars_uri.is_empty() {
-        // ngx_http_proxy_create_request: vars.uri (unless the URI was
-        // rewritten with "break", r->valid_location reset), then the
-        // request URI past the location
-        let mut u = if r.valid_location.get() { conf_borrowed.vars_uri.clone() } else { Vec::new() };
-        let loc_len = if r.valid_location.get() && request_uri.starts_with(loc_name.as_slice()) { loc_name.len() } else { 0 };
-        u.extend_from_slice(&request_uri[loc_len..]);
-        u
-    } else {
-        request_uri.clone()
-    };
-    // For byte-preservation in the request line below.
-    let request_uri_bytes = forwarded_uri;
 
     // proxy_next_upstream state.
     let next_upstream_mask = conf_borrowed.next_upstream_mask.get_or(FT_ERROR | FT_TIMEOUT);
@@ -1107,297 +1901,29 @@ async fn proxy_handler(r: R) -> i64 {
         }
     };
 
+    drop(conf_borrowed);
 
-
-    // Build request line. proxy_method overrides the client method if set.
-    let convert_head_active = conf_borrowed.cache.zone.is_some()
-        && conf_borrowed.cache.convert_head
-        && conf_borrowed.method.is_none()
-        && r.method.get() == NGX_HTTP_HEAD;
-    let method_owned: Vec<u8> = if let Some(mcv) = conf_borrowed.method.clone() {
-        drop(conf_borrowed);
-        let m = crate::script::complex_value(&r, &mcv).unwrap_or_default();
-        m
-    } else if convert_head_active {
-        drop(conf_borrowed);
-        // proxy_cache_convert_head: fetch the full body from the upstream
-        // via GET so the cache stores a body a later GET can HIT, then
-        // let head_only trim the body before sending to the client.
-        b"GET".to_vec()
-    } else {
-        drop(conf_borrowed);
-        r.method_name.borrow().clone()
-    };
-    let method = std::str::from_utf8(&method_owned).unwrap_or("GET");
-
-    let uri_path = std::str::from_utf8(&request_uri_bytes).unwrap_or("/").to_string();
-    // Include query string if present. Clone into a Vec so we don't hold a
-    // Ref on r.args across the many awaits that follow — a live Ref would
-    // panic when e.g. an X-Accel-Redirect internal_redirect tries to
-    // borrow_mut() the same cell, silently killing the request task.
-    let uri_with_args = {
-        let args = r.args.borrow().clone();
-        // Variable-based proxy_pass: args are dropped — the expanded URL is
-        // used verbatim as the upstream URI. Matches C's proxy_lengths path.
-        if !args.is_empty() && !is_variable_pass {
-            format!("{}?{}", uri_path, std::str::from_utf8(&args).unwrap_or(""))
-        } else {
-            uri_path
-        }
-    };
-
-    // Read pass_request_headers/body, set_body, and set_headers configs.
-    let (pass_headers_flag, pass_body_flag, set_body_cv, set_headers_list) = {
-        let lcf3 = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let b = lcf3.borrow();
-        (
-            b.pass_request_headers.get_or(true),
-            b.pass_request_body.get_or(true),
-            b.set_body.clone(),
-            b.set_headers.clone(),
-        )
-    };
-    // Names that proxy_set_header overrides (case-insensitive). Also used to
-    // suppress the corresponding client header from the pass-through loop.
-    let overridden_names: Vec<Vec<u8>> = set_headers_list
-        .iter()
-        .map(|(n, _)| n.to_ascii_lowercase())
-        .collect();
-
-    // An unbuffered body still being read goes as it arrives: what was read
-    // so far follows the header, with Content-Length, or chunked when the
-    // client's body is (ngx_http_proxy_create_request, internal_chunked).
-    let unbuffered = r.request_body_no_buffering.get();
-    let internal_chunked = unbuffered && r.headers_in.borrow().chunked && r.reading_body.get();
-    // Collect request body (if any) into a Vec. proxy_set_body wins over the
-    // client body when configured; otherwise honour proxy_pass_request_body.
-    let body_bytes: Vec<u8> = if unbuffered {
-        let bufs = take_request_body_bufs(&r);
-        let mut out = Vec::new();
-        body_output_filter(&mut out, &bufs, internal_chunked);
-        out
-    } else if let Some(cv) = set_body_cv {
-        crate::script::complex_value(&r, &cv).unwrap_or_default()
-    } else if !pass_body_flag { Vec::new() } else {
-        let rb = r.request_body.borrow();
-        let mut out = Vec::new();
-        if let Some(body) = rb.as_ref() {
-            let bod = body.borrow();
-            for b in bod.bufs.iter() {
-                if let ngx_core::buf::BufData::Memory(m) = &b.data {
-                    let end = b.last.min(m.len());
-                    if b.pos < end { out.extend_from_slice(&m[b.pos..end]); }
-                }
-                if b.in_file {
-                    if let ngx_core::buf::BufData::File(f) = &b.data {
-                        let sz = (b.file_last - b.file_pos) as usize;
-                        let mut buf = vec![0u8; sz];
-                        let mut off = 0usize;
-                        while off < sz {
-                            let n = unsafe { libc::pread(f.fd, buf[off..].as_mut_ptr() as *mut _, sz - off, b.file_pos + off as i64) };
-                            if n <= 0 { break; }
-                            off += n as usize;
-                        }
-                        out.extend_from_slice(&buf[..off]);
-                    }
-                }
-            }
-        }
-        out
-    };
-    // "Content-Length: $proxy_internal_body_length" and "Transfer-Encoding:
-    // $proxy_internal_chunked" are default headers: proxy_set_header of the
-    // same name replaces them (an empty value drops them).
-    let cl_overridden = overridden_names.iter().any(|n| n.as_slice() == b"content-length");
-    let te_overridden = overridden_names.iter().any(|n| n.as_slice() == b"transfer-encoding");
-    let content_length_hdr = if internal_chunked {
-        if te_overridden { String::new() } else { "Transfer-Encoding: chunked\r\n".to_string() }
-    } else if cl_overridden {
-        String::new()
-    } else if unbuffered {
-        format!("Content-Length: {}\r\n", r.headers_in.borrow().content_length_n)
-    } else if !body_bytes.is_empty() {
-        format!("Content-Length: {}\r\n", body_bytes.len())
-    } else if r.headers_in.borrow().content_length_n > 0 || r.headers_in.borrow().chunked {
-        format!("Content-Length: 0\r\n")
-    } else {
-        String::new()
-    };
-    let content_type_hdr = {
-        let hin = r.headers_in.borrow();
-        if let Some(ct) = hin.content_type.first() {
-            format!("Content-Type: {}\r\n", std::str::from_utf8(&ct.value.borrow()).unwrap_or(""))
-        } else { String::new() }
-    };
-    // proxy_cache_max_range_offset: when the client's Range starts at or
-    // below the offset, strip Range from the upstream request so the
-    // whole entry lands in cache and the range_filter serves the subrange
-    // from a memory buf. Matches ngx_http_upstream_cache_check_range.
-    // proxy_cache implies we want the FULL upstream response so we can
-    // cache it, so strip client conditional headers unless the location
-    // has proxy_cache_revalidate on (which needs its own IMS/INM built
-    // from the cached response). Matches C's
-    // ngx_http_upstream_process_conditional_headers behavior.
-    let strip_conditional = {
-        let lcf_c = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let c = lcf_c.borrow();
-        c.cache.zone.is_some()
-    };
-    let strip_range = {
-        let lcf_mro = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-        let c = lcf_mro.borrow();
-        match (c.cache.zone.as_ref(), c.cache.max_range_offset) {
-            (Some(_zone), Some(off)) => {
-                let hin = r.headers_in.borrow();
-                let range_ok = hin.range.first()
-                    .map(|h| crate::proxy_cache::range_below_offset(&h.value.borrow(), off))
-                    .unwrap_or(false);
-                if range_ok && c.cache.min_uses > 1 {
-                    // Gate on min_uses hits: if this key hasn't been
-                    // requested min_uses times yet, don't do the range-strip
-                    // optimization — matches C's cache_min_uses interaction
-                    // with cache_check_range.
-                    if let Some(Ok(zn)) = crate::proxy_cache::resolve_zone_name(&r, &c.cache) {
-                        let base_key = match &c.cache.key {
-                            Some(cv) => crate::script::complex_value(&r, cv).unwrap_or_default(),
-                            None => crate::proxy_cache::default_cache_key(&r, &upstream_uri),
-                        };
-                        crate::proxy_cache::get_hits(&zn, &base_key) >= c.cache.min_uses
-                    } else {
-                        false
-                    }
-                } else {
-                    range_ok
-                }
-            }
-            _ => false,
-        }
-    };
-    if strip_range {
-        r.allow_ranges.set(true);
-    }
-    // Forward client request headers that aren't the ones we synthesize ourselves.
-    // C proxies most client headers by default; the exact list is governed by
-    // proxy_set_header, hide_headers, etc.  We don't implement those yet, so this
-    // is a subset: pass everything except headers that would conflict with the
-    // synthesized request line, hop-by-hop headers, and things upstream shouldn't
-    // trust from the client.
-    let mut forward_headers: String = if !pass_headers_flag { String::new() } else {
-        let hin = r.headers_in.borrow();
-        let mut s = String::new();
-        for h in hin.headers.iter() {
-            if h.hash.get() == 0 { continue; }
-            let lc = &h.lowcase_key;
-            if matches!(lc.as_slice(),
-                b"host" | b"connection" | b"keep-alive" |
-                b"transfer-encoding" | b"te" | b"upgrade" |
-                b"content-length" | b"content-type" |
-                b"expect" | b"proxy-connection")
-            {
-                continue;
-            }
-            if strip_range && lc.as_slice() == b"range" {
-                continue;
-            }
-            if strip_conditional && matches!(lc.as_slice(),
-                b"if-modified-since" | b"if-unmodified-since" |
-                b"if-none-match" | b"if-match" | b"if-range")
-            {
-                continue;
-            }
-            if overridden_names.iter().any(|n| n.as_slice() == lc.as_slice()) {
-                continue; // proxy_set_header will emit (or drop) this one
-            }
-            let key = match std::str::from_utf8(&h.key) { Ok(s) => s, Err(_) => continue };
-            let val = h.value.borrow();
-            let val = match std::str::from_utf8(&val) { Ok(s) => s, Err(_) => continue };
-            s.push_str(key);
-            s.push_str(": ");
-            s.push_str(val);
-            s.push_str("\r\n");
-        }
-        s
-    };
-    // Append proxy_set_header emissions (skip empty-valued ones to drop them).
-    for (name, cv) in &set_headers_list {
-        let val = crate::script::complex_value(&r, cv).unwrap_or_default();
-        if val.is_empty() {
-            continue;
-        }
-        if let (Ok(k), Ok(v)) = (std::str::from_utf8(name), std::str::from_utf8(&val)) {
-            forward_headers.push_str(k);
-            forward_headers.push_str(": ");
-            forward_headers.push_str(v);
-            forward_headers.push_str("\r\n");
-        }
-    }
-
-    let http_version = {
-        let c = lcf.borrow();
-        *c.http_version
-    };
-    let ver_str = if http_version == 1 { "HTTP/1.1" } else { "HTTP/1.0" };
-    // Only synthesize a `Connection: close` line if the user's config didn't
-    // set Connection via proxy_set_header (in which case its value — possibly
-    // empty to drop the header — lives in forward_headers already). This lets
-    // `proxy_set_header Connection ""` + `proxy_http_version 1.1` produce a
-    // keep-alive request suitable for an upstream {} block with `keepalive N;`.
-    let connection_overridden = overridden_names.iter().any(|n| n.as_slice() == b"connection");
-    let conn_line = if connection_overridden { "" } else { "Connection: close\r\n" };
-    // proxy_cache_revalidate: if the cached response had Last-Modified /
-    // ETag and the cache has expired, add If-Modified-Since /
-    // If-None-Match so the upstream can 304 us and reuse the entry.
-    let reval_hdrs: String = match crate::proxy_cache::get_revalidate(&r) {
-        Some(h) => {
-            let mut s = String::new();
-            if let Some(ims) = &h.if_modified_since {
-                s.push_str("If-Modified-Since: ");
-                s.push_str(std::str::from_utf8(ims).unwrap_or(""));
-                s.push_str("\r\n");
-            }
-            if let Some(inm) = &h.if_none_match {
-                s.push_str("If-None-Match: ");
-                s.push_str(std::str::from_utf8(inm).unwrap_or(""));
-                s.push_str("\r\n");
-            }
-            s
-        }
-        None => String::new(),
-    };
-    // IPv6 literal hostnames need bracket-quoting in the Host header.
-    // For unix upstreams C sends "unix:<path>:" — copy that.
-    let host_hdr: String = if let Some(path) = host.strip_prefix("unix:") {
-        format!("unix:{}:", path)
-    } else if host.contains(':') && !host.starts_with('[') {
-        format!("[{}]", host)
-    } else {
-        host.to_string()
-    };
-    let request = format!(
-        "{} {} {}\r\n\
-         Host: {}\r\n\
-         {}{}{}{}{}\r\n",
-        method, uri_with_args, ver_str, host_hdr, conn_line, content_length_hdr, content_type_hdr, reval_hdrs, forward_headers
-    );
-
-    // u->ssl (the URL is https): ngx_http_upstream_ssl_init_connection
-    // after connecting, with u->conf's SSL fields
+    // u->ssl: ngx_http_upstream_ssl_init_connection after connecting, with
+    // u->conf's SSL fields
     let connect_timeout = *lcf.borrow().connect_timeout.get();
-    let ssl_setup = if upstream_uri.len() >= 8 && upstream_uri[..8].eq_ignore_ascii_case(b"https://") {
+    let ssl_setup = if u.ssl {
         let conf = lcf.borrow().upstream_ssl.clone();
         Some(crate::upstream_ssl::SslSetup { conf, alpn: Vec::new() })
     } else {
         None
     };
 
-    // ngx_http_upstream_init_request: the peers of the upstream{} or
-    // implicit upstream of proxy_pass, of the upstream a variable URL's
-    // host names, or of the addresses it resolves to
+    // the peers of the upstream{} or implicit upstream of proxy_pass, of
+    // the upstream a variable URL's host names, or of the addresses it
+    // resolves to
     let tag = Rc::as_ptr(&lcf) as *const () as usize;
-    let peer = if let Some(uscf) = static_upstream.as_ref().filter(|_| !is_variable_pass) {
-        crate::upstream::UpstreamPeer::init(&r, uscf, next_upstream_mask, next_upstream_tries, next_upstream_timeout, tag)
-    } else {
-        resolved_peer(&r, &upstream_uri, next_upstream_mask, next_upstream_tries, next_upstream_timeout, tag).await
+    let peer = match (&u.resolved, static_upstream.as_ref()) {
+        (Some(url), _) => crate::upstream::UpstreamPeer::resolve(&r, url, next_upstream_mask, next_upstream_tries, next_upstream_timeout, tag).await,
+        (None, Some(uscf)) => crate::upstream::UpstreamPeer::init(&r, uscf, next_upstream_mask, next_upstream_tries, next_upstream_timeout, tag),
+        (None, None) => {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
+            Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR)
+        }
     };
     let peer = match peer {
         Ok(p) => p,
@@ -1493,7 +2019,7 @@ async fn proxy_handler(r: R) -> i64 {
         // Send request + body in one write so a fast upstream that reads once and
         // closes (e.g. Test::Nginx daemons calling sysread) sees the body too.
         let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body_bytes.len());
-        wire.extend_from_slice(request.as_bytes());
+        wire.extend_from_slice(&request);
         if !body_bytes.is_empty() {
             wire.extend_from_slice(&body_bytes);
         }
@@ -1767,7 +2293,6 @@ async fn proxy_handler(r: R) -> i64 {
         response_keepalive = got_header
             && framing_complete
             && !upstream_wants_close
-            && conn_line.is_empty()
             && response.starts_with(b"HTTP/1.1");
         if !read_ok || response.is_empty() {
             // the upstream closed the connection without a response:
@@ -1968,6 +2493,10 @@ async fn proxy_handler(r: R) -> i64 {
             }
             pos = line_end + 1;
         }
+
+        // "Content-Length" is not copied (ngx_http_upstream_ignore_header_line):
+        // the header filter sends r->headers_out.content_length_n
+        ho.content_length = None;
     }
 
     // If the upstream sent malformed / duplicate framing headers per C
@@ -2162,7 +2691,7 @@ async fn proxy_handler(r: R) -> i64 {
     rewrite_set_cookies(&r);
 
     // proxy_redirect: rewrite Location / Refresh (url=...) headers.
-    rewrite_redirect_headers(&r, &upstream_uri);
+    rewrite_redirect_headers(&r);
 
     // Snapshot cached headers *before* send_header runs — filters
     // (addition_filter, sub_filter, gzip) rewrite headers_out during the
@@ -2247,7 +2776,7 @@ async fn proxy_handler(r: R) -> i64 {
             // "short" and skip caching. If the client sent HEAD and we
             // stayed HEAD upstream, Content-Length describes the notional
             // GET body — there's no upstream body to be short.
-            let head_upstream = method == "HEAD";
+            let head_upstream = head;
             let tail_len = response.len().saturating_sub(body_start);
             let short_response = !head_upstream
                 && upstream_content_length >= 0
@@ -2282,7 +2811,7 @@ async fn proxy_handler(r: R) -> i64 {
 
         let initial = if body_start < response.len() { response[body_start..].to_vec() } else { Vec::new() };
 
-        let conn_close = u_upstream_wants_close || !conn_line.is_empty() || !response.starts_with(b"HTTP/1.1");
+        let conn_close = u_upstream_wants_close || !response.starts_with(b"HTTP/1.1");
 
         let (rc, keepalive) = send_non_buffered(&r, &mut sock, &initial, status, u_expected_body_len, u_is_chunked, conn_close).await;
 
@@ -2371,6 +2900,24 @@ async fn proxy_handler(r: R) -> i64 {
             }
         }
     } else {
+        if upstream_content_length > 0 {
+            // the response is shorter than its "Content-Length":
+            // ngx_http_upstream_finalize_request with 502 after the header
+            // is sent, a flush and no last buffer
+            r.keepalive.set(false);
+            return NGX_OK;
+        }
+
+        // ngx_http_upstream_finalize_request(r, u, 0): the last buffer
+        let mut b = ngx_core::buf::Buf::special();
+        b.last_buf = r.is_main();
+        b.last_in_chain = true;
+        let mut chain = ngx_core::buf::Chain::new();
+        chain.push_back(b);
+        if crate::core_rt::output_filter(&r, chain).await == NGX_ERROR {
+            return NGX_ERROR;
+        }
+
         // Empty 200 response — still honor proxy_store (writes an empty file).
         maybe_store_body(&r, &[]);
         if let Some(hdrs) = cache_snapshot_headers {
@@ -2767,7 +3314,7 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, connect_timeout, set_msec),
         cmd_fn!("proxy_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_send_timeout_handler),
         ngx_core::cmd!("proxy_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, read_timeout, set_msec),
-        cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_set_header_handler),
+        cmd_fn!("proxy_set_header", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, proxy_set_header_handler),
         // Additional proxy directives that tests need
         cmd_fn!("proxy_temp_path", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1234, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
@@ -2780,15 +3327,12 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_pass_request_headers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_headers, set_flag),
         ngx_core::cmd!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_body, set_flag),
         cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
-        cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
+        cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, cmd, conf: Option<Rc<dyn Any>>| {
+            // ngx_conf_set_enum_slot with ngx_http_proxy_http_version
+            // ("2" is ngx_http_proxy_v2_module, not ported)
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
-            let v = match cf.args[1].as_slice() {
-                b"1.0" => 0u32,
-                b"1.1" => 1,
-                _ => return Err(msg("invalid version")),
-            };
-            cell.borrow_mut().http_version = Val::set(v);
-            Ok(())
+            let mut c = cell.borrow_mut();
+            set_enum(cf, cmd, &mut c.http_version, &[("1.0", crate::NGX_HTTP_VERSION_10), ("1.1", crate::NGX_HTTP_VERSION_11)])
         }),
         cmd_fn!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_domain_handler),
@@ -2818,14 +3362,15 @@ pub fn proxy_module() -> ModuleDef {
             }
             Ok(())
         }),
+        ngx_core::cmd!("proxy_pass_trailers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_trailers, set_flag),
         ngx_core::cmd!("proxy_intercept_errors", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, intercept_errors, set_flag),
         cmd_fn!("proxy_ignore_client_abort", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_store", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_store_handler),
         cmd_fn!("proxy_store_access", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         cmd_fn!("proxy_limit_rate", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
         ngx_core::cmd!("proxy_force_ranges", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, force_ranges, set_flag),
-        cmd_fn!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
-        cmd_fn!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, |_cf, _cmd, _conf| Ok(())),
+        ngx_core::cmd!("proxy_headers_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_max_size, set_num),
+        ngx_core::cmd!("proxy_headers_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, NgxHttpProxyLocConf, headers_hash_bucket_size, set_num),
         cmd_fn!("proxy_cache_path", NGX_HTTP_MAIN_CONF | NGX_CONF_2MORE, ConfLevel::None, |cf, _cmd, _conf| crate::proxy_cache::parse_proxy_cache_path(cf)),
         cmd_fn!("proxy_cache", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, _cmd, conf: Option<Rc<dyn Any>>| {
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
@@ -3601,29 +4146,14 @@ fn proxy_next_upstream_tries_handler(cf: &mut Conf, _cmd: &Command, conf: Option
 }
 
 /// proxy_redirect: rewrite ho.location and any Refresh header per configured
-/// rules. Called after upstream headers have been parsed into ho.
-///
-/// `upstream_uri` is the raw proxy_pass URL (for `proxy_redirect default`).
-pub fn rewrite_redirect_headers(r: &R, upstream_uri: &[u8]) {
+/// rules (u->rewrite_redirect, set when plcf->redirects is not NULL).
+/// Called after upstream headers have been parsed into ho.
+pub fn rewrite_redirect_headers(r: &R) {
     let plcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
-    let plcf_ref = plcf.borrow();
-    if plcf_ref.redirect_off {
-        return;
-    }
-    let mut effective: Vec<CookieRewrite> = plcf_ref.redirects.clone();
-    if plcf_ref.redirect_default {
-        // `default`: pattern = proxy_pass URL, replacement = location name.
-        let clcf = r.clcf();
-        let loc_name = clcf.borrow().name.clone();
-        effective.insert(0, CookieRewrite {
-            pattern: CookieRewritePattern::Path(crate::script::ComplexValue::constant(upstream_uri)),
-            replacement: crate::script::ComplexValue::constant(&loc_name),
-        });
-    }
-    if effective.is_empty() {
-        return;
-    }
-    drop(plcf_ref);
+    let effective: Vec<CookieRewrite> = match &plcf.borrow().redirects {
+        Some(redirects) => redirects.clone(),
+        None => return,
+    };
 
     // Location: rewrite via header value.
     {
@@ -3677,7 +4207,7 @@ fn try_redirect_rewrite(r: &R, value: &[u8], prefix: usize, rewrites: &[CookieRe
             CookieRewritePattern::Path(pat) => {
                 // Prefix match (matches ngx_http_proxy_rewrite_complex_handler).
                 let pattern = crate::script::complex_value(r, pat).ok()?;
-                if pattern.is_empty() || target.len() < pattern.len() { continue; }
+                if target.len() < pattern.len() { continue; }
                 if target[..pattern.len()] != pattern[..] { continue; }
                 let repl = crate::script::complex_value(r, &pr.replacement).ok()?;
                 let mut out = Vec::with_capacity(prefix + repl.len() + target.len() - pattern.len());

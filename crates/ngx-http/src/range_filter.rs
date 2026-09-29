@@ -170,27 +170,47 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
                     h.hash.set(0);
                 }
             } else {
-                // Multipart range - build boundary header
-                let boundary = simple_random();
-                ctx.boundary_header = format!("\r\n--{:x}\r\nContent-Type: ", boundary).into_bytes();
+                // ngx_http_range_multipart_header: the boundary header of
+                // each range, CRLF "--0123456789" CRLF "Content-Type: ..."
+                // CRLF "Content-Range: " (completed by the range's "bytes
+                // SSSS-EEEE/TTTT" CRLF CRLF), and the exact length
+                let boundary = ngx_core::connection::stats().temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let boundary = format!("{:020}", boundary);
 
-                // Compute total content length for multipart
-                let mut total_len = 0i64;
-                for range in &ctx.ranges {
-                    total_len += ctx.boundary_header.len() as i64;
-                    total_len += 100; // rough estimate for Content-Range header
-                    total_len += range.end - range.start;
-                    total_len += 2; // \r\n
+                let mut bh = format!("\r\n--{}\r\n", boundary).into_bytes();
+                {
+                    let ho = r.headers_out.borrow();
+                    if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
+                        bh.extend_from_slice(b"Content-Type: ");
+                        bh.extend_from_slice(&ho.content_type);
+                        bh.extend_from_slice(b"; charset=");
+                        bh.extend_from_slice(&ho.charset);
+                        bh.extend_from_slice(b"\r\n");
+                    } else if !ho.content_type.is_empty() {
+                        bh.extend_from_slice(b"Content-Type: ");
+                        bh.extend_from_slice(&ho.content_type);
+                        bh.extend_from_slice(b"\r\n");
+                    }
                 }
-                total_len += 4 + format!("{:x}", boundary).len() as i64 + 4; // closing boundary
+                bh.extend_from_slice(b"Content-Range: ");
+                ctx.boundary_header = bh;
+
+                // the size of the last boundary CRLF "--0123456789--" CRLF
+                let mut total_len = ("\r\n--".len() + boundary.len() + "--\r\n".len()) as i64;
+                for range in &ctx.ranges {
+                    total_len += (ctx.boundary_header.len() + range.content_range.len()) as i64;
+                    total_len += range.end - range.start;
+                }
 
                 r.headers_out.borrow_mut().content_length_n = total_len;
 
                 // Set Content-Type to multipart
-                let content_type = format!("multipart/byteranges; boundary={:x}", boundary);
+                let content_type = format!("multipart/byteranges; boundary={}", boundary);
                 {
                     let mut ho = r.headers_out.borrow_mut();
                     ho.content_type = content_type.into_bytes();
+                    ho.content_type_len = ho.content_type.len();
+                    ho.charset.clear();
                     // Strip any Content-Range the upstream carried
                     // through — each body part now carries its own.
                     ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
@@ -386,12 +406,8 @@ async fn range_multipart_body(r: R, mut input: Chain, next: BodyFilter, ctx: Rc<
         c.ranges.clone()
     };
 
-    // Build multipart response
-    for (i, range) in ranges.iter().enumerate() {
-        if i > 0 {
-            output.push_back(Buf::from_vec(b"\r\n".to_vec()));
-        }
-
+    // Build multipart response (ngx_http_range_multipart_body)
+    for range in ranges.iter() {
         // Boundary
         output.push_back(Buf::from_vec(boundary_header.clone()));
 
@@ -408,10 +424,11 @@ async fn range_multipart_body(r: R, mut input: Chain, next: BodyFilter, ctx: Rc<
         }
     }
 
-    // Final boundary
-    let boundary_num = format!("{:x}", simple_random());
-    let final_boundary = format!("\r\n--{}--\r\n", boundary_num);
-    let mut final_buf = Buf::from_vec(final_boundary.into_bytes());
+    // the last boundary CRLF "--0123456789--" CRLF: the start of the
+    // boundary header
+    let mut final_boundary = boundary_header[..boundary_header.len().min("\r\n--".len() + 20)].to_vec();
+    final_boundary.extend_from_slice(b"--\r\n");
+    let mut final_buf = Buf::from_vec(final_boundary);
     final_buf.last_buf = r.is_main();
     final_buf.last_in_chain = true;
     output.push_back(final_buf);
@@ -483,11 +500,4 @@ fn parse_ranges(range_str: &[u8], content_len: i64, max_ranges: i64, ranges: &mu
     }
 
     Ok(())
-}
-
-fn simple_random() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let nanos = dur.subsec_nanos();
-    nanos ^ (nanos >> 16)
 }
