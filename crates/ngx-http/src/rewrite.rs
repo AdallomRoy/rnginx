@@ -31,6 +31,24 @@ pub struct RewriteRule {
     /// regex->add_args: the replacement does not end with "?", the
     /// original arguments are appended
     pub add_args: bool,
+    /// the values codes of the replacement (ngx_http_script_compile)
+    pub values: Vec<ReplacementCode>,
+    /// regex->args: the replacement has a "?"
+    pub args: bool,
+}
+
+/// The codes ngx_http_script_compile() makes of a rewrite replacement.
+#[derive(Clone)]
+pub enum ReplacementCode {
+    /// ngx_http_script_copy_code
+    Copy(Vec<u8>),
+    /// ngx_http_script_copy_var_code
+    Var(usize),
+    /// ngx_http_script_copy_capture_code, n = 2 * $n
+    Capture(usize),
+    /// ngx_http_script_start_args_code: the first "?" of a replacement
+    /// that is not a redirect
+    StartArgs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -367,6 +385,114 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     Ok(())
 }
 
+/// ngx_http_script_compile() of a rewrite replacement (sc->complete_lengths,
+/// sc->compile_args unless the rewrite is a redirect): the values codes and
+/// sc->args, whether the replacement has a "?".
+fn compile_replacement(cf: &mut Conf, source: &[u8], mut compile_args: bool) -> Result<(Vec<ReplacementCode>, bool), ConfError> {
+    let mut codes = Vec::new();
+    let mut args = false;
+
+    let mut i = 0;
+
+    while i < source.len() {
+        if source[i] == b'$' {
+            i += 1;
+
+            if i == source.len() {
+                return Err(cf.emerg(format_args!("invalid variable name")));
+            }
+
+            if (b'1'..=b'9').contains(&source[i]) {
+                codes.push(ReplacementCode::Capture(2 * (source[i] - b'0') as usize));
+
+                i += 1;
+
+                continue;
+            }
+
+            let mut bracket = false;
+
+            if source[i] == b'{' {
+                bracket = true;
+
+                i += 1;
+
+                if i == source.len() {
+                    return Err(cf.emerg(format_args!("invalid variable name")));
+                }
+            }
+
+            let start = i;
+            let mut len = 0;
+
+            while i < source.len() {
+                let ch = source[i];
+
+                if ch == b'}' && bracket {
+                    i += 1;
+                    bracket = false;
+                    break;
+                }
+
+                if ch.is_ascii_alphanumeric() || ch == b'_' {
+                    i += 1;
+                    len += 1;
+                    continue;
+                }
+
+                break;
+            }
+
+            if bracket {
+                return Err(cf.emerg(format_args!("the closing bracket in \"{}\" variable is missing", B(&source[start..start + len]))));
+            }
+
+            if len == 0 {
+                return Err(cf.emerg(format_args!("invalid variable name")));
+            }
+
+            let index = get_variable_index(cf, &source[start..start + len])?;
+
+            codes.push(ReplacementCode::Var(index));
+
+            continue;
+        }
+
+        if source[i] == b'?' && compile_args {
+            args = true;
+            compile_args = false;
+
+            codes.push(ReplacementCode::StartArgs);
+
+            i += 1;
+
+            continue;
+        }
+
+        let start = i;
+
+        while i < source.len() {
+            if source[i] == b'$' {
+                break;
+            }
+
+            if source[i] == b'?' {
+                args = true;
+
+                if compile_args {
+                    break;
+                }
+            }
+
+            i += 1;
+        }
+
+        codes.push(ReplacementCode::Copy(source[start..i].to_vec()));
+    }
+
+    Ok((codes, args))
+}
+
 /// ngx_http_rewrite directive handler
 fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<RewriteConf>(conf.as_ref().unwrap());
@@ -442,12 +568,17 @@ fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
         }
     }
 
+    // sc.compile_args = !regex->redirect
+    let (values, args) = compile_replacement(cf, &replacement, !flags.redirect)?;
+
     let rule = RewriteRule {
         regex,
         replacement,
         flags,
         log: cell.borrow().log.get_or(false),
         add_args,
+        values,
+        args,
     };
 
     // the regex code with its end code; with "last" (flags.last) a match
@@ -870,114 +1001,36 @@ async fn return_code(r: &R, status: i64, text: &Option<ComplexValue>) -> Flow {
     Flow::Exit(rc)
 }
 
-/// The replacement of a rewrite for the URI matched with `captures`.
-fn rewrite_replacement(r: &R, rule: &RewriteRule, uri: &[u8], cap_vec: &[i32]) -> Vec<u8> {
-    // Build replacement string from template
-    // Track which captures have been used for encoding on second+ use
-    let mut replacement = Vec::new();
-    let repl = &rule.replacement;
-    let mut i = 0;
-    let mut capture_use_count: [usize; 10] = [0; 10];
-
-    while i < repl.len() {
-        if repl[i] == b'$' && i + 1 < repl.len() {
-            if repl[i + 1].is_ascii_digit() {
-                // Capture group reference: $1, $2, etc.
-                let cap_num = (repl[i + 1] - b'0') as usize;
-                let cap_idx = cap_num * 2;
-
-                // Check if this capture group exists
-                if cap_idx + 1 < cap_vec.len() {
-                    let start = cap_vec[cap_idx];
-                    let end = cap_vec[cap_idx + 1];
-                    if start >= 0 && end >= start {
-                        let s = start as usize;
-                        let e = end as usize;
-                        if e <= uri.len() {
-                            let captured = &uri[s..e];
-                            // URL-encode on second and subsequent uses
-                            if capture_use_count[cap_num] > 0 {
-                                // Percent-encode special characters
-                                for &byte in captured {
-                                    match byte {
-                                        b'%' | b'?' | b'#' | b'&' | b'=' | b'+' => {
-                                            replacement.extend_from_slice(
-                                                format!("%{:02X}", byte).as_bytes()
-                                            );
-                                        }
-                                        _ => replacement.push(byte),
-                                    }
-                                }
-                            } else {
-                                replacement.extend_from_slice(captured);
-                            }
-                            capture_use_count[cap_num] += 1;
-                        }
-                    }
-                }
-                i += 2;
-                continue;
-            } else if repl[i + 1] == b'{' {
-                // ${N} style capture reference
-                let end = match memchr::memchr(b'}', &repl[i + 2..]) {
-                    Some(e) => e,
-                    None => {
-                        replacement.push(b'$');
-                        i += 1;
-                        continue;
-                    }
-                };
-
-                if let Ok(num_str) = std::str::from_utf8(&repl[i + 2..i + 2 + end]) {
-                    if let Ok(cap_num) = num_str.parse::<usize>() {
-                        let cap_idx = cap_num * 2;
-                        if cap_idx + 1 < cap_vec.len() {
-                            let start = cap_vec[cap_idx];
-                            let end_val = cap_vec[cap_idx + 1];
-                            if start >= 0 && end_val >= start {
-                                let s = start as usize;
-                                let e = end_val as usize;
-                                if e <= uri.len() {
-                                    replacement.extend_from_slice(&uri[s..e]);
-                                }
-                            }
-                        }
-                        i += 3 + end;
-                        continue;
-                    }
-                }
-                replacement.push(b'$');
-                i += 1;
-                continue;
-            } else if repl[i + 1] == b'$' {
-                // Escaped $: $$
-                replacement.push(b'$');
-                i += 2;
-                continue;
-            } else if repl[i + 1].is_ascii_alphabetic() || repl[i + 1] == b'_' {
-                // Variable reference: $name or ${name}
-                let start = i + 1;
-                let mut end = start;
-                while end < repl.len()
-                    && (repl[end].is_ascii_alphanumeric() || repl[end] == b'_')
-                {
-                    end += 1;
-                }
-                let name = &repl[start..end];
-                if let Some(vv) = crate::variables::get_variable(r, name) {
-                    if !vv.not_found {
-                        replacement.extend_from_slice(&vv.data);
-                    }
-                }
-                i = end;
-                continue;
-            }
-        }
-        replacement.push(repl[i]);
-        i += 1;
+/// ngx_http_script_copy_capture_code: the capture n (2 * $n) of the
+/// request's captures, escaped as arguments in the arguments of the
+/// replacement or in a redirect (e->is_args || e->quote) when the request
+/// URI was quoted or had a "+".
+fn copy_capture(r: &R, n: usize, escape: bool, buf: &mut Vec<u8>) {
+    if n >= r.ncaptures.get() {
+        return;
     }
 
-    replacement
+    let cap = r.captures.borrow();
+
+    if n + 1 >= cap.len() || cap[n] < 0 || cap[n + 1] < cap[n] {
+        return;
+    }
+
+    let data = r.captures_data.borrow();
+
+    let (start, end) = (cap[n] as usize, cap[n + 1] as usize);
+
+    if end > data.len() {
+        return;
+    }
+
+    let p = &data[start..end];
+
+    if escape && (r.quoted_uri.get() || r.plus_in_uri.get()) {
+        ngx_core::string::escape_uri_into(buf, p, ngx_core::string::NGX_ESCAPE_ARGS);
+    } else {
+        buf.extend_from_slice(p);
+    }
 }
 
 /// ngx_http_script_regex_start_code and ngx_http_script_regex_end_code of
@@ -1032,45 +1085,77 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
         r.uri_changed.set(true);
     }
 
-    let replacement = rewrite_replacement(r, rule, &uri, &cap_vec);
+    // the values codes: e->quote = code->redirect, e->is_args after the
+    // start args code, e->args the position of the arguments
 
-    // Handle redirect response
+    let mut buf = Vec::new();
+    let mut is_args = false;
+    let mut args_pos = None;
+
+    for code in &rule.values {
+        match code {
+            ReplacementCode::Copy(data) => {
+                buf.extend_from_slice(data);
+
+                http_debug!(r, "http script copy: \"{}\"", B(data));
+            }
+
+            ReplacementCode::Var(index) => {
+                let pos = buf.len();
+
+                if let Some(value) = crate::variables::get_flushed_variable(r, *index) {
+                    if !value.not_found {
+                        buf.extend_from_slice(&value.data);
+                    }
+                }
+
+                http_debug!(r, "http script var: \"{}\"", B(&buf[pos..]));
+            }
+
+            ReplacementCode::Capture(n) => {
+                let pos = buf.len();
+
+                copy_capture(r, *n, is_args || rule.flags.redirect, &mut buf);
+
+                http_debug!(r, "http script capture: \"{}\"", B(&buf[pos..]));
+            }
+
+            ReplacementCode::StartArgs => {
+                http_debug!(r, "http script args");
+
+                is_args = true;
+                args_pos = Some(buf.len());
+            }
+        }
+    }
+
+    // ngx_http_script_regex_end_code
+
+    http_debug!(r, "http script regex end");
+
     if rule.flags.redirect {
-        // A trailing '?' of the replacement (removed at
-        // configuration time) suppresses the original args
-        let mut response_url = replacement;
-        let suppress_args = !rule.add_args;
-
-        // Unescape the URL per C ngx_http_script_regex_end_code:
-        // percent-encoded bytes in variable/capture expansions get
-        // decoded up to the first '?', then the query string is
-        // copied verbatim.
-        let (mut decoded, consumed) = ngx_core::string::unescape_uri(
-            &response_url,
+        // the unescaped URL up to the first "?", the rest as is
+        let (mut location, consumed) = ngx_core::string::unescape_uri(
+            &buf,
             ngx_core::string::NGX_UNESCAPE_REDIRECT,
         );
-        if consumed < response_url.len() {
-            decoded.extend_from_slice(&response_url[consumed..]);
+        if consumed < buf.len() {
+            location.extend_from_slice(&buf[consumed..]);
         }
-        response_url = decoded;
 
         let orig_args = r.args.borrow().clone();
-        if !suppress_args && !orig_args.is_empty() {
-            // Append original args to the replacement URL
-            if !response_url.contains(&b'?') {
-                response_url.push(b'?');
-            } else {
-                response_url.push(b'&');
-            }
-            response_url.extend_from_slice(&orig_args);
+        if rule.add_args && !orig_args.is_empty() {
+            location.push(if rule.args { b'&' } else { b'?' });
+            location.extend_from_slice(&orig_args);
         }
 
         if log {
-            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten redirect: \"{}\"", B(&response_url));
+            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten redirect: \"{}\"", B(&location));
         }
 
-        // Send redirect response
-        let cv = ComplexValue::constant(&response_url);
+        // the Location header and e->status = code->status, which the
+        // NULL code after the end code returns
+        let cv = ComplexValue::constant(&location);
         let rc = send_response(r, rule.flags.redirect_status, None, &cv).await;
         if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
             return Flow::Exit(NGX_DONE);
@@ -1078,22 +1163,24 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
         return Flow::Exit(rc);
     }
 
-    // the args of the replacement (e->args), then the original args unless
-    // the replacement ended with '?'
-    let orig_args = r.args.borrow().clone();
+    let (rewritten_uri, rewritten_args) = match args_pos {
+        Some(pos) => {
+            let mut args = buf.split_off(pos);
 
-    let (rewritten_uri, rewritten_args) = if let Some(qpos) = replacement.iter().position(|&b| b == b'?') {
-        let uri_part = replacement[..qpos].to_vec();
-        let mut args_part = replacement[qpos + 1..].to_vec();
-        if rule.add_args && !orig_args.is_empty() {
-            args_part.push(b'&');
-            args_part.extend_from_slice(&orig_args);
+            let orig_args = r.args.borrow().clone();
+            if rule.add_args && !orig_args.is_empty() {
+                args.push(b'&');
+                args.extend_from_slice(&orig_args);
+            }
+
+            (buf, args)
         }
-        (uri_part, args_part)
-    } else if rule.add_args {
-        (replacement, orig_args)
-    } else {
-        (replacement, Vec::new())
+
+        None => {
+            let args = if rule.add_args { r.args.borrow().clone() } else { Vec::new() };
+
+            (buf, args)
+        }
     };
 
     if log {
