@@ -719,8 +719,12 @@ fn upstream_cache_background_update(r: &R) -> i64 {
     let uri = r.uri.borrow().clone();
     let args = r.args.borrow().clone();
 
-    match crate::request_rt::background_subrequest(r, &uri, Some(&args), crate::NGX_HTTP_SUBREQUEST_CLONE | crate::NGX_HTTP_SUBREQUEST_BACKGROUND, true) {
-        Ok(()) => NGX_OK,
+    // ngx_http_subrequest(): posted, it runs once this request waits
+    match crate::request_rt::subrequest_posted(r, &uri, Some(&args), crate::NGX_HTTP_SUBREQUEST_CLONE | crate::NGX_HTTP_SUBREQUEST_BACKGROUND, None) {
+        Ok(sr) => {
+            sr.header_only.set(true);
+            NGX_OK
+        }
         Err(()) => NGX_ERROR,
     }
 }

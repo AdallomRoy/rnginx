@@ -343,6 +343,28 @@ pub async fn run_posted_requests(r: &R) -> i64 {
     NGX_OK
 }
 
+/// r->main->count of the posted subrequests, NGX_HTTP_SUBREQUEST_BACKGROUND
+/// ones among them: the connection of the main request is not finalized
+/// (closed or kept alive, ngx_http_finalize_connection) before they are over.
+pub async fn wait_posted_subrequests(r: &R) {
+    let st = match main_state_if_any(r) {
+        Some(st) => st,
+        None => return,
+    };
+
+    loop {
+        let tasks: Vec<tokio::task::JoinHandle<()>> = st.borrow_mut().tasks.drain(..).collect();
+
+        if tasks.is_empty() {
+            return;
+        }
+
+        for t in tasks {
+            let _ = t.await;
+        }
+    }
+}
+
 /// Sets the log request of a subrequest's task whenever it runs, as C does
 /// before running a posted request (ngx_http_set_log_request).
 struct LogRequest {
