@@ -333,42 +333,49 @@ pub fn parse_addr(text: &[u8]) -> Option<SockAddr> {
     None
 }
 
-/// ngx_parse_addr_port: "host:port", "[v6]:port", "unix:path" or plain address.
+/// ngx_parse_addr_port: an address, "addr:port", "[addr]:port" or "[addr]";
+/// None if not an address (NGX_DECLINED).
 pub fn parse_addr_port(text: &[u8]) -> Option<SockAddr> {
-    if text.is_empty() {
-        return None;
-    }
-    if text.len() >= 5 && starts_with_ignore_case(text, b"unix:") {
-        return Some(SockAddr::Unix(text[5..].to_vec()));
-    }
     if let Some(a) = parse_addr(text) {
         return Some(a);
     }
+
     let last = text.len();
+
     let (host, port): (&[u8], &[u8]);
-    if text[0] == b'[' {
-        let p = memchr::memchr(b']', text)?;
-        if p + 1 >= last || text[p + 1] != b':' {
-            return None;
+
+    if !text.is_empty() && text[0] == b'[' {
+        let p = memchr::memchr(b']', text);
+
+        if p == Some(last - 1) {
+            return parse_addr(&text[1..last - 1]);
         }
-        host = &text[1..p];
-        port = &text[p + 2..];
-        let a = inet6_addr(host)?;
-        let n = atoi(port)?;
-        if !(1..=65535).contains(&n) {
-            return None;
-        }
-        return Some(SockAddr::v6(a, n as u16));
+
+        // p < last - 1: the character after "]" must be ":"
+        let p = match p {
+            Some(p) if text[p + 1] == b':' => p + 1,
+            _ => return None,
+        };
+
+        host = &text[1..p - 1];
+        port = &text[p + 1..];
+    } else {
+        let p = memchr::memchr(b':', text)?;
+
+        host = &text[..p];
+        port = &text[p + 1..];
     }
-    let p = memchr::memrchr(b':', text)?;
-    host = &text[..p];
-    port = &text[p + 1..];
-    let n = atoi(port)?;
-    if !(1..=65535).contains(&n) {
-        return None;
-    }
-    let a = inet_addr(host)?;
-    Some(SockAddr::v4(a, n as u16))
+
+    let port = match atoi(port) {
+        Some(n) if (1..=65535).contains(&n) => n as u16,
+        _ => return None,
+    };
+
+    let mut a = parse_addr(host)?;
+
+    a.set_port(port);
+
+    Some(a)
 }
 
 #[derive(Clone, Debug)]
@@ -727,6 +734,33 @@ mod tests {
         assert!(matches!(ptocidr(b"10.0.0.0/8"), CidrParse::Ok(Cidr::V4 { addr: 0x0a000000, mask: 0xff000000 })));
         assert!(matches!(ptocidr(b"10.0.0.1/8"), CidrParse::Done(_)));
         assert!(matches!(ptocidr(b"10.0.0.1/33"), CidrParse::Error));
+    }
+
+    #[test]
+    fn addr_port() {
+        let v4 = |a, b, c, d, port| Some(SockAddr::v4(Ipv4Addr::new(a, b, c, d), port));
+        let v6 = |s: &str, port| Some(SockAddr::v6(s.parse().unwrap(), port));
+
+        assert_eq!(parse_addr_port(b"192.0.2.1"), v4(192, 0, 2, 1, 0));
+        assert_eq!(parse_addr_port(b"192.0.2.1:8080"), v4(192, 0, 2, 1, 8080));
+        assert_eq!(parse_addr_port(b"::1"), v6("::1", 0));
+        assert_eq!(parse_addr_port(b"[::1]:80"), v6("::1", 80));
+        assert_eq!(parse_addr_port(b"[::1]"), v6("::1", 0));
+        assert_eq!(parse_addr_port(b"[192.0.2.1]:80"), v4(192, 0, 2, 1, 80));
+        assert_eq!(parse_addr_port(b"[192.0.2.1]"), v4(192, 0, 2, 1, 0));
+
+        // not addresses in ngx_parse_addr_port
+        assert_eq!(parse_addr_port(b""), None);
+        assert_eq!(parse_addr_port(b"unix:/tmp/x"), None);
+        assert_eq!(parse_addr_port(b"192.0.2.1:0"), None);
+        assert_eq!(parse_addr_port(b"192.0.2.1:65536"), None);
+        assert_eq!(parse_addr_port(b"192.0.2.1:"), None);
+        assert_eq!(parse_addr_port(b"[::1]x"), None);
+        assert_eq!(parse_addr_port(b"[::1"), None);
+        assert_eq!(parse_addr_port(b"["), None);
+        assert_eq!(parse_addr_port(b"[]"), None);
+        assert_eq!(parse_addr_port(b",192.0.2.1"), None);
+        assert_eq!(parse_addr_port(b"localhost:80"), None);
     }
 
     #[test]
