@@ -139,7 +139,15 @@ async fn connection_task(c: Rc<Connection>) {
         c.log.set_action(Some("reading client request line"));
         c.set_reusable(false);
         let r = create_request(&c, &hc, &log_ctx);
-        let end = run_request(&r).await;
+        let end = tokio::select! {
+            end = run_request(&r) => end,
+            _ = connection_close(&c) => {
+                // ngx_http_request_handler: c->close (the shutdown timer)
+                // terminates the request
+                terminate_request(&r, 0);
+                End::Close
+            }
+        };
         match end {
             End::Keepalive => {
                 if keepalive(&r, &hc).await.is_err() {
@@ -160,6 +168,20 @@ async fn connection_task(c: Rc<Connection>) {
                 return;
             }
         }
+    }
+}
+
+/// c->close set and the connection woken (ngx_shutdown_timer_handler:
+/// c->close = 1, c->error = 1, then its read handler)
+async fn connection_close(c: &Connection) {
+    loop {
+        let notified = c.close_notify.notified();
+
+        if c.close.get() {
+            return;
+        }
+
+        notified.await;
     }
 }
 
