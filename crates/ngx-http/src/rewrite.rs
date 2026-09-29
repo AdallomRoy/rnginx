@@ -7,7 +7,6 @@ use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
-use ngx_core::regex::Regex;
 use ngx_core::string::{atoi, B};
 
 use ngx_core::open_file_cache::*;
@@ -24,7 +23,7 @@ crate::http_module_index!("ngx_http_rewrite_module");
 /// Compiled rewrite rule (regex rewrite directive)
 #[derive(Clone)]
 pub struct RewriteRule {
-    pub regex: Rc<Regex>,
+    pub regex: Rc<HttpRegex>,
     pub replacement: Vec<u8>,
     pub flags: RewriteFlags,
     pub log: bool,
@@ -82,18 +81,19 @@ pub enum Code {
 pub enum IfCondition {
     /// Variable is non-empty and not "0"
     Variable(usize),
-    /// String equality: $var = "value"
-    Equal(usize, Vec<u8>),
+    /// String equality: $var = "value" (the value may have variables,
+    /// ngx_http_rewrite_value)
+    Equal(usize, ComplexValue),
     /// String inequality: $var != "value"
-    NotEqual(usize, Vec<u8>),
+    NotEqual(usize, ComplexValue),
     /// Regex match: $var ~ pattern
-    RegexMatch(usize, Rc<Regex>),
+    RegexMatch(usize, Rc<HttpRegex>),
     /// Case-insensitive regex: $var ~* pattern
-    RegexMatchCaseInsensitive(usize, Rc<Regex>),
+    RegexMatchCaseInsensitive(usize, Rc<HttpRegex>),
     /// Negated regex: $var !~ pattern
-    RegexNotMatch(usize, Rc<Regex>),
+    RegexNotMatch(usize, Rc<HttpRegex>),
     /// Negated case-insensitive: $var !~* pattern
-    RegexNotMatchCaseInsensitive(usize, Rc<Regex>),
+    RegexNotMatchCaseInsensitive(usize, Rc<HttpRegex>),
     /// File exists: -f "path"
     FileExists(crate::script::ComplexValue),
     /// File does not exist: !-f "path"
@@ -119,220 +119,308 @@ pub struct RewriteConf {
     pub uninitialized_variable_warn: Val<bool>,
 }
 
-/// Parse if condition from directive arguments
-fn parse_if_condition(cf: &mut Conf, args_orig: &[Vec<u8>]) -> Result<IfCondition, ConfError> {
-    if args_orig.is_empty() {
-        return Err(cf.emerg(format_args!("no condition specified")));
+/// ngx_http_rewrite_if_condition: `value` are the arguments of the "if"
+/// directive (value[0] is "if"), the first one starting with "(" and the
+/// last one ending with ")".
+fn parse_if_condition(cf: &mut Conf, args: &[Vec<u8>]) -> Result<IfCondition, ConfError> {
+    let mut value = args.to_vec();
+    let mut last = value.len() - 1;
+
+    if value[1].is_empty() || value[1][0] != b'(' {
+        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&value[1]))));
     }
 
-    // Handle parentheses around condition: if ($var) or if ( $var )
-    let mut args = args_orig.to_vec();
+    let mut cur;
 
-    // Remove leading '(' from first arg if present
-    if args[0].starts_with(b"(") {
-        if args[0].len() == 1 {
-            // Just "(" - remove it and shift subsequent args
-            args.remove(0);
-        } else {
-            // "($var" etc - remove the leading paren
-            args[0] = args[0][1..].to_vec();
-        }
+    if value[1].len() == 1 {
+        cur = 2;
+
+    } else {
+        cur = 1;
+        value[1].remove(0);
     }
 
-    // Remove trailing ')' from last arg if present
-    if !args.is_empty() && args[args.len() - 1].ends_with(b")") {
-        let last_idx = args.len() - 1;
-        if args[last_idx].len() == 1 {
-            // Just ")" - remove it
-            args.pop();
-        } else {
-            // "var)" etc - remove the trailing paren
-            args[last_idx] = args[last_idx][..args[last_idx].len() - 1].to_vec();
-        }
+    if value[last].last() != Some(&b')') {
+        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&value[last]))));
     }
 
-    if args.is_empty() {
-        return Err(cf.emerg(format_args!("no condition specified")));
+    if value[last].len() == 1 {
+        last -= 1;
+
+    } else {
+        value[last].pop();
     }
 
-    // Check for file test operators: -f, -d, -e, -x (and negated !-f, !-d, etc)
-    let first = std::str::from_utf8(&args[0]).unwrap_or("");
-    let is_negated = first.starts_with('!');
-    let test_str = if is_negated { &first[1..] } else { first };
+    let p = value.get(cur).cloned().unwrap_or_default();
+    let len = p.len();
 
-    if test_str.starts_with('-') && test_str.len() == 2 {
-        // File test operator
-        if args.len() < 2 {
-            return Err(cf.emerg(format_args!("file test needs an argument")));
+    if len > 1 && p[0] == b'$' {
+
+        if cur != last && cur + 2 != last {
+            return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&p))));
         }
 
-        let test_char = test_str.chars().nth(1).unwrap();
-        let path_cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
+        // ngx_http_rewrite_variable
+        let index = get_variable_index(cf, &p[1..])?;
 
-        let cond = match (test_char, is_negated) {
-            ('f', false) => IfCondition::FileExists(path_cv),
-            ('f', true) => IfCondition::FileNotExists(path_cv),
-            ('d', false) => IfCondition::DirectoryExists(path_cv),
-            ('d', true) => IfCondition::DirectoryNotExists(path_cv),
-            ('e', false) => IfCondition::EntityExists(path_cv),
-            ('e', true) => IfCondition::EntityNotExists(path_cv),
-            ('x', false) => IfCondition::Executable(path_cv),
-            ('x', true) => IfCondition::NotExecutable(path_cv),
-            _ => return Err(cf.emerg(format_args!("unknown file test operator: {}", test_str))),
-        };
-
-        return Ok(cond);
-    }
-
-    // Variable-based condition
-    if !first.starts_with('$') {
-        return Err(cf.emerg(format_args!("invalid condition: {}", B(&args[0]))));
-    }
-
-    let var_name = &args[0][1..]; // Remove leading '$'
-    // ngx_http_rewrite_variable: the variable is referenced by its index only
-    let var_idx = get_variable_index(cf, var_name)?;
-
-    // If only variable, check if non-empty and not "0"
-    if args.len() == 1 {
-        return Ok(IfCondition::Variable(var_idx));
-    }
-
-    // Check for comparison/regex operators
-    let op = std::str::from_utf8(&args[1]).unwrap_or("");
-
-    if args.len() < 3 {
-        return Err(cf.emerg(format_args!("operator {} needs a value", op)));
-    }
-
-    let value = &args[2];
-
-    match op {
-        "=" => Ok(IfCondition::Equal(var_idx, value.clone())),
-        "!=" => Ok(IfCondition::NotEqual(var_idx, value.clone())),
-        "~" => {
-            let regex = match ngx_core::regex::Regex::compile(value, 0) {
-                Ok(r) => r,
-                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-            };
-            Ok(IfCondition::RegexMatch(var_idx, regex))
+        if cur == last {
+            return Ok(IfCondition::Variable(index));
         }
-        "~*" => {
-            let regex = match ngx_core::regex::Regex::compile(value, ngx_core::regex::NGX_REGEX_CASELESS) {
-                Ok(r) => r,
-                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-            };
-            Ok(IfCondition::RegexMatchCaseInsensitive(var_idx, regex))
+
+        cur += 1;
+
+        let p = value[cur].clone();
+
+        if p == b"=" {
+            // ngx_http_rewrite_value
+            let value = crate::script::compile_complex_value(cf, &value[last], 0)?;
+            return Ok(IfCondition::Equal(index, value));
         }
-        "!~" => {
-            let regex = match ngx_core::regex::Regex::compile(value, 0) {
-                Ok(r) => r,
-                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-            };
-            Ok(IfCondition::RegexNotMatch(var_idx, regex))
+
+        if p == b"!=" {
+            let value = crate::script::compile_complex_value(cf, &value[last], 0)?;
+            return Ok(IfCondition::NotEqual(index, value));
         }
-        "!~*" => {
-            let regex = match ngx_core::regex::Regex::compile(value, ngx_core::regex::NGX_REGEX_CASELESS) {
-                Ok(r) => r,
-                Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-            };
-            Ok(IfCondition::RegexNotMatchCaseInsensitive(var_idx, regex))
+
+        if p == b"~" || p == b"~*" || p == b"!~" || p == b"!~*" {
+            let caseless = p.last() == Some(&b'*');
+            let options = if caseless { ngx_core::regex::NGX_REGEX_CASELESS } else { 0 };
+
+            let regex = crate::variables::regex_compile(cf, &value[last], options)?;
+
+            return Ok(match (p[0] == b'!', caseless) {
+                (false, false) => IfCondition::RegexMatch(index, regex),
+                (false, true) => IfCondition::RegexMatchCaseInsensitive(index, regex),
+                (true, false) => IfCondition::RegexNotMatch(index, regex),
+                (true, true) => IfCondition::RegexNotMatchCaseInsensitive(index, regex),
+            });
         }
-        _ => Err(cf.emerg(format_args!("unknown operator: {}", op))),
+
+        return Err(cf.emerg(format_args!("unexpected \"{}\" in condition", B(&p))));
+
+    } else if (len == 2 && p[0] == b'-') || (len == 3 && p[0] == b'!' && p[1] == b'-') {
+
+        if cur + 1 != last {
+            return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&p))));
+        }
+
+        // ngx_http_rewrite_value
+        let file = crate::script::compile_complex_value(cf, &value[last], 0)?;
+
+        match p[1] {
+            b'f' => return Ok(IfCondition::FileExists(file)),
+            b'd' => return Ok(IfCondition::DirectoryExists(file)),
+            b'e' => return Ok(IfCondition::EntityExists(file)),
+            b'x' => return Ok(IfCondition::Executable(file)),
+            _ => {}
+        }
+
+        if p[0] == b'!' {
+            match p[2] {
+                b'f' => return Ok(IfCondition::FileNotExists(file)),
+                b'd' => return Ok(IfCondition::DirectoryNotExists(file)),
+                b'e' => return Ok(IfCondition::EntityNotExists(file)),
+                b'x' => return Ok(IfCondition::NotExecutable(file)),
+                _ => {}
+            }
+        }
+
+        return Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&p))));
     }
+
+    Err(cf.emerg(format_args!("invalid condition \"{}\"", B(&p))))
 }
 
-/// Check file existence and type
-fn check_file_type(r: &R, cv: &crate::script::ComplexValue, is_dir: bool, is_exec: bool, entity: bool) -> bool {
-    let path = match crate::script::complex_value(r, cv) {
-        Ok(v) => v,
-        Err(_) => return false,
+/// The operations of ngx_http_script_file_code.
+#[derive(Clone, Copy, Debug)]
+enum FileOp {
+    Plain,
+    NotPlain,
+    Dir,
+    NotDir,
+    Exists,
+    NotExists,
+    Exec,
+    NotExec,
+}
+
+/// ngx_http_script_file_code: the file is looked up as ngx_open_cached_file
+/// with of.test_only and the symlink restrictions of the location;
+/// Err(status) ends the codes.
+fn file_code(r: &R, file: &ComplexValue, op: FileOp) -> Result<bool, i64> {
+    let path = crate::script::complex_value(r, file).unwrap_or_default();
+
+    http_debug!(r, "http script file op {:?} \"{}\"", op, B(&path));
+
+    let clcf = r.clcf();
+
+    let (mut of, cache) = {
+        let c = clcf.borrow();
+
+        let mut of = crate::static_module::open_file_info(r, &c);
+        of.test_only = true;
+
+        (of, c.open_file_cache.get().clone())
     };
-    use std::os::unix::ffi::OsStrExt;
-    let os = std::ffi::OsStr::from_bytes(&path);
-    match std::fs::metadata(os) {
-        Ok(m) => {
-            if entity { true }
-            else if is_dir { m.is_dir() }
-            else if is_exec {
-                // -x matches file or directory with any execute bit set
-                // (C: ngx_file_info + (fi.st_mode & S_IXUSR)).
-                use std::os::unix::fs::PermissionsExt;
-                m.permissions().mode() & 0o111 != 0
-            } else { m.is_file() }
-        }
-        Err(_) => false,
+
+    if set_disable_symlinks(r, &clcf, &path, &mut of) != NGX_OK {
+        return Err(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
+
+    if ngx_core::open_file_cache::open_cached_file(cache.as_ref(), &path, &mut of, &r.connection.log).is_err() {
+        if of.err == 0 {
+            return Err(NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        if of.err != libc::ENOENT && of.err != libc::ENOTDIR && of.err != libc::ENAMETOOLONG {
+            ngx_core::ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(of.err), "{} \"{}\" failed", of.failed, B(&path));
+        }
+
+        let value = match op {
+            FileOp::Plain | FileOp::Dir | FileOp::Exists | FileOp::Exec => false,
+            FileOp::NotPlain | FileOp::NotDir | FileOp::NotExists | FileOp::NotExec => true,
+        };
+
+        if !value {
+            http_debug!(r, "http script file op false");
+        }
+
+        return Ok(value);
+    }
+
+    let value = match op {
+        FileOp::Plain => of.is_file,
+        FileOp::NotPlain => !of.is_file,
+        FileOp::Dir => of.is_dir,
+        FileOp::NotDir => !of.is_dir,
+        FileOp::Exists => of.is_file || of.is_dir || of.is_link,
+        FileOp::NotExists => !(of.is_file || of.is_dir || of.is_link),
+        FileOp::Exec => of.is_exec,
+        FileOp::NotExec => !of.is_exec,
+    };
+
+    if !value {
+        http_debug!(r, "http script file op false");
+    }
+
+    Ok(value)
+}
+
+/// ngx_http_set_disable_symlinks
+fn set_disable_symlinks(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, path: &[u8], of: &mut OpenFileInfo) -> i64 {
+    let from = {
+        let c = clcf.borrow();
+
+        of.disable_symlinks = *c.disable_symlinks as u8;
+
+        c.disable_symlinks_from.as_option().cloned().flatten()
+    };
+
+    let from = match from {
+        Some(cv) => cv,
+        None => return NGX_OK,
+    };
+
+    let from = match crate::script::complex_value(r, &from) {
+        Ok(v) => v,
+        Err(_) => return NGX_ERROR,
+    };
+
+    if from.is_empty() || from.len() > path.len() || path[..from.len()] != from[..] {
+        return NGX_OK;
+    }
+
+    if from.len() == path.len() {
+        of.disable_symlinks = NGX_DISABLE_SYMLINKS_OFF as u8;
+        return NGX_OK;
+    }
+
+    let p = from.len();
+
+    if path[p] == b'/' {
+        of.disable_symlinks_from = from.len();
+        return NGX_OK;
+    }
+
+    if path[p - 1] == b'/' {
+        of.disable_symlinks_from = from.len() - 1;
+    }
+
+    NGX_OK
 }
 
 /// The regex test of an if condition (ngx_http_script_regex_start_code with
 /// code->test): the variable's value (empty if not found, as
-/// ngx_http_script_var_code) is matched, the captures of a match are the
-/// request's captures, and a mismatch resets them.
-fn regex_test(r: &R, idx: usize, regex: &Rc<Regex>, negative_test: bool, log: bool) -> bool {
+/// ngx_http_script_var_code) is matched with ngx_http_regex_exec, which
+/// makes the captures of a match the request's, and a mismatch resets them.
+fn regex_test(r: &R, idx: usize, regex: &Rc<HttpRegex>, negative_test: bool, log: bool) -> Result<bool, i64> {
     let line = match crate::variables::get_flushed_variable(r, idx) {
         Some(vv) if !vv.not_found => vv.data,
         _ => Vec::new(),
     };
 
-    http_debug!(r, "http script regex: \"{}\"", B(&regex.pattern));
+    http_debug!(r, "http script regex: \"{}\"", B(&regex.name));
 
     let log = log || r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP);
 
-    let captures = match regex.exec(&line) {
-        Some(c) => c,
-        None => {
-            if log {
-                ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&regex.pattern), B(&line));
-            }
+    let rc = crate::variables::regex_exec(r, regex, &line);
 
-            r.ncaptures.set(0);
-
-            return negative_test;
+    if rc == NGX_DECLINED {
+        if log {
+            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&regex.name), B(&line));
         }
-    };
 
-    // ngx_http_regex_exec
-    let mut cap_vec = Vec::with_capacity(captures.len() * 2);
-    for (start, end) in &captures {
-        cap_vec.push(*start);
-        cap_vec.push(*end);
+        r.ncaptures.set(0);
+
+        return Ok(negative_test);
     }
 
-    r.ncaptures.set(cap_vec.len());
-    *r.captures.borrow_mut() = cap_vec;
-    *r.captures_data.borrow_mut() = line.clone();
+    if rc == NGX_ERROR {
+        return Err(NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
 
     if log {
-        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&regex.pattern), B(&line));
+        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&regex.name), B(&line));
     }
 
-    !negative_test
+    Ok(!negative_test)
 }
 
-/// Evaluate if condition at runtime
-fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> bool {
+/// The value of the variable of a condition, empty when not found
+/// (ngx_http_script_var_code).
+fn condition_variable(r: &R, idx: usize) -> Vec<u8> {
+    match crate::variables::get_flushed_variable(r, idx) {
+        Some(vv) if !vv.not_found => vv.data,
+        _ => Vec::new(),
+    }
+}
+
+/// The value of the condition of an if code; Err(status) ends the codes.
+fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> Result<bool, i64> {
     match condition {
         IfCondition::Variable(idx) => {
-            if let Some(vv) = crate::variables::get_flushed_variable(r, *idx) {
-                !vv.not_found && !vv.data.is_empty() && !(vv.data.len() == 1 && vv.data[0] == b'0')
-            } else {
-                false
-            }
+            let v = condition_variable(r, *idx);
+            Ok(!v.is_empty() && !(v.len() == 1 && v[0] == b'0'))
         }
-        IfCondition::Equal(idx, expected) => {
-            // Match C ngx_http_script_equal_code: compare value bytes regardless
-            // of not_found (unset variables have empty data, so `$x = ""` is true).
-            match crate::variables::get_flushed_variable(r, *idx) {
-                Some(vv) => vv.data == *expected,
-                None => expected.is_empty(),
+        IfCondition::Equal(idx, value) => {
+            // ngx_http_script_equal_code
+            let v = condition_variable(r, *idx);
+            let value = crate::script::complex_value(r, value).unwrap_or_default();
+            http_debug!(r, "http script equal");
+            if v != value {
+                http_debug!(r, "http script equal: no \"{}\"", B(&value));
             }
+            Ok(v == value)
         }
-        IfCondition::NotEqual(idx, expected) => {
-            match crate::variables::get_flushed_variable(r, *idx) {
-                Some(vv) => vv.data != *expected,
-                None => !expected.is_empty(),
+        IfCondition::NotEqual(idx, value) => {
+            // ngx_http_script_not_equal_code
+            let v = condition_variable(r, *idx);
+            let value = crate::script::complex_value(r, value).unwrap_or_default();
+            http_debug!(r, "http script not equal");
+            if v == value {
+                http_debug!(r, "http script not equal: no");
             }
+            Ok(v != value)
         }
         IfCondition::RegexMatch(idx, regex) | IfCondition::RegexMatchCaseInsensitive(idx, regex) => {
             regex_test(r, *idx, regex, false, log)
@@ -340,30 +428,14 @@ fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> bool {
         IfCondition::RegexNotMatch(idx, regex) | IfCondition::RegexNotMatchCaseInsensitive(idx, regex) => {
             regex_test(r, *idx, regex, true, log)
         }
-        IfCondition::FileExists(cv) => {
-            check_file_type(&r, cv, false, false, false)
-        }
-        IfCondition::FileNotExists(cv) => {
-            !check_file_type(&r, cv, false, false, false)
-        }
-        IfCondition::DirectoryExists(cv) => {
-            check_file_type(&r, cv, true, false, false)
-        }
-        IfCondition::DirectoryNotExists(cv) => {
-            !check_file_type(&r, cv, true, false, false)
-        }
-        IfCondition::EntityExists(cv) => {
-            check_file_type(&r, cv, false, false, true)
-        }
-        IfCondition::EntityNotExists(cv) => {
-            !check_file_type(&r, cv, false, false, true)
-        }
-        IfCondition::Executable(cv) => {
-            check_file_type(&r, cv, false, true, false)
-        }
-        IfCondition::NotExecutable(cv) => {
-            !check_file_type(&r, cv, false, true, false)
-        }
+        IfCondition::FileExists(cv) => file_code(r, cv, FileOp::Plain),
+        IfCondition::FileNotExists(cv) => file_code(r, cv, FileOp::NotPlain),
+        IfCondition::DirectoryExists(cv) => file_code(r, cv, FileOp::Dir),
+        IfCondition::DirectoryNotExists(cv) => file_code(r, cv, FileOp::NotDir),
+        IfCondition::EntityExists(cv) => file_code(r, cv, FileOp::Exists),
+        IfCondition::EntityNotExists(cv) => file_code(r, cv, FileOp::NotExists),
+        IfCondition::Executable(cv) => file_code(r, cv, FileOp::Exec),
+        IfCondition::NotExecutable(cv) => file_code(r, cv, FileOp::NotExec),
     }
 }
 
@@ -509,11 +581,8 @@ fn rewrite_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -
         return Err(cf.emerg(format_args!("empty replacement")));
     }
 
-    // Compile regex
-    let regex = match ngx_core::regex::Regex::compile(pattern, 0) {
-        Ok(r) => r,
-        Err(e) => return Err(cf.emerg(format_args!("{}", e))),
-    };
+    // ngx_http_regex_compile
+    let regex = crate::variables::regex_compile(cf, pattern, 0)?;
 
     let add_args = if replacement.last() == Some(&b'?') {
         // the last "?" drops the original arguments
@@ -613,7 +682,10 @@ fn return_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) ->
             }
         }
         None => {
-            if args.len() == 3 {
+            // only a URL can be given without a code
+            if args.len() != 2
+                || !(v.starts_with(b"http://") || v.starts_with(b"https://") || v.starts_with(b"$scheme"))
+            {
                 return Err(cf.emerg(format_args!("invalid return code \"{}\"", B(v))));
             }
             status = NGX_HTTP_MOVED_TEMPORARILY;
@@ -743,7 +815,7 @@ fn if_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRes
 
     // ngx_http_rewrite_if_condition
     let args = cf.args.clone();
-    let condition = parse_if_condition(cf, &args[1..])?;
+    let condition = parse_if_condition(cf, &args)?;
 
     // the inner directives must be compiled to the same code array: they
     // are collected in the codes of the if's rewrite conf, which are moved
@@ -932,10 +1004,10 @@ async fn run_codes(r: &R, codes: &[Code], log: bool) -> Flow {
             Code::Break { .. } => break_code(r),
 
             Code::If { condition, codes, loc_conf } => {
-                if if_code(r, condition, loc_conf, log) {
-                    Box::pin(run_codes(r, codes, log)).await
-                } else {
-                    Flow::Next
+                match if_code(r, condition, loc_conf, log) {
+                    Ok(true) => Box::pin(run_codes(r, codes, log)).await,
+                    Ok(false) => Flow::Next,
+                    Err(status) => Flow::Exit(status),
                 }
             }
         };
@@ -949,9 +1021,10 @@ async fn run_codes(r: &R, codes: &[Code], log: bool) -> Flow {
 }
 
 /// ngx_http_script_if_code: the condition value is popped; if it is true,
-/// the location configuration of the block (if any) becomes the request's
-fn if_code(r: &R, condition: &IfCondition, loc_conf: &Option<Rc<ConfSlots>>, log: bool) -> bool {
-    let value = eval_if_condition(r, condition, log);
+/// the location configuration of the block (if any) becomes the request's;
+/// Err(status) when the condition ended the codes
+fn if_code(r: &R, condition: &IfCondition, loc_conf: &Option<Rc<ConfSlots>>, log: bool) -> Result<bool, i64> {
+    let value = eval_if_condition(r, condition, log)?;
 
     http_debug!(r, "http script if");
 
@@ -961,12 +1034,12 @@ fn if_code(r: &R, condition: &IfCondition, loc_conf: &Option<Rc<ConfSlots>>, log
             update_location_config(r);
         }
 
-        return true;
+        return Ok(true);
     }
 
     http_debug!(r, "http script if: false");
 
-    false
+    Ok(false)
 }
 
 /// ngx_http_script_break_code
@@ -981,8 +1054,11 @@ fn break_code(r: &R) -> Flow {
 
 /// ngx_http_script_return_code
 async fn return_code(r: &R, status: i64, text: &Option<ComplexValue>) -> Flow {
-    // If no explicit text, send error page HTML for error statuses
-    if text.is_none() && status >= 400 {
+    // an error status without text (or with an empty one) is the special
+    // response of the status: code->text.value.len || code->text.lengths
+    let has_text = text.as_ref().map_or(false, |t| !t.value.is_empty() || !t.is_constant());
+
+    if status >= 400 && !has_text {
         // Set the error status and return it to be handled by error_page/default error page
         r.headers_out.borrow_mut().status = status;
         return Flow::Exit(status);
@@ -1039,40 +1115,31 @@ fn copy_capture(r: &R, n: usize, escape: bool, buf: &mut Vec<u8>) {
 async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
     let uri = r.uri.borrow().clone();
 
-    http_debug!(r, "http script regex: \"{}\"", B(&rule.regex.pattern));
+    http_debug!(r, "http script regex: \"{}\"", B(&rule.regex.name));
 
     let log = log || r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP);
 
-    let captures = match rule.regex.exec(&uri) {
-        Some(c) => c,
-        None => {
-            if log {
-                ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&rule.regex.pattern), B(&uri));
-            }
+    // ngx_http_regex_exec: the captures of a match are the request's
+    let rc = crate::variables::regex_exec(r, &rule.regex, &uri);
 
-            r.ncaptures.set(0);
-
-            // e->ip += code->next: past the end code and the NULL code
-            return Flow::Next;
+    if rc == NGX_DECLINED {
+        if log {
+            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&rule.regex.name), B(&uri));
         }
-    };
+
+        r.ncaptures.set(0);
+
+        // e->ip += code->next: past the end code and the NULL code
+        return Flow::Next;
+    }
+
+    if rc == NGX_ERROR {
+        return Flow::Exit(NGX_HTTP_INTERNAL_SERVER_ERROR);
+    }
 
     if log {
-        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&rule.regex.pattern), B(&uri));
+        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&rule.regex.name), B(&uri));
     }
-
-    // Store captures in request for later use ($1, $2, etc)
-    // captures is Vec<(i32, i32)> pairs
-    let mut cap_vec = Vec::new();
-    for (start, end) in &captures {
-        cap_vec.push(*start);
-        cap_vec.push(*end);
-    }
-
-    // Store captures and the URI being rewritten (ngx_http_regex_exec)
-    r.ncaptures.set(cap_vec.len());
-    *r.captures.borrow_mut() = cap_vec.clone();
-    *r.captures_data.borrow_mut() = uri.clone();
 
     // code->uri
     r.internal.set(true);
