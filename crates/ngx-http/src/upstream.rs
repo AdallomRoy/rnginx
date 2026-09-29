@@ -1488,6 +1488,13 @@ pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, 
             let h = ho.add(name, value);
             ho.etag = Some(h);
         }
+        b"accept-ranges" => {
+            // ngx_http_upstream_copy_allow_ranges: the copy is
+            // r->headers_out.accept_ranges, which
+            // ngx_http_clear_accept_ranges() removes
+            let h = ho.add(name, value);
+            ho.accept_ranges = Some(h);
+        }
         b"content-encoding" => {
             // Populate the typed slot so gunzip_filter can detect
             // upstream-gzipped responses (matches C's

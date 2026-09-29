@@ -47,7 +47,16 @@ pub fn output_buffers_size(r: &R) -> usize {
     b.bufs.num.max(1) * b.bufs.size.max(1)
 }
 
+/// The request's ngx_output_chain_ctx_t: only its creation is kept track of.
+struct CopyCtx;
+
 async fn copy_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
+    if r.get_ctx::<CopyCtx>(ctx_index()).is_none() {
+        r.set_ctx(ctx_index(), CopyCtx);
+        if input.front().is_some_and(|b| b.buf_size() != 0) {
+            r.request_output.set(true);
+        }
+    }
     let need_in_memory = r.main_filter_need_in_memory.get() || r.filter_need_in_memory.get() || !r.connection.sendfile.get();
     let has_file = input.iter().any(|b| b.in_file && !b.in_memory());
     if !has_file || !need_in_memory {

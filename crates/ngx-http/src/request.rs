@@ -246,7 +246,20 @@ pub struct UpstreamState {
 
 pub type ContentHandler = Rc<dyn Fn(R) -> BoxFut<i64>>;
 pub type PostSubrequest = Rc<dyn Fn(&R, i64) -> i64>;
+/// A post_subrequest handler that has to send output (e.g.
+/// ngx_http_ssi_stub_output calls ngx_http_send_header() and
+/// ngx_http_output_filter()); called by ngx_http_finalize_request() after
+/// the synchronous one.
+pub type PostSubrequestAsync = Rc<dyn Fn(R, i64) -> BoxFut<i64>>;
 pub type CleanupFn = Box<dyn FnOnce()>;
+
+/// ngx_http_postponed_request_t: an entry of r->postponed, either a
+/// subrequest of r or output of r kept until the subrequests before it
+/// are done.
+pub struct PostponedRequest {
+    pub request: Option<R>,
+    pub out: Chain,
+}
 
 /// ngx_http_connection_t
 pub struct HttpConnection {
@@ -523,6 +536,10 @@ pub struct Request {
     pub log_ctx: Rc<HttpLogCtx>,
     /// Signalled when a subrequest waiting on this request completes (unused in sequential model).
     pub weak_self: RefCell<Weak<Request>>,
+    /// r->postponed (see crate::postpone_filter)
+    pub postponed: RefCell<std::collections::VecDeque<PostponedRequest>>,
+    /// the post_subrequest handler of the subrequest when it sends output
+    pub post_subrequest_async: RefCell<Option<PostSubrequestAsync>>,
 }
 
 impl Request {
@@ -804,6 +821,8 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         stream: RefCell::new(None),
         log_ctx: log_ctx.clone(),
         weak_self: RefCell::new(Weak::new()),
+        postponed: RefCell::new(std::collections::VecDeque::new()),
+        post_subrequest_async: RefCell::new(None),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is

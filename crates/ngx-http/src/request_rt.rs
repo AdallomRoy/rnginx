@@ -976,6 +976,10 @@ pub async fn finalize_request(r: &R, mut rc: i64) {
         if let Some(ps) = r.post_subrequest.borrow().clone() {
             rc = ps(r, rc);
         }
+        let psa = r.post_subrequest_async.borrow().clone();
+        if let Some(ps) = psa {
+            rc = ps(r.clone(), rc).await;
+        }
     }
     if rc == NGX_ERROR || rc == NGX_HTTP_REQUEST_TIME_OUT || rc == NGX_HTTP_CLIENT_CLOSED_REQUEST || c.error.get() {
         if post_action(r).await == NGX_OK {
@@ -1490,4 +1494,159 @@ pub async fn subrequest(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps: 
     *r.variables.borrow_mut() = sr.variables.borrow().clone();
     r.set_log_request();
     Ok((sr, rc))
+}
+
+/// ngx_http_subrequest as C has it: the subrequest is created and, unless
+/// it is a background one, appended to r->postponed. It runs when
+/// crate::postpone_filter::run_posted_requests() gets to it, which stands
+/// for ngx_http_run_posted_requests() and the postpone filter waking the
+/// subrequest up; until then r keeps its own output postponed after it
+/// (C: c->data moved to the subrequest). subrequest() above creates a
+/// subrequest and runs it at once instead.
+pub fn subrequest_posted(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps: Option<PostSubrequest>) -> Result<R, ()> {
+    if r.subrequests.get() == 0 {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "subrequests cycle while processing \"{}\"", B(uri));
+        return Err(());
+    }
+    if r.subrequest_in_memory.get() {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "nested in-memory subrequest \"{}\"", B(uri));
+        return Err(());
+    }
+    let c = r.connection.clone();
+    let sr = alloc_request(&c, &r.http_connection, &r.log_ctx);
+    let cscf = r.cscf();
+    let ctx = cscf.borrow().ctx.clone();
+    *sr.main_conf.borrow_mut() = ctx.main.clone().unwrap();
+    *sr.srv_conf.borrow_mut() = ctx.srv.clone().unwrap();
+    *sr.loc_conf.borrow_mut() = ctx.loc.clone().unwrap();
+    // sr->headers_in = r->headers_in
+    {
+        let hin = r.headers_in.borrow();
+        let mut shin = sr.headers_in.borrow_mut();
+        shin.headers = hin.headers.clone();
+        shin.count = hin.count;
+        shin.host = hin.host.clone();
+        shin.connection = hin.connection.clone();
+        shin.if_modified_since = hin.if_modified_since.clone();
+        shin.if_unmodified_since = hin.if_unmodified_since.clone();
+        shin.if_match = hin.if_match.clone();
+        shin.if_none_match = hin.if_none_match.clone();
+        shin.user_agent = hin.user_agent.clone();
+        shin.referer = hin.referer.clone();
+        shin.content_length = hin.content_length.clone();
+        shin.content_range = hin.content_range.clone();
+        shin.content_type = hin.content_type.clone();
+        shin.range = hin.range.clone();
+        shin.if_range = hin.if_range.clone();
+        shin.transfer_encoding = hin.transfer_encoding.clone();
+        shin.te = hin.te.clone();
+        shin.expect = hin.expect.clone();
+        shin.upgrade = hin.upgrade.clone();
+        shin.accept_encoding = hin.accept_encoding.clone();
+        shin.via = hin.via.clone();
+        shin.authorization = hin.authorization.clone();
+        shin.proxy_authorization = hin.proxy_authorization.clone();
+        shin.keep_alive = hin.keep_alive.clone();
+        shin.x_forwarded_for = hin.x_forwarded_for.clone();
+        shin.x_real_ip = hin.x_real_ip.clone();
+        shin.accept = hin.accept.clone();
+        shin.accept_language = hin.accept_language.clone();
+        shin.depth = hin.depth.clone();
+        shin.destination = hin.destination.clone();
+        shin.overwrite = hin.overwrite.clone();
+        shin.date = hin.date.clone();
+        shin.cookie = hin.cookie.clone();
+        shin.user = hin.user.clone();
+        shin.user_tested = hin.user_tested;
+        shin.passwd = hin.passwd.clone();
+        shin.server = hin.server.clone();
+        shin.content_length_n = hin.content_length_n;
+        shin.keep_alive_n = hin.keep_alive_n;
+        shin.connection_type = hin.connection_type;
+        shin.chunked = hin.chunked;
+        shin.multi = hin.multi;
+        shin.multi_linked = hin.multi_linked;
+        shin.msie = hin.msie;
+        shin.msie6 = hin.msie6;
+        shin.opera = hin.opera;
+        shin.gecko = hin.gecko;
+        shin.chrome = hin.chrome;
+        shin.safari = hin.safari;
+        shin.konqueror = hin.konqueror;
+    }
+    sr.clear_content_length();
+    sr.clear_accept_ranges();
+    sr.clear_last_modified();
+    *sr.request_body.borrow_mut() = r.request_body.borrow().clone();
+    *sr.stream.borrow_mut() = r.stream.borrow().clone();
+    sr.method.set(NGX_HTTP_GET);
+    sr.http_version.set(r.http_version.get());
+    sr.port.set(r.port.get());
+    *sr.request_line.borrow_mut() = r.request_line.borrow().clone();
+    *sr.uri.borrow_mut() = uri.to_vec();
+    if let Some(a) = args {
+        *sr.args.borrow_mut() = a.to_vec();
+    }
+    http_debug!(r, "http subrequest \"{}?{}\"", B(uri), B(&sr.args.borrow()));
+    sr.subrequest_in_memory.set(flags & NGX_HTTP_SUBREQUEST_IN_MEMORY != 0);
+    sr.waited.set(flags & NGX_HTTP_SUBREQUEST_WAITED != 0);
+    sr.background.set(flags & NGX_HTTP_SUBREQUEST_BACKGROUND != 0);
+    *sr.unparsed_uri.borrow_mut() = r.unparsed_uri.borrow().clone();
+    *sr.method_name.borrow_mut() = b"GET".to_vec();
+    *sr.http_protocol.borrow_mut() = r.http_protocol.borrow().clone();
+    *sr.schema.borrow_mut() = r.schema.borrow().clone();
+    set_exten(&sr);
+    *sr.main.borrow_mut() = Some(Rc::downgrade(&r.main()));
+    *sr.parent.borrow_mut() = Some(Rc::downgrade(r));
+    *sr.post_subrequest.borrow_mut() = ps;
+    if sr.subrequest_in_memory.get() {
+        sr.filter_need_in_memory.set(true);
+    }
+    if !sr.background.get() {
+        r.postponed.borrow_mut().push_back(PostponedRequest { request: Some(sr.clone()), out: ngx_core::buf::Chain::new() });
+    }
+    sr.internal.set(true);
+    sr.discard_body.set(r.discard_body.get());
+    sr.expect_tested.set(true);
+    sr.main_filter_need_in_memory.set(r.main_filter_need_in_memory.get());
+    sr.uri_changes.set(NGX_HTTP_MAX_URI_CHANGES + 1);
+    sr.subrequests.set(r.subrequests.get() - 1);
+    let now = ngx_core::times::cached();
+    sr.start_sec.set(now.sec);
+    sr.start_msec.set(now.msec);
+    if flags & NGX_HTTP_SUBREQUEST_CLONE != 0 {
+        sr.method.set(r.method.get());
+        *sr.method_name.borrow_mut() = r.method_name.borrow().clone();
+        *sr.loc_conf.borrow_mut() = r.loc_conf.borrow().clone();
+        sr.valid_location.set(r.valid_location.get());
+        sr.valid_unparsed_uri.set(r.valid_unparsed_uri.get());
+        *sr.content_handler.borrow_mut() = r.content_handler.borrow().clone();
+        sr.phase_handler.set(r.phase_handler.get());
+        sr.ncaptures.set(r.ncaptures.get());
+        *sr.captures.borrow_mut() = r.captures.borrow().clone();
+        *sr.captures_data.borrow_mut() = r.captures_data.borrow().clone();
+        sr.realloc_captures.set(true);
+        r.realloc_captures.set(true);
+        update_location_config(&sr);
+    }
+    Ok(sr)
+}
+
+/// Runs a subrequest made by subrequest_posted() to its end: what its
+/// write_event_handler (ngx_http_handler, or ngx_http_core_run_phases for
+/// a clone, which starts at the parent's phase handler) and the
+/// ngx_http_finalize_request() calls that follow do in C. The subrequest
+/// shares r->variables in C: it gets the values the parent has cached by
+/// now, and the parent gets its values back.
+pub async fn subrequest_run(r: &R, sr: &R) -> i64 {
+    *sr.variables.borrow_mut() = r.variables.borrow().clone();
+    sr.set_log_request();
+    http_debug!(sr, "http posted request: \"{}?{}\"", B(&sr.uri.borrow()), B(&sr.args.borrow()));
+    // only NGX_HTTP_SUBREQUEST_CLONE copies the parent's phase handler
+    let clone = sr.phase_handler.get() != 0;
+    let rc = if clone { Box::pin(run_phases(sr.clone())).await } else { Box::pin(handler(sr.clone())).await };
+    Box::pin(finalize_request(sr, rc)).await;
+    *r.variables.borrow_mut() = sr.variables.borrow().clone();
+    r.set_log_request();
+    rc
 }

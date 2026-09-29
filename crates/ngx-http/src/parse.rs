@@ -1721,6 +1721,106 @@ pub fn parse_unsafe_uri(uri: &[u8], _args: &[u8], _flags: &mut u32) -> i64 {
     NGX_OK
 }
 
+/// ngx_http_parse_unsafe_uri: the part of `uri` after the first "?" goes
+/// to `args` (untouched when there is none) and the path is unescaped if
+/// it has a "%"; either way it must not be empty, start with "?", have
+/// "..", "/../" or "/.." as a path segment, or a NUL. `log` is
+/// r->connection->log, for the NGX_HTTP_LOG_UNSAFE message.
+pub fn parse_unsafe_uri_args(log: &ngx_core::log::Log, uri: &mut Vec<u8>, args: &mut Vec<u8>, flags: u32) -> i64 {
+    let mut quoted = false;
+
+    'check: {
+        let len = uri.len();
+
+        if len == 0 || uri[0] == b'?' {
+            break 'check;
+        }
+
+        if uri[0] == b'.' && len > 1 && uri[1] == b'.' && (len == 2 || uri[2] == b'/') {
+            break 'check;
+        }
+
+        let mut i = 0;
+
+        while i < uri.len() {
+            let ch = uri[i];
+            // the bytes left after ch, as "len" counts down in C
+            let rest = uri.len() - i;
+            i += 1;
+
+            if ch == b'%' {
+                quoted = true;
+                continue;
+            }
+
+            if is_usual(ch) {
+                continue;
+            }
+
+            if ch == b'?' {
+                *args = uri[i..].to_vec();
+                uri.truncate(i - 1);
+                break;
+            }
+
+            if ch == b'\0' {
+                break 'check;
+            }
+
+            if ch == b'/' && rest > 2 {
+                // detect "/../" and "/.."
+                if uri[i] == b'.' && uri[i + 1] == b'.' && (rest == 3 || uri[i + 2] == b'/') {
+                    break 'check;
+                }
+            }
+        }
+
+        if quoted {
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, log, "escaped URI: \"{}\"", ngx_core::string::B(uri));
+
+            let (unescaped, _) = ngx_core::string::unescape_uri(uri, 0);
+            *uri = unescaped;
+
+            ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, log, "unescaped URI: \"{}\"", ngx_core::string::B(uri));
+
+            let len = uri.len();
+
+            if len > 1 && uri[0] == b'.' && uri[1] == b'.' && (len == 2 || uri[2] == b'/') {
+                break 'check;
+            }
+
+            let mut i = 0;
+
+            while i < uri.len() {
+                let ch = uri[i];
+                let rest = uri.len() - i;
+                i += 1;
+
+                if ch == b'\0' {
+                    break 'check;
+                }
+
+                if ch == b'/' && rest > 2 {
+                    // detect "/../" and "/.."
+                    if uri[i] == b'.' && uri[i + 1] == b'.' && (rest == 3 || uri[i + 2] == b'/') {
+                        break 'check;
+                    }
+                }
+            }
+        }
+
+        return NGX_OK;
+    }
+
+    // unsafe:
+
+    if flags & NGX_HTTP_LOG_UNSAFE != 0 {
+        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, None, "unsafe URI \"{}\" was detected", ngx_core::string::B(uri));
+    }
+
+    NGX_ERROR
+}
+
 /// Parse Set-Cookie header values looking for a specific cookie name.
 /// Returns the cookie value if found, None otherwise.
 /// Ported from ngx_http_parse_set_cookie_lines.
