@@ -429,6 +429,17 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
                     let h = crate::request::TableElt::new(name, &v);
                     ho.etag = Some(h);
                 }
+                // ngx_http_add_multi_header_lines
+                b"cache-control" => {
+                    let mut ho = r.headers_out.borrow_mut();
+                    let h = ho.add(name, &v);
+                    ho.cache_control.push(h);
+                }
+                b"link" => {
+                    let mut ho = r.headers_out.borrow_mut();
+                    let h = ho.add(name, &v);
+                    ho.link.push(h);
+                }
                 _ => {
                     r.headers_out.borrow_mut().add(name, &v);
                 }

@@ -1497,6 +1497,15 @@ pub fn copy_header(ho: &mut crate::request::HeadersOut, st: &mut CopiedHeaders, 
             ho.content_encoding = Some(h.clone());
             ho.headers.push(h);
         }
+        // ngx_http_upstream_copy_multi_header_lines
+        b"cache-control" => {
+            let h = ho.add(name, value);
+            ho.cache_control.push(h);
+        }
+        b"link" => {
+            let h = ho.add(name, value);
+            ho.link.push(h);
+        }
         _ => {
             ho.add(name, value);
         }

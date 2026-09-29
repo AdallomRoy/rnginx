@@ -124,6 +124,7 @@ pub async fn header_filter(r: R) -> i64 {
         }
         out.extend_from_slice(b"\r\n");
     }
+    let mut content_type: Option<Vec<u8>> = None;
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
@@ -149,10 +150,13 @@ pub async fn header_filter(r: R) -> i64 {
         }
         if !ho.content_type.is_empty() {
             out.extend_from_slice(b"Content-Type: ");
+            let p = out.len();
             out.extend_from_slice(&ho.content_type);
             if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
                 out.extend_from_slice(b"; charset=");
                 out.extend_from_slice(&ho.charset);
+                // update r->headers_out.content_type for possible logging
+                content_type = Some(out[p..].to_vec());
             }
             out.extend_from_slice(b"\r\n");
         }
@@ -193,6 +197,9 @@ pub async fn header_filter(r: R) -> i64 {
                 et.hash.set(0);
             }
         }
+    }
+    if let Some(ct) = content_type {
+        r.headers_out.borrow_mut().content_type = ct;
     }
     // Location: emit ho.location. If relative and absolute_redirect on,
     // prepend scheme://host; otherwise pass through verbatim.

@@ -763,6 +763,15 @@ pub async fn serve_hit(r: &R, resp: CachedResponse) -> i64 {
                 b"etag" => {
                     ho.etag = Some(crate::request::TableElt::new(k, v));
                 }
+                // ngx_http_upstream_copy_multi_header_lines
+                b"cache-control" => {
+                    let h = ho.add(k, v);
+                    ho.cache_control.push(h);
+                }
+                b"link" => {
+                    let h = ho.add(k, v);
+                    ho.link.push(h);
+                }
                 _ => {
                     ho.add(k, v);
                 }

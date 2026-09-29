@@ -855,40 +855,140 @@ fn var_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     NGX_OK
 }
 
-fn var_host_header_or_not(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    // Selector 0 is Host (unique). Others are multi-value: join with ", " to match
-    // C ngx_http_variable_headers_internal.
-    let hin = r.headers_in.borrow();
-    if d == 0 {
-        match &hin.host {
-            Some(h) => set_str(v, &h.value.borrow()),
-            None => v.not_found = true,
+// The ngx_table_elt_t lists ngx_http_variable_header() and
+// ngx_http_variable_cookies() read: offsetof(ngx_http_request_t, ...) in C.
+const HEADERS_IN_HOST: usize = 0;
+const HEADERS_IN_USER_AGENT: usize = 1;
+const HEADERS_IN_REFERER: usize = 2;
+const HEADERS_IN_VIA: usize = 3;
+const HEADERS_IN_X_FORWARDED_FOR: usize = 4;
+const HEADERS_IN_COOKIE: usize = 5;
+const HEADERS_IN_CONTENT_TYPE: usize = 6;
+const HEADERS_OUT_CACHE_CONTROL: usize = 7;
+const HEADERS_OUT_LINK: usize = 8;
+
+/// `*(ngx_table_elt_t **) ((char *) r + data)` and its h->next chain.
+fn variable_header_lines(r: &R, data: usize) -> Vec<Header> {
+    match data {
+        HEADERS_IN_HOST => r.headers_in.borrow().host.iter().cloned().collect(),
+        HEADERS_IN_USER_AGENT => r.headers_in.borrow().user_agent.clone(),
+        HEADERS_IN_REFERER => r.headers_in.borrow().referer.clone(),
+        HEADERS_IN_VIA => r.headers_in.borrow().via.clone(),
+        HEADERS_IN_X_FORWARDED_FOR => r.headers_in.borrow().x_forwarded_for.clone(),
+        HEADERS_IN_COOKIE => r.headers_in.borrow().cookie.clone(),
+        HEADERS_IN_CONTENT_TYPE => r.headers_in.borrow().content_type.clone(),
+        HEADERS_OUT_CACHE_CONTROL => r.headers_out.borrow().cache_control.clone(),
+        HEADERS_OUT_LINK => r.headers_out.borrow().link.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// ngx_http_variable_header
+fn variable_header(r: &R, v: &mut VariableValue, data: usize) -> i64 {
+    variable_headers_internal(r, v, data, b',')
+}
+
+/// ngx_http_variable_cookies
+fn variable_cookies(r: &R, v: &mut VariableValue, data: usize) -> i64 {
+    variable_headers_internal(r, v, data, b';')
+}
+
+/// ngx_http_variable_headers_internal
+fn variable_headers_internal(r: &R, v: &mut VariableValue, data: usize, sep: u8) -> i64 {
+    let h = variable_header_lines(r, data);
+    match join_header_lines(&h, sep) {
+        Some(value) => {
+            v.data = value;
+            v.valid = true;
+            v.no_cacheable = false;
+            v.not_found = false;
         }
-        return NGX_OK;
+        None => v.not_found = true,
     }
-    let list: &[Header] = match d {
-        1 => &hin.user_agent,
-        2 => &hin.referer,
-        3 => &hin.via,
-        _ => &[],
-    };
-    if list.is_empty() {
-        v.not_found = true;
-        return NGX_OK;
-    }
-    let parts: Vec<Vec<u8>> = list.iter().map(|h| h.value.borrow().clone()).collect();
-    set_str(v, &parts.join(&b", "[..]));
     NGX_OK
 }
 
-fn var_content_type(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let hin = r.headers_in.borrow();
-    if hin.content_type.is_empty() {
+/// The value of ngx_http_variable_headers_internal(): the lines with a
+/// nonzero hash joined with "<sep> ", None (not found) if there are none.
+fn join_header_lines(h: &[Header], sep: u8) -> Option<Vec<u8>> {
+    let mut len = 0;
+    for th in h.iter() {
+        if th.hash.get() == 0 {
+            continue;
+        }
+        len += th.value.borrow().len() + 2;
+    }
+    if len == 0 {
+        return None;
+    }
+    len -= 2;
+    if h.len() == 1 {
+        return Some(h[0].value.borrow().clone());
+    }
+    let mut p = Vec::with_capacity(len);
+    for th in h.iter() {
+        if th.hash.get() == 0 {
+            continue;
+        }
+        p.extend_from_slice(&th.value.borrow());
+        if p.len() == len {
+            break;
+        }
+        p.push(sep);
+        p.push(b' ');
+    }
+    Some(p)
+}
+
+/// ngx_http_variable_unknown_header: the headers named as `var` without its
+/// `prefix` bytes (letters lowercased, '-' read as '_'), joined with ", ".
+pub fn variable_unknown_header(v: &mut VariableValue, var: &[u8], headers: &[Header], prefix: usize) -> i64 {
+    let want = &var[prefix..];
+    let mut found: Vec<&Header> = Vec::new();
+    let mut len = 0;
+    for h in headers.iter() {
+        if h.hash.get() == 0 {
+            continue;
+        }
+        if h.key.len() != want.len() {
+            continue;
+        }
+        let same = h.key.iter().zip(want.iter()).all(|(&c, &w)| {
+            let ch = if c.is_ascii_uppercase() {
+                c | 0x20
+            } else if c == b'-' {
+                b'_'
+            } else {
+                c
+            };
+            ch == w
+        });
+        if !same {
+            continue;
+        }
+        len += h.value.borrow().len() + 2;
+        found.push(h);
+    }
+    if found.is_empty() {
         v.not_found = true;
         return NGX_OK;
     }
-    let parts: Vec<Vec<u8>> = hin.content_type.iter().map(|h| h.value.borrow().clone()).collect();
-    set_str(v, &parts.join(&b", "[..]));
+    len -= 2;
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+    if found.len() == 1 {
+        v.data = found[0].value.borrow().clone();
+        return NGX_OK;
+    }
+    let mut p = Vec::with_capacity(len);
+    for (i, h) in found.iter().enumerate() {
+        if i > 0 {
+            p.extend_from_slice(b", ");
+        }
+        p.extend_from_slice(&h.value.borrow());
+    }
+    v.data = p;
     NGX_OK
 }
 
@@ -916,132 +1016,112 @@ fn var_arg_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
     NGX_OK
 }
 
+/// ngx_http_variable_unknown_header_in
 fn var_http_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
     let name = prefix_var_name(r, d);
-    let want = &name["http_".len()..];
-    let hin = r.headers_in.borrow();
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    for h in hin.headers.iter() {
-        if h.lowcase_key.len() != want.len() {
-            continue;
-        }
-        let same = h.lowcase_key.iter().zip(want.iter()).all(|(a, b)| *a == *b || (*a == b'-' && *b == b'_'));
-        if same {
-            parts.push(h.value.borrow().clone());
-        }
-    }
-    if parts.is_empty() {
-        v.not_found = true;
-        return NGX_OK;
-    }
-    let sep: &[u8] = if want == b"cookie" { b"; " } else { b", " };
-    set_str(v, &parts.join(sep));
-    NGX_OK
+    let headers = r.headers_in.borrow().headers.clone();
+    variable_unknown_header(v, &name, &headers, "http_".len())
 }
 
+/// ngx_http_variable_unknown_header_out
 fn var_sent_http_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
     let name = prefix_var_name(r, d);
-    let want = &name["sent_http_".len()..];
+    let headers = r.headers_out.borrow().headers.clone();
+    variable_unknown_header(v, &name, &headers, "sent_http_".len())
+}
+
+/// ngx_http_variable_unknown_trailer_out
+fn var_sent_trailer_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
+    let name = prefix_var_name(r, d);
+    let trailers = r.headers_out.borrow().trailers.clone();
+    variable_unknown_header(v, &name, &trailers, "sent_trailer_".len())
+}
+
+/// ngx_http_variable_sent_content_type
+fn var_sent_content_type(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let ho = r.headers_out.borrow();
-    // special-cased known headers
-    if want == b"content_type" {
-        if ho.content_type.is_empty() {
-            v.not_found = true;
-        } else {
-            let mut ct = ho.content_type.clone();
-            if !ho.charset.is_empty() && ho.content_type_len == ho.content_type.len() {
-                ct.extend_from_slice(b"; charset=");
-                ct.extend_from_slice(&ho.charset);
-            }
-            set_str(v, &ct);
-        }
-        return NGX_OK;
-    }
-    if want == b"content_length" {
-        if let Some(h) = &ho.content_length {
-            set_str(v, &h.value.borrow());
-        } else if ho.content_length_n >= 0 {
-            set_str(v, ho.content_length_n.to_string().as_bytes());
-        } else {
-            v.not_found = true;
-        }
-        return NGX_OK;
-    }
-    if want == b"last_modified" {
-        if let Some(h) = &ho.last_modified {
-            set_str(v, &h.value.borrow());
-        } else if ho.last_modified_time >= 0 {
-            set_str(v, ngx_core::times::http_time(ho.last_modified_time).as_bytes());
-        } else {
-            v.not_found = true;
-        }
-        return NGX_OK;
-    }
-    if want == b"connection" {
-        if r.headers_out.borrow().status == NGX_HTTP_SWITCHING_PROTOCOLS {
-            set_str(v, b"upgrade");
-        } else if r.keepalive.get() {
-            set_str(v, b"keep-alive");
-        } else {
-            set_str(v, b"close");
-        }
-        return NGX_OK;
-    }
-    if want == b"keep_alive" {
-        let clcf = r.clcf();
-        let kh = *clcf.borrow().keepalive_header;
-        if r.keepalive.get() && kh > 0 {
-            set_str(v, format!("timeout={}", kh).as_bytes());
-        } else {
-            v.not_found = true;
-        }
-        return NGX_OK;
-    }
-    if want == b"transfer_encoding" {
-        if r.chunked.get() {
-            set_str(v, b"chunked");
-        } else {
-            v.not_found = true;
-        }
-        return NGX_OK;
-    }
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    for h in ho.headers.iter() {
-        if h.hash.get() == 0 || h.lowcase_key.len() != want.len() {
-            continue;
-        }
-        let same = h.lowcase_key.iter().zip(want.iter()).all(|(a, b)| *a == *b || (*a == b'-' && *b == b'_'));
-        if same {
-            parts.push(h.value.borrow().clone());
-        }
-    }
-    if parts.is_empty() {
+    if !ho.content_type.is_empty() {
+        set_str(v, &ho.content_type);
+    } else {
         v.not_found = true;
-        return NGX_OK;
     }
-    set_str(v, &parts.join(&b", "[..]));
     NGX_OK
 }
 
-fn var_sent_trailer_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let want = &name["sent_trailer_".len()..];
+/// ngx_http_variable_sent_content_length
+fn var_sent_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let ho = r.headers_out.borrow();
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    for h in ho.trailers.iter() {
-        if h.hash.get() == 0 || h.lowcase_key.len() != want.len() {
-            continue;
-        }
-        let same = h.lowcase_key.iter().zip(want.iter()).all(|(a, b)| *a == *b || (*a == b'-' && *b == b'_'));
-        if same {
-            parts.push(h.value.borrow().clone());
-        }
-    }
-    if parts.is_empty() {
-        v.not_found = true;
+    if let Some(h) = &ho.content_length {
+        set_str(v, &h.value.borrow());
         return NGX_OK;
     }
-    set_str(v, &parts.join(&b", "[..]));
+    if ho.content_length_n >= 0 {
+        set_str(v, ho.content_length_n.to_string().as_bytes());
+        return NGX_OK;
+    }
+    v.not_found = true;
+    NGX_OK
+}
+
+/// ngx_http_variable_sent_location
+fn var_sent_location(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    let ho = r.headers_out.borrow();
+    if let Some(h) = &ho.location {
+        set_str(v, &h.value.borrow());
+        return NGX_OK;
+    }
+    variable_unknown_header(v, b"sent_http_location", &ho.headers, "sent_http_".len())
+}
+
+/// ngx_http_variable_sent_last_modified
+fn var_sent_last_modified(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    let ho = r.headers_out.borrow();
+    if let Some(h) = &ho.last_modified {
+        set_str(v, &h.value.borrow());
+        return NGX_OK;
+    }
+    if ho.last_modified_time >= 0 {
+        set_str(v, ngx_core::times::http_time(ho.last_modified_time).as_bytes());
+        return NGX_OK;
+    }
+    v.not_found = true;
+    NGX_OK
+}
+
+/// ngx_http_variable_sent_connection
+fn var_sent_connection(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    let p: &[u8] = if r.headers_out.borrow().status == NGX_HTTP_SWITCHING_PROTOCOLS {
+        b"upgrade"
+    } else if r.keepalive.get() {
+        b"keep-alive"
+    } else {
+        b"close"
+    };
+    set_str(v, p);
+    NGX_OK
+}
+
+/// ngx_http_variable_sent_keep_alive
+fn var_sent_keep_alive(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    if r.keepalive.get() {
+        let clcf = r.clcf();
+        let kh = *clcf.borrow().keepalive_header;
+        if kh != 0 {
+            set_str(v, format!("timeout={}", kh).as_bytes());
+            return NGX_OK;
+        }
+    }
+    v.not_found = true;
+    NGX_OK
+}
+
+/// ngx_http_variable_sent_transfer_encoding
+fn var_sent_transfer_encoding(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
+    if r.chunked.get() {
+        set_str(v, b"chunked");
+    } else {
+        v.not_found = true;
+    }
     NGX_OK
 }
 
@@ -1092,12 +1172,14 @@ fn var_tcpinfo(r: &R, v: &mut VariableValue, d: usize) -> i64 {
 }
 
 pub static CORE_VARIABLES: &[VarDef] = &[
-    VarDef { name: "http_host", set: None, get: Some(var_host_header_or_not), data: 0, flags: 0 },
-    VarDef { name: "http_user_agent", set: None, get: Some(var_host_header_or_not), data: 1, flags: 0 },
-    VarDef { name: "http_referer", set: None, get: Some(var_host_header_or_not), data: 2, flags: 0 },
-    VarDef { name: "http_via", set: None, get: Some(var_host_header_or_not), data: 3, flags: 0 },
+    VarDef { name: "http_host", set: None, get: Some(variable_header), data: HEADERS_IN_HOST, flags: 0 },
+    VarDef { name: "http_user_agent", set: None, get: Some(variable_header), data: HEADERS_IN_USER_AGENT, flags: 0 },
+    VarDef { name: "http_referer", set: None, get: Some(variable_header), data: HEADERS_IN_REFERER, flags: 0 },
+    VarDef { name: "http_via", set: None, get: Some(variable_header), data: HEADERS_IN_VIA, flags: 0 },
+    VarDef { name: "http_x_forwarded_for", set: None, get: Some(variable_header), data: HEADERS_IN_X_FORWARDED_FOR, flags: 0 },
+    VarDef { name: "http_cookie", set: None, get: Some(variable_cookies), data: HEADERS_IN_COOKIE, flags: 0 },
     VarDef { name: "content_length", set: None, get: Some(var_content_length), data: 0, flags: 0 },
-    VarDef { name: "content_type", set: None, get: Some(var_content_type), data: 0, flags: 0 },
+    VarDef { name: "content_type", set: None, get: Some(variable_header), data: HEADERS_IN_CONTENT_TYPE, flags: 0 },
     VarDef { name: "host", set: None, get: Some(var_host), data: 0, flags: 0 },
     VarDef { name: "binary_remote_addr", set: None, get: Some(var_binary_remote_addr), data: 0, flags: 0 },
     VarDef { name: "remote_addr", set: None, get: Some(var_remote_addr), data: 0, flags: 0 },
@@ -1137,6 +1219,15 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "request_port", set: None, get: Some(var_request_port), data: 0, flags: 0 },
     VarDef { name: "is_request_port", set: None, get: Some(var_is_request_port), data: 0, flags: 0 },
     VarDef { name: "status", set: None, get: Some(var_status), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
+    VarDef { name: "sent_http_content_type", set: None, get: Some(var_sent_content_type), data: 0, flags: 0 },
+    VarDef { name: "sent_http_content_length", set: None, get: Some(var_sent_content_length), data: 0, flags: 0 },
+    VarDef { name: "sent_http_location", set: None, get: Some(var_sent_location), data: 0, flags: 0 },
+    VarDef { name: "sent_http_last_modified", set: None, get: Some(var_sent_last_modified), data: 0, flags: 0 },
+    VarDef { name: "sent_http_connection", set: None, get: Some(var_sent_connection), data: 0, flags: 0 },
+    VarDef { name: "sent_http_keep_alive", set: None, get: Some(var_sent_keep_alive), data: 0, flags: 0 },
+    VarDef { name: "sent_http_transfer_encoding", set: None, get: Some(var_sent_transfer_encoding), data: 0, flags: 0 },
+    VarDef { name: "sent_http_cache_control", set: None, get: Some(variable_header), data: HEADERS_OUT_CACHE_CONTROL, flags: 0 },
+    VarDef { name: "sent_http_link", set: None, get: Some(variable_header), data: HEADERS_OUT_LINK, flags: 0 },
     VarDef { name: "sent_http_", set: None, get: Some(var_sent_http_prefix), data: 0, flags: NGX_HTTP_VAR_PREFIX },
     VarDef { name: "sent_trailer_", set: None, get: Some(var_sent_trailer_prefix), data: 0, flags: NGX_HTTP_VAR_PREFIX },
     VarDef { name: "limit_rate", set: Some(set_limit_rate), get: Some(var_limit_rate), data: 0, flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE },
@@ -1174,4 +1265,56 @@ pub fn set_indexed_variable(r: &R, index: usize, value: Vec<u8>) {
         vars.resize(index + 1, VariableValue::default());
     }
     vars[index] = VariableValue { data: value, valid: true, no_cacheable: false, not_found: false, escape: false };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(key: &str, value: &str) -> Header {
+        TableElt::new(key.as_bytes(), value.as_bytes())
+    }
+
+    fn removed(key: &str, value: &str) -> Header {
+        let e = h(key, value);
+        e.hash.set(0);
+        e
+    }
+
+    #[test]
+    fn headers_internal_joins_lines() {
+        assert_eq!(join_header_lines(&[], b';'), None);
+        assert_eq!(join_header_lines(&[h("Cookie", "a=1")], b';'), Some(b"a=1".to_vec()));
+        assert_eq!(join_header_lines(&[h("Cookie", "a=1"), h("Cookie", "b=2; c=3")], b';'), Some(b"a=1; b=2; c=3".to_vec()));
+        let xff = [h("X-Forwarded-For", "10.0.0.1"), h("X-Forwarded-For", "10.0.0.2, 10.0.0.3")];
+        assert_eq!(join_header_lines(&xff, b','), Some(b"10.0.0.1, 10.0.0.2, 10.0.0.3".to_vec()));
+        // empty lines keep their separators, as the C copy loop does
+        assert_eq!(join_header_lines(&[h("Cookie", ""), h("Cookie", "a=5"), h("Cookie", "")], b';'), Some(b"; a=5; ".to_vec()));
+    }
+
+    #[test]
+    fn headers_internal_skips_removed_lines() {
+        assert_eq!(join_header_lines(&[removed("Cache-Control", "a")], b','), None);
+        assert_eq!(join_header_lines(&[removed("Cache-Control", "a"), h("Cache-Control", "b")], b','), Some(b"b".to_vec()));
+        assert_eq!(join_header_lines(&[h("Cache-Control", "a"), removed("Cache-Control", "b")], b','), Some(b"a".to_vec()));
+        let cc = [h("Cache-Control", "a"), removed("Cache-Control", "b"), h("Cache-Control", "c")];
+        assert_eq!(join_header_lines(&cc, b','), Some(b"a, c".to_vec()));
+    }
+
+    #[test]
+    fn unknown_header_matches_names() {
+        let headers = [h("X-Foo", "one"), h("x-foo", "two"), h("X_FOO", "three"), h("X-Foo-Bar", "no"), removed("X-Foo", "gone")];
+        let mut v = VariableValue::default();
+        assert_eq!(variable_unknown_header(&mut v, b"sent_http_x_foo", &headers, "sent_http_".len()), NGX_OK);
+        assert!(v.valid && !v.not_found);
+        assert_eq!(v.data, b"one, two, three".to_vec());
+
+        let mut v = VariableValue::default();
+        variable_unknown_header(&mut v, b"http_x_foo_bar", &headers, "http_".len());
+        assert_eq!(v.data, b"no".to_vec());
+
+        let mut v = VariableValue::default();
+        variable_unknown_header(&mut v, b"http_x_bar", &headers, "http_".len());
+        assert!(v.not_found && !v.valid);
+    }
 }
