@@ -2728,7 +2728,7 @@ async fn process_headers(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, resp: &U
 
 /// The X-Accel-Redirect of ngx_http_upstream_process_headers: a named
 /// location, or the URI (with its arguments) for an internal redirect.
-pub(crate) async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
+async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
     if xar.first() == Some(&b'@') {
         let _ = crate::core_rt::named_location(r, xar).await;
         return NGX_DONE;
@@ -3742,7 +3742,7 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, hea
 /// ngx_http_upstream_finalize_request with an error after the header was
 /// sent: rc becomes NGX_ERROR with a flush, no last buffer, and the client
 /// connection is not kept alive.
-pub(crate) async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
+async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
     r.keepalive.set(false);
 
     if downstream {
@@ -3924,7 +3924,7 @@ pub(crate) async fn send_request_body(r: &R, upstream: &mut UpstreamSock, output
     }
 }
 
-pub(crate) async fn return_error(r: &R, status: i64) -> i64 {
+async fn return_error(r: &R, status: i64) -> i64 {
     // Populate a synthetic upstream state so $upstream_addr / $upstream_status
     // in add_header 'always' show the failed peer(s) — otherwise the client's
     // error response has no way to reflect which upstream was tried.
