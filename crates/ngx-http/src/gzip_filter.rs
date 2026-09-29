@@ -107,6 +107,7 @@ fn accept(_cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfRes
 pub fn gzip_filter_module() -> ModuleDef {
     const F: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
     let def = HttpModuleDef {
+        preconfiguration: Some(add_variables),
         postconfiguration: Some(init),
         create_loc_conf: Some(create_conf),
         merge_loc_conf: Some(merge_conf),
@@ -130,6 +131,55 @@ pub fn gzip_filter_module() -> ModuleDef {
     http_module_def("ngx_http_gzip_filter_module", def, commands)
 }
 
+/// ngx_http_gzip_add_variables
+fn add_variables(cf: &mut Conf) -> ConfResult {
+    crate::variables::add_variables(cf, &[crate::variables::VarDef {
+        name: "gzip_ratio",
+        set: None,
+        get: Some(gzip_ratio_variable),
+        data: 0,
+        flags: crate::variables::NGX_HTTP_VAR_NOHASH,
+    }])
+}
+
+/// ngx_http_gzip_ratio_variable
+fn gzip_ratio_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let (zin, zout) = match r.get_ctx::<GzipCtx>(ctx_index()) {
+        Some(ctx) => {
+            let c = ctx.borrow();
+            (c.zin, c.zout)
+        }
+        None => (0, 0),
+    };
+
+    if zout == 0 {
+        v.not_found = true;
+        return NGX_OK;
+    }
+
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    let mut zint = zin / zout;
+    let mut zfrac = (zin * 100 / zout) % 100;
+
+    if (zin * 1000 / zout) % 10 > 4 {
+        // the rounding, e.g., 2.125 to 2.13
+
+        zfrac += 1;
+
+        if zfrac > 99 {
+            zint += 1;
+            zfrac = 0;
+        }
+    }
+
+    v.data = format!("{}.{:02}", zint, zfrac).into_bytes();
+
+    NGX_OK
+}
+
 fn init(_cf: &mut Conf) -> ConfResult {
     install_header_filter(|r, next| async move { gzip_header_filter(r, next).await });
     install_body_filter(|r, chain, next| async move { gzip_body_filter(r, chain, next).await });
@@ -143,6 +193,11 @@ struct GzipCtx {
     isize: u32,
     header_sent: bool,
     done: bool,
+    /// ctx->zin and ctx->zout: zstream.total_in and total_out when the
+    /// deflate stream ended (total_out of the gzip-wrapped stream counts
+    /// the 10-byte header and 8-byte trailer written around the deflate data)
+    zin: usize,
+    zout: usize,
 }
 
 impl GzipCtx {
@@ -155,6 +210,8 @@ impl GzipCtx {
             isize: 0,
             header_sent: false,
             done: false,
+            zin: 0,
+            zout: 0,
         }
     }
 }
@@ -365,6 +422,9 @@ async fn gzip_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         let (crc, isize) = {
             let mut c = ctx.borrow_mut();
             c.done = true;
+            // ngx_http_gzip_filter_deflate_end
+            c.zin = c.compress.total_in() as usize;
+            c.zout = c.compress.total_out() as usize + 10 + 8;
             (c.crc32.clone().finalize(), c.isize)
         };
         tail.extend_from_slice(&crc.to_le_bytes());

@@ -668,6 +668,45 @@ fn var_upstream_cache_status(r: &R, v: &mut VariableValue, _data: usize) -> i64 
     NGX_OK
 }
 
+/// ngx_http_upstream_cache_last_modified: the Last-Modified time of the
+/// expired cached response revalidated with proxy_cache_revalidate
+/// (r->cache->last_modified), which the revalidation hints carry.
+fn var_upstream_cache_last_modified(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let last_modified = match (get_status(r), get_revalidate(r)) {
+        (Some(CacheStatus::Expired), Some(h)) => h.if_modified_since.and_then(|lm| ngx_core::parse::parse_http_time(&lm)),
+        _ => None,
+    };
+    match last_modified {
+        Some(t) => {
+            v.data = ngx_core::times::http_time(t).into_bytes();
+            v.valid = true;
+            v.no_cacheable = false;
+            v.not_found = false;
+        }
+        None => v.not_found = true,
+    }
+    NGX_OK
+}
+
+/// ngx_http_upstream_cache_etag: the ETag of the expired cached response
+/// revalidated with proxy_cache_revalidate (r->cache->etag).
+fn var_upstream_cache_etag(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let etag = match (get_status(r), get_revalidate(r)) {
+        (Some(CacheStatus::Expired), Some(h)) => h.if_none_match.filter(|e| !e.is_empty()),
+        _ => None,
+    };
+    match etag {
+        Some(e) => {
+            v.data = e;
+            v.valid = true;
+            v.no_cacheable = false;
+            v.not_found = false;
+        }
+        None => v.not_found = true,
+    }
+    NGX_OK
+}
+
 pub fn add_variables(cf: &mut Conf) -> ConfResult {
     let vars = [
         crate::variables::VarDef {
@@ -676,6 +715,20 @@ pub fn add_variables(cf: &mut Conf) -> ConfResult {
             get: Some(var_upstream_cache_status),
             data: 0,
             flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE,
+        },
+        crate::variables::VarDef {
+            name: "upstream_cache_last_modified",
+            set: None,
+            get: Some(var_upstream_cache_last_modified),
+            data: 0,
+            flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
+        },
+        crate::variables::VarDef {
+            name: "upstream_cache_etag",
+            set: None,
+            get: Some(var_upstream_cache_etag),
+            data: 0,
+            flags: crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
         },
     ];
     crate::variables::add_variables(cf, &vars)

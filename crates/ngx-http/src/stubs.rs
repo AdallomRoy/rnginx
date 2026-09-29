@@ -37,7 +37,8 @@ pub fn upstream_module() -> ModuleDef {
 }
 
 pub fn v3_module() -> ModuleDef {
-    stub("ngx_http_v3_module", vec![
+    let def = HttpModuleDef { preconfiguration: Some(v3_add_variables), ..Default::default() };
+    http_module_def("ngx_http_v3_module", def, vec![
         Command::new("http3", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
         Command::new("http3_hq", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
         Command::new("http3_max_concurrent_streams", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
@@ -47,6 +48,19 @@ pub fn v3_module() -> ModuleDef {
         Command::new("quic_host_key", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
         Command::new("quic_active_connection_id_limit", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
     ])
+}
+
+/// ngx_http_v3_add_variables
+fn v3_add_variables(cf: &mut Conf) -> ConfResult {
+    use crate::variables::{add_variables, VarDef};
+    add_variables(cf, &[VarDef { name: "http3", set: None, get: Some(v3_variable), data: 0, flags: 0 }])
+}
+
+/// ngx_http_v3_variable: HTTP/3 is not ported, so r->connection->quic is
+/// always NULL and the value is ngx_http_variable_null_value.
+fn v3_variable(_r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    *v = VariableValue { valid: true, ..Default::default() };
+    NGX_OK
 }
 
 pub fn gzip_static_module() -> ModuleDef {
@@ -382,7 +396,8 @@ pub fn scgi_module() -> ModuleDef {
 }
 
 pub fn grpc_module() -> ModuleDef {
-    stub("ngx_http_grpc_module", vec![
+    let def = HttpModuleDef { preconfiguration: Some(grpc_add_variables), ..Default::default() };
+    http_module_def("ngx_http_grpc_module", def, vec![
         Command::new("grpc_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
         Command::new("grpc_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, accept),
         Command::new("grpc_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
@@ -415,6 +430,42 @@ pub fn grpc_module() -> ModuleDef {
         Command::new("grpc_ssl_password_file", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
         Command::new("grpc_ssl_conf_command", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::None, accept),
     ])
+}
+
+/// ngx_http_grpc_add_variables
+fn grpc_add_variables(cf: &mut Conf) -> ConfResult {
+    use crate::variables::{add_variables, VarDef, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH};
+    add_variables(cf, &[VarDef {
+        name: "grpc_internal_trailers",
+        set: None,
+        get: Some(grpc_internal_trailers_variable),
+        data: 0,
+        flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_NOHASH,
+    }])
+}
+
+/// ngx_http_grpc_internal_trailers_variable
+fn grpc_internal_trailers_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    let te = match r.headers_in.borrow().te.first() {
+        Some(te) => te.value.borrow().clone(),
+        None => {
+            v.not_found = true;
+            return NGX_OK;
+        }
+    };
+
+    if ngx_core::string::strcasestr(&te, b"trailers").is_none() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+
+    v.valid = true;
+    v.no_cacheable = false;
+    v.not_found = false;
+
+    v.data = b"trailers".to_vec();
+
+    NGX_OK
 }
 
 pub fn proxy_v2_module() -> ModuleDef {
@@ -602,30 +653,31 @@ pub fn range_body_filter_module() -> ModuleDef {
 }
 
 pub fn slice_filter_module() -> ModuleDef {
-    // The slice filter is not implemented, but configs commonly reference
-    // `$slice_range` in `proxy_set_header Range $slice_range;` — register a
-    // no-op variable so complex_value can evaluate it without emitting a
-    // "cycle while evaluating" alert. Without slice_range the sub-request
-    // pipeline won't actually issue byte ranges; we just avoid noise.
-    let def = HttpModuleDef {
-        preconfiguration: Some(|cf: &mut Conf| {
-            use crate::variables::{VarDef, add_variables, NGX_HTTP_VAR_NOCACHEABLE};
-            let vars = vec![
-                VarDef {
-                    name: "slice_range",
-                    set: None,
-                    get: Some(|_r, v, _d| { v.data = Vec::new(); v.valid = true; crate::NGX_OK }),
-                    data: 0,
-                    flags: NGX_HTTP_VAR_NOCACHEABLE,
-                },
-            ];
-            add_variables(cf, &vars)
-        }),
-        ..Default::default()
-    };
+    let def = HttpModuleDef { preconfiguration: Some(slice_add_variables), ..Default::default() };
     http_module_def("ngx_http_slice_filter_module", def, vec![
         Command::new("slice", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
     ])
+}
+
+/// ngx_http_slice_add_variables
+fn slice_add_variables(cf: &mut Conf) -> ConfResult {
+    use crate::variables::{add_variables, VarDef};
+    add_variables(cf, &[VarDef { name: "slice_range", set: None, get: Some(slice_range_variable), data: 0, flags: 0 }])
+}
+
+/// ngx_http_slice_range_variable as far as it applies to this stub: the
+/// filter is not ported, so there is no module ctx, and the "slice"
+/// directive is accepted but not stored, so slcf->size is 0.
+fn slice_range_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
+    // ctx == NULL
+    if !r.is_main() || r.headers_out.borrow().status != 0 {
+        v.not_found = true;
+        return NGX_OK;
+    }
+
+    // slcf->size == 0
+    v.not_found = true;
+    NGX_OK
 }
 
 
