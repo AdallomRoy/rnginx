@@ -1445,11 +1445,33 @@ enum EvalPart {
     Value(Vec<u8>),
 }
 
+/// What looking a variable up gives ngx_http_ssi_evaluate_string(): None
+/// for an error, Some(None) for a variable not found.
+type EvalLookup<'a> = dyn FnMut(&[u8], u32) -> Option<Option<Vec<u8>>> + 'a;
+
 /// ngx_http_ssi_evaluate_string: the variables in `text` replaced with
-/// their values; backslashes escape "\", "'", '"' and "$". With
-/// NGX_HTTP_SSI_ADD_PREFIX, a relative result gets the directory of the
-/// request's URI prepended.
+/// their values (an SSI variable, else a variable of the request); a
+/// backslash escapes "\", "'", '"' and "$". With NGX_HTTP_SSI_ADD_PREFIX,
+/// a relative result gets the directory of the request's URI prepended.
 fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
+    let uri = r.uri.borrow().clone();
+
+    let mut lookup = |var: &[u8], key: u32| -> Option<Option<Vec<u8>>> {
+        match ssi_get_variable(r, var, key) {
+            Some(val) => Some(Some(val.value())),
+            None => {
+                let vv = get_variable(r, var)?;
+                Some((!vv.not_found).then_some(vv.data))
+            }
+        }
+    };
+
+    evaluate_string(&r.connection.log, &uri, text, flags, &mut lookup)
+}
+
+/// The string part of ngx_http_ssi_evaluate_string(), for a request with
+/// the URI `uri`, `lookup` looking the variables up.
+fn evaluate_string(log: &Log, uri: &[u8], text: &mut Vec<u8>, flags: u32, lookup: &mut EvalLookup) -> i64 {
     // ngx_http_script_variables_count()
     let n = text.iter().filter(|&&c| c == b'$').count();
 
@@ -1457,8 +1479,6 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
         let mut data = Vec::with_capacity(text.len());
 
         if flags & NGX_HTTP_SSI_ADD_PREFIX != 0 && text.first() != Some(&b'/') {
-            let uri = r.uri.borrow();
-
             let mut prefix = uri.len();
 
             while prefix > 0 {
@@ -1544,7 +1564,7 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
                 }
 
                 if bracket {
-                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the closing bracket in \"{}\" variable is missing", B(&text[var_start..var_start + var_len]));
+                    ngx_log_error!(NGX_LOG_ERR, log, None, "the closing bracket in \"{}\" variable is missing", B(&text[var_start..var_start + var_len]));
                     return NGX_HTTP_SSI_ERROR;
                 }
 
@@ -1556,18 +1576,11 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
 
                 let var = text[var_start..var_start + var_len].to_vec();
 
-                match ssi_get_variable(r, &var, key) {
-                    Some(val) => parts.push(EvalPart::Value(val.value())),
-                    None => match get_variable(r, &var) {
-                        None => return NGX_ERROR,
-                        Some(vv) => {
-                            if vv.not_found {
-                                continue;
-                            }
-
-                            parts.push(EvalPart::Value(vv.data));
-                        }
-                    },
+                match lookup(&var, key) {
+                    None => return NGX_ERROR,
+                    // not found
+                    Some(None) => continue,
+                    Some(Some(value)) => parts.push(EvalPart::Value(value)),
                 }
             } else {
                 let part_start = i;
@@ -1618,8 +1631,6 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
             for part in parts.iter() {
                 if let Some(first) = part_first(part) {
                     if first != b'/' {
-                        let uri = r.uri.borrow();
-
                         prefix = uri.len();
 
                         while prefix > 0 {
@@ -1635,7 +1646,7 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
             }
         }
 
-        let mut data = r.uri.borrow()[..prefix].to_vec();
+        let mut data = uri[..prefix].to_vec();
 
         for part in parts.iter() {
             match part {
@@ -1651,7 +1662,7 @@ fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
 
     // invalid_variable:
 
-    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "invalid variable name in \"{}\"", B(text));
+    ngx_log_error!(NGX_LOG_ERR, log, None, "invalid variable name in \"{}\"", B(text));
 
     NGX_HTTP_SSI_ERROR
 }
@@ -2436,6 +2447,49 @@ mod tests {
         let mut p = parser(255);
         let res = feed(&mut p, b"a<b<!x<!--y");
         assert_eq!(res, vec![(NGX_AGAIN, b"a<b<!x<!--y".to_vec())]);
+    }
+
+    fn eval(uri: &[u8], text: &[u8], flags: u32) -> (i64, Vec<u8>) {
+        let log = Log::stderr(NGX_LOG_EMERG);
+        let mut lookup = |var: &[u8], key: u32| -> Option<Option<Vec<u8>>> {
+            assert_eq!(key, hash_key(var));
+            match var {
+                b"a" => Some(Some(b"A".to_vec())),
+                b"path" => Some(Some(b"/p/q".to_vec())),
+                b"rel" => Some(Some(b"r.html".to_vec())),
+                b"empty" => Some(Some(Vec::new())),
+                b"error" => None,
+                _ => Some(None),
+            }
+        };
+        let mut text = text.to_vec();
+        let rc = evaluate_string(&log, uri, &mut text, flags, &mut lookup);
+        (rc, text)
+    }
+
+    #[test]
+    fn test_evaluate_string() {
+        // no variables: the escapes, and a lone backslash at the end dropped
+        assert_eq!(eval(b"/", br#"a\b\\c\$d\"e\'f\"#, 0), (NGX_OK, br#"a\b\c$d"e'f"#.to_vec()));
+        // variables, lowercased, with and without brackets
+        assert_eq!(eval(b"/", b"x$A-${a}y", 0), (NGX_OK, b"xA-Ay".to_vec()));
+        // "$ay" is a variable named "ay", not found: nothing
+        assert_eq!(eval(b"/", b"[$ay]", 0), (NGX_OK, b"[]".to_vec()));
+        assert_eq!(eval(b"/", b"[$empty]\\$a", 0), (NGX_OK, b"[]$a".to_vec()));
+        // errors
+        assert_eq!(eval(b"/", b"x$", 0).0, NGX_HTTP_SSI_ERROR);
+        assert_eq!(eval(b"/", b"x${", 0).0, NGX_HTTP_SSI_ERROR);
+        assert_eq!(eval(b"/", b"x${a", 0).0, NGX_HTTP_SSI_ERROR);
+        assert_eq!(eval(b"/", b"x$-", 0).0, NGX_HTTP_SSI_ERROR);
+        assert_eq!(eval(b"/", b"$error", 0).0, NGX_ERROR);
+        // the prefix of relative includes
+        assert_eq!(eval(b"/dir/page.html", b"inc.html", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"/dir/inc.html".to_vec()));
+        assert_eq!(eval(b"/dir/page.html", b"/inc.html", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"/inc.html".to_vec()));
+        assert_eq!(eval(b"/dir/page.html", b"$rel", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"/dir/r.html".to_vec()));
+        assert_eq!(eval(b"/dir/page.html", b"$path/x", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"/p/q/x".to_vec()));
+        // the first non-empty part decides
+        assert_eq!(eval(b"/dir/page.html", b"$empty$path", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"/p/q".to_vec()));
+        assert_eq!(eval(b"page.html", b"x.html", NGX_HTTP_SSI_ADD_PREFIX), (NGX_OK, b"x.html".to_vec()));
     }
 
     #[test]
