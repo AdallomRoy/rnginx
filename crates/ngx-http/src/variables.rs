@@ -501,7 +501,15 @@ fn var_https(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_request_uri(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, &r.main().unparsed_uri.borrow());
+    // ngx_http_variable_request: r->unparsed_uri.data is NULL until the
+    // request line is parsed
+    let m = r.main();
+    let u = m.unparsed_uri.borrow();
+    if u.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    set_str(v, &u);
     NGX_OK
 }
 
@@ -511,7 +519,14 @@ fn var_uri(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_args(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, &r.args.borrow());
+    // ngx_http_variable_request: r->args.data is set only for arguments
+    // after "?" (ngx_http_process_request_uri: r->uri_end > r->args_start)
+    let a = r.args.borrow();
+    if a.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+    set_str(v, &a);
     NGX_OK
 }
 

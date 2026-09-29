@@ -75,6 +75,8 @@ fn ngx_hash(hash: u32, ch: u8) -> u32 {
 pub struct ParseRequest {
     pub state: u32,
     pub request_start: usize,
+    /// C: request_start != NULL
+    pub request_start_set: bool,
     pub request_end: usize,
     pub method: u32,
     pub method_end: usize,
@@ -116,6 +118,7 @@ impl Default for ParseRequest {
         ParseRequest {
             state: 0,
             request_start: 0,
+            request_start_set: false,
             request_end: 0,
             method: 0,
             method_end: 0,
@@ -205,6 +208,7 @@ pub fn parse_request_line(r: &mut ParseRequest, buf: &[u8], pos: &mut usize) -> 
         match state {
             SW_START => {
                 r.request_start = p;
+                r.request_start_set = true;
                 if ch == CR || ch == LF {
                     p += 1;
                     continue;

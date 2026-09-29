@@ -598,9 +598,11 @@ impl Request {
         }
     }
 
+    /// The request line of a request whose line was not parsed, for
+    /// $request: from r->request_start to CR or LF in the header buffer.
     pub fn partial_request_line(&self) -> Option<Vec<u8>> {
         let p = self.parse.borrow();
-        if p.uri_start.is_some() || p.method_end != 0 {
+        if p.request_start_set {
             let hb = self.http_connection.buffer.borrow();
             let start = p.request_start.min(hb.last);
             let mut end = start;
