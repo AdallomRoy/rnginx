@@ -35,8 +35,10 @@ pub struct Variable {
 }
 
 impl Variable {
+    /// The name is stored lowercased (ngx_strlow() in ngx_http_add_variable,
+    /// ngx_http_add_prefix_variable and ngx_http_get_variable_index).
     fn new(name: &[u8], flags: u32) -> Rc<Variable> {
-        Rc::new(Variable { name: name.to_vec(), set_handler: Cell::new(None), get_handler: Cell::new(None), data: Cell::new(0), flags: Cell::new(flags), index: Cell::new(0) })
+        Rc::new(Variable { name: name.to_ascii_lowercase(), set_handler: Cell::new(None), get_handler: Cell::new(None), data: Cell::new(0), flags: Cell::new(flags), index: Cell::new(0) })
     }
 }
 
@@ -77,7 +79,7 @@ pub fn add_variable(cf: &mut Conf, name: &[u8], flags: u32) -> Result<Rc<Variabl
         }
     }
     let v = Variable::new(name, flags);
-    let rc = m.variables_keys.as_mut().unwrap().add_key(name.to_vec(), v.clone(), 0);
+    let rc = m.variables_keys.as_mut().unwrap().add_key(v.name.clone(), v.clone(), 0);
     if rc == NGX_ERROR {
         return Err(ConfError::Logged);
     }
@@ -121,8 +123,10 @@ pub fn get_variable_index(cf: &mut Conf, name: &[u8]) -> Result<usize, ConfError
             return Ok(i);
         }
     }
-    // User-defined variables (from set directive) should be marked as changeable
-    let v = Variable::new(name, NGX_HTTP_VAR_CHANGEABLE);
+    // v->flags = 0: whatever defines the variable does so through
+    // ngx_http_add_variable (the "set" directive, map, geo, ...), and
+    // ngx_http_variables_init_vars() fails on names nothing defined
+    let v = Variable::new(name, 0);
     let idx = m.variables.len();
     v.index.set(idx);
     m.variables.push(v);
@@ -203,6 +207,9 @@ pub fn get_flushed_variable(r: &R, index: usize) -> Option<VariableValue> {
 
 /// ngx_http_get_variable (by name at runtime).
 pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
+    // every C caller (ssi, perl) passes the name lowercased with
+    // ngx_hash_strlow(); the variable names are stored lowercased
+    let name = &name.to_ascii_lowercase()[..];
     let cmcf = r.cmcf();
     let key = hash_key(name);
     let v = {
@@ -224,10 +231,11 @@ pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
     // prefix variables
     let prefixes = cmcf.borrow().prefix_variables.clone();
     let mut best: Option<Rc<Variable>> = None;
+    let mut len = 0;
     for pv in prefixes.iter() {
-        if name.len() >= pv.name.len() && eq_ignore_case(&name[..pv.name.len()], &pv.name) {
+        if name.len() >= pv.name.len() && name.len() > len && name[..pv.name.len()] == pv.name[..] {
+            len = pv.name.len();
             best = Some(pv.clone());
-            break;
         }
     }
     if let Some(pv) = best {
@@ -268,10 +276,10 @@ pub fn init_vars(cf: &mut Conf) -> ConfResult {
         let m = cmcf.borrow();
         (m.variables.clone(), m.prefix_variables.clone(), m.variables_keys.as_ref().map(|k| k.keys().iter().map(|k| k.value.clone()).collect::<Vec<_>>()).unwrap_or_default())
     };
-    for v in vars.iter() {
-        let mut found = false;
+    // set the handlers for the indexed http variables
+    'next: for v in vars.iter() {
         for av in keys.iter() {
-            if av.name.len() == v.name.len() && eq_ignore_case(&av.name, &v.name) {
+            if v.name == av.name {
                 v.get_handler.set(av.get_handler.get());
                 v.data.set(av.data.get());
                 av.flags.set(av.flags.get() | NGX_HTTP_VAR_INDEXED);
@@ -280,33 +288,28 @@ pub fn init_vars(cf: &mut Conf) -> ConfResult {
                 if av.get_handler.get().is_none() || (av.flags.get() & NGX_HTTP_VAR_WEAK) != 0 {
                     break;
                 }
-                found = true;
-                break;
+                continue 'next;
             }
         }
-        if found {
-            continue;
-        }
-        let mut pfound = false;
-        let mut best_len = 0;
+        let mut len = 0;
+        let mut found: Option<&Rc<Variable>> = None;
         for pv in prefixes.iter() {
-            if v.name.len() >= pv.name.len() && eq_ignore_case(&v.name[..pv.name.len()], &pv.name) && pv.name.len() >= best_len {
-                v.get_handler.set(pv.get_handler.get());
-                v.data.set(v.index.get());
-                v.flags.set(pv.flags.get());
-                best_len = pv.name.len();
-                pfound = true;
+            if v.name.len() >= pv.name.len() && v.name.len() > len && v.name[..pv.name.len()] == pv.name[..] {
+                found = Some(pv);
+                len = pv.name.len();
             }
         }
-        if pfound {
-            continue;
+        if let Some(pv) = found {
+            v.get_handler.set(pv.get_handler.get());
+            // v[i].data = (uintptr_t) &v[i].name: prefix_var_name()
+            v.data.set(v.index.get());
+            v.flags.set(pv.flags.get());
+            continue 'next;
         }
-        // User-defined variables (from rewrite set directive) don't need handlers
-        // They are created with NGX_HTTP_VAR_CHANGEABLE flag by get_variable_index()
-        // No error for variables without handlers - they may be user-defined
-        // if v.get_handler.get().is_none() {
-        //     return Err(cf.emerg(format_args!("unknown \"{}\" variable", B(&v.name))));
-        // }
+        if v.get_handler.get().is_none() {
+            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "unknown \"{}\" variable", B(&v.name));
+            return Err(ConfError::Logged);
+        }
     }
     // build the hash of non-indexed / all variables (NOHASH excluded)
     let mut names: Vec<HashKey<Rc<Variable>>> = Vec::new();
