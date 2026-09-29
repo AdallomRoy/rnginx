@@ -266,6 +266,41 @@ impl FileCache {
     fn shpool(&self) -> &SlabPool {
         unsafe { &*self.shpool.get() }
     }
+
+    /// &cache->sh->queue
+    fn queue(&self) -> *mut Queue {
+        unsafe { std::ptr::addr_of_mut!((*self.sh.get()).queue) }
+    }
+}
+
+/// ngx_queue_init
+unsafe fn queue_init(h: *mut Queue) {
+    (*h).prev = h;
+    (*h).next = h;
+}
+
+/// ngx_queue_empty
+unsafe fn queue_empty(h: *mut Queue) -> bool {
+    h == (*h).prev
+}
+
+/// ngx_queue_last
+unsafe fn queue_last(h: *mut Queue) -> *mut Queue {
+    (*h).prev
+}
+
+/// ngx_queue_insert_head
+unsafe fn queue_insert_head(h: *mut Queue, x: *mut Queue) {
+    (*x).next = (*h).next;
+    (*(*x).next).prev = x;
+    (*x).prev = h;
+    (*h).next = x;
+}
+
+/// ngx_queue_remove
+unsafe fn queue_remove(x: *mut Queue) {
+    (*(*x).next).prev = (*x).prev;
+    (*(*x).prev).next = (*x).next;
 }
 
 /// The data of a cache path (cache->path->data).
@@ -552,7 +587,7 @@ fn file_cache_init(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Result<
 
         (*sh).rbtree.init(&mut (*sh).sentinel, file_cache_rbtree_insert_value);
 
-        (*sh).queue.init();
+        queue_init(std::ptr::addr_of_mut!((*sh).queue));
 
         std::ptr::write(&mut (*sh).cold, AtomicUsize::new(1));
         std::ptr::write(&mut (*sh).loading, AtomicUsize::new(0));
@@ -1049,7 +1084,7 @@ fn file_cache_exists(cache: &FileCache, c: &mut HttpCache) -> i64 {
         'done: {
             'renew: {
                 if !fcn.is_null() {
-                    (*fcn).queue.remove();
+                    queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
 
                     if c.node.is_null() {
                         (*fcn).uses_inc();
@@ -1134,7 +1169,7 @@ fn file_cache_exists(cache: &FileCache, c: &mut HttpCache) -> i64 {
 
         (*fcn).expire = ngx_core::times::time() + cache.inactive;
 
-        cache.sh().queue.insert_head(&mut (*fcn).queue);
+        queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
 
         c.uniq = (*fcn).uniq;
         c.error = (*fcn).error as usize;
@@ -1713,7 +1748,7 @@ pub fn file_cache_free(c: &mut HttpCache, tf: Option<&CacheTempFile>) {
                 (*fcn).valid_msec = c.valid_msec as u32 & MSEC_MASK;
             }
         } else if !(*fcn).exists && (*fcn).count == 0 && c.min_uses == 1 {
-            (*fcn).queue.remove();
+            queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
             cache.sh().rbtree.delete(&mut (*fcn).node);
             cache.shpool().free_locked(fcn as *mut u8);
             cache.sh().count -= 1;
@@ -2079,11 +2114,11 @@ fn file_cache_forced_expire(cache: &FileCache) -> i64 {
 
     unsafe {
         loop {
-            if cache.sh().queue.is_empty() {
+            if queue_empty(cache.queue()) {
                 break;
             }
 
-            let q = cache.sh().queue.last();
+            let q = queue_last(cache.queue());
 
             if q == sentinel {
                 break;
@@ -2122,9 +2157,9 @@ fn file_cache_forced_expire(cache: &FileCache) -> i64 {
             // and although it may be safe to remove them completely,
             // we prefer to just move them to the top of the inactive queue
 
-            (*q).remove();
+            queue_remove(q);
             (*fcn).expire = ngx_core::times::time() + cache.inactive;
-            cache.sh().queue.insert_head(&mut (*fcn).queue);
+            queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
 
             ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), (*fcn).count);
 
@@ -2172,12 +2207,12 @@ fn file_cache_expire(cache: &FileCache) -> i64 {
                 break;
             }
 
-            if cache.sh().queue.is_empty() {
+            if queue_empty(cache.queue()) {
                 wait = 10;
                 break;
             }
 
-            let q = cache.sh().queue.last();
+            let q = queue_last(cache.queue());
 
             let fcn = queue_data(q);
 
@@ -2220,9 +2255,9 @@ fn file_cache_expire(cache: &FileCache) -> i64 {
                 // and although it may be safe to remove them completely,
                 // we prefer to just move them to the top of the inactive queue
 
-                (*q).remove();
+                queue_remove(q);
                 (*fcn).expire = ngx_core::times::time() + cache.inactive;
-                cache.sh().queue.insert_head(&mut (*fcn).queue);
+                queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
 
                 ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), (*fcn).count);
             }
@@ -2280,7 +2315,7 @@ unsafe fn file_cache_delete(cache: &FileCache, q: *mut Queue) {
     }
 
     if (*fcn).count == 0 {
-        (*q).remove();
+        queue_remove(q);
         cache.sh().rbtree.delete(&mut (*fcn).node);
         cache.shpool().free_locked(fcn as *mut u8);
         cache.sh().count -= 1;
@@ -2594,12 +2629,12 @@ fn file_cache_add(cache: &FileCache, key: &[u8; NGX_HTTP_CACHE_KEY_LEN], fs_size
 
             cache.sh().size += fs_size;
         } else {
-            (*fcn).queue.remove();
+            queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
         }
 
         (*fcn).expire = ngx_core::times::time() + cache.inactive;
 
-        cache.sh().queue.insert_head(&mut (*fcn).queue);
+        queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
     }
 
     cache.shpool().unlock();
