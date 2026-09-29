@@ -330,7 +330,7 @@ pub fn open_cached_file(
 
         None => {
             if of.test_only {
-                match file_info_wrapper(name, of) {
+                match file_info_wrapper(name, of, log) {
                     Ok(st) => {
                         let _ = fill_info_from_stat(&st, of);
                         return Ok(None);
@@ -649,7 +649,7 @@ fn open_failed(cache: &OpenFileCache, file: Option<CachedFileRef>, name: &[u8], 
 /// ngx_open_and_stat_file
 fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(), ()> {
     if of.fd != NGX_INVALID_FILE {
-        match file_info_wrapper(name, of) {
+        match file_info_wrapper(name, of, log) {
             Err((err, failed)) => {
                 of.err = err;
                 of.failed = failed;
@@ -664,7 +664,7 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
             }
         }
     } else if of.test_dir {
-        match file_info_wrapper(name, of) {
+        match file_info_wrapper(name, of, log) {
             Err((err, failed)) => {
                 of.err = err;
                 of.failed = failed;
@@ -756,12 +756,26 @@ fn open_file_wrapper(
     }
 }
 
-fn file_info_wrapper(name: &[u8], of: &OpenFileInfo) -> Result<libc::stat, (i32, &'static str)> {
+/// ngx_file_info_wrapper: with disable_symlinks, the file is opened with
+/// ngx_open_file_wrapper() and its information is taken with fstat()
+fn file_info_wrapper(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<libc::stat, (i32, &'static str)> {
     if of.disable_symlinks == 0 {
-        os::stat(name).map_err(|e| (e, "stat()"))
-    } else {
-        os::lstat(name).map_err(|e| (e, "lstat()"))
+        return os::stat(name).map_err(|e| (e, "stat()"));
     }
+
+    let fd = open_file_wrapper(name, of, libc::O_RDONLY | libc::O_NONBLOCK, 0, 0, log);
+
+    if fd == NGX_INVALID_FILE {
+        return Err((of.err, of.failed));
+    }
+
+    let rc = os::fstat(fd).map_err(|e| (e, "fstat()"));
+
+    if let Err(e) = close_file(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
+    }
+
+    rc
 }
 
 fn fill_info_from_stat(st: &libc::stat, of: &mut OpenFileInfo) -> Result<(), ()> {
