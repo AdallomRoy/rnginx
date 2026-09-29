@@ -66,7 +66,7 @@ pub fn add_variable(cf: &mut Conf, name: &[u8], flags: u32) -> Result<Rc<Variabl
     for k in keys.keys() {
         if k.key.len() == name.len() && eq_ignore_case(&k.key, name) {
             let v = k.value.clone();
-            if flags & NGX_HTTP_VAR_CHANGEABLE == 0 {
+            if v.flags.get() & NGX_HTTP_VAR_CHANGEABLE == 0 {
                 drop(m);
                 return Err(cf.emerg(format_args!("the duplicate \"{}\" variable", B(name))));
             }
@@ -94,7 +94,7 @@ pub fn add_prefix_variable(cf: &mut Conf, name: &[u8], flags: u32) -> Result<Rc<
     let mut m = cmcf.borrow_mut();
     for v in m.prefix_variables.iter() {
         if v.name.len() == name.len() && eq_ignore_case(&v.name, name) {
-            if flags & NGX_HTTP_VAR_CHANGEABLE == 0 {
+            if v.flags.get() & NGX_HTTP_VAR_CHANGEABLE == 0 {
                 drop(m);
                 return Err(cf.emerg(format_args!("the duplicate \"{}\" variable", B(name))));
             }
@@ -1104,11 +1104,11 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "document_root", set: None, get: Some(var_document_root), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "realpath_root", set: None, get: Some(var_realpath_root), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "query_string", set: None, get: Some(var_args), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
-    VarDef { name: "args", set: Some(set_args), get: Some(var_args), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
+    VarDef { name: "args", set: Some(set_args), get: Some(var_args), data: 0, flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "is_args", set: None, get: Some(var_is_args), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "request_filename", set: None, get: Some(var_request_filename), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "server_name", set: None, get: Some(var_server_name), data: 0, flags: 0 },
-    VarDef { name: "request_method", set: None, get: Some(var_request_method), data: 0, flags: 0 },
+    VarDef { name: "request_method", set: None, get: Some(var_request_method), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "remote_user", set: None, get: Some(var_remote_user), data: 0, flags: 0 },
     VarDef { name: "bytes_sent", set: None, get: Some(var_bytes_sent), data: 0, flags: 0 },
     VarDef { name: "body_bytes_sent", set: None, get: Some(var_body_bytes_sent), data: 0, flags: 0 },
@@ -1122,8 +1122,8 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "request_port", set: None, get: Some(var_request_port), data: 0, flags: 0 },
     VarDef { name: "is_request_port", set: None, get: Some(var_is_request_port), data: 0, flags: 0 },
     VarDef { name: "status", set: None, get: Some(var_status), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE },
-    VarDef { name: "sent_http_", set: None, get: Some(var_sent_http_prefix), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX },
-    VarDef { name: "sent_trailer_", set: None, get: Some(var_sent_trailer_prefix), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX },
+    VarDef { name: "sent_http_", set: None, get: Some(var_sent_http_prefix), data: 0, flags: NGX_HTTP_VAR_PREFIX },
+    VarDef { name: "sent_trailer_", set: None, get: Some(var_sent_trailer_prefix), data: 0, flags: NGX_HTTP_VAR_PREFIX },
     VarDef { name: "limit_rate", set: Some(set_limit_rate), get: Some(var_limit_rate), data: 0, flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE },
     VarDef { name: "connection", set: None, get: Some(var_connection), data: 0, flags: 0 },
     VarDef { name: "connection_requests", set: None, get: Some(var_connection_requests), data: 0, flags: 0 },

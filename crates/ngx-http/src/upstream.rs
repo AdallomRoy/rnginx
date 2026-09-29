@@ -1155,14 +1155,14 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             get: Some(upstream_addr_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_status",
             get: Some(upstream_status_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_connect_time",
@@ -1190,21 +1190,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             get: Some(upstream_zero_variable),
             set: None,
             data: 0, // response body length
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_bytes_received",
             get: Some(upstream_zero_variable),
             set: None,
             data: 1, // total bytes received from upstream
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_bytes_sent",
             get: Some(upstream_zero_variable),
             set: None,
             data: 2, // total bytes sent to upstream
-            flags: 0,
+            flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
     ];
 

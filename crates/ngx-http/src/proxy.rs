@@ -920,21 +920,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
             get: Some(proxy_host_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
         },
         VarDef {
             name: "proxy_port",
             get: Some(proxy_port_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: crate::variables::NGX_HTTP_VAR_CHANGEABLE | crate::variables::NGX_HTTP_VAR_NOCACHEABLE | crate::variables::NGX_HTTP_VAR_NOHASH,
         },
         VarDef {
             name: "proxy_add_x_forwarded_for",
             get: Some(proxy_add_x_forwarded_for_variable),
             set: None,
             data: 0,
-            flags: 0,
+            flags: crate::variables::NGX_HTTP_VAR_NOHASH,
         },
     ];
 
