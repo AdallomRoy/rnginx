@@ -62,73 +62,53 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     Ok(())
 }
 
+/// ngx_http_access_rule
 fn access_rule(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = conf_rc::<AccessLocConf>(conf.as_ref().unwrap());
     let args = cf.args.clone();
-    let deny = args[0][0] == b'd'; // 'd' for deny, 'a' for allow
 
-    let spec = &args[1];
+    let deny = args[0][0] == b'd';
 
-    // Check for "all"
-    if spec == b"all" {
-        // Add rules for both IPv4 and IPv6
-        {
-            let mut c = cell.borrow_mut();
-            if c.rules_v4.is_none() {
-                c.rules_v4 = Some(Vec::new());
+    let value = &args[1];
+
+    let mut all = false;
+    let mut cidr: Option<Cidr> = None;
+
+    if value.as_slice() == b"all" {
+        all = true;
+    } else if value.as_slice() == b"unix:" {
+        cidr = Some(Cidr::Unix);
+    } else {
+        match ptocidr(value) {
+            CidrParse::Ok(c) => cidr = Some(c),
+            CidrParse::Done(c) => {
+                cf.warn(format_args!("low address bits of {} are meaningless", B(value)));
+                cidr = Some(c);
             }
-            c.rules_v4.as_mut().unwrap().push(AccessRuleV4 {
-                mask: 0,
-                addr: 0,
-                deny,
-            });
+            CidrParse::Error => return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(value)))),
         }
-        {
-            let mut c = cell.borrow_mut();
-            if c.rules_v6.is_none() {
-                c.rules_v6 = Some(Vec::new());
-            }
-            c.rules_v6.as_mut().unwrap().push(AccessRuleV6 {
-                mask: [0; 16],
-                addr: [0; 16],
-                deny,
-            });
-        }
-        {
-            let mut c = cell.borrow_mut();
-            if c.rules_unix.is_none() {
-                c.rules_unix = Some(Vec::new());
-            }
-            c.rules_unix.as_mut().unwrap().push(AccessRuleUnix { deny });
-        }
-        return Ok(());
     }
 
-    // Check for unix:
-    if spec.starts_with(b"unix:") {
-        let mut c = cell.borrow_mut();
-        if c.rules_unix.is_none() {
-            c.rules_unix = Some(Vec::new());
-        }
-        c.rules_unix.as_mut().unwrap().push(AccessRuleUnix { deny });
-        return Ok(());
-    }
-
-    // ngx_ptocidr, as in ngx_http_access_rule
-    let cidr = match ptocidr(spec) {
-        CidrParse::Ok(cidr) => cidr,
-        CidrParse::Done(cidr) => {
-            cf.warn(format_args!("low address bits of {} are meaningless", B(spec)));
-            cidr
-        }
-        CidrParse::Error => return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(spec)))),
-    };
     let mut c = cell.borrow_mut();
+
     match cidr {
-        Cidr::V4 { addr, mask } => c.rules_v4.get_or_insert_with(Vec::new).push(AccessRuleV4 { mask, addr, deny }),
-        Cidr::V6 { addr, mask } => c.rules_v6.get_or_insert_with(Vec::new).push(AccessRuleV6 { mask, addr, deny }),
-        Cidr::Unix => c.rules_unix.get_or_insert_with(Vec::new).push(AccessRuleUnix { deny }),
+        Some(Cidr::V4 { addr, mask }) => c.rules_v4.get_or_insert_with(Vec::new).push(AccessRuleV4 { mask, addr, deny }),
+        None if all => c.rules_v4.get_or_insert_with(Vec::new).push(AccessRuleV4 { mask: 0, addr: 0, deny }),
+        _ => {}
     }
+
+    match cidr {
+        Some(Cidr::V6 { addr, mask }) => c.rules_v6.get_or_insert_with(Vec::new).push(AccessRuleV6 { mask, addr, deny }),
+        None if all => c.rules_v6.get_or_insert_with(Vec::new).push(AccessRuleV6 { mask: [0; 16], addr: [0; 16], deny }),
+        _ => {}
+    }
+
+    match cidr {
+        Some(Cidr::Unix) => c.rules_unix.get_or_insert_with(Vec::new).push(AccessRuleUnix { deny }),
+        None if all => c.rules_unix.get_or_insert_with(Vec::new).push(AccessRuleUnix { deny }),
+        _ => {}
+    }
+
     Ok(())
 }
 
@@ -155,51 +135,37 @@ fn init(cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
+/// ngx_http_access_handler
 async fn access_handler(r: R) -> i64 {
     let conf = r.loc_conf::<AccessLocConf>(ctx_index());
-    let conf = conf.borrow();
+    let alcf = conf.borrow();
 
-    let remote_addr_ref = r.connection.sockaddr.borrow();
-    let remote_addr = &*remote_addr_ref;
+    let sockaddr = r.connection.sockaddr.borrow().clone();
 
-    match remote_addr {
-        SockAddr::V4(sa) => {
-            let addr = u32::from_be_bytes(sa.ip().octets());
-            if let Some(rules) = &conf.rules_v4 {
-                for rule in rules {
-                    if (addr & rule.mask) == rule.addr {
-                        return access_found(&r, rule.deny);
-                    }
-                }
+    match sockaddr {
+        SockAddr::V4(sin) => {
+            if let Some(rules) = &alcf.rules_v4 {
+                return access_inet(&r, rules, u32::from(*sin.ip()));
             }
         }
-        SockAddr::V6(sa) => {
-            let addr_bytes = sa.ip().octets();
-            // Check if it's a v4-mapped IPv6 address
-            if is_ipv4_mapped(&addr_bytes) {
-                let v4_addr = u32::from_be_bytes([addr_bytes[12], addr_bytes[13], addr_bytes[14], addr_bytes[15]]);
-                if let Some(rules) = &conf.rules_v4 {
-                    for rule in rules {
-                        if (v4_addr & rule.mask) == rule.addr {
-                            return access_found(&r, rule.deny);
-                        }
-                    }
+
+        SockAddr::V6(sin6) => {
+            let p = sin6.ip().octets();
+
+            if let Some(rules) = &alcf.rules_v4 {
+                if let Some(v4) = sin6.ip().to_ipv4_mapped() {
+                    return access_inet(&r, rules, u32::from(v4));
                 }
             }
-            if let Some(rules) = &conf.rules_v6 {
-                for rule in rules {
-                    if ipv6_match(&addr_bytes, &rule.addr, &rule.mask) {
-                        return access_found(&r, rule.deny);
-                    }
-                }
+
+            if let Some(rules) = &alcf.rules_v6 {
+                return access_inet6(&r, rules, &p);
             }
         }
+
         SockAddr::Unix(_) => {
-            if let Some(rules) = &conf.rules_unix {
-                for rule in rules {
-                    // Unix socket always matches
-                    return access_found(&r, rule.deny);
-                }
+            if let Some(rules) = &alcf.rules_unix {
+                return access_unix(&r, rules);
             }
         }
     }
@@ -207,19 +173,53 @@ async fn access_handler(r: R) -> i64 {
     NGX_DECLINED
 }
 
-fn is_ipv4_mapped(addr: &[u8; 16]) -> bool {
-    addr[0..10] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] && addr[10..12] == [0xff, 0xff]
-}
+/// ngx_http_access_inet: `addr` in host byte order; the debug line shows
+/// the in_addr_t values as C prints them
+fn access_inet(r: &R, rules: &[AccessRuleV4], addr: u32) -> i64 {
+    for rule in rules {
+        http_debug!(r, "access: {:08X} {:08X} {:08X}", addr.to_be(), rule.mask.to_be(), rule.addr.to_be());
 
-fn ipv6_match(addr: &[u8; 16], rule_addr: &[u8; 16], mask: &[u8; 16]) -> bool {
-    for i in 0..16 {
-        if (addr[i] & mask[i]) != rule_addr[i] {
-            return false;
+        if (addr & rule.mask) == rule.addr {
+            return access_found(r, rule.deny);
         }
     }
-    true
+
+    NGX_DECLINED
 }
 
+/// ngx_http_access_inet6
+fn access_inet6(r: &R, rules: &[AccessRuleV6], p: &[u8; 16]) -> i64 {
+    'rules: for rule in rules {
+        http_debug!(
+            r,
+            "access: {} {} {}",
+            B(&ngx_core::inet::inet6_ntop(p)),
+            B(&ngx_core::inet::inet6_ntop(&rule.mask)),
+            B(&ngx_core::inet::inet6_ntop(&rule.addr))
+        );
+
+        for n in 0..16 {
+            if (p[n] & rule.mask[n]) != rule.addr[n] {
+                continue 'rules;
+            }
+        }
+
+        return access_found(r, rule.deny);
+    }
+
+    NGX_DECLINED
+}
+
+/// ngx_http_access_unix
+fn access_unix(r: &R, rules: &[AccessRuleUnix]) -> i64 {
+    // TODO in C too: check path
+    match rules.first() {
+        Some(rule) => access_found(r, rule.deny),
+        None => NGX_DECLINED,
+    }
+}
+
+/// ngx_http_access_found
 fn access_found(r: &R, deny: bool) -> i64 {
     if deny {
         let clcf = r.clcf();
@@ -234,18 +234,5 @@ fn access_found(r: &R, deny: bool) -> i64 {
         NGX_HTTP_FORBIDDEN
     } else {
         NGX_OK
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ipv6_match() {
-        let addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let rule_addr = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mask = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(ipv6_match(&addr, &rule_addr, &mask));
     }
 }

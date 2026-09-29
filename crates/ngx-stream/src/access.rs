@@ -102,6 +102,15 @@ fn access_inet(s: &Session, rules: &[AccessRule], addr: u32) -> i64 {
 /// ngx_stream_access_inet6
 fn access_inet6(s: &Session, rules6: &[AccessRule6], p: &[u8; 16]) -> i64 {
     'next: for rule6 in rules6 {
+        ngx_log_debug!(
+            NGX_LOG_DEBUG_STREAM,
+            s.connection.log,
+            "access: {} {} {}",
+            B(&ngx_core::inet::inet6_ntop(p)),
+            B(&ngx_core::inet::inet6_ntop(&rule6.mask)),
+            B(&ngx_core::inet::inet6_ntop(&rule6.addr))
+        );
+
         for n in 0..16 {
             if (p[n] & rule6.mask[n]) != rule6.addr[n] {
                 continue 'next;
