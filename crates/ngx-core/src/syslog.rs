@@ -197,7 +197,8 @@ impl SyslogPeer {
     /// ngx_syslog_send
     pub fn send(&self, buf: &[u8]) -> isize {
         if self.log.borrow().is_none() {
-            *self.log.borrow_mut() = Some(Log::stderr(NGX_LOG_ALERT));
+            // the errors of ngx_connection_error() are [error] at least
+            self.set_log(Log::stderr(NGX_LOG_ERR));
         }
         let log = self.log.borrow().clone().unwrap();
         if self.fd.get() == -1 && self.init(&log).is_err() {
