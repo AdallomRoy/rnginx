@@ -69,10 +69,15 @@ pub fn process_conf(cf: &Conf, arg: &[u8]) -> Result<Rc<SyslogPeer>, ConfError> 
     let mut server_name = Vec::new();
 
     let mut p = &arg[7..]; // skip "syslog:"
-    while !p.is_empty() {
+    // for ( ;; ): each parameter up to a comma, an empty one included
+    let mut last = false;
+    while !last {
         let (item, rest) = match memchr::memchr(b',', p) {
             Some(i) => (&p[..i], &p[i + 1..]),
-            None => (p, &p[p.len()..]),
+            None => {
+                last = true;
+                (p, &p[p.len()..])
+            }
         };
         p = rest;
         if item.starts_with(b"server=") {
@@ -115,8 +120,10 @@ pub fn process_conf(cf: &Conf, arg: &[u8]) -> Result<Rc<SyslogPeer>, ConfError> 
                 return Err(cf.emerg(format_args!("syslog tag length exceeds 32")));
             }
             for &c in t {
-                if c == b' ' {
-                    return Err(cf.emerg(format_args!("syslog \"tag\" can't contain spaces")));
+                let c = c.to_ascii_lowercase();
+
+                if c < b'0' || (c > b'9' && c < b'a' && c != b'_') || c > b'z' {
+                    return Err(cf.emerg(format_args!("syslog \"tag\" only allows alphanumeric characters and underscore")));
                 }
             }
             tag = Some(t.to_vec());
