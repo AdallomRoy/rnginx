@@ -155,8 +155,23 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
                 c.write_delayed.set(true);
                 let delay = (-limit) as u64 * 1000 / limit_rate as u64 + 1;
                 http_debug!(r, "delayed for {}ms", delay);
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+                // the write event timer; meanwhile the read event handler is
+                // ngx_http_test_reading (ngx_http_set_write_handler)
+                let closed = {
+                    let watch = TestReading::new(&r);
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => None,
+                        err = watch.closed() => Some(err),
+                    }
+                };
+
                 c.write_delayed.set(false);
+
+                if let Some(err) = closed {
+                    return test_reading_closed(&r, err);
+                }
+
                 continue;
             }
             if sendfile_max_chunk > 0 && limit > sendfile_max_chunk as i64 {
@@ -207,6 +222,96 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         }
         // partial due to sendfile_max_chunk: keep looping
     }
+}
+
+/// ngx_http_test_reading, as the Linux build runs it (epoll with
+/// EPOLLRDHUP), on a duplicate of the client socket, so that the readiness
+/// of the connection itself (pipelined requests) is not disturbed: the
+/// client closed its side of an HTTP/1.x connection. An HTTP/2 stream is
+/// not tested.
+struct TestReading {
+    afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl TestReading {
+    fn new(r: &R) -> TestReading {
+        use std::os::fd::FromRawFd;
+
+        if r.stream.borrow().is_some() || r.connection.fd.get() < 0 {
+            return TestReading { afd: None };
+        }
+
+        // SAFETY: dup() of the connection's open socket, owned (and
+        // closed) by the OwnedFd
+        let dup = unsafe { libc::dup(r.connection.fd.get()) };
+
+        if dup < 0 {
+            return TestReading { afd: None };
+        }
+
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+
+        TestReading { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok() }
+    }
+
+    /// Resolves with the pending socket error (0 if none) when the client
+    /// has closed the connection (rev->pending_eof).
+    async fn closed(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+
+        let afd = match &self.afd {
+            Some(a) => a,
+            None => return std::future::pending().await,
+        };
+
+        loop {
+            let mut guard = match afd.readable().await {
+                Ok(g) => g,
+                Err(_) => return std::future::pending().await,
+            };
+
+            if guard.ready().is_read_closed() {
+                break;
+            }
+
+            guard.clear_ready();
+        }
+
+        // getsockopt(SO_ERROR): a pending error, if any
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+        // SAFETY: err and len are valid for an int to be written
+        unsafe {
+            libc::getsockopt(afd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
+        }
+
+        err
+    }
+}
+
+/// The "closed:" part of ngx_http_test_reading: the request is finalized
+/// with NGX_HTTP_CLIENT_CLOSED_REQUEST (ngx_http_terminate_request sets
+/// the status if nothing was sent).
+fn test_reading_closed(r: &R, err: i32) -> i64 {
+    let c = &r.connection;
+
+    c.read_eof.set(true);
+    c.error.set(true);
+
+    if let Some(sc) = c.ssl.borrow().as_ref() {
+        sc.no_send_shutdown.set(true);
+    }
+
+    ngx_log_error!(NGX_LOG_INFO, c.log, if err != 0 { Some(err) } else { None }, "client prematurely closed connection");
+
+    let m = r.main();
+
+    if m.headers_out.borrow().status == 0 || m.connection.sent.get() == 0 {
+        m.headers_out.borrow_mut().status = NGX_HTTP_CLIENT_CLOSED_REQUEST;
+    }
+
+    NGX_ERROR
 }
 
 /// Force out any pending buffered output (called at request end).
