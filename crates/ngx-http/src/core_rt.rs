@@ -980,48 +980,59 @@ pub fn get_forwarded_addr(r: &R, addr: &ngx_core::inet::SockAddr, headers: &[Hea
     (rc, cur)
 }
 
+/// ngx_http_get_forwarded_addr_internal
 fn forwarded_addr_internal(addr: &mut ngx_core::inet::SockAddr, xff: &[u8], proxies: &[ngx_core::inet::Cidr], recursive: bool) -> i64 {
     let mut found = false;
     let mut xfflen = xff.len();
+
     loop {
         if !proxies.iter().any(|c| c.matches(addr)) {
             return if found { NGX_DONE } else { NGX_DECLINED };
         }
-        let mut p = xfflen;
-        while p > 1 {
-            let c = xff[p - 1];
-            if c != b' ' && c != b',' {
+
+        if xfflen == 0 {
+            // an empty value: C parses the byte before it, the ':' or the
+            // space of the header line, which is not an address
+            return if found { NGX_DONE } else { NGX_DECLINED };
+        }
+
+        // p is an index in xff; as in C, the first character is never
+        // taken for a separator
+
+        let mut p = xfflen - 1;
+
+        while p > 0 {
+            if xff[p] != b' ' && xff[p] != b',' {
                 break;
             }
+
             p -= 1;
             xfflen -= 1;
         }
-        // p is now one past the last non-separator char; find start of token
-        let mut start = p;
-        while start > 0 {
-            let c = xff[start - 1];
-            if c == b' ' || c == b',' {
+
+        while p > 0 {
+            if xff[p] == b' ' || xff[p] == b',' {
+                p += 1;
                 break;
             }
-            start -= 1;
+
+            p -= 1;
         }
-        let token = &xff[start..p];
-        match ngx_core::inet::parse_addr_port(token) {
+
+        match ngx_core::inet::parse_addr_port(&xff[p..xfflen]) {
             Some(a) => *addr = a,
             None => return if found { NGX_DONE } else { NGX_DECLINED },
         }
+
         found = true;
-        if start == 0 {
+
+        if !(recursive && p > 0) {
             break;
         }
-        xfflen = start - 1;
-        if !recursive {
-            break;
-        }
-        if xfflen == 0 {
-            break;
-        }
+
+        xfflen = p - 1;
     }
+
     NGX_OK
 }
 
