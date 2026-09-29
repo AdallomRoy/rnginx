@@ -4,9 +4,7 @@
 //! (request_rt::subrequest_posted(), see crate::postpone_filter). Where C
 //! returns NGX_AGAIN to wait for a subrequest (wait="yes", set=, file=) and
 //! the body filter is called again once the request is posted, the filter
-//! here waits for being posted and goes on (ssi_wait()). Where C's handler
-//! returns with subrequests still postponed and the request ends in
-//! ngx_http_writer(), the filter waits for them before it returns.
+//! here waits for being posted and goes on (ssi_wait()).
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -747,12 +745,8 @@ async fn ssi_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     // from ending, see crate::postpone_filter)
     ssi_buffered(&r, &ctx);
 
-    // C returns, and the request waits for its postponed subrequests in
-    // ngx_http_writer() once its handler is done
-
-    if !r.postponed.borrow().is_empty() && crate::postpone_filter::run_posted_requests(&r).await == NGX_ERROR {
-        return NGX_ERROR;
-    }
+    // the subrequests posted run once the request waits (for more input,
+    // or in request_rt::finalize_request() for its postponed subrequests)
 
     rc
 }

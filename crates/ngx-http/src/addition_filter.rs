@@ -8,7 +8,7 @@ use ngx_core::conf::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 
-use crate::request_rt::subrequest;
+use crate::request_rt::subrequest_posted;
 use crate::*;
 
 crate::http_module_index!("ngx_http_addition_filter_module");
@@ -124,92 +124,65 @@ async fn addition_header_filter(r: R, next: HeaderFilter) -> i64 {
     r.clear_accept_ranges();
     core_rt::weak_etag(&r);
 
+    r.preserve_body.set(true);
+
     next(r).await
 }
 
-async fn addition_body_filter(r: R, chain: Chain, next: BodyFilter) -> i64 {
+/// ngx_http_addition_body_filter: the subrequests are posted ones
+/// (ngx_http_subrequest), which the request waits for once its handler is
+/// done (request_rt::finalize_request).
+async fn addition_body_filter(r: R, mut chain: Chain, next: BodyFilter) -> i64 {
     if chain.is_empty() || r.header_only.get() {
         return next(r, chain).await;
     }
 
-    let ctx_opt = r.get_ctx::<AdditionCtx>(ctx_index());
-    if ctx_opt.is_none() {
+    let ctx = match r.get_ctx::<AdditionCtx>(ctx_index()) {
+        Some(ctx) => ctx,
+        None => return next(r, chain).await,
+    };
+
+    let (before_body, after_body) = {
+        let conf = r.loc_conf::<AdditionLocConf>(ctx_index());
+        let conf = conf.borrow();
+        (conf.before_body.get().clone(), conf.after_body.get().clone())
+    };
+
+    let before_body_sent = std::mem::replace(&mut ctx.borrow_mut().before_body_sent, true);
+
+    if !before_body_sent && !before_body.is_empty() && subrequest_posted(&r, &before_body, None, 0, None).is_err() {
+        return NGX_ERROR;
+    }
+
+    if after_body.is_empty() {
+        r.clear_ctx(ctx_index());
         return next(r, chain).await;
     }
 
-    let conf = r.loc_conf::<AdditionLocConf>(ctx_index());
-    let conf_ref = conf.borrow();
+    let mut last = false;
 
-    let mut chain = chain;
-    if let Some(ctx) = ctx_opt {
-        let mut ctx_ref = ctx.borrow_mut();
-        if !ctx_ref.before_body_sent {
-            ctx_ref.before_body_sent = true;
-            if !conf_ref.before_body.get().is_empty() {
-                let before_uri = conf_ref.before_body.get().clone();
-                drop(ctx_ref);
-                let _ = subrequest(&r, &before_uri, None, 0, None).await;
-                // Subrequest wrote through write_filter to the shared
-                // connection before returning, so its bytes are already in
-                // flight — nothing more to do here.
-            }
+    for b in chain.iter_mut() {
+        if b.last_buf {
+            b.last_buf = false;
+            b.last_in_chain = true;
+            b.sync = true;
+            last = true;
         }
     }
 
-    if conf_ref.after_body.get().is_empty() {
-        drop(conf_ref);
-        return next(r, chain).await;
-    }
+    let rc = next(r.clone(), chain).await;
 
-    // Check if this is the last buffer
-    let mut has_last = false;
-    for buf in chain.iter() {
-        if buf.last_buf {
-            has_last = true;
-            break;
-        }
-    }
-
-    // Clear last_buf flags
-    let mut modified = Chain::new();
-    for mut buf in chain {
-        if buf.last_buf {
-            buf.last_buf = false;
-            buf.last_in_chain = true;
-            buf.sync = true;
-        }
-        modified.push_back(buf);
-    }
-
-    let rc = next(r.clone(), modified).await;
-
-    if rc == NGX_ERROR || !has_last {
-        drop(conf_ref);
+    if rc == NGX_ERROR || !last {
         return rc;
     }
 
-    // Send the after_body subrequest, again absorbing its output into our
-    // chain so it appears after the main body.
-    let after_body = conf_ref.after_body.get().clone();
-    drop(conf_ref);
+    if subrequest_posted(&r, &after_body, None, 0, None).is_err() {
+        return NGX_ERROR;
+    }
 
-    // After the last body chunk, run the after_body subrequest. Same shared-
-    // connection story as before_body — write_filter sends its bytes.
-    let _ = subrequest(&r, &after_body, None, 0, None).await;
+    r.clear_ctx(ctx_index());
 
-    // Terminate the response with an empty last_buf so write_filter flushes
-    // the connection. Without postpone_filter we have to inject this
-    // ourselves; C achieves it because the subrequest's postpone-flush
-    // eventually propagates last_buf into the parent's chain.
-    use ngx_core::buf::Buf;
-    let mut end_chain: Chain = Chain::new();
-    let mut b = Buf::from_vec(Vec::new());
-    b.last_buf = true;
-    b.last_in_chain = true;
-    b.sync = true;
-    end_chain.push_back(b);
-    let _ = next(r.clone(), end_chain).await;
-    NGX_OK
+    crate::special_response::send_special(&r, true).await
 }
 
 #[cfg(test)]

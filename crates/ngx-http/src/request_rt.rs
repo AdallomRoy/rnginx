@@ -962,6 +962,12 @@ pub async fn finalize_request(r: &R, mut rc: i64) {
     let c = r.connection.clone();
     http_debug!(r, "http finalize request: {}, \"{}?{}\" a:{}, c:{}", rc, B(&r.uri.borrow()), B(&r.args.borrow()), 1, r.count.get());
     if rc == NGX_DONE {
+        // a handler that has sent the response itself (the "return"
+        // directive here) still leaves the request waiting for its posted
+        // subrequests, as ngx_http_writer would
+        if !crate::postpone_filter::is_posted(r) && !r.postponed.borrow().is_empty() && crate::postpone_filter::run_posted_requests(r).await == NGX_ERROR {
+            terminate_request(r, NGX_ERROR);
+        }
         return;
     }
     if rc == NGX_OK && r.filter_finalize.get() {
@@ -1002,6 +1008,11 @@ pub async fn finalize_request(r: &R, mut rc: i64) {
         if crate::postpone_filter::is_posted(r) {
             return;
         }
+        // r->postponed: ngx_http_writer until the posted subrequests are done
+        if !r.postponed.borrow().is_empty() && crate::postpone_filter::run_posted_requests(r).await == NGX_ERROR {
+            terminate_request(r, NGX_ERROR);
+            return;
+        }
         // subrequest completion
         if !r.logged.get() {
             let clcf = r.clcf();
@@ -1013,6 +1024,11 @@ pub async fn finalize_request(r: &R, mut rc: i64) {
             ngx_log_error!(NGX_LOG_ALERT, c.log, None, "subrequest: \"{}?{}\" logged again", B(&r.uri.borrow()), B(&r.args.borrow()));
         }
         r.done.set(true);
+        return;
+    }
+    // r->postponed: ngx_http_writer until the posted subrequests are done
+    if !r.postponed.borrow().is_empty() && crate::postpone_filter::run_posted_requests(r).await == NGX_ERROR {
+        terminate_request(r, NGX_ERROR);
         return;
     }
     r.done.set(true);
