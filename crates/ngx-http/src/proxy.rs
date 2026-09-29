@@ -279,22 +279,7 @@ fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
     let mut p = conf_cell::<NgxHttpProxyLocConf>(prev).borrow_mut();
     let mut c = conf_cell::<NgxHttpProxyLocConf>(conf).borrow_mut();
-    // conf->ssl = prev->ssl with the proxy_pass inherited below (C inherits
-    // it in "if" and "limit_except" only, where it follows
-    // ngx_http_proxy_set_ssl; here the context is set up for every
-    // location proxying to https)
-    if c.upstream_uri.is_none() {
-        c.ssl = p.ssl;
-    }
     merge_ssl(cf, &mut p, &mut c)?;
-    if c.upstream_uri.is_none() {
-        c.upstream_uri = p.upstream_uri.clone();
-        c.upstream = p.upstream.clone();
-        c.vars_uri = p.vars_uri.clone();
-    }
-    if c.upstream_uri_cv.is_none() {
-        c.upstream_uri_cv = p.upstream_uri_cv.clone();
-    }
     if c.method.is_none() {
         c.method = p.method.clone();
     }
@@ -353,6 +338,31 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     // which pulls each list from prev when NGX_CONF_UNSET_PTR.
     if c.hide_headers.is_none() { c.hide_headers = p.hide_headers.clone(); }
     if c.pass_headers.is_none() { c.pass_headers = p.pass_headers.clone(); }
+
+    // the proxy_pass of the enclosing location is inherited by the "if"
+    // and "limit_except" blocks only (conf->upstream.upstream, location,
+    // vars, proxy_lengths/values and ssl), not by nested locations
+    let clcf = get_loc_conf::<CoreLocConf>(cf, crate::core::ctx_index());
+
+    if clcf.borrow().noname && c.upstream.is_none() && c.upstream_uri_cv.is_none() {
+        c.upstream = p.upstream.clone();
+        c.upstream_uri = p.upstream_uri.clone();
+        c.vars_uri = p.vars_uri.clone();
+
+        c.upstream_uri_cv = p.upstream_uri_cv.clone();
+
+        c.ssl = p.ssl;
+    }
+
+    let lmt_excpt_no_handler = {
+        let l = clcf.borrow();
+        l.lmt_excpt && l.handler.is_none()
+    };
+
+    if lmt_excpt_no_handler && (c.upstream.is_some() || c.upstream_uri_cv.is_some()) {
+        clcf.borrow_mut().handler = Some(Rc::new(|r| Box::pin(proxy_handler(r))));
+    }
+
     // proxy_cache_* inheritance — location-level overrides win, otherwise
     // pull each field from the parent (matches C's per-field
     // ngx_conf_merge_ptr_value / merge_str_value pattern).
@@ -945,9 +955,6 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
     // access_log and rewrite scripts can see it.
     crate::proxy_cache::add_variables(cf)?;
 
-    // Register proxy handler in content phase
-    crate::core::add_phase_handler(cf, crate::NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(proxy_handler(r))));
-
     Ok(())
 }
 
@@ -1002,7 +1009,11 @@ async fn proxy_handler(r: R) -> i64 {
         match &conf_borrowed.upstream_uri {
             Some(uri) => uri.clone(),
             None => {
-                return NGX_DECLINED;
+                // ngx_http_upstream_init_request: no u->conf->upstream,
+                // e.g. the proxy_pass handler of an "if" block used with
+                // the configuration of another "if" block
+                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
+                return crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         }
     };
