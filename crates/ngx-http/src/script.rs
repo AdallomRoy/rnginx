@@ -146,7 +146,8 @@ pub fn complex_value(r: &R, cv: &ComplexValue) -> Result<Vec<u8>, i64> {
             Part::Capture(n) => {
                 let caps = r.captures.borrow();
                 let data = r.captures_data.borrow();
-                if *n + 1 < caps.len() {
+                // ngx_http_script_copy_capture_code: n < r->ncaptures
+                if *n < r.ncaptures.get() && *n + 1 < caps.len() {
                     let s = caps[*n];
                     let e = caps[*n + 1];
                     if s >= 0 && e >= s {
