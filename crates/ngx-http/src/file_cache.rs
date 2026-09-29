@@ -1919,7 +1919,7 @@ fn create_full_path(dir: &[u8], access: u32) -> Result<(), i32> {
 }
 
 /// ngx_ext_rename_file with ext->time = -1
-fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u32, create_path: bool, delete_file: bool, log: &Log) -> i64 {
+pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u32, create_path: bool, delete_file: bool, log: &Log) -> i64 {
     let mut err;
 
     'failed: {

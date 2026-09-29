@@ -545,7 +545,7 @@ const PROXY_CACHE_HEADERS: &[(&[u8], &[u8])] = &[
 ];
 
 /// sc->flushes of ngx_http_script_compile(): the variables of the codes.
-fn script_flushes(codes: &[crate::script::Part]) -> Vec<usize> {
+pub(crate) fn script_flushes(codes: &[crate::script::Part]) -> Vec<usize> {
     codes
         .iter()
         .filter_map(|c| match c {
@@ -1520,7 +1520,7 @@ fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::script::Part],
 /// as ngx_http_proxy_create_request() runs them: the variables with
 /// ngx_http_get_indexed_variable() (e.flushed = 1), the no cacheable ones
 /// having been flushed.
-fn run_codes(r: &R, codes: &[crate::script::Part]) -> Vec<u8> {
+pub(crate) fn run_codes(r: &R, codes: &[crate::script::Part]) -> Vec<u8> {
     let mut value = Vec::new();
 
     for code in codes {
@@ -2728,7 +2728,7 @@ async fn process_headers(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, resp: &U
 
 /// The X-Accel-Redirect of ngx_http_upstream_process_headers: a named
 /// location, or the URI (with its arguments) for an internal redirect.
-async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
+pub(crate) async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
     if xar.first() == Some(&b'@') {
         let _ = crate::core_rt::named_location(r, xar).await;
         return NGX_DONE;
@@ -2755,32 +2755,32 @@ async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
 /// u->headers_in and u->buffer of an upstream response
 /// (ngx_http_upstream_headers_in_t): what ngx_http_proxy_process_status_line
 /// and ngx_http_proxy_process_header found, the body starting at `pos`.
-struct UpstreamResponse {
-    buf: Vec<u8>,
-    pos: usize,
-    status_n: i64,
-    status_line: Vec<u8>,
-    headers: Vec<crate::request::Header>,
-    content_length: Option<crate::request::Header>,
-    transfer_encoding: Option<crate::request::Header>,
-    content_length_n: i64,
-    chunked: bool,
-    connection_close: bool,
+pub(crate) struct UpstreamResponse {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) pos: usize,
+    pub(crate) status_n: i64,
+    pub(crate) status_line: Vec<u8>,
+    pub(crate) headers: Vec<crate::request::Header>,
+    pub(crate) content_length: Option<crate::request::Header>,
+    pub(crate) transfer_encoding: Option<crate::request::Header>,
+    pub(crate) content_length_n: i64,
+    pub(crate) chunked: bool,
+    pub(crate) connection_close: bool,
     /// headers_in.server and headers_in.date were sent
-    server: bool,
-    date: bool,
+    pub(crate) server: bool,
+    pub(crate) date: bool,
     /// u->keepalive, set for a response without a body
-    keepalive: bool,
+    pub(crate) keepalive: bool,
     /// u->upgrade
-    upgrade: bool,
+    pub(crate) upgrade: bool,
     /// u->headers_in.trailers
-    trailers: Vec<crate::request::Header>,
+    pub(crate) trailers: Vec<crate::request::Header>,
     /// the fields of u->headers_in the cache handlers set
-    cache: crate::upstream_cache::CacheHeadersIn,
+    pub(crate) cache: crate::upstream_cache::CacheHeadersIn,
 }
 
 impl UpstreamResponse {
-    fn new() -> UpstreamResponse {
+    pub(crate) fn new() -> UpstreamResponse {
         UpstreamResponse {
             buf: Vec::new(),
             pos: 0,
@@ -3102,7 +3102,7 @@ fn parse_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, u: &mut UpstreamResponse, st
 /// the headers a response is read with, and of the ones only the first of
 /// which counts (a duplicate is ignored: hash 0). Err is the failure of
 /// NGX_HTTP_UPSTREAM_INVALID_HEADER.
-fn upstream_process_header_line(r: &R, u: &mut UpstreamResponse, h: &crate::request::Header) -> Result<(), u32> {
+pub(crate) fn upstream_process_header_line(r: &R, u: &mut UpstreamResponse, h: &crate::request::Header) -> Result<(), u32> {
     let invalid = crate::upstream::NGX_HTTP_UPSTREAM_FT_INVALID_HEADER;
 
     match h.lowcase_key.as_slice() {
@@ -3256,12 +3256,12 @@ fn atoof(v: &[u8]) -> i64 {
 /// readiness is its own, so the request's reading of the body and of
 /// pipelined requests is not disturbed. An HTTP/2 or HTTP/3 stream is not
 /// checked.
-struct ClientWatch {
+pub(crate) struct ClientWatch {
     afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
 }
 
 impl ClientWatch {
-    fn new(r: &R) -> ClientWatch {
+    pub(crate) fn new(r: &R) -> ClientWatch {
         use std::os::fd::FromRawFd;
 
         if r.stream.borrow().is_some() || r.http_version.get() >= crate::NGX_HTTP_VERSION_20 {
@@ -3331,7 +3331,7 @@ impl ClientWatch {
 }
 
 /// The client's close if watched, else never.
-async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
+pub(crate) async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
     match watch {
         Some(w) => w.closed().await,
         None => std::future::pending().await,
@@ -3341,7 +3341,7 @@ async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
 /// The end of ngx_http_upstream_check_broken_connection when the client
 /// closed the connection of a request that is not cached: the upstream
 /// connection is closed too, and the request is finalized with 499.
-fn client_closed_request(r: &R, err: i32) -> i64 {
+pub(crate) fn client_closed_request(r: &R, err: i32) -> i64 {
     r.connection.error.set(true);
 
     ngx_core::ngx_log_error!(
@@ -3742,7 +3742,7 @@ async fn read_body(r: &R, sock: &mut UpstreamSock, u: &mut UpstreamResponse, hea
 /// ngx_http_upstream_finalize_request with an error after the header was
 /// sent: rc becomes NGX_ERROR with a flush, no last buffer, and the client
 /// connection is not kept alive.
-async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
+pub(crate) async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
     r.keepalive.set(false);
 
     if downstream {
@@ -3761,7 +3761,7 @@ async fn finalize_after_header(r: &R, downstream: bool) -> i64 {
 
 /// A proxy_limit_rate delay, false if the client closed the connection
 /// (ngx_http_upstream_check_broken_connection) meanwhile.
-async fn sleep_or_client_closed(delay: u64, watch: Option<&ClientWatch>) -> bool {
+pub(crate) async fn sleep_or_client_closed(delay: u64, watch: Option<&ClientWatch>) -> bool {
     let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay));
 
     tokio::select! {
@@ -3845,7 +3845,7 @@ fn process_trailer(
 }
 
 /// The request body buffers read so far (rb->bufs), taken to be sent.
-fn take_request_body_bufs(r: &R) -> ngx_core::buf::Chain {
+pub(crate) fn take_request_body_bufs(r: &R) -> ngx_core::buf::Chain {
     match r.request_body.borrow().as_ref() {
         Some(rb) => std::mem::take(&mut rb.borrow_mut().bufs),
         None => ngx_core::buf::Chain::new(),
@@ -3924,7 +3924,7 @@ pub(crate) async fn send_request_body(r: &R, upstream: &mut UpstreamSock, output
     }
 }
 
-async fn return_error(r: &R, status: i64) -> i64 {
+pub(crate) async fn return_error(r: &R, status: i64) -> i64 {
     // Populate a synthetic upstream state so $upstream_addr / $upstream_status
     // in add_header 'always' show the failed peer(s) — otherwise the client's
     // error response has no way to reflect which upstream was tried.
@@ -3954,6 +3954,13 @@ async fn return_error(r: &R, status: i64) -> i64 {
 /// TcpStream after a 101 Switching Protocols response. Mirrors what
 /// ngx_http_upstream_upgrade sets up for WebSocket / HTTP upgrade paths.
 async fn proxy_upgrade_tunnel(r: R, upstream: UpstreamSock) -> i64 {
+    let read_timeout = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index()).borrow().read_timeout.get_or(60000);
+    upgrade_tunnel(r, upstream, read_timeout).await
+}
+
+/// The tunnel of proxy_upgrade_tunnel with the read_timeout of the
+/// module's configuration (u->conf->read_timeout).
+pub(crate) async fn upgrade_tunnel(r: R, upstream: UpstreamSock, read_timeout: u64) -> i64 {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     let (mut up_r, mut up_w) = tokio::io::split(upstream);
@@ -3982,7 +3989,6 @@ async fn proxy_upgrade_tunnel(r: R, upstream: UpstreamSock) -> i64 {
     // to the other; the tunnel is done (and both connections closed) when
     // either side's end is read and what it sent was passed on, or on an
     // error; proxy_read_timeout without activity: "upstream timed out"
-    let read_timeout = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index()).borrow().read_timeout.get_or(60000);
     let activity = Rc::new(std::cell::Cell::new(ngx_core::times::current_msec()));
 
     let client_to_up = {

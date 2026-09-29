@@ -168,7 +168,7 @@ impl UpstreamCacheConf {
             self.cache_key = prev.cache_key.clone();
         }
 
-        if self.enabled() && self.cache_key.is_none() && module == "fastcgi" {
+        if self.enabled() && self.cache_key.is_none() && (module == "fastcgi" || module == "uwsgi") {
             cf.warn(format_args!("no \"{}_cache_key\" for \"{}_cache\"", module, module));
         }
 

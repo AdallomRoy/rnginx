@@ -867,8 +867,13 @@ fn var_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         set_str(v, &h.value.borrow());
     } else if r.reading_body.get() {
         v.not_found = true;
+        v.no_cacheable = true;
     } else if hin.content_length_n >= 0 {
         set_str(v, hin.content_length_n.to_string().as_bytes());
+    } else if hin.chunked {
+        // ngx_http_variable_content_length: known once the body is read
+        v.not_found = true;
+        v.no_cacheable = true;
     } else {
         v.not_found = true;
     }

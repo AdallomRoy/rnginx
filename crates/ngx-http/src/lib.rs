@@ -89,6 +89,7 @@ pub mod sub_filter;
 pub mod charset_filter;
 pub mod secure_link;
 pub mod geoip;
+pub mod uwsgi;
 
 pub use request::{Request, R};
 
@@ -603,7 +604,7 @@ pub fn modules() -> Vec<ModuleDef> {
         ssl_module::ssl_module(),
         proxy::proxy_module(),
         fastcgi::fastcgi_module(),
-        stubs::uwsgi_module(),
+        uwsgi::uwsgi_module(),
         stubs::scgi_module(),
         stubs::grpc_module(),
         stubs::proxy_v2_module(),
