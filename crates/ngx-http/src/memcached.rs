@@ -24,6 +24,8 @@ pub struct MemcachedLocConf {
     pub upstream_conf: Option<Rc<crate::upstream::UpstreamSrvConf>>,
     pub gzip_flag: Val<u32>,
     pub next_upstream_not_found: Val<bool>,
+    /// the index of $memcached_key (mlcf->index)
+    pub index: Option<usize>,
 }
 
 impl Default for MemcachedLocConf {
@@ -33,6 +35,7 @@ impl Default for MemcachedLocConf {
             upstream_conf: None,
             gzip_flag: Val::unset(),
             next_upstream_not_found: Val::unset(),
+            index: None,
         }
     }
 }
@@ -46,6 +49,9 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
         c.upstream = p.upstream.clone();
         c.upstream_conf = p.upstream_conf.clone();
     }
+    if c.index.is_none() {
+        c.index = p.index;
+    }
     c.gzip_flag.merge(&p.gzip_flag, 0);
     c.next_upstream_not_found.merge(&p.next_upstream_not_found, false);
     Ok(())
@@ -53,7 +59,6 @@ fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Con
 
 pub fn memcached_module() -> ModuleDef {
     let def = HttpModuleDef {
-        preconfiguration: Some(preconfiguration),
         create_loc_conf: Some(create_loc_conf),
         merge_loc_conf: Some(merge_loc_conf),
         ..Default::default()
@@ -85,7 +90,17 @@ fn set_memcached_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
     cell.borrow_mut().upstream_conf = Some(uscf);
     cell.borrow_mut().upstream = Some(cf.args[1].clone());
     let loc = crate::get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
-    loc.borrow_mut().handler = Some(Rc::new(|r| Box::pin(handler(r))));
+    {
+        let mut clcf = loc.borrow_mut();
+        clcf.handler = Some(Rc::new(|r| Box::pin(handler(r))));
+        if clcf.name.last() == Some(&b'/') {
+            clcf.auto_redirect = true;
+        }
+    }
+    // $memcached_key is not defined by the module: a "set" or another
+    // module has to define it, or ngx_http_variables_init_vars() fails
+    let index = get_variable_index(cf, b"memcached_key")?;
+    cell.borrow_mut().index = Some(index);
     Ok(())
 }
 
@@ -108,33 +123,15 @@ fn set_gzip_flag(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Co
     Ok(())
 }
 
-fn preconfiguration(cf: &mut Conf) -> ConfResult {
-    let vars = vec![
-        VarDef { name: "memcached_key", set: None, get: Some(var_memcached_key), data: 0, flags: NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE },
-    ];
-    add_variables(cf, &vars)?;
-    Ok(())
-}
-
-fn var_memcached_key(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    v.data = Vec::new();
-    v.valid = true;
-    NGX_OK
-}
-
 async fn handler(r: R) -> i64 {
-    // Read memcached_key: nginx exposes it as $memcached_key which is
-    // usually set via `set $memcached_key $uri;`. We look up the value
-    // through the variable engine (which handles the `set` writeback).
-    let key = {
-        let name = b"memcached_key".to_vec();
-        match crate::variables::get_variable(&r, &name) {
-            Some(v) if !v.not_found && !v.data.is_empty() => v.data,
-            _ => {
-                ngx_core::ngx_log_error!(NGX_LOG_ERR, r.connection.log, None,
-                    "the \"$memcached_key\" variable is not set");
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
+    // ngx_http_memcached_create_request
+    let index = r.loc_conf::<MemcachedLocConf>(ctx_index()).borrow().index;
+    let key = match index.and_then(|i| get_indexed_variable(&r, i)) {
+        Some(v) if !v.not_found && !v.data.is_empty() => v.data,
+        _ => {
+            ngx_core::ngx_log_error!(NGX_LOG_ERR, r.connection.log, None,
+                "the \"$memcached_key\" variable is not set");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     };
     let (uscf, next_not_found, gzip_flag, tag) = {
@@ -157,7 +154,9 @@ async fn handler(r: R) -> i64 {
         Err(rc) => return rc,
     };
 
-    let cmd = format!("get {}\r\n", std::str::from_utf8(&key).unwrap_or(""));
+    let mut cmd = b"get ".to_vec();
+    ngx_core::string::escape_uri_into(&mut cmd, &key, ngx_core::string::NGX_ESCAPE_MEMCACHED);
+    cmd.extend_from_slice(b"\r\n");
 
     let (conn, buf) = loop {
         // ngx_http_upstream_connect
@@ -199,7 +198,7 @@ async fn handler(r: R) -> i64 {
 
         u.request_sent = true;
 
-        if stream.write_all(cmd.as_bytes()).await.is_err() {
+        if stream.write_all(&cmd).await.is_err() {
             match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
                 Ok(()) => continue,
                 Err(st) => return st,
