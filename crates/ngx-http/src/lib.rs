@@ -95,6 +95,7 @@ pub mod uwsgi;
 pub mod slice;
 pub mod scgi;
 pub mod grpc;
+pub mod upstream_h2;
 pub mod tunnel;
 pub mod json;
 
