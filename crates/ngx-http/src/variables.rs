@@ -1274,8 +1274,11 @@ pub static CORE_VARIABLES: &[VarDef] = &[
     VarDef { name: "arg_", set: None, get: Some(var_arg_prefix), data: 0, flags: NGX_HTTP_VAR_NOCACHEABLE | NGX_HTTP_VAR_PREFIX },
 ];
 
+/// ngx_http_variable_set_args: the arguments, and the request line's URI no
+/// longer valid for them
 fn set_args(r: &R, v: &mut VariableValue, _d: usize) {
     *r.args.borrow_mut() = v.data.clone();
+    r.valid_unparsed_uri.set(false);
 }
 
 /// ngx_http_variables_add_core_vars (preconfiguration of the core module).
