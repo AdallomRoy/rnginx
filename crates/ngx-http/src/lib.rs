@@ -94,6 +94,7 @@ pub mod geoip;
 pub mod uwsgi;
 pub mod slice;
 pub mod scgi;
+pub mod grpc;
 
 pub use request::{Request, R};
 
@@ -610,7 +611,7 @@ pub fn modules() -> Vec<ModuleDef> {
         fastcgi::fastcgi_module(),
         uwsgi::uwsgi_module(),
         scgi::scgi_module(),
-        stubs::grpc_module(),
+        grpc::grpc_module(),
         stubs::proxy_v2_module(),
         stubs::tunnel_module(),
         stubs::perl_module(),
