@@ -564,7 +564,7 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
     let wake = wake_fd();
     let chan = CHANNEL.with(|c| c.get());
     let wake_afd = if wake >= 0 { AsyncFd::with_interest(Fd(wake), tokio::io::Interest::READABLE).ok() } else { None };
-    let chan_afd = if chan >= 0 && process_type() != ProcessType::Single { AsyncFd::with_interest(Fd(chan), tokio::io::Interest::READABLE).ok() } else { None };
+    let mut chan_afd = if chan >= 0 && process_type() != ProcessType::Single { AsyncFd::with_interest(Fd(chan), tokio::io::Interest::READABLE).ok() } else { None };
     let notify = flags_notify();
     loop {
         tokio::select! {
@@ -579,7 +579,15 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
                 if r.is_err() { break; }
                 loop {
                     match read_channel(chan, &cycle.log) {
-                        Err(()) => { return; }
+                        Err(()) => {
+                            // ngx_close_connection() of the channel: signals
+                            // are still handled
+                            chan_afd = None;
+                            if unsafe { libc::close(chan) } == -1 {
+                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() socket {} failed", chan);
+                            }
+                            break;
+                        }
                         Ok(None) => break,
                         Ok(Some(ch)) => {
                             ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "channel command: {}", ch.command);

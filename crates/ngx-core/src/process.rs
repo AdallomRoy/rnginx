@@ -354,7 +354,7 @@ pub fn read_channel(s: i32, log: &Log) -> Result<Option<Channel>, ()> {
                 let cm = libc::CMSG_FIRSTHDR(&msg);
                 if (*cm).cmsg_level != libc::SOL_SOCKET || (*cm).cmsg_type != libc::SCM_RIGHTS {
                     ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned invalid ancillary data level {} or type {}", (*cm).cmsg_level, (*cm).cmsg_type);
-                    ch.fd = -1;
+                    return Err(());
                 } else {
                     let mut fd: i32 = -1;
                     std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cm), &mut fd as *mut i32 as *mut u8, std::mem::size_of::<i32>());
@@ -362,7 +362,9 @@ pub fn read_channel(s: i32, log: &Log) -> Result<Option<Channel>, ()> {
                 }
             }
         }
-        if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        // not MSG_CTRUNC: a descriptor which could not be received (EMFILE)
+        // is the "too small ancillary data" above
+        if msg.msg_flags & libc::MSG_TRUNC != 0 {
             ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() truncated data");
         }
         Ok(Some(ch))
