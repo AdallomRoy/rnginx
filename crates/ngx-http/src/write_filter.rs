@@ -229,12 +229,12 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
 /// of the connection itself (pipelined requests) is not disturbed: the
 /// client closed its side of an HTTP/1.x connection. An HTTP/2 stream is
 /// not tested.
-struct TestReading {
+pub(crate) struct TestReading {
     afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
 }
 
 impl TestReading {
-    fn new(r: &R) -> TestReading {
+    pub(crate) fn new(r: &R) -> TestReading {
         use std::os::fd::FromRawFd;
 
         if r.stream.borrow().is_some() || r.connection.fd.get() < 0 {
@@ -256,7 +256,7 @@ impl TestReading {
 
     /// Resolves with the pending socket error (0 if none) when the client
     /// has closed the connection (rev->pending_eof).
-    async fn closed(&self) -> i32 {
+    pub(crate) async fn closed(&self) -> i32 {
         use std::os::fd::AsRawFd;
 
         let afd = match &self.afd {
@@ -293,7 +293,7 @@ impl TestReading {
 /// The "closed:" part of ngx_http_test_reading: the request is finalized
 /// with NGX_HTTP_CLIENT_CLOSED_REQUEST (ngx_http_terminate_request sets
 /// the status if nothing was sent).
-fn test_reading_closed(r: &R, err: i32) -> i64 {
+pub(crate) fn test_reading_closed(r: &R, err: i32) -> i64 {
     let c = &r.connection;
 
     c.read_eof.set(true);
