@@ -39,6 +39,16 @@ pub enum End {
 
 /// Listening socket handler: start the connection task.
 pub fn init_connection(c: Rc<Connection>) {
+    if c.listening().is_some_and(|ls| ls.quic.get()) && !c.is_quic_stream() {
+        // ngx_http_v3_init_stream of a QUIC connection: ngx_quic_run()
+        // handles its first datagram at once
+        match init_http_connection(&c) {
+            Some((hc, _)) => crate::v3::request::init_quic_connection(&c, &hc),
+            None => c.close(),
+        }
+        return;
+    }
+
     ngx_core::event::spawn(async move {
         connection_task(c).await;
     });
@@ -61,7 +71,46 @@ fn addr_conf_for(c: &Rc<Connection>) -> Option<Rc<AddrConf>> {
     port.addrs.first().map(|(_, c)| c.clone())
 }
 
+/// The part of ngx_http_init_connection before the connection reads:
+/// c->data (the http connection) and the log context.
+fn init_http_connection(c: &Rc<Connection>) -> Option<(Rc<HttpConnection>, Rc<HttpLogCtx>)> {
+    let addr_conf = addr_conf_for(c)?;
+    let conf_ctx = addr_conf.default_server.borrow().ctx.clone();
+    let cscf = srv_conf_from_ctx(&conf_ctx);
+    let hb_size = *cscf.borrow().client_header_buffer_size;
+    let hc = Rc::new(HttpConnection {
+        addr_conf: addr_conf.clone(),
+        conf_ctx: std::cell::RefCell::new(conf_ctx),
+        ssl: Cell::new(false),
+        proxy_protocol: Cell::new(false),
+        ssl_servername: std::cell::RefCell::new(None),
+        ssl_servername_regex: std::cell::RefCell::new(None),
+        keepalive_timeout: Cell::new(0),
+        buffer: std::cell::RefCell::new(HeaderBuf { data: Vec::new(), pos: 0, last: 0, allocated: false, cap: hb_size, nbusy: 0 }),
+        nbusy: Cell::new(0),
+        v3_session: std::cell::RefCell::new(None),
+    });
+    let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(c), request: std::cell::RefCell::new(None), current_request: std::cell::RefCell::new(None) });
+    // the log of a QUIC connection is that of the listening so far
+    c.log.set_connection(c.number);
+    c.log.set_context(Some(log_ctx.clone()));
+    c.log.set_action(Some("waiting for request"));
+    c.log_error.set(ngx_core::connection::NGX_ERROR_INFO);
+    let hc_any: Rc<dyn std::any::Any> = hc.clone();
+    *c.data.borrow_mut() = Some(hc_any);
+    Some((hc, log_ctx))
+}
+
 async fn connection_task(c: Rc<Connection>) {
+    if c.is_quic_stream() {
+        // ngx_http_init_connection of a QUIC stream: ngx_http_v3_init_stream
+        match init_http_connection(&c) {
+            Some((hc, log_ctx)) => crate::v3::request::init_stream(&c, &hc, &log_ctx).await,
+            None => c.close(),
+        }
+        return;
+    }
+
     let addr_conf = match addr_conf_for(&c) {
         Some(a) => a,
         None => {
@@ -82,6 +131,7 @@ async fn connection_task(c: Rc<Connection>) {
         keepalive_timeout: Cell::new(0),
         buffer: std::cell::RefCell::new(HeaderBuf { data: Vec::new(), pos: 0, last: 0, allocated: false, cap: hb_size, nbusy: 0 }),
         nbusy: Cell::new(0),
+        v3_session: std::cell::RefCell::new(None),
     });
     let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(&c), request: std::cell::RefCell::new(None), current_request: std::cell::RefCell::new(None) });
     c.log.set_context(Some(log_ctx.clone()));
@@ -171,6 +221,24 @@ async fn connection_task(c: Rc<Connection>) {
     }
 }
 
+/// A request stream of an hq-interop (HTTP/0.9 over QUIC) connection:
+/// ngx_http_wait_request_handler and the request, on the stream.
+pub async fn hq_request_stream(c: Rc<Connection>, hc: Rc<HttpConnection>, log_ctx: Rc<HttpLogCtx>) {
+    if wait_request(&c, &hc).await.is_err() {
+        close_connection(&c);
+        return;
+    }
+
+    c.log.set_action(Some("reading client request line"));
+
+    let r = create_request(&c, &hc, &log_ctx);
+
+    let _ = run_request(&r).await;
+
+    close_request_final(&r);
+    close_connection(&c);
+}
+
 /// c->close set and the connection woken (ngx_shutdown_timer_handler:
 /// c->close = 1, c->error = 1, then its read handler)
 async fn connection_close(c: &Connection) {
@@ -187,7 +255,15 @@ async fn connection_close(c: &Connection) {
 
 /// ngx_http_close_connection
 pub fn close_connection(c: &Rc<Connection>) {
-    http_debug_c(c, "close http connection");
+    http_debug_c(c, &format!("close http connection: {}", c.fd.get()));
+    if c.is_quic_stream() {
+        // ngx_ssl_shutdown() does nothing for a QUIC stream
+        crate::v3::request::reset_stream(c);
+        ngx_core::connection::stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        c.destroyed.set(true);
+        c.close();
+        return;
+    }
     if !crate::ssl_module::ngx_http_ssl_close_connection(c, close_connection) {
         // closed once ngx_ssl_shutdown() completes
         return;
@@ -1090,6 +1166,10 @@ async fn finalize_connection(r: &R) -> End {
         // stream task once the request returns
         return End::Close;
     }
+    if r.connection.is_quic_stream() {
+        // ngx_http_close_request(r, 0), done by the stream task
+        return End::Close;
+    }
     let c = r.connection.clone();
     if r.terminated.get() || c.error.get() {
         return End::Close;
@@ -1188,7 +1268,7 @@ pub fn free_request(r: &R, rc: i64) {
         r.logged.set(true);
     }
     log.set_action(Some("closing request"));
-    if r.connection.timedout.get() {
+    if r.connection.timedout.get() && !r.connection.is_quic_stream() {
         let clcf = r.clcf();
         if *clcf.borrow().reset_timedout_connection {
             r.connection.set_linger_reset();

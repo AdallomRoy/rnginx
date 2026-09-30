@@ -298,6 +298,14 @@ fn event_module_init(cycle: &mut Cycle) -> Result<(), ()> {
 
 fn event_process_init(cycle: &Rc<Cycle>) -> Result<(), ()> {
     set_connection_n(cycle.connection_n.max(1));
+
+    // a connection for each listening socket, but those of the other
+    // workers with reuseport
+    let worker = worker_index();
+    let n = cycle.listening.iter().filter(|ls| ls.fd.get() != -1 && !(ls.reuseport.get() && ls.worker.get() as i64 != worker)).count();
+
+    crate::connection::reserve_connections(n);
+
     if let Some(e) = get_event_conf(cycle) {
         EVENT_CONF.with(|c| *c.borrow_mut() = Some(e));
     }
@@ -425,6 +433,8 @@ fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
             }
         }
     }
+    // the connection of the channel (ngx_add_channel_event)
+    crate::connection::reserve_connections(1);
     // close other workers' channel[1] and our channel[0]
     let slot = PROCESS_SLOT.with(|p| p.get());
     PROCESSES.with(|p| {
@@ -724,7 +734,14 @@ async fn accept_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                     }
                 }
             }
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "*{} accept: {} fd:{}", c.number, B(&c.addr_text.borrow()), s);
+            if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+                // c->log is a copy of ls->log until the handler sets the
+                // connection number in it
+                let addr = c.sockaddr.borrow().to_text(true);
+                c.log.set_connection(0);
+                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "*{} accept: {} fd:{}", c.number, B(&addr), s);
+                c.log.set_connection(c.number);
+            }
             handler(c);
 
             if !multi_accept {
@@ -1112,6 +1129,8 @@ fn event_runtime() -> tokio::runtime::Runtime {
 /// ngx_process_events_and_timers()
 fn events_unparked() {
     EVENTS_PARKED.store(false, Ordering::SeqCst);
+
+    crate::times::update_event_msec();
 
     let pt = process_type();
     let exit = SIG_TERMINATE.load(Ordering::SeqCst) || (pt != ProcessType::Worker && SIG_QUIT.load(Ordering::SeqCst));

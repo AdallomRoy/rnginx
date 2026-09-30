@@ -51,6 +51,7 @@ pub mod listen_event;
 pub mod process;
 pub mod event;
 pub mod event_udp;
+pub mod quic;
 pub mod ssl;
 pub mod radix_tree;
 pub mod stubs;

@@ -599,6 +599,84 @@ pub unsafe fn sk_X509_NAME_pop_free(sk: *mut OPENSSL_STACK) {
     OPENSSL_sk_pop_free(sk, Some(x509_name_free_void))
 }
 
+pub type EVP_PKEY_CTX = c_void;
+
+pub type SSL_CTX_keylog_cb = unsafe extern "C" fn(ssl: *const SSL, line: *const c_char);
+pub type SSL_msg_cb = unsafe extern "C" fn(write_p: c_int, version: c_int, content_type: c_int, buf: *const c_void, len: usize, ssl: *mut SSL, arg: *mut c_void);
+pub type SSL_custom_ext_add_cb_ex = unsafe extern "C" fn(s: *mut SSL, ext_type: c_uint, context: c_uint, out: *mut *const u8, outlen: *mut usize, x: *mut X509, chainidx: usize, al: *mut c_int, add_arg: *mut c_void) -> c_int;
+pub type SSL_custom_ext_free_cb_ex = unsafe extern "C" fn(s: *mut SSL, ext_type: c_uint, context: c_uint, out: *const u8, add_arg: *mut c_void);
+pub type SSL_custom_ext_parse_cb_ex = unsafe extern "C" fn(s: *mut SSL, ext_type: c_uint, context: c_uint, inp: *const u8, inlen: usize, x: *mut X509, chainidx: usize, al: *mut c_int, parse_arg: *mut c_void) -> c_int;
+
+extern "C" {
+    // QUIC (ngx_event_quic_protection.c, ngx_event_quic_tokens.c,
+    // ngx_event_quic_openssl_compat.c)
+    pub fn EVP_CIPHER_CTX_new() -> *mut EVP_CIPHER_CTX;
+    pub fn EVP_CIPHER_CTX_free(ctx: *mut EVP_CIPHER_CTX);
+    pub fn EVP_CIPHER_CTX_ctrl(ctx: *mut EVP_CIPHER_CTX, ty: c_int, arg: c_int, ptr: *mut c_void) -> c_int;
+    pub fn EVP_CIPHER_CTX_is_encrypting(ctx: *const EVP_CIPHER_CTX) -> c_int;
+    pub fn EVP_CIPHER_CTX_get0_cipher(ctx: *const EVP_CIPHER_CTX) -> *const EVP_CIPHER;
+    pub fn EVP_CIPHER_get_mode(cipher: *const EVP_CIPHER) -> c_int;
+    pub fn EVP_CipherInit_ex(ctx: *mut EVP_CIPHER_CTX, cipher: *const EVP_CIPHER, e: *mut ENGINE, key: *const u8, iv: *const u8, enc: c_int) -> c_int;
+    pub fn EVP_CipherUpdate(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, outl: *mut c_int, inp: *const u8, inl: c_int) -> c_int;
+    pub fn EVP_CipherFinal_ex(ctx: *mut EVP_CIPHER_CTX, outm: *mut u8, outl: *mut c_int) -> c_int;
+    pub fn EVP_EncryptUpdate(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, outl: *mut c_int, inp: *const u8, inl: c_int) -> c_int;
+    pub fn EVP_EncryptFinal_ex(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, outl: *mut c_int) -> c_int;
+    pub fn EVP_DecryptUpdate(ctx: *mut EVP_CIPHER_CTX, out: *mut u8, outl: *mut c_int, inp: *const u8, inl: c_int) -> c_int;
+    pub fn EVP_DecryptFinal_ex(ctx: *mut EVP_CIPHER_CTX, outm: *mut u8, outl: *mut c_int) -> c_int;
+    pub fn EVP_aes_128_gcm() -> *const EVP_CIPHER;
+    pub fn EVP_aes_256_gcm() -> *const EVP_CIPHER;
+    pub fn EVP_aes_128_ccm() -> *const EVP_CIPHER;
+    pub fn EVP_aes_128_ctr() -> *const EVP_CIPHER;
+    pub fn EVP_aes_256_ctr() -> *const EVP_CIPHER;
+    pub fn EVP_chacha20() -> *const EVP_CIPHER;
+    pub fn EVP_chacha20_poly1305() -> *const EVP_CIPHER;
+    pub fn EVP_sha384() -> *const EVP_MD;
+    pub fn EVP_PKEY_CTX_new_id(id: c_int, e: *mut ENGINE) -> *mut EVP_PKEY_CTX;
+    pub fn EVP_PKEY_CTX_free(ctx: *mut EVP_PKEY_CTX);
+    pub fn EVP_PKEY_derive_init(ctx: *mut EVP_PKEY_CTX) -> c_int;
+    pub fn EVP_PKEY_derive(ctx: *mut EVP_PKEY_CTX, key: *mut u8, keylen: *mut usize) -> c_int;
+    pub fn EVP_PKEY_CTX_set_hkdf_mode(ctx: *mut EVP_PKEY_CTX, mode: c_int) -> c_int;
+    pub fn EVP_PKEY_CTX_set_hkdf_md(ctx: *mut EVP_PKEY_CTX, md: *const EVP_MD) -> c_int;
+    pub fn EVP_PKEY_CTX_set1_hkdf_key(ctx: *mut EVP_PKEY_CTX, key: *const u8, keylen: c_int) -> c_int;
+    pub fn EVP_PKEY_CTX_set1_hkdf_salt(ctx: *mut EVP_PKEY_CTX, salt: *const u8, saltlen: c_int) -> c_int;
+    pub fn EVP_PKEY_CTX_add1_hkdf_info(ctx: *mut EVP_PKEY_CTX, info: *const u8, infolen: c_int) -> c_int;
+    pub fn SSL_CIPHER_get_id(c: *const SSL_CIPHER) -> u32;
+    pub fn SSL_CTX_set_keylog_callback(ctx: *mut SSL_CTX, cb: Option<SSL_CTX_keylog_cb>);
+    pub fn SSL_CTX_has_client_custom_ext(ctx: *const SSL_CTX, ext_type: c_uint) -> c_int;
+    pub fn SSL_CTX_add_custom_ext(ctx: *mut SSL_CTX, ext_type: c_uint, context: c_uint, add_cb: Option<SSL_custom_ext_add_cb_ex>, free_cb: Option<SSL_custom_ext_free_cb_ex>, add_arg: *mut c_void, parse_cb: Option<SSL_custom_ext_parse_cb_ex>, parse_arg: *mut c_void) -> c_int;
+    pub fn SSL_set_msg_callback(ssl: *mut SSL, cb: Option<SSL_msg_cb>);
+    pub fn SSL_set_bio(ssl: *mut SSL, rbio: *mut BIO, wbio: *mut BIO);
+    pub fn SSL_set_max_early_data(ssl: *mut SSL, max: u32) -> c_int;
+    pub fn BIO_s_null() -> *const BIO_METHOD;
+}
+
+pub const EVP_PKEY_HKDF: c_int = 1036;
+pub const EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY: c_int = 1;
+pub const EVP_PKEY_HKDEF_MODE_EXPAND_ONLY: c_int = 2;
+
+pub const EVP_CIPH_CCM_MODE: c_int = 0x7;
+
+pub const EVP_CTRL_AEAD_SET_IVLEN: c_int = 0x9;
+pub const EVP_CTRL_AEAD_GET_TAG: c_int = 0x10;
+pub const EVP_CTRL_AEAD_SET_TAG: c_int = 0x11;
+
+pub const TLS1_3_CK_AES_128_GCM_SHA256: u32 = 0x03001301;
+pub const TLS1_3_CK_AES_256_GCM_SHA384: u32 = 0x03001302;
+pub const TLS1_3_CK_CHACHA20_POLY1305_SHA256: u32 = 0x03001303;
+pub const TLS1_3_CK_AES_128_CCM_SHA256: u32 = 0x03001304;
+
+pub const SSL_EXT_CLIENT_HELLO: c_uint = 0x0080;
+pub const SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS: c_uint = 0x0400;
+
+pub const SSL3_RT_HEADER_LENGTH: usize = 5;
+pub const SSL3_RT_ALERT: c_int = 21;
+pub const SSL3_RT_HANDSHAKE: c_int = 22;
+pub const SSL3_RT_APPLICATION_DATA: c_int = 23;
+
+pub const SSL_AD_UNEXPECTED_MESSAGE: c_int = 10;
+pub const SSL_AD_MISSING_EXTENSION: c_int = 109;
+pub const SSL_AD_NO_APPLICATION_PROTOCOL: c_int = 120;
+
 #[cfg(test)]
 mod tests {
     use super::*;

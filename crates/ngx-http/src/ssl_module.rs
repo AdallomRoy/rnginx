@@ -41,6 +41,12 @@ const NGX_HTTP_ALPN_PROTOS: &[u8] = b"\x08http/1.1\x08http/1.0\x08http/0.9";
 /// NGX_HTTP_V2_ALPN_PROTO NGX_HTTP_ALPN_PROTOS
 const NGX_HTTP_V2_ALPN_PROTOS: &[u8] = b"\x02h2\x08http/1.1\x08http/1.0\x08http/0.9";
 
+/// NGX_HTTP_V3_ALPN_PROTO NGX_HTTP_V3_HQ_ALPN_PROTO
+const NGX_HTTP_V3_ALPN_PROTOS: &[u8] = b"\x02h3\x0Ahq-interop";
+
+/// SSL_OP_ENABLE_MIDDLEBOX_COMPAT
+const SSL_OP_ENABLE_MIDDLEBOX_COMPAT: u64 = 0x00100000;
+
 /// ngx_http_ssl_srv_conf_t
 pub struct HttpSslSrvConf {
     pub prefer_server_ciphers: Val<bool>,
@@ -220,6 +226,19 @@ unsafe extern "C" fn ngx_http_ssl_alpn_select(ssl_conn: *mut SSL, out: *mut *con
     let hc = c.and_then(http_connection_of);
 
     let srv: &[u8] = match hc {
+        Some(hc) if hc.addr_conf.quic => {
+            let h3scf = crate::v3::module::srv_conf_of(&hc);
+
+            if h3scf.enable && h3scf.enable_hq {
+                NGX_HTTP_V3_ALPN_PROTOS
+            } else if h3scf.enable_hq {
+                crate::v3::NGX_HTTP_V3_HQ_ALPN_PROTO
+            } else if h3scf.enable {
+                crate::v3::NGX_HTTP_V3_ALPN_PROTO
+            } else {
+                return SSL_TLSEXT_ERR_ALERT_FATAL;
+            }
+        }
         Some(hc) if crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2 => NGX_HTTP_V2_ALPN_PROTOS,
         _ => NGX_HTTP_ALPN_PROTOS,
     };
@@ -896,10 +915,18 @@ fn ngx_http_ssl_init(cf: &mut Conf) -> ConfResult {
 
     let m = cmcf.borrow();
 
+    // NGX_QUIC_OPENSSL_COMPAT
+
+    let compat = m.ports.iter().any(|port| port.addrs.iter().any(|addr| addr.opt.quic));
+
     for port in m.ports.iter() {
         for addr in port.addrs.iter() {
             if !addr.opt.ssl && !addr.opt.quic {
                 continue;
+            }
+
+            if compat {
+                ngx_http_ssl_quic_compat_init(cf, addr)?;
             }
 
             let name = if addr.opt.quic { "quic" } else { "ssl" };
@@ -940,6 +967,30 @@ fn ngx_http_ssl_init(cf: &mut Conf) -> ConfResult {
                 let c = cscf.borrow();
                 ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "no \"ssl_certificate\" is defined for the \"listen ... {}\" directive in {}:{}", name, B(&c.file_name), c.line);
                 return Err(ConfError::Logged);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// ngx_http_ssl_quic_compat_init
+fn ngx_http_ssl_quic_compat_init(cf: &mut Conf, addr: &crate::core::ConfAddr) -> ConfResult {
+    for cscf in addr.servers.iter() {
+        let sscf = sscf_of_ctx(&cscf.borrow().ctx);
+
+        let (certificates, reject_handshake, ctx) = {
+            let s = sscf.borrow();
+            (s.certificates.is_set(), s.reject_handshake.as_option().copied().unwrap_or(false), s.ssl.ctx)
+        };
+
+        if certificates || reject_handshake {
+            if ngx_core::quic::openssl_compat::ngx_quic_compat_ext_init(&cf.log, ctx) != NGX_OK {
+                return Err(ConfError::Logged);
+            }
+
+            if addr.opt.quic {
+                ngx_core::quic::openssl_compat::ngx_quic_compat_keylog_init(ctx);
             }
         }
     }
@@ -1337,6 +1388,10 @@ unsafe extern "C" fn ngx_http_ssl_servername(ssl_conn: *mut SSL, ad: *mut c_int,
             SSL_set_options(ssl_conn, SSL_CTX_get_options(sctx));
 
             SSL_set_options(ssl_conn, SSL_OP_NO_RENEGOTIATION);
+
+            if c.listening().is_some_and(|ls| ls.quic.get()) {
+                SSL_clear_options(ssl_conn, SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
+            }
         }
 
         false

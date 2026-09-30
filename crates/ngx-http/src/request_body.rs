@@ -19,7 +19,7 @@ fn new_body() -> RequestBody {
 
 /// ngx_http_test_expect: send "100 Continue" if requested.
 pub async fn test_expect(r: &R) -> i64 {
-    if r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() {
+    if r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() || r.connection.is_quic_stream() {
         return NGX_OK;
     }
     let expect = match &r.headers_in.borrow().expect {
@@ -127,6 +127,9 @@ async fn start_read_client_request_body(r: &R) -> i64 {
     if r.stream.borrow().is_some() {
         return crate::v2::request_body::read_request_body(r, &rb).await;
     }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
+        return crate::v3::request::read_request_body(r, &rb).await;
+    }
     let hc = r.http_connection.clone();
     // preread bytes already in the header buffer
     let preread: Vec<u8> = {
@@ -225,6 +228,10 @@ pub async fn read_unbuffered_request_body(r: &R) -> i64 {
         }
         return rc;
     }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
+        // ngx_http_v3_read_unbuffered_request_body() clears r->reading_body
+        return crate::v3::request::read_unbuffered_request_body(r).await;
+    }
     let rb = match r.request_body.borrow().clone() {
         Some(rb) => rb,
         None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
@@ -241,6 +248,10 @@ pub async fn read_unbuffered_request_body(r: &R) -> i64 {
 pub async fn wait_request_body(r: &R) {
     if let Some(stream) = crate::v2::stream::request_stream(r) {
         stream.notify.notified().await;
+        return;
+    }
+    if r.connection.is_quic_stream() {
+        crate::v3::request::wait_request_body(r).await;
         return;
     }
     // an error is reported by the next read
@@ -656,6 +667,9 @@ pub async fn discard_request_body(r: &R) -> i64 {
     }
     if let Some(stream) = crate::v2::stream::request_stream(r) {
         stream.skip_data.set(true);
+        return NGX_OK;
+    }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
         return NGX_OK;
     }
     if test_expect(r).await != NGX_OK {

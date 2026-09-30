@@ -95,6 +95,7 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         if last || r.out.borrow().iter().any(|b| b.last_buf) {
             r.out.borrow_mut().clear();
             r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
+            r.response_sent.set(true);
             return NGX_OK;
         }
         if r.out.borrow().is_empty() {
@@ -263,6 +264,9 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             // drop special (sync/flush/last) buffers as sent
             r.out.borrow_mut().clear();
             r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
+            if last {
+                r.response_sent.set(true);
+            }
             return NGX_OK;
         }
         if limit_rate > 0 {
@@ -375,14 +379,21 @@ impl Drop for StreamTestReading {
 /// not tested.
 pub(crate) struct TestReading {
     afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    /// the stream of an HTTP/3 request: ngx_http_test_reading tests
+    /// rev->error
+    quic: Option<(Rc<ngx_core::connection::Connection>, Rc<ngx_core::quic::QuicStream>)>,
 }
 
 impl TestReading {
     pub(crate) fn new(r: &R) -> TestReading {
         use std::os::fd::FromRawFd;
 
+        if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(&r.connection) {
+            return TestReading { afd: None, quic: Some((r.connection.clone(), qs)) };
+        }
+
         if r.stream.borrow().is_some() || r.connection.fd.get() < 0 {
-            return TestReading { afd: None };
+            return TestReading { afd: None, quic: None };
         }
 
         // SAFETY: dup() of the connection's open socket, owned (and
@@ -390,18 +401,24 @@ impl TestReading {
         let dup = unsafe { libc::dup(r.connection.fd.get()) };
 
         if dup < 0 {
-            return TestReading { afd: None };
+            return TestReading { afd: None, quic: None };
         }
 
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
 
-        TestReading { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok() }
+        TestReading { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), quic: None }
     }
 
     /// Resolves with the pending socket error (0 if none) when the client
     /// has closed the connection (rev->pending_eof).
     pub(crate) async fn closed(&self) -> i32 {
         use std::os::fd::AsRawFd;
+
+        if let Some((c, qs)) = &self.quic {
+            ngx_core::quic::streams::wait_stream(qs, || qs.read_error.get()).await;
+            c.error.set(true);
+            return 0;
+        }
 
         let afd = match &self.afd {
             Some(a) => a,

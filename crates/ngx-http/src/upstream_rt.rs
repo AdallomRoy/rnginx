@@ -817,6 +817,8 @@ pub fn process_header_line(r: &R, u: &mut Upstream, h: &Header) -> Result<(), u3
 pub struct ClientWatch {
     afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
     stream: Option<Rc<crate::v2::StreamWatch>>,
+    /// an HTTP/3 stream: its c->write->error
+    quic: Option<Rc<ngx_core::quic::QuicStream>>,
 }
 
 impl ClientWatch {
@@ -824,11 +826,15 @@ impl ClientWatch {
         use std::os::fd::FromRawFd;
 
         if let Some(w) = stream {
-            return ClientWatch { afd: None, stream: Some(w.clone()) };
+            return ClientWatch { afd: None, stream: Some(w.clone()), quic: None };
+        }
+
+        if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(&r.connection) {
+            return ClientWatch { afd: None, stream: None, quic: Some(qs) };
         }
 
         if r.stream.borrow().is_some() || r.http_version.get() >= NGX_HTTP_VERSION_20 || r.connection.fd.get() < 0 {
-            return ClientWatch { afd: None, stream: None };
+            return ClientWatch { afd: None, stream: None, quic: None };
         }
 
         // SAFETY: dup() of the connection's open socket; the duplicate is
@@ -836,12 +842,12 @@ impl ClientWatch {
         let dup = unsafe { libc::dup(r.connection.fd.get()) };
 
         if dup < 0 {
-            return ClientWatch { afd: None, stream: None };
+            return ClientWatch { afd: None, stream: None, quic: None };
         }
 
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
 
-        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), stream: None }
+        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), stream: None, quic: None }
     }
 
     /// Resolves with the pending socket error (0 if none) when the client
@@ -852,6 +858,11 @@ impl ClientWatch {
 
         if let Some(w) = &self.stream {
             w.closed().await;
+            return 0;
+        }
+
+        if let Some(qs) = &self.quic {
+            ngx_core::quic::streams::wait_stream(qs, || qs.write_error.get()).await;
             return 0;
         }
 
@@ -929,6 +940,15 @@ fn broken_connection(r: &R, cacheable: bool, connected: bool, err: i32) -> Optio
     // c->error: an HTTP/2 stream reset, or its connection closed
     if r.stream.borrow().is_some() {
         if !cacheable {
+            return Some(NGX_HTTP_CLIENT_CLOSED_REQUEST);
+        }
+
+        return None;
+    }
+
+    // c->write->error of an HTTP/3 stream
+    if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(c) {
+        if qs.write_error.get() {
             return Some(NGX_HTTP_CLIENT_CLOSED_REQUEST);
         }
 

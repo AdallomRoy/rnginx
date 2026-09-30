@@ -26,6 +26,7 @@ pub mod write_filter;
 pub mod huff_decode;
 pub mod huff_encode;
 pub mod v2;
+pub mod v3;
 pub mod memcached;
 pub mod special_response;
 pub mod static_module;
@@ -613,7 +614,7 @@ pub fn modules() -> Vec<ModuleDef> {
         log::log_module(),
         upstream::upstream_module(),
         v2::module::v2_module(),
-        stubs::v3_module(),
+        v3::module::v3_module(),
         static_module::static_module(),
         gzip_static::gzip_static_module(),
         dav::dav_module(),
@@ -664,7 +665,7 @@ pub fn modules() -> Vec<ModuleDef> {
         header_filter::header_filter_module(),
         chunked_filter::chunked_filter_module(),
         v2::filter::v2_filter_module(),
-        stubs::v3_filter_module(),
+        v3::filter::v3_filter_module(),
         range_filter::range_header_filter_module(),
         gzip_filter::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),

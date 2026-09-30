@@ -11,6 +11,9 @@ use ngx_core::ngx_log_debug;
 /// Send as much of `chain` as possible up to `limit` bytes; returns bytes sent.
 /// Buffers are advanced in place (like ngx_chain_update_sent); fully sent buffers are removed.
 pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    if c.is_quic_stream() {
+        return quic_send_chain(c, chain, limit).await;
+    }
     if c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get()) {
         return ssl_send_chain(c, chain, limit).await;
     }
@@ -151,6 +154,62 @@ async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
     ngx_core::buf::chain_update_sent(chain, n);
 
     Ok(n)
+}
+
+/// c->send_chain of a QUIC stream: ngx_quic_stream_send_chain(), the data
+/// copied to the stream within its flow control window (the buffers not
+/// in memory are skipped, as ngx_quic_write_buffer does), waiting for the
+/// write event while the window is closed. `limit` 0 is none.
+async fn quic_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    let mut total: i64 = 0;
+
+    loop {
+        while let Some(b) = chain.front() {
+            if b.buf_size() == 0 {
+                chain.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let (n, left) = {
+            let mut iov: Vec<&[u8]> = chain
+                .iter()
+                .filter(|b| b.in_memory() && b.last > b.pos)
+                .filter_map(|b| match &b.data {
+                    BufData::Memory(v) => Some(&v[b.pos..b.last]),
+                    _ => None,
+                })
+                .collect();
+
+            if iov.is_empty() {
+                return Ok(total);
+            }
+
+            let before: usize = iov.iter().map(|s| s.len()).sum();
+
+            let budget = if limit > 0 { (limit - total) as u64 } else { 0 };
+
+            if ngx_core::quic::streams::ngx_quic_stream_send_chain(c, &mut iov, budget).is_err() {
+                return Err(io::Error::other("quic stream send failed"));
+            }
+
+            let after: usize = iov.iter().map(|s| s.len()).sum();
+
+            (before - after, after)
+        };
+
+        total += n as i64;
+
+        ngx_core::buf::chain_update_sent(chain, n as i64);
+
+        if left == 0 || (limit > 0 && total >= limit) {
+            return Ok(total);
+        }
+
+        // wev->ready = 0: the write event, once the peer acknowledges data
+        c.writable().await?;
+    }
 }
 
 /// Convenience: send a whole chain (awaiting writability) — used by simple paths.

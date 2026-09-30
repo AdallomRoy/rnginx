@@ -4,6 +4,23 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use crate::string::{atoi, starts_with_ignore_case, B};
 
+/// ngx_cmp_sockaddr: NGX_OK for the same address (and port, if asked),
+/// else NGX_DECLINED
+pub fn cmp_sockaddr(a: &SockAddr, b: &SockAddr, cmp_port: bool) -> i64 {
+    let same = match (a, b) {
+        (SockAddr::V4(x), SockAddr::V4(y)) => x.ip() == y.ip() && (!cmp_port || x.port() == y.port()),
+        (SockAddr::V6(x), SockAddr::V6(y)) => x.ip() == y.ip() && (!cmp_port || x.port() == y.port()),
+        (SockAddr::Unix(x), SockAddr::Unix(y)) => x == y,
+        _ => false,
+    };
+
+    if same {
+        crate::rc::NGX_OK
+    } else {
+        crate::rc::NGX_DECLINED
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SockAddr {
     V4(SocketAddrV4),

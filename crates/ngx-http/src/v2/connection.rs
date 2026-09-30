@@ -847,7 +847,7 @@ async fn finish(h2c: &Rc<H2Connection>, d: &Driver) {
         let _ = send_output_queue(h2c, d);
     }
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "close http connection");
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "close http connection: {}", c.fd.get());
 
     // Break the reference cycles through the tree and the output queue.
     h2c.last_out.borrow_mut().clear();

@@ -71,7 +71,13 @@ const NGX_SOCKADDRLEN: usize = std::mem::size_of::<libc::sockaddr_un>();
 /// A cmsghdr buffer, aligned for cmsghdr: enough for
 /// CMSG_SPACE(sizeof(ngx_addrinfo_t)).
 #[repr(C, align(8))]
-struct CmsgBuf([u8; 64]);
+pub(crate) struct CmsgBuf(pub(crate) [u8; 64]);
+
+impl Default for CmsgBuf {
+    fn default() -> Self {
+        CmsgBuf([0; 64])
+    }
+}
 
 /// ngx_log_debug with an error number, e.g. "recvmsg() not ready (11: ...)"
 macro_rules! udp_debug_err {
@@ -211,6 +217,10 @@ impl UdpListening {
 pub fn stop_recvmsg(ls: &Listening) {
     let fd = ls.fd.get();
 
+    if ls.quic.get() {
+        crate::quic::udp::ngx_quic_close_listening(ls);
+    }
+
     let ul = LISTENINGS.with(|m| m.borrow_mut().remove(&fd));
 
     if let Some(ul) = ul {
@@ -236,7 +246,10 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
         None => return,
     };
 
-    let mut buffer = vec![0u8; NGX_UDP_BUFFER_SIZE];
+    // ngx_quic_recvmsg for a QUIC listening socket
+    let quic = ls.quic.get();
+
+    let mut buffer = vec![0u8; if quic { crate::quic::NGX_QUIC_MAX_UDP_PAYLOAD_SIZE } else { NGX_UDP_BUFFER_SIZE }];
 
     loop {
         // the datagrams of the connections which left the lookup unread
@@ -255,7 +268,11 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
 
             let local_sockaddr = key.local.clone().unwrap_or_else(|| ls.sockaddr.clone());
 
-            dispatch(&ul, &ls, &handler, &log, key.sockaddr, local_sockaddr, &data);
+            if quic {
+                crate::quic::udp::ngx_quic_dispatch(&ls, &handler, &log, key.sockaddr, local_sockaddr, &data);
+            } else {
+                dispatch(&ul, &ls, &handler, &log, key.sockaddr, local_sockaddr, &data);
+            }
 
             tokio::task::yield_now().await;
         }
@@ -283,7 +300,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
 
         let available = crate::event::event_conf().map(|c| *c.borrow().multi_accept).unwrap_or(false);
 
-        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "recvmsg on {}, ready: {}", B(&ls.addr_text), available as i32);
+        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "{}recvmsg on {}, ready: {}", if quic { "quic " } else { "" }, B(&ls.addr_text), available as i32);
 
         let mut again = false;
 
@@ -313,7 +330,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                 Recvmsg::Datagram(n, sockaddr, local_sockaddr) => (n, sockaddr, local_sockaddr),
             };
 
-            let more = dispatch(&ul, &ls, &handler, &log, sockaddr, local_sockaddr, &buffer[..n]);
+            let more = if quic { crate::quic::udp::ngx_quic_dispatch(&ls, &handler, &log, sockaddr, local_sockaddr, &buffer[..n]) } else { dispatch(&ul, &ls, &handler, &log, sockaddr, local_sockaddr, &buffer[..n]) };
 
             // the session handles the datagram before the next one is read
 
@@ -369,21 +386,23 @@ fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], log: &Log) -> Recvmsg {
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
 
+    let quic = if ls.quic.get() { "quic " } else { "" };
+
     if n == -1 {
         let err = os::errno();
 
         if err == libc::EAGAIN {
-            udp_debug_err!(log, err, "recvmsg() not ready");
+            udp_debug_err!(log, err, "{}recvmsg() not ready", quic);
             return Recvmsg::Again;
         }
 
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "recvmsg() failed");
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "{}recvmsg() failed", quic);
 
         return Recvmsg::Error;
     }
 
     if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-        ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() truncated data");
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "{}recvmsg() truncated data", quic);
         return Recvmsg::Truncated;
     }
 
@@ -432,7 +451,7 @@ fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], log: &Log) -> Recvmsg {
 }
 
 /// CMSG_SPACE(sizeof(ngx_addrinfo_t))
-fn cmsg_space_addrinfo() -> usize {
+pub(crate) fn cmsg_space_addrinfo() -> usize {
     let size = std::mem::size_of::<libc::in_pktinfo>().max(std::mem::size_of::<libc::in6_pktinfo>());
     unsafe { libc::CMSG_SPACE(size as u32) as usize }
 }
@@ -498,7 +517,7 @@ fn dispatch(ul: &Rc<UdpListening>, ls: &Rc<Listening>, handler: &ListenHandler, 
 }
 
 /// ngx_debug_accepted_connection
-fn debug_accepted_connection(c: &Connection, log: &Log) {
+pub(crate) fn debug_accepted_connection(c: &Connection, log: &Log) {
     if log.level() & NGX_LOG_DEBUG_CONNECTION != 0 {
         return;
     }

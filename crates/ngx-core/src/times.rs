@@ -223,6 +223,30 @@ pub fn current_msec() -> u64 {
     ts.tv_sec as u64 * 1000 + (ts.tv_nsec / 1_000_000) as u64
 }
 
+thread_local! {
+    static EVENT_MSEC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// ngx_current_msec as the event handlers see it: the same all along an
+/// iteration of the event loop (see update_event_msec()), for the code
+/// whose delays depend on it (QUIC: a packet sent in the handler of the
+/// datagram it answers is sent at the time the datagram came)
+pub fn event_msec() -> u64 {
+    match EVENT_MSEC.with(|t| t.get()) {
+        0 => update_event_msec(),
+        t => t,
+    }
+}
+
+/// ngx_time_update() of the event loop, once epoll_wait() returns; a
+/// QUIC connection's handlers start with it too, which run in their own
+/// tasks here.
+pub fn update_event_msec() -> u64 {
+    let t = current_msec();
+    EVENT_MSEC.with(|e| e.set(t));
+    t
+}
+
 pub fn cached() -> CachedTime {
     update();
     CACHED.with(|c| c.borrow().clone())

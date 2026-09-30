@@ -277,6 +277,8 @@ pub struct HttpConnection {
     /// Client header buffer shared by pipelined requests.
     pub buffer: RefCell<HeaderBuf>,
     pub nbusy: Cell<usize>,
+    /// the HTTP/3 session of a QUIC connection (c->data in C)
+    pub v3_session: RefCell<Option<Rc<crate::v3::H3Session>>>,
 }
 
 /// In-memory header buffer: data[pos..last] unread.
@@ -543,8 +545,10 @@ pub struct Request {
 
     /// Parser state for request line / headers (offsets into the header buffer).
     pub parse: RefCell<ParseRequest>,
-    /// The HTTP/2 or /3 stream, if any.
+    /// The HTTP/2 stream, if any.
     pub stream: RefCell<Option<Rc<dyn Any>>>,
+    /// r->v3_parse of an HTTP/3 request
+    pub v3_parse: RefCell<Option<Rc<RefCell<crate::v3::request::V3Parse>>>>,
     /// Trailer state etc.
     pub log_ctx: Rc<HttpLogCtx>,
     /// Signalled when a subrequest waiting on this request completes (unused in sequential model).
@@ -856,6 +860,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         discard_body_done: Cell::new(false),
         parse: RefCell::new(ParseRequest::default()),
         stream: RefCell::new(None),
+        v3_parse: RefCell::new(None),
         log_ctx: log_ctx.clone(),
         weak_self: RefCell::new(Weak::new()),
         postponed: RefCell::new(std::collections::VecDeque::new()),

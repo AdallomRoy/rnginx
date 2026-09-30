@@ -1226,7 +1226,9 @@ fn listen(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResul
             continue;
         }
         if s == b"quic" {
-            return Err(cf.emerg(format_args!("the \"quic\" parameter requires ngx_http_v3_module")));
+            lsopt.quic = true;
+            lsopt.ty = libc::SOCK_DGRAM;
+            continue;
         }
         if let Some(rest) = s.strip_prefix(b"so_keepalive=") {
             if rest == b"on" {
@@ -1270,7 +1272,36 @@ fn listen(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResul
         }
         return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(s))));
     }
-    let _ = backlog;
+
+    if lsopt.quic {
+        if lsopt.fastopen != -1 {
+            return Err(msg("\"fastopen\" parameter is incompatible with \"quic\""));
+        }
+
+        if backlog {
+            return Err(msg("\"backlog\" parameter is incompatible with \"quic\""));
+        }
+
+        if lsopt.deferred_accept {
+            return Err(msg("\"deferred\" parameter is incompatible with \"quic\""));
+        }
+
+        if lsopt.ssl {
+            return Err(msg("\"ssl\" parameter is incompatible with \"quic\""));
+        }
+
+        if lsopt.http2 {
+            return Err(msg("\"http2\" parameter is incompatible with \"quic\""));
+        }
+
+        if lsopt.so_keepalive != 0 {
+            return Err(msg("\"so_keepalive\" parameter is incompatible with \"quic\""));
+        }
+
+        if lsopt.proxy_protocol {
+            return Err(msg("\"proxy_protocol\" parameter is incompatible with \"quic\""));
+        }
+    }
 
     let mut seen: Vec<SockAddr> = Vec::new();
     // Expand each addr over any port range (`listen 127.0.0.1:8080-8083`).
