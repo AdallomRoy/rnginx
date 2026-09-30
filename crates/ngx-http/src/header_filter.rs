@@ -243,6 +243,14 @@ pub async fn header_filter(r: R) -> i64 {
         } else {
             out.extend_from_slice(b"Connection: close\r\n");
         }
+        // NGX_HTTP_GZIP
+        if r.gzip_vary.get() {
+            if *cl.gzip_vary {
+                out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+            } else {
+                r.gzip_vary.set(false);
+            }
+        }
         for h in ho.headers.iter() {
             if h.hash.get() == 0 {
                 continue;

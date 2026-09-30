@@ -104,7 +104,8 @@ struct SbrkState {
     time: u64,
 }
 
-fn is_degraded(r: &R) -> bool {
+/// ngx_http_degraded
+pub(crate) fn is_degraded(r: &R) -> bool {
     use ngx_core::rc::*;
 
     let main_conf = r.main_conf::<DegradationMainConf>(ctx_index());
