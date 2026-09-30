@@ -67,8 +67,8 @@ fn is_usual(ch: u8) -> bool {
 
 // ngx_hash function for header hashing
 #[inline]
-fn ngx_hash(hash: u32, ch: u8) -> u32 {
-    hash.wrapping_mul(31).wrapping_add(ch as u32)
+fn ngx_hash(hash: usize, ch: u8) -> usize {
+    hash.wrapping_mul(31).wrapping_add(ch as usize)
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ pub struct ParseRequest {
     pub header_name_end: usize,
     pub header_start: usize,
     pub header_end: usize,
-    pub header_hash: u32,
+    pub header_hash: usize,
     pub lowcase_header: [u8; NGX_HTTP_LC_HEADER_LEN],
     pub lowcase_index: usize,
     pub invalid_header: bool,

@@ -2480,13 +2480,13 @@ fn process_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, up: &mut crate::upstream_r
             // special empty headers
 
             if !up.resp.server {
-                let h = crate::request::TableElt::with_hash(b"Server", b"", ngx_core::hash::hash_key(b"server") as u32, b"server".to_vec());
+                let h = crate::request::TableElt::with_hash(b"Server", b"", ngx_core::hash::hash_key(b"server"), b"server".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }
 
             if !up.resp.date {
-                let h = crate::request::TableElt::with_hash(b"Date", b"", ngx_core::hash::hash_key(b"date") as u32, b"date".to_vec());
+                let h = crate::request::TableElt::with_hash(b"Date", b"", ngx_core::hash::hash_key(b"date"), b"date".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }

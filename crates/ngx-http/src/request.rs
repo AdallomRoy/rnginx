@@ -20,7 +20,7 @@ pub type R = Rc<Request>;
 
 /// ngx_table_elt_t
 pub struct TableElt {
-    pub hash: Cell<u32>,
+    pub hash: Cell<usize>,
     pub key: Vec<u8>,
     pub value: RefCell<Vec<u8>>,
     pub lowcase_key: Vec<u8>,
@@ -42,7 +42,7 @@ impl TableElt {
         })
     }
 
-    pub fn with_hash(key: &[u8], value: &[u8], hash: u32, lowcase_key: Vec<u8>) -> Header {
+    pub fn with_hash(key: &[u8], value: &[u8], hash: usize, lowcase_key: Vec<u8>) -> Header {
         Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key, null: Cell::new(false) })
     }
 
@@ -150,7 +150,7 @@ pub struct HeadersOut {
     pub content_type: Vec<u8>,
     pub charset: Vec<u8>,
     pub content_type_lowcase: Option<Vec<u8>>,
-    pub content_type_hash: u32,
+    pub content_type_hash: usize,
     pub content_length_n: i64,
     pub content_offset: i64,
     pub date_time: i64,
