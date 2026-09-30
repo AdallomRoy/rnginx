@@ -91,6 +91,7 @@ pub mod charset_filter;
 pub mod secure_link;
 pub mod geoip;
 pub mod uwsgi;
+pub mod slice;
 
 pub use request::{Request, R};
 
@@ -647,7 +648,7 @@ pub fn modules() -> Vec<ModuleDef> {
         copy_filter::copy_filter_module(),
         range_filter::range_body_filter_module(),
         not_modified_filter::not_modified_filter_module(),
-        stubs::slice_filter_module(),
+        slice::slice_filter_module(),
     ]
 }
 

@@ -584,35 +584,6 @@ pub fn range_body_filter_module() -> ModuleDef {
     ])
 }
 
-pub fn slice_filter_module() -> ModuleDef {
-    let def = HttpModuleDef { preconfiguration: Some(slice_add_variables), ..Default::default() };
-    http_module_def("ngx_http_slice_filter_module", def, vec![
-        Command::new("slice", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-    ])
-}
-
-/// ngx_http_slice_add_variables
-fn slice_add_variables(cf: &mut Conf) -> ConfResult {
-    use crate::variables::{add_variables, VarDef};
-    add_variables(cf, &[VarDef { name: "slice_range", set: None, get: Some(slice_range_variable), data: 0, flags: 0 }])
-}
-
-/// ngx_http_slice_range_variable as far as it applies to this stub: the
-/// filter is not ported, so there is no module ctx, and the "slice"
-/// directive is accepted but not stored, so slcf->size is 0.
-fn slice_range_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
-    // ctx == NULL
-    if !r.is_main() || r.headers_out.borrow().status != 0 {
-        v.not_found = true;
-        return NGX_OK;
-    }
-
-    // slcf->size == 0
-    v.not_found = true;
-    NGX_OK
-}
-
-
 // --- hooks the core calls into not-yet-ported modules ---
 
 pub fn upstream_log_info(r: &Request) -> Option<Vec<u8>> {
