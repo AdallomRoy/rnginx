@@ -23,7 +23,13 @@ fn init(_cf: &mut Conf) -> ConfResult {
 
 async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
     let status = r.headers_out.borrow().status;
-    if status == NGX_HTTP_NOT_MODIFIED || status == NGX_HTTP_NO_CONTENT || status < NGX_HTTP_OK || !r.is_main() || r.method.get() == NGX_HTTP_HEAD {
+    if status == NGX_HTTP_NOT_MODIFIED
+        || status == NGX_HTTP_NO_CONTENT
+        || status < NGX_HTTP_OK
+        || !r.is_main()
+        || r.method.get() == NGX_HTTP_HEAD
+        || (r.method.get() == NGX_HTTP_CONNECT && status < NGX_HTTP_SPECIAL_RESPONSE)
+    {
         return next(r).await;
     }
     let cl = r.headers_out.borrow().content_length_n;

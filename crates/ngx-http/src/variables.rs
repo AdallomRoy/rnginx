@@ -764,9 +764,10 @@ fn var_request_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_is_request_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     // Emits `:` when a port is present so `$is_request_port$request_port`
-    // renders as `:8080` when needed and empty otherwise.
+    // renders as `:8080` when needed and empty otherwise
+    // (ngx_http_variable_null_value).
     if r.port.get() == 0 {
-        v.not_found = true;
+        set_str(v, b"");
         return NGX_OK;
     }
     set_str(v, b":");

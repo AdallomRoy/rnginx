@@ -28,8 +28,9 @@ pub const SERVER_STRING: &[u8] = b"Server: nginx\r\n";
 pub const SERVER_FULL_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 pub const SERVER_BUILD_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 
+/// ngx_http_status_lines: the statuses without a line there are written as
+/// their number
 static STATUS_LINES: &[(i64, &str)] = &[
-    (101, "101 Switching Protocols"),
     (200, "200 OK"),
     (201, "201 Created"),
     (202, "202 Accepted"),
@@ -48,6 +49,7 @@ static STATUS_LINES: &[(i64, &str)] = &[
     (404, "404 Not Found"),
     (405, "405 Not Allowed"),
     (406, "406 Not Acceptable"),
+    (407, "407 Proxy Authentication Required"),
     (408, "408 Request Time-out"),
     (409, "409 Conflict"),
     (410, "410 Gone"),
@@ -117,7 +119,7 @@ pub async fn header_filter(r: R) -> i64 {
         } else if let Some(l) = status_line(status) {
             out.extend_from_slice(l.as_bytes());
         } else {
-            out.extend_from_slice(format!("{} ", status).as_bytes());
+            out.extend_from_slice(format!("{:03} ", status).as_bytes());
         }
         out.extend_from_slice(b"\r\n");
     }
