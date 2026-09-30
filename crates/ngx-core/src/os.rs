@@ -258,3 +258,105 @@ pub fn ncpu() -> usize {
 pub fn cacheline_size() -> usize {
     64
 }
+
+/// ngx_dir_t: opendir()/readdir()/closedir() as ngx_open_dir, ngx_read_dir
+/// and ngx_close_dir use them.
+pub struct Dir {
+    dir: *mut libc::DIR,
+}
+
+impl Dir {
+    /// ngx_open_dir; Err(errno) on failure
+    pub fn open(name: &[u8]) -> Result<Dir, i32> {
+        let c = cstr(name);
+
+        // SAFETY: c is a NUL-terminated string that outlives the call
+        let dir = unsafe { libc::opendir(c.as_ptr()) };
+
+        if dir.is_null() {
+            return Err(errno());
+        }
+
+        Ok(Dir { dir })
+    }
+
+    /// ngx_read_dir: the next entry name, "." and ".." included; Err(errno)
+    /// when readdir() returns NULL, the errno being 0 (NGX_ENOMOREFILES)
+    /// at the end of the directory
+    pub fn read(&mut self) -> Result<Vec<u8>, i32> {
+        // SAFETY: errno is thread-local; self.dir is an open DIR stream
+        // (it is set to NULL only by close(), which consumes self), and the
+        // dirent returned stays valid until the next readdir() on it
+        unsafe {
+            *libc::__errno_location() = 0;
+
+            let de = libc::readdir(self.dir);
+
+            if de.is_null() {
+                return Err(errno());
+            }
+
+            Ok(CStr::from_ptr((*de).d_name.as_ptr()).to_bytes().to_vec())
+        }
+    }
+
+    /// ngx_close_dir; Err(errno) on failure
+    pub fn close(mut self) -> Result<(), i32> {
+        let dir = std::mem::replace(&mut self.dir, std::ptr::null_mut());
+
+        // SAFETY: dir is the open stream, closed exactly once
+        if unsafe { libc::closedir(dir) } == -1 {
+            return Err(errno());
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        if !self.dir.is_null() {
+            // SAFETY: the stream was not closed (close() nulls the pointer)
+            unsafe { libc::closedir(self.dir) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_entries() {
+        let d = std::env::temp_dir().join(format!("ngx-os-dir-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("file"), b"x").unwrap();
+        let name = d.as_os_str().as_bytes().to_vec();
+
+        let mut dir = Dir::open(&name).unwrap();
+        let mut names = Vec::new();
+        loop {
+            match dir.read() {
+                Ok(n) => names.push(n),
+                Err(e) => {
+                    assert_eq!(e, 0, "the end of the directory is errno 0");
+                    break;
+                }
+            }
+        }
+        dir.close().unwrap();
+        names.sort();
+        assert_eq!(names, vec![b".".to_vec(), b"..".to_vec(), b"file".to_vec(), b"sub".to_vec()]);
+
+        let mut file = name.clone();
+        file.extend_from_slice(b"/file");
+        assert_eq!(Dir::open(&file).err(), Some(libc::ENOTDIR));
+        file.extend_from_slice(b"/x");
+        assert_eq!(Dir::open(&file).err(), Some(libc::ENOTDIR));
+        let mut missing = name.clone();
+        missing.extend_from_slice(b"/missing");
+        assert_eq!(Dir::open(&missing).err(), Some(libc::ENOENT));
+
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}

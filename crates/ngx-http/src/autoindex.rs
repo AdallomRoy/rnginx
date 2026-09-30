@@ -1,34 +1,59 @@
-//! ngx_http_autoindex_module: HTML directory listing when the request URI
-//! resolves to a directory. Renders the same format ngx_http_autoindex_html
-//! does (roughly): `<h1>Index of /uri/</h1><hr><pre><a>../</a>...</pre>`.
-//! Filenames are HTML-escaped for display and percent-escaped in the href.
-//! Long names are truncated at 50 display columns with `..&gt;`.
+//! ngx_http_autoindex_module: directory listings in the html, json, jsonp
+//! and xml formats (port of ngx_http_autoindex_module.c).
 
 use std::any::Any;
-use std::os::unix::ffi::OsStrExt;
+use std::cmp::Ordering;
 use std::rc::Rc;
 
+use ngx_core::buf::{Buf, Chain};
 use ngx_core::conf::*;
+use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
+use ngx_core::string::{escape_html_into, escape_json_into, escape_uri_count, escape_uri_into, utf8_cpystrn, utf8_length, B, NGX_ESCAPE_URI_COMPONENT};
+use ngx_core::times::{gmtime, http_time, MONTHS};
+use ngx_core::ngx_log_error;
+use ngx_core::os::Dir;
 
 use crate::*;
 
 crate::http_module_index!("ngx_http_autoindex_module");
 
+const NGX_HTTP_AUTOINDEX_HTML: u32 = 0;
+const NGX_HTTP_AUTOINDEX_JSON: u32 = 1;
+const NGX_HTTP_AUTOINDEX_JSONP: u32 = 2;
+const NGX_HTTP_AUTOINDEX_XML: u32 = 3;
+
+const NGX_HTTP_AUTOINDEX_PREALLOCATE: usize = 50;
+
+const NGX_HTTP_AUTOINDEX_NAME_LEN: usize = 50;
+
 pub struct AutoIndexConf {
     pub enable: Val<bool>,
+    pub format: Val<u32>,
     pub localtime: Val<bool>,
     pub exact_size: Val<bool>,
-    pub format: Val<u32>, // 0=html, 1=xml, 2=json, 3=jsonp (only html implemented)
+}
+
+struct Entry {
+    name: Vec<u8>,
+    utf_len: usize,
+    escape: usize,
+    escape_html: usize,
+
+    dir: bool,
+    file: bool,
+
+    mtime: i64,
+    size: i64,
 }
 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(AutoIndexConf {
         enable: Val::unset(),
+        format: Val::unset(),
         localtime: Val::unset(),
         exact_size: Val::unset(),
-        format: Val::unset(),
     })
 }
 
@@ -36,9 +61,9 @@ fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfRes
     let p = conf_cell::<AutoIndexConf>(prev).borrow();
     let mut c = conf_cell::<AutoIndexConf>(conf).borrow_mut();
     c.enable.merge(&p.enable, false);
+    c.format.merge(&p.format, NGX_HTTP_AUTOINDEX_HTML);
     c.localtime.merge(&p.localtime, false);
     c.exact_size.merge(&p.exact_size, true);
-    c.format.merge(&p.format, 0);
     Ok(())
 }
 
@@ -51,25 +76,26 @@ pub fn autoindex_module() -> ModuleDef {
     };
     let commands = vec![
         ngx_core::cmd!("autoindex", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, AutoIndexConf, enable, set_flag),
+        ngx_core::cmd_fn!("autoindex_format", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, autoindex_format_handler),
         ngx_core::cmd!("autoindex_localtime", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, AutoIndexConf, localtime, set_flag),
         ngx_core::cmd!("autoindex_exact_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, AutoIndexConf, exact_size, set_flag),
-        ngx_core::cmd_fn!("autoindex_format", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, autoindex_format_handler),
     ];
     http_module_def("ngx_http_autoindex_module", def, commands)
 }
 
-fn autoindex_format_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+/// ngx_conf_set_enum_slot with ngx_http_autoindex_format[]
+fn autoindex_format_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    const FORMATS: [(&str, u32); 4] = [
+        ("html", NGX_HTTP_AUTOINDEX_HTML),
+        ("json", NGX_HTTP_AUTOINDEX_JSON),
+        ("jsonp", NGX_HTTP_AUTOINDEX_JSONP),
+        ("xml", NGX_HTTP_AUTOINDEX_XML),
+    ];
+
     let cell = conf_rc::<AutoIndexConf>(conf.as_ref().unwrap());
-    let v = &cf.args[1];
-    let format = match v.as_slice() {
-        b"html" => 0,
-        b"xml"  => 1,
-        b"json" => 2,
-        b"jsonp" => 3,
-        _ => return Err(cf.emerg(format_args!("invalid parameter \"{}\"", ngx_core::string::B(v)))),
-    };
-    cell.borrow_mut().format = Val::set(format);
-    Ok(())
+    let mut c = cell.borrow_mut();
+
+    set_enum(cf, cmd, &mut c.format, &FORMATS)
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
@@ -77,419 +103,788 @@ fn init(cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
+fn close_dir(r: &R, dir: Dir, path: &[u8]) {
+    if let Err(err) = dir.close() {
+        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(err), "closedir() \"{}\" failed", B(path));
+    }
+}
+
 async fn autoindex_handler(r: R) -> i64 {
-    // Only fire on directory requests: URI must end with `/`.
     {
         let uri = r.uri.borrow();
-        if uri.is_empty() || uri[uri.len() - 1] != b'/' {
+        if uri.last() != Some(&b'/') {
             return NGX_DECLINED;
         }
     }
-    if !(r.method.get() == NGX_HTTP_GET || r.method.get() == NGX_HTTP_HEAD) {
+
+    if r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD) == 0 {
         return NGX_DECLINED;
     }
-    let conf = r.loc_conf::<AutoIndexConf>(ctx_index());
-    if !*conf.borrow().enable { return NGX_DECLINED; }
 
-    let (path, _root) = match crate::core_rt::map_uri_to_path(&r, 0) {
-        Some(p) => p,
+    let alcf = r.loc_conf::<AutoIndexConf>(ctx_index());
+
+    let (enable, mut format, localtime, exact_size) = {
+        let c = alcf.borrow();
+        (*c.enable, *c.format, *c.localtime, *c.exact_size)
+    };
+
+    if !enable {
+        return NGX_DECLINED;
+    }
+
+    let rc = crate::request_body::discard_request_body(&r).await;
+
+    if rc != NGX_OK {
+        return rc;
+    }
+
+    let mut path = match crate::core_rt::map_uri_to_path(&r, NGX_HTTP_AUTOINDEX_PREALLOCATE) {
+        Some((path, _root)) => path,
         None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
     };
 
-    // Read directory entries.
-    let os_path = std::ffi::OsStr::from_bytes(&path);
-    let read = match std::fs::read_dir(os_path) {
-        Ok(rd) => rd,
-        Err(e) => {
-            match e.kind() {
-                std::io::ErrorKind::NotFound => return NGX_HTTP_NOT_FOUND,
-                std::io::ErrorKind::PermissionDenied => return NGX_HTTP_FORBIDDEN,
-                _ => return NGX_HTTP_INTERNAL_SERVER_ERROR,
-            }
-        }
-    };
+    // the file names are appended where the mapped path ends, in the
+    // buffer that has NGX_HTTP_AUTOINDEX_PREALLOCATE bytes reserved
+    let mut filename = path.clone();
+    let mut allocated = path.len() + NGX_HTTP_AUTOINDEX_PREALLOCATE + 1;
 
-    let mut entries: Vec<Entry> = Vec::new();
-    for de in read.flatten() {
-        let name = de.file_name();
-        let name_bytes = name.as_bytes().to_vec();
-        let is_dir = de.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let is_dir_effective = if is_dir { true } else {
-            // Follow symlinks so `symlink to directory` displays correctly.
-            std::fs::metadata(de.path()).map(|m| m.is_dir()).unwrap_or(false)
-        };
-        let (size, mtime) = match std::fs::metadata(de.path()) {
-            Ok(m) => (m.len(), file_mtime(&m)),
-            Err(_) => (0, 0),
-        };
-        entries.push(Entry { name: name_bytes, is_dir: is_dir_effective, size, mtime });
+    if path.len() > 1 {
+        path.pop();
     }
 
-    // Sort: directories first, then by name (C uses locale-independent lex sort).
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries.sort_by_key(|e| !e.is_dir);
+    http_debug!(r, "http autoindex: \"{}\"", B(&path));
 
-    let format = *conf.borrow().format;
-    let uri = r.uri.borrow().clone();
-    let (body, content_type): (Vec<u8>, &[u8]) = match format {
-        1 => (render_xml(&entries, *conf.borrow().localtime), b"text/xml; charset=utf-8"),
-        2 => (render_json(&entries, *conf.borrow().localtime, None), b"application/json"),
-        3 => {
-            // jsonp callback: $arg_callback if non-empty, otherwise plain JSON
-            let cb: Option<Vec<u8>> = {
-                let args = r.args.borrow();
-                extract_arg(&args, b"callback").filter(|v| !v.is_empty())
-            };
-            (render_json(&entries, *conf.borrow().localtime, cb.as_deref()), b"application/javascript")
+    let mut callback = Vec::new();
+
+    if format == NGX_HTTP_AUTOINDEX_JSONP {
+        callback = match autoindex_jsonp_callback(&r) {
+            Some(callback) => callback,
+            None => return NGX_HTTP_BAD_REQUEST,
+        };
+
+        if callback.is_empty() {
+            format = NGX_HTTP_AUTOINDEX_JSON;
         }
-        _ => (render_html(&uri, &entries, *conf.borrow().localtime, *conf.borrow().exact_size), b"text/html"),
-    };
-    let _ = uri;
+    }
 
-    let rc = crate::request_body::discard_request_body(&r).await;
-    if rc != NGX_OK { return rc; }
+    let mut dir = match Dir::open(&path) {
+        Ok(dir) => dir,
+        Err(err) => {
+            let (level, rc) = if err == libc::ENOENT || err == libc::ENOTDIR || err == libc::ENAMETOOLONG {
+                (NGX_LOG_ERR, NGX_HTTP_NOT_FOUND)
+            } else if err == libc::EACCES {
+                (NGX_LOG_ERR, NGX_HTTP_FORBIDDEN)
+            } else {
+                (NGX_LOG_CRIT, NGX_HTTP_INTERNAL_SERVER_ERROR)
+            };
+
+            ngx_log_error!(level, r.connection.log, Some(err), "opendir() \"{}\" failed", B(&path));
+
+            return rc;
+        }
+    };
+
     {
         let mut ho = r.headers_out.borrow_mut();
+
         ho.status = NGX_HTTP_OK;
-        ho.content_length_n = body.len() as i64;
-        // content_type may include the "; charset=" suffix; content_type_len is
-        // the length up to the semicolon so charset filter behaves like the
-        // upstream ct extractor.
-        let semi = content_type.iter().position(|&b| b == b';').unwrap_or(content_type.len());
-        ho.content_type_len = semi;
-        ho.content_type = content_type.to_vec();
-    }
-    let rc = crate::core_rt::send_header(&r).await;
-    if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() { return rc; }
 
-    use ngx_core::buf::{Buf, Chain};
-    let mut b = Buf::from_vec(body);
-    b.last_buf = r.is_main();
-    b.last_in_chain = true;
-    let mut chain = Chain::new();
-    chain.push_back(b);
-    return crate::core_rt::output_filter(&r, chain).await;
-}
-
-fn extract_arg(qs: &[u8], name: &[u8]) -> Option<Vec<u8>> {
-    let mut start = 0usize;
-    while start < qs.len() {
-        let end = qs[start..].iter().position(|&b| b == b'&').map(|i| start + i).unwrap_or(qs.len());
-        let pair = &qs[start..end];
-        if let Some(eq) = pair.iter().position(|&b| b == b'=') {
-            if &pair[..eq] == name {
-                return Some(pair[eq+1..].to_vec());
+        match format {
+            NGX_HTTP_AUTOINDEX_JSON => ho.content_type = b"application/json".to_vec(),
+            NGX_HTTP_AUTOINDEX_JSONP => ho.content_type = b"application/javascript".to_vec(),
+            NGX_HTTP_AUTOINDEX_XML => {
+                ho.content_type = b"text/xml".to_vec();
+                ho.charset = b"utf-8".to_vec();
             }
+            _ => ho.content_type = b"text/html".to_vec(),
         }
-        start = end + 1;
+
+        ho.content_type_len = ho.content_type.len();
+        ho.content_type_lowcase = None;
     }
-    None
+
+    let rc = crate::core_rt::send_header(&r).await;
+
+    if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
+        close_dir(&r, dir, &path);
+        return rc;
+    }
+
+    let mut entries: Vec<Entry> = Vec::with_capacity(40);
+
+    loop {
+        let name = match dir.read() {
+            Ok(name) => name,
+            Err(0) => break,
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(err), "readdir() \"{}\" failed", B(&path));
+                close_dir(&r, dir, &path);
+                return NGX_ERROR;
+            }
+        };
+
+        http_debug!(r, "http autoindex file: \"{}\"", B(&name));
+
+        if name.first() == Some(&b'.') {
+            continue;
+        }
+
+        // 1 byte for '/' and 1 byte for terminating '\0'
+
+        if path.len() + 1 + name.len() + 1 > allocated {
+            allocated = path.len() + 1 + name.len() + 1 + NGX_HTTP_AUTOINDEX_PREALLOCATE;
+
+            filename.clear();
+            filename.extend_from_slice(&path);
+            filename.push(b'/');
+        }
+
+        let prefix = filename.len();
+        filename.extend_from_slice(&name);
+
+        let info = match ngx_core::os::stat(&filename) {
+            Ok(st) => st,
+            Err(err) => {
+                if err != libc::ENOENT && err != libc::ELOOP {
+                    ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(err), "stat() \"{}\" failed", B(&filename));
+
+                    if err == libc::EACCES {
+                        filename.truncate(prefix);
+                        continue;
+                    }
+
+                    close_dir(&r, dir, &path);
+                    return NGX_ERROR;
+                }
+
+                match ngx_core::os::lstat(&filename) {
+                    Ok(st) => st,
+                    Err(err) => {
+                        ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(err), "lstat() \"{}\" failed", B(&filename));
+                        close_dir(&r, dir, &path);
+                        return NGX_ERROR;
+                    }
+                }
+            }
+        };
+
+        filename.truncate(prefix);
+
+        entries.push(Entry {
+            name,
+            utf_len: 0,
+            escape: 0,
+            escape_html: 0,
+            dir: ngx_core::os::is_dir(&info),
+            file: ngx_core::os::is_file(&info),
+            mtime: info.st_mtime as i64,
+            size: info.st_size as i64,
+        });
+    }
+
+    close_dir(&r, dir, &path);
+
+    if entries.len() > 1 {
+        entries.sort_by(autoindex_cmp_entries);
+    }
+
+    let body = match format {
+        NGX_HTTP_AUTOINDEX_JSON => autoindex_json(&mut entries, None),
+        NGX_HTTP_AUTOINDEX_JSONP => autoindex_json(&mut entries, Some(&callback)),
+        NGX_HTTP_AUTOINDEX_XML => autoindex_xml(&mut entries),
+        _ => {
+            let utf8 = {
+                let ho = r.headers_out.borrow();
+                ho.charset.eq_ignore_ascii_case(b"utf-8")
+            };
+            let uri = r.uri.borrow().clone();
+            let gmtoff = ngx_core::times::with_cached(|tp| tp.gmtoff);
+
+            autoindex_html(&uri, &mut entries, utf8, gmtoff * 60 * localtime as i64, exact_size)
+        }
+    };
+
+    let mut b = Buf::from_vec(body);
+
+    if r.is_main() {
+        b.last_buf = true;
+    }
+
+    b.last_in_chain = true;
+
+    let mut out = Chain::new();
+    out.push_back(b);
+
+    crate::core_rt::output_filter(&r, out).await
 }
 
-fn render_html(uri: &[u8], entries: &[Entry], localtime: bool, exact: bool) -> Vec<u8> {
-    let title = html_escape(uri);
-    let mut body = Vec::with_capacity(1024 + entries.len() * 128);
-    body.extend_from_slice(b"<html>\n<head><title>Index of ");
-    body.extend_from_slice(&title);
-    body.extend_from_slice(b"</title></head>\n<body>\n<h1>Index of ");
-    body.extend_from_slice(&title);
-    body.extend_from_slice(b"</h1><hr><pre><a href=\"../\">../</a>\n");
+/// Number of bytes ngx_escape_html() adds
+fn escape_html_len(src: &[u8]) -> usize {
+    src.iter()
+        .map(|&ch| match ch {
+            b'<' | b'>' => "&lt;".len() - 1,
+            b'&' => "&amp;".len() - 1,
+            b'"' => "&quot;".len() - 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Number of bytes ngx_escape_json() adds
+fn escape_json_len(src: &[u8]) -> usize {
+    src.iter()
+        .map(|&ch| match ch {
+            b'\\' | b'"' => 1,
+            b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 1,
+            0..=0x1f => "\\u001F".len() - 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// ngx_sprintf() "%[0][width]i" / "%O": '-' for a negative value, then the
+/// magnitude padded to `width` with `zero`
+fn sprintf_num(buf: &mut Vec<u8>, value: i64, zero: u8, width: usize) {
+    if value < 0 {
+        buf.push(b'-');
+    }
+
+    let digits = value.unsigned_abs().to_string();
+
+    for _ in digits.len()..width {
+        buf.push(zero);
+    }
+
+    buf.extend_from_slice(digits.as_bytes());
+}
+
+/// ngx_http_autoindex_html; `offset` is the gmtoff in seconds when
+/// autoindex_localtime is on, and 0 otherwise
+fn autoindex_html(uri: &[u8], entries: &mut [Entry], utf8: bool, offset: i64, exact_size: bool) -> Vec<u8> {
+    const TITLE: &[u8] = b"<html>\r\n<head><title>Index of ";
+    const HEADER: &[u8] = b"</title></head>\r\n<body>\r\n<h1>Index of ";
+    const TAIL: &[u8] = b"</body>\r\n</html>\r\n";
+
+    let escape_html = escape_html_len(uri);
+
+    let mut len = TITLE.len() + 2 * (uri.len() + escape_html) + HEADER.len() + TAIL.len() + 64;
+
+    for e in entries.iter_mut() {
+        e.escape = 2 * escape_uri_count(&e.name, NGX_ESCAPE_URI_COMPONENT);
+
+        e.escape_html = escape_html_len(&e.name);
+
+        e.utf_len = if utf8 { utf8_length(&e.name) } else { e.name.len() };
+
+        len += 2 * e.name.len() + e.escape + e.escape_html + NGX_HTTP_AUTOINDEX_NAME_LEN + 64;
+    }
+
+    let mut b = Vec::with_capacity(len);
+
+    b.extend_from_slice(TITLE);
+
+    if escape_html != 0 {
+        escape_html_into(&mut b, uri);
+        b.extend_from_slice(HEADER);
+        escape_html_into(&mut b, uri);
+    } else {
+        b.extend_from_slice(uri);
+        b.extend_from_slice(HEADER);
+        b.extend_from_slice(uri);
+    }
+
+    b.extend_from_slice(b"</h1>");
+
+    b.extend_from_slice(b"<hr><pre><a href=\"../\">../</a>\r\n");
 
     for e in entries.iter() {
-        let mut href = percent_escape_uri(&e.name);
-        let mut display = html_escape(&e.name);
-        if e.is_dir { href.push(b'/'); display.push(b'/'); }
+        b.extend_from_slice(b"<a href=\"");
 
-        // Column layout: name link (padded to 50 chars), space, mtime (formatted),
-        // space, size (or "-" for directory).
-        let (short_display, dots_needed, cols_used) = truncate_display_to(&display, 50);
-        body.extend_from_slice(b"<a href=\"");
-        body.extend_from_slice(&href);
-        body.extend_from_slice(b"\">");
-        body.extend_from_slice(&short_display);
-        if dots_needed { body.extend_from_slice(b"..&gt;"); }
-        body.extend_from_slice(b"</a>");
-        // Pad to column 51
-        let pad = if dots_needed { 51usize.saturating_sub(cols_used + 3) }
-                  else { 51usize.saturating_sub(cols_used) };
-        for _ in 0..pad { body.push(b' '); }
-        // Date
-        body.extend_from_slice(&format_time(e.mtime, localtime));
-        body.push(b' ');
-        if e.is_dir {
-            body.extend_from_slice(b"                  -");
-        } else if exact {
-            let s = format!("{:>19}", e.size);
-            body.extend_from_slice(s.as_bytes());
+        if e.escape != 0 {
+            escape_uri_into(&mut b, &e.name, NGX_ESCAPE_URI_COMPONENT);
         } else {
-            body.extend_from_slice(&format_human_size(e.size));
+            b.extend_from_slice(&e.name);
         }
-        body.push(b'\n');
-    }
-    body.extend_from_slice(b"</pre><hr></body>\n</html>\n");
-    body
-}
 
-/// XML autoindex format — mirrors ngx_http_autoindex_xml.
-fn render_xml(entries: &[Entry], localtime: bool) -> Vec<u8> {
-    let mut body = Vec::with_capacity(256 + entries.len() * 128);
-    body.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<list>\n");
-    for e in entries {
-        body.extend_from_slice(if e.is_dir { b"<directory" } else { b"<file" });
-        body.extend_from_slice(b" mtime=\"");
-        body.extend_from_slice(&format_iso8601(e.mtime, localtime));
-        body.push(b'"');
-        if !e.is_dir {
-            body.extend_from_slice(b" size=\"");
-            body.extend_from_slice(format!("{}", e.size).as_bytes());
-            body.push(b'"');
+        if e.dir {
+            b.push(b'/');
         }
-        body.push(b'>');
-        body.extend_from_slice(&xml_escape(&e.name));
-        body.extend_from_slice(if e.is_dir { b"</directory>\n" } else { b"</file>\n" });
-    }
-    body.extend_from_slice(b"</list>\n");
-    body
-}
 
-/// JSON autoindex format (with optional JSONP callback wrap).
-fn render_json(entries: &[Entry], localtime: bool, callback: Option<&[u8]>) -> Vec<u8> {
-    let mut body = Vec::with_capacity(256 + entries.len() * 128);
-    if let Some(cb) = callback {
-        body.extend_from_slice(cb);
-        body.push(b'(');
-    }
-    body.push(b'[');
-    let mut first = true;
-    for e in entries {
-        if !first { body.push(b','); }
-        first = false;
-        body.extend_from_slice(b"\n{ \"name\":\"");
-        body.extend_from_slice(&json_escape(&e.name));
-        body.extend_from_slice(b"\", \"type\":\"");
-        body.extend_from_slice(if e.is_dir { b"directory" } else { b"file" });
-        body.extend_from_slice(b"\", \"mtime\":\"");
-        body.extend_from_slice(&format_rfc1123(e.mtime, localtime));
-        body.push(b'"');
-        if !e.is_dir {
-            body.extend_from_slice(b", \"size\":");
-            body.extend_from_slice(format!("{}", e.size).as_bytes());
-        }
-        body.extend_from_slice(b" }");
-    }
-    body.extend_from_slice(b"\n]");
-    if callback.is_some() {
-        body.push(b')');
-        body.push(b';');
-        body.push(b'\n');
-    }
-    body
-}
+        b.push(b'"');
+        b.push(b'>');
 
-/// XML escape for element text: < > & " '
-fn xml_escape(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    for &b in s {
-        match b {
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'&' => out.extend_from_slice(b"&amp;"),
-            // Note: single quote is intentionally NOT escaped — matches
-            // C's ngx_http_autoindex_xml which uses ngx_escape_html
-            // (escapes < > & " but leaves ').
-            b'"' => out.extend_from_slice(b"&quot;"),
-            _ => out.push(b),
-        }
-    }
-    out
-}
+        let mut len = e.utf_len;
 
-/// JSON string escape — quotes, backslashes, control chars.
-fn json_escape(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    for &b in s {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            0x00..=0x1f | 0x7f => out.extend_from_slice(format!("\\u{:04x}", b).as_bytes()),
-            _ => out.push(b),
-        }
-    }
-    out
-}
+        // where "..&gt;" goes for a name longer than NGX_HTTP_AUTOINDEX_NAME_LEN
+        let last;
 
-/// ISO 8601 mtime formatter (YYYY-MM-DDTHH:MM:SSZ or ±HH:MM).
-fn format_iso8601(t: i64, localtime: bool) -> Vec<u8> {
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let tt: libc::time_t = t as libc::time_t;
-        if localtime { libc::localtime_r(&tt, &mut tm); }
-        else { libc::gmtime_r(&tt, &mut tm); }
-        let mut buf = [0u8; 64];
-        // %Y-%m-%dT%H:%M:%S plus timezone suffix
-        let fmt = if localtime { b"%Y-%m-%dT%H:%M:%S%z\0" as &[u8] }
-                  else { b"%Y-%m-%dT%H:%M:%SZ\0" as &[u8] };
-        let n = libc::strftime(buf.as_mut_ptr() as *mut i8, buf.len(), fmt.as_ptr() as *const i8, &tm);
-        buf[..n].to_vec()
-    }
-}
+        if e.name.len() != len {
+            let char_len = if len > NGX_HTTP_AUTOINDEX_NAME_LEN {
+                NGX_HTTP_AUTOINDEX_NAME_LEN - 3 + 1
+            } else {
+                NGX_HTTP_AUTOINDEX_NAME_LEN + 1
+            };
 
-/// RFC1123 date used in JSON mtime.
-fn format_rfc1123(t: i64, localtime: bool) -> Vec<u8> {
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let tt: libc::time_t = t as libc::time_t;
-        if localtime { libc::localtime_r(&tt, &mut tm); }
-        else { libc::gmtime_r(&tt, &mut tm); }
-        let mut buf = [0u8; 64];
-        let fmt = if localtime { b"%a, %d %b %Y %H:%M:%S %z\0" as &[u8] }
-                  else { b"%a, %d %b %Y %H:%M:%S GMT\0" as &[u8] };
-        let n = libc::strftime(buf.as_mut_ptr() as *mut i8, buf.len(), fmt.as_ptr() as *const i8, &tm);
-        buf[..n].to_vec()
-    }
-}
+            let copied = utf8_cpystrn(&e.name, char_len).len();
 
-struct Entry {
-    name: Vec<u8>,
-    is_dir: bool,
-    size: u64,
-    mtime: i64,
-}
+            if e.escape_html != 0 {
+                escape_html_into(&mut b, &e.name[..copied]);
+            } else {
+                b.extend_from_slice(&e.name[..copied]);
+            }
 
-fn file_mtime(m: &std::fs::Metadata) -> i64 {
-    use std::time::UNIX_EPOCH;
-    m.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+            last = b.len();
+        } else if e.escape_html != 0 {
+            let char_len = if len > NGX_HTTP_AUTOINDEX_NAME_LEN { NGX_HTTP_AUTOINDEX_NAME_LEN - 3 } else { len };
 
-/// HTML-escape < > & (no need to escape " because href uses percent-escapes).
-fn html_escape(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    for &b in s {
-        match b {
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'&' => out.extend_from_slice(b"&amp;"),
-            _ => out.push(b),
-        }
-    }
-    out
-}
-
-/// Percent-escape all bytes that aren't in the "safe URI path char" set
-/// (alnum, `-_.~/`). Matches ngx_escape_uri(NGX_ESCAPE_HTML) roughly.
-fn percent_escape_uri(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    for &b in s {
-        let safe = b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/');
-        if safe {
-            out.push(b);
+            escape_html_into(&mut b, &e.name[..char_len]);
+            last = b.len();
         } else {
-            out.extend_from_slice(format!("%{:02x}", b).as_bytes());
+            // ngx_cpystrn(b->last, name, NGX_HTTP_AUTOINDEX_NAME_LEN + 1)
+            b.extend_from_slice(&e.name[..len.min(NGX_HTTP_AUTOINDEX_NAME_LEN)]);
+            last = b.len() - 3;
         }
-    }
-    out
-}
 
-/// Truncate the (already HTML-escaped) display name so it fits in `cols`
-/// display columns. Returns (truncated_bytes, needs_dots, display_cols_used).
-/// Counts entity escapes as their display width (1 column) and UTF-8
-/// multi-byte sequences as 1 column each.
-fn truncate_display_to(s: &[u8], cols: usize) -> (Vec<u8>, bool, usize) {
-    let mut out = Vec::with_capacity(s.len());
-    let mut used = 0usize;
-    let mut i = 0;
-    while i < s.len() {
-        // If we've already used `cols - 3` columns and there's more, need `..>`.
-        if used > cols.saturating_sub(3) && i < s.len() {
-            // Check if remaining fits.
-            let rest_cols = count_display_cols(&s[i..]);
-            if rest_cols > 0 {
-                // Only trigger if there IS more content past cols-3.
+        if len > NGX_HTTP_AUTOINDEX_NAME_LEN {
+            b.truncate(last);
+            b.extend_from_slice(b"..&gt;</a>");
+        } else {
+            if e.dir && NGX_HTTP_AUTOINDEX_NAME_LEN - len > 0 {
+                b.push(b'/');
+                len += 1;
+            }
+
+            b.extend_from_slice(b"</a>");
+
+            if NGX_HTTP_AUTOINDEX_NAME_LEN - len > 0 {
+                b.resize(b.len() + NGX_HTTP_AUTOINDEX_NAME_LEN - len, b' ');
             }
         }
-        let b = s[i];
-        let (adv_bytes, adv_cols) = if b == b'&' {
-            // find ';' to consume the entity
-            let end = s[i..].iter().position(|&c| c == b';').map(|p| i + p + 1).unwrap_or(i + 1);
-            (end - i, 1usize)
-        } else if b < 0x80 {
-            (1, 1)
+
+        b.push(b' ');
+
+        let tm = gmtime(e.mtime + offset);
+
+        sprintf_num(&mut b, tm.mday as i64, b'0', 2);
+        b.push(b'-');
+        b.extend_from_slice(MONTHS[(tm.mon - 1) as usize].as_bytes());
+        b.push(b'-');
+        sprintf_num(&mut b, tm.year as i64, b' ', 0);
+        b.push(b' ');
+        sprintf_num(&mut b, tm.hour as i64, b'0', 2);
+        b.push(b':');
+        sprintf_num(&mut b, tm.min as i64, b'0', 2);
+        b.push(b' ');
+
+        if exact_size {
+            if e.dir {
+                b.extend_from_slice(b"                  -");
+            } else {
+                sprintf_num(&mut b, e.size, b' ', 19);
+            }
+        } else if e.dir {
+            b.extend_from_slice(b"      -");
         } else {
-            // UTF-8 leading byte
-            let n = if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else if b >= 0xC0 { 2 } else { 1 };
-            (n.min(s.len() - i), 1usize)
-        };
-        if used + adv_cols > cols - 3 && count_display_cols(&s[i..]) > 3 {
-            return (out, true, used);
+            let (size, scale) = human_size(e.size);
+
+            if scale != 0 {
+                sprintf_num(&mut b, size, b' ', 6);
+                b.push(scale);
+            } else {
+                b.push(b' ');
+                sprintf_num(&mut b, size, b' ', 6);
+            }
         }
-        out.extend_from_slice(&s[i..i + adv_bytes]);
-        used += adv_cols;
-        i += adv_bytes;
-        if used >= cols { break; }
+
+        b.extend_from_slice(b"\r\n");
     }
-    (out, false, used)
+
+    b.extend_from_slice(b"</pre><hr>");
+
+    b.extend_from_slice(TAIL);
+
+    b
 }
 
-fn count_display_cols(s: &[u8]) -> usize {
-    let mut cols = 0usize;
-    let mut i = 0;
-    while i < s.len() {
-        let b = s[i];
-        if b == b'&' {
-            let end = s[i..].iter().position(|&c| c == b';').map(|p| i + p + 1).unwrap_or(i + 1);
-            i = end;
-        } else if b < 0x80 {
-            i += 1;
-        } else {
-            let n = if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else if b >= 0xC0 { 2 } else { 1 };
-            i += n.min(s.len() - i);
+/// The size and scale letter ("autoindex_exact_size off"), 0 for no scale
+fn human_size(length: i64) -> (i64, u8) {
+    const G: i64 = 1024 * 1024 * 1024;
+    const M: i64 = 1024 * 1024;
+
+    if length > G - 1 {
+        let mut size = length / G;
+        if length % G > G / 2 - 1 {
+            size += 1;
         }
-        cols += 1;
-    }
-    cols
-}
-
-fn format_time(t: i64, localtime: bool) -> Vec<u8> {
-    if t == 0 { return b"                  -".to_vec(); } // 19 chars, no time
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let tt: libc::time_t = t as libc::time_t;
-    unsafe {
-        if localtime { libc::localtime_r(&tt, &mut tm); }
-        else { libc::gmtime_r(&tt, &mut tm); }
-    }
-    let months = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun",
-                  b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
-    let mon = months.get(tm.tm_mon as usize).copied().unwrap_or(b"???");
-    format!("{:02}-{}-{} {:02}:{:02}",
-        tm.tm_mday,
-        std::str::from_utf8(mon).unwrap(),
-        tm.tm_year + 1900,
-        tm.tm_hour,
-        tm.tm_min).into_bytes()
-}
-
-fn format_human_size(size: u64) -> Vec<u8> {
-    // Matches ngx_http_autoindex.c's readable-size formatting.
-    if size < 1024 {
-        format!("{:>19}", size).into_bytes()
-    } else if size < 1024 * 1024 {
-        let n = (size + 512) / 1024;
-        format!("{:>18}K", n).into_bytes()
-    } else if size < 1024 * 1024 * 1024 {
-        let mb = size as f64 / (1024.0 * 1024.0);
-        format!("{:>17.1}M", mb).into_bytes()
+        (size, b'G')
+    } else if length > M - 1 {
+        let mut size = length / M;
+        if length % M > M / 2 - 1 {
+            size += 1;
+        }
+        (size, b'M')
+    } else if length > 9999 {
+        let mut size = length / 1024;
+        if length % 1024 > 511 {
+            size += 1;
+        }
+        (size, b'K')
     } else {
-        let gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
-        format!("{:>17.1}G", gb).into_bytes()
+        (length, 0)
+    }
+}
+
+fn entry_type(e: &Entry) -> &'static [u8] {
+    if e.dir {
+        b"directory"
+    } else if e.file {
+        b"file"
+    } else {
+        b"other"
+    }
+}
+
+/// ngx_http_autoindex_json
+fn autoindex_json(entries: &mut [Entry], callback: Option<&[u8]>) -> Vec<u8> {
+    let mut len = "[\r\n\r\n]".len();
+
+    if let Some(callback) = callback {
+        len += "/* callback */\r\n();".len() + callback.len();
+    }
+
+    for e in entries.iter_mut() {
+        e.escape = escape_json_len(&e.name);
+
+        len += e.name.len() + e.escape + 128;
+    }
+
+    let mut b = Vec::with_capacity(len);
+
+    if let Some(callback) = callback {
+        b.extend_from_slice(b"/* callback */\r\n");
+
+        b.extend_from_slice(callback);
+
+        b.push(b'(');
+    }
+
+    b.push(b'[');
+
+    for e in entries.iter() {
+        b.extend_from_slice(b"\r\n{ \"name\":\"");
+
+        if e.escape != 0 {
+            escape_json_into(&mut b, &e.name);
+        } else {
+            b.extend_from_slice(&e.name);
+        }
+
+        b.extend_from_slice(b"\", \"type\":\"");
+
+        b.extend_from_slice(entry_type(e));
+
+        b.extend_from_slice(b"\", \"mtime\":\"");
+
+        b.extend_from_slice(http_time(e.mtime).as_bytes());
+
+        if e.file {
+            b.extend_from_slice(b"\", \"size\":");
+            sprintf_num(&mut b, e.size, b' ', 0);
+        } else {
+            b.push(b'"');
+        }
+
+        b.extend_from_slice(b" },");
+    }
+
+    if !entries.is_empty() {
+        b.pop(); /* strip last comma */
+    }
+
+    b.extend_from_slice(b"\r\n]");
+
+    if callback.is_some() {
+        b.push(b')');
+        b.push(b';');
+    }
+
+    b
+}
+
+/// ngx_http_autoindex_jsonp_callback: Some(callback), empty when there is
+/// no "callback" argument, or None for an invalid one (400)
+fn autoindex_jsonp_callback(r: &R) -> Option<Vec<u8>> {
+    let callback = {
+        let args = r.args.borrow();
+        match crate::parse::arg(&args, b"callback") {
+            Some(callback) => callback.to_vec(),
+            None => return Some(Vec::new()),
+        }
+    };
+
+    match check_jsonp_callback(&callback) {
+        Ok(()) => Some(callback),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent {} callback name: \"{}\"", e, B(&callback));
+            None
+        }
+    }
+}
+
+/// The callback name checks: Err("too long") or Err("invalid")
+fn check_jsonp_callback(callback: &[u8]) -> Result<(), &'static str> {
+    if callback.len() > 128 {
+        return Err("too long");
+    }
+
+    for &ch in callback {
+        let c = ch | 0x20;
+        if c.is_ascii_lowercase() {
+            continue;
+        }
+
+        if ch.is_ascii_digit() || ch == b'_' || ch == b'.' {
+            continue;
+        }
+
+        return Err("invalid");
+    }
+
+    Ok(())
+}
+
+/// ngx_http_autoindex_xml
+fn autoindex_xml(entries: &mut [Entry]) -> Vec<u8> {
+    const HEAD: &[u8] = b"<?xml version=\"1.0\"?>\r\n<list>\r\n";
+    const TAIL: &[u8] = b"</list>\r\n";
+
+    let mut len = HEAD.len() + TAIL.len();
+
+    for e in entries.iter_mut() {
+        e.escape = escape_html_len(&e.name);
+
+        len += e.name.len() + e.escape + 96;
+    }
+
+    let mut b = Vec::with_capacity(len);
+
+    b.extend_from_slice(HEAD);
+
+    for e in entries.iter() {
+        b.push(b'<');
+
+        let ty = entry_type(e);
+
+        b.extend_from_slice(ty);
+
+        b.extend_from_slice(b" mtime=\"");
+
+        let tm = gmtime(e.mtime);
+
+        sprintf_num(&mut b, tm.year as i64, b' ', 4);
+        b.push(b'-');
+        sprintf_num(&mut b, tm.mon as i64, b'0', 2);
+        b.push(b'-');
+        sprintf_num(&mut b, tm.mday as i64, b'0', 2);
+        b.push(b'T');
+        sprintf_num(&mut b, tm.hour as i64, b'0', 2);
+        b.push(b':');
+        sprintf_num(&mut b, tm.min as i64, b'0', 2);
+        b.push(b':');
+        sprintf_num(&mut b, tm.sec as i64, b'0', 2);
+        b.push(b'Z');
+
+        if e.file {
+            b.extend_from_slice(b"\" size=\"");
+            sprintf_num(&mut b, e.size, b' ', 0);
+        }
+
+        b.push(b'"');
+        b.push(b'>');
+
+        if e.escape != 0 {
+            escape_html_into(&mut b, &e.name);
+        } else {
+            b.extend_from_slice(&e.name);
+        }
+
+        b.push(b'<');
+        b.push(b'/');
+
+        b.extend_from_slice(ty);
+
+        b.push(b'>');
+
+        b.extend_from_slice(b"\r\n");
+    }
+
+    b.extend_from_slice(TAIL);
+
+    b
+}
+
+/// ngx_http_autoindex_cmp_entries: directories first, then ngx_strcmp()
+fn autoindex_cmp_entries(first: &Entry, second: &Entry) -> Ordering {
+    if first.dir && !second.dir {
+        /* move the directories to the start */
+        return Ordering::Less;
+    }
+
+    if !first.dir && second.dir {
+        /* move the directories to the start */
+        return Ordering::Greater;
+    }
+
+    first.name.cmp(&second.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &[u8], dir: bool, file: bool, mtime: i64, size: i64) -> Entry {
+        Entry { name: name.to_vec(), utf_len: 0, escape: 0, escape_html: 0, dir, file, mtime, size }
+    }
+
+    /// The entry lines of an html listing of "/d/"
+    fn html_lines(entries: &mut [Entry], utf8: bool, exact_size: bool) -> Vec<Vec<u8>> {
+        let out = autoindex_html(b"/d/", entries, utf8, 0, exact_size);
+        let mut lines: Vec<Vec<u8>> = out.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
+        lines.retain(|l| l.starts_with(b"<a href=\"") && !l.starts_with(b"<a href=\"../"));
+        lines
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn html_layout() {
+        let mut e = vec![entry(b"dir", true, false, 0, 4096), entry(b"a<b", false, true, 86400 * 365, 12345)];
+        let out = autoindex_html(b"/x&y/", &mut e, false, 0, true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("<html>\r\n<head><title>Index of /x&amp;y/</title></head>\r\n<body>\r\n<h1>Index of /x&amp;y/</h1><hr><pre><a href=\"../\">../</a>\r\n"));
+        assert!(s.ends_with("</pre><hr></body>\r\n</html>\r\n"));
+        let lines: Vec<&str> = s.split("\r\n").collect();
+        assert_eq!(lines[4], format!("<a href=\"dir/\">dir/</a>{} 01-Jan-1970 00:00 {}-", " ".repeat(46), " ".repeat(18)));
+        assert_eq!(lines[5], format!("<a href=\"a%3Cb\">a&lt;b</a>{} 01-Jan-1971 00:00 {}12345", " ".repeat(47), " ".repeat(14)));
+
+        // autoindex_localtime: the offset is added to the mtime
+        let mut e = vec![entry(b"f", false, true, 0, 1)];
+        let out = autoindex_html(b"/", &mut e, false, 3 * 3600 + 25 * 60, true);
+        assert!(contains(&out, b" 01-Jan-1970 03:25 "));
+    }
+
+    #[test]
+    fn html_long_names() {
+        let long = [b"test-long-".to_vec(), vec![b'0'; 50]].concat();
+        let long_esc = [b"test-long-".to_vec(), vec![b'>'; 50]].concat();
+        let exact = [b"x".to_vec(), vec![b'y'; 49]].concat();
+        let mut e = vec![entry(&long, false, true, 0, 0), entry(&long_esc, false, true, 0, 0), entry(&exact, true, false, 0, 0)];
+        let lines = html_lines(&mut e, false, true);
+        assert!(contains(&lines[0], format!(">test-long-{}..&gt;</a> 01-Jan", "0".repeat(37)).as_bytes()));
+        assert!(contains(&lines[1], format!(">test-long-{}..&gt;</a> 01-Jan", "&gt;".repeat(37)).as_bytes()));
+        // exactly 50 characters: no room for the directory slash, no padding
+        assert!(contains(&lines[2], format!("<a href=\"x{0}/\">x{0}</a> 01-Jan", "y".repeat(49)).as_bytes()));
+    }
+
+    #[test]
+    fn html_utf8_names() {
+        let f = "\u{444}";
+        let short = format!("test-utf8-{}", f.repeat(3));
+        let long = format!("test-utf8-{}", f.repeat(45));
+        let long_esc = format!("test-utf8-<>&-{}", f.repeat(45));
+        let mut e = vec![entry(short.as_bytes(), false, true, 0, 0), entry(long.as_bytes(), false, true, 0, 0), entry(long_esc.as_bytes(), false, true, 0, 0)];
+        let lines = html_lines(&mut e, true, true);
+        assert!(contains(&lines[0], format!(">test-utf8-{}</a>{} 01-Jan", f.repeat(3), " ".repeat(37)).as_bytes()));
+        assert!(contains(&lines[1], format!(">test-utf8-{}..&gt;</a> 01-Jan", f.repeat(37)).as_bytes()));
+        assert!(contains(&lines[2], format!(">test-utf8-&lt;&gt;&amp;-{}..&gt;</a> 01-Jan", f.repeat(33)).as_bytes()));
+
+        // without the utf-8 charset the name is cut at 47 bytes
+        let mut e = vec![entry(long.as_bytes(), false, true, 0, 0)];
+        let lines = html_lines(&mut e, false, true);
+        let cut = [b">test-utf8-".to_vec(), f.repeat(18).into_bytes(), b"\xd1..&gt;</a> ".to_vec()].concat();
+        assert!(contains(&lines[0], &cut));
+
+        // invalid utf-8 is counted in bytes
+        let mut e = vec![entry(b"\xff\xffabc", false, true, 0, 0), entry(b"\xd1\x84abc", false, true, 0, 0)];
+        let lines = html_lines(&mut e, true, true);
+        assert!(contains(&lines[0], [b">\xff\xffabc</a>".to_vec(), vec![b' '; 45], b" 01-Jan".to_vec()].concat().as_slice()));
+        assert!(contains(&lines[1], [b">\xd1\x84abc</a>".to_vec(), vec![b' '; 46], b" 01-Jan".to_vec()].concat().as_slice()));
+    }
+
+    #[test]
+    fn html_sizes() {
+        let mut e = vec![
+            entry(b"d", true, false, 0, 0),
+            entry(b"a", false, true, 0, 9999),
+            entry(b"b", false, true, 0, 10000),
+            entry(b"c", false, true, 0, 1024 * 1024 - 1),
+            entry(b"e", false, true, 0, 1024 * 1024 + 512 * 1024),
+            entry(b"f", false, true, 0, 3 * 1024 * 1024 * 1024 - 1),
+        ];
+        let lines = html_lines(&mut e, false, false);
+        let tails: Vec<&[u8]> = lines.iter().map(|l| &l[l.len() - 8..]).collect();
+        let expected: Vec<&[u8]> = vec![b"       -", b"    9999", b"     10K", b"   1024K", b"      2M", b"      3G"];
+        assert_eq!(tails, expected);
+        assert_eq!(human_size(1024 * 1024 + 512 * 1024 - 1), (1, b'M'));
+        assert_eq!(human_size(10240 + 511), (10, b'K'));
+        assert_eq!(human_size(10240 + 512), (11, b'K'));
+    }
+
+    #[test]
+    fn json_output() {
+        let mut e = vec![entry(b"d\"x", true, false, 0, 0), entry(b"f", false, true, 784111777, 42), entry(b"l", false, false, 0, 7)];
+        let out = autoindex_json(&mut e, None);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "[\r\n{ \"name\":\"d\\\"x\", \"type\":\"directory\", \"mtime\":\"Thu, 01 Jan 1970 00:00:00 GMT\" },\
+             \r\n{ \"name\":\"f\", \"type\":\"file\", \"mtime\":\"Sun, 06 Nov 1994 08:49:37 GMT\", \"size\":42 },\
+             \r\n{ \"name\":\"l\", \"type\":\"other\", \"mtime\":\"Thu, 01 Jan 1970 00:00:00 GMT\" }\r\n]"
+        );
+        assert_eq!(autoindex_json(&mut [], None), b"[\r\n]");
+        assert_eq!(autoindex_json(&mut [], Some(b"foo")), b"/* callback */\r\nfoo([\r\n]);");
+    }
+
+    #[test]
+    fn xml_output() {
+        let mut e = vec![entry(b"d", true, false, 0, 0), entry(b"a<\"'", false, true, 784111777, 42), entry(b"s", false, false, 0, 3)];
+        let out = autoindex_xml(&mut e);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "<?xml version=\"1.0\"?>\r\n<list>\r\n<directory mtime=\"1970-01-01T00:00:00Z\">d</directory>\r\n\
+             <file mtime=\"1994-11-06T08:49:37Z\" size=\"42\">a&lt;&quot;'</file>\r\n\
+             <other mtime=\"1970-01-01T00:00:00Z\">s</other>\r\n</list>\r\n"
+        );
+    }
+
+    #[test]
+    fn jsonp_callback_names() {
+        assert_eq!(check_jsonp_callback(b"foo.bar_1"), Ok(()));
+        assert_eq!(check_jsonp_callback(b""), Ok(()));
+        assert_eq!(check_jsonp_callback(b"a-b"), Err("invalid"));
+        assert_eq!(check_jsonp_callback(b"a%28"), Err("invalid"));
+        assert_eq!(check_jsonp_callback(b"\xc1"), Err("invalid"));
+        assert_eq!(check_jsonp_callback(&[b'a'; 128]), Ok(()));
+        assert_eq!(check_jsonp_callback(&[b'a'; 129]), Err("too long"));
+    }
+
+    #[test]
+    fn sort_order() {
+        let mut e = vec![entry(b"b", false, true, 0, 0), entry(b"z", true, false, 0, 0), entry(b"\xd1\x84", false, true, 0, 0), entry(b"B", false, true, 0, 0), entry(b"a", true, false, 0, 0)];
+        e.sort_by(autoindex_cmp_entries);
+        let names: Vec<&[u8]> = e.iter().map(|e| e.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"a"[..], b"z", b"B", b"b", b"\xd1\x84"]);
+    }
+
+    #[test]
+    fn numbers() {
+        let mut b = Vec::new();
+        sprintf_num(&mut b, 7, b'0', 2);
+        sprintf_num(&mut b, 123, b'0', 2);
+        sprintf_num(&mut b, -5, b' ', 3);
+        assert_eq!(b, b"07123-  5");
+        assert_eq!(escape_html_len(b"<a&\"'>"), 3 + 4 + 5 + 3);
+        assert_eq!(escape_json_len(b"a\"\\\n\x01"), 1 + 1 + 1 + 5);
     }
 }

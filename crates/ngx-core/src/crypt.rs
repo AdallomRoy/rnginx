@@ -155,23 +155,11 @@ fn crypt_sha(key: &[u8]) -> Result<Vec<u8>, i32> {
 /// {SSHA} - base64(SHA1(key+salt)+salt)
 fn crypt_ssha(key: &[u8], salt_arg: &[u8]) -> Result<Vec<u8>, i32> {
     // Extract the base64-encoded part
-    let encoded_part = if salt_arg.len() > 6 {
-        &salt_arg[6..] // Skip "{SSHA}"
-    } else {
-        return Err(22); // EINVAL
-    };
+    let encoded_part = &salt_arg[6..]; // Skip "{SSHA}"
 
-    // Decode the base64 to get the stored digest + salt
-    let decoded = match base64_decode(encoded_part) {
-        Ok(d) => d,
-        Err(_) => {
-            // Invalid base64; return with just 20 zero bytes for SHA1 digest
-            let mut result = b"{SSHA}".to_vec();
-            let payload = [vec![0u8; 20], vec![0u8; 0]].concat();
-            result.extend_from_slice(&base64_encode(&payload));
-            return Ok(result);
-        }
-    };
+    // Decode the base64 to get the stored digest + salt; as in C, a value
+    // that is empty or does not decode has no salt
+    let decoded = crate::string::decode_base64(encoded_part).unwrap_or_default();
 
     // The stored format is: SHA1(key+salt) || salt
     // Minimum is 20 bytes (SHA1 digest), rest is salt
@@ -239,6 +227,7 @@ fn base64_encode(data: &[u8]) -> Vec<u8> {
 }
 
 /// Simple base64 decoder
+#[cfg(test)]
 fn base64_decode(data: &[u8]) -> Result<Vec<u8>, ()> {
     let mut result = Vec::new();
     let mut buf = 0u32;
@@ -381,6 +370,18 @@ mod tests {
         let salt = b"{SSHA}qUqP5cyxm6YcTAhz05Hph5gvu9Mtest";
         let result = crypt(key, salt).unwrap();
         assert!(result.starts_with(b"{SSHA}"));
+    }
+
+    #[test]
+    fn test_ssha_no_salt() {
+        // as ngx_crypt_ssha: no salt when the value is empty, does not
+        // decode or is shorter than the digest
+        let sha = crypt(b"test", b"{SHA}").unwrap();
+        let expected = [&b"{SSHA}"[..], &sha[5..]].concat();
+        assert_eq!(crypt(b"test", b"{SSHA}").unwrap(), expected);
+        assert_eq!(crypt(b"test", b"{SSHA}_____wQadOA1e+/f+T+H3eCQQhRzYWx0").unwrap(), expected);
+        assert_eq!(crypt(b"test", b"{SSHA}Zm9vCg==").unwrap(), expected);
+        assert_eq!(crypt(b"password", b"{SSHA}yI6cZwQadOA1e+/f+T+H3eCQQhRzYWx0").unwrap(), b"{SSHA}yI6cZwQadOA1e+/f+T+H3eCQQhRzYWx0");
     }
 
     #[test]

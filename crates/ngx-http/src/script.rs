@@ -89,7 +89,8 @@ pub fn compile_complex_value(cf: &mut Conf, v: &[u8], flags: u32) -> Result<Comp
     let mut value = v.to_vec();
     let mut prefix = false;
     if (flags & NGX_HTTP_COMPLEX_VALUE_ROOT_PREFIX) != 0 || (flags & NGX_HTTP_COMPLEX_VALUE_CONF_PREFIX) != 0 {
-        if !value.is_empty() && value[0] != b'$' && value[0] != b'/' {
+        // an empty value gets the prefix too, as in C
+        if value.first() != Some(&b'$') && value.first() != Some(&b'/') {
             prefix = true;
         }
     }
