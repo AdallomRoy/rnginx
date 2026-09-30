@@ -84,32 +84,18 @@ pub fn autoindex_module() -> ModuleDef {
 }
 
 /// ngx_conf_set_enum_slot with ngx_http_autoindex_format[]
-fn autoindex_format_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    const FORMATS: [(&[u8], u32); 4] = [
-        (b"html", NGX_HTTP_AUTOINDEX_HTML),
-        (b"json", NGX_HTTP_AUTOINDEX_JSON),
-        (b"jsonp", NGX_HTTP_AUTOINDEX_JSONP),
-        (b"xml", NGX_HTTP_AUTOINDEX_XML),
+fn autoindex_format_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    const FORMATS: [(&str, u32); 4] = [
+        ("html", NGX_HTTP_AUTOINDEX_HTML),
+        ("json", NGX_HTTP_AUTOINDEX_JSON),
+        ("jsonp", NGX_HTTP_AUTOINDEX_JSONP),
+        ("xml", NGX_HTTP_AUTOINDEX_XML),
     ];
 
     let cell = conf_rc::<AutoIndexConf>(conf.as_ref().unwrap());
+    let mut c = cell.borrow_mut();
 
-    if cell.borrow().format.is_set() {
-        return Err(msg("is duplicate"));
-    }
-
-    let value = &cf.args[1];
-
-    for (name, format) in FORMATS {
-        if name.eq_ignore_ascii_case(value) {
-            cell.borrow_mut().format = Val::set(format);
-            return Ok(());
-        }
-    }
-
-    cf.warn(format_args!("invalid value \"{}\"", B(value)));
-
-    Err(ConfError::Logged)
+    set_enum(cf, cmd, &mut c.format, &FORMATS)
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
