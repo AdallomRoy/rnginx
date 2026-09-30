@@ -181,10 +181,10 @@ fn gzip_tag() -> usize {
 }
 
 /// The start of the data of a buffer in memory (buf->start), NULL for
-/// the others
+/// the others (pos and last of these are NULL in C)
 fn buf_data_ptr(b: &Buf) -> *const u8 {
     match &b.data {
-        BufData::Memory(v) if b.in_memory() => v.as_ptr(),
+        BufData::Memory(v) => v.as_ptr(),
         _ => std::ptr::null(),
     }
 }
