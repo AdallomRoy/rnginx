@@ -91,11 +91,10 @@ pub async fn header_filter(r: R) -> i64 {
     let mut out: Vec<u8> = Vec::with_capacity(512);
     {
         let mut ho = r.headers_out.borrow_mut();
+        // r->headers_out.last_modified = NULL: a header of the list stays
         if ho.last_modified_time != -1 && ho.status != NGX_HTTP_OK && ho.status != NGX_HTTP_PARTIAL_CONTENT && ho.status != NGX_HTTP_NOT_MODIFIED {
             ho.last_modified_time = -1;
-            if let Some(lm) = ho.last_modified.take() {
-                lm.hash.set(0);
-            }
+            ho.last_modified = None;
         }
         if ho.status == NGX_HTTP_NO_CONTENT {
             r.header_only.set(true);
@@ -105,9 +104,7 @@ pub async fn header_filter(r: R) -> i64 {
             if let Some(cl) = ho.content_length.take() {
                 cl.hash.set(0);
             }
-            if let Some(lm) = ho.last_modified.take() {
-                lm.hash.set(0);
-            }
+            ho.last_modified = None;
             ho.last_modified_time = -1;
         }
         if ho.status == NGX_HTTP_NOT_MODIFIED {

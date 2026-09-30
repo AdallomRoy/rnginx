@@ -104,9 +104,7 @@ async fn header_filter(r: &R) -> i64 {
                 ho.content_length_n = -1;
 
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = indexed(NGX_HTTP_V2_STATUS_204_INDEX);
             }
@@ -120,9 +118,7 @@ async fn header_filter(r: &R) -> i64 {
 
             _ => {
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = match ho.status {
                     NGX_HTTP_BAD_REQUEST => indexed(NGX_HTTP_V2_STATUS_400_INDEX),
