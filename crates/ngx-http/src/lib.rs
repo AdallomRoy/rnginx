@@ -96,6 +96,7 @@ pub mod slice;
 pub mod scgi;
 pub mod grpc;
 pub mod upstream_h2;
+pub mod proxy_v2;
 pub mod tunnel;
 pub mod json;
 

@@ -634,7 +634,8 @@ fn upstream_conf(c: &NgxHttpProxyLocConf) -> crate::upstream_rt::UpstreamConf {
         store_values: c.store_values.clone(),
         intercept_404: false,
         change_buffering: true,
-        preserve_output: false,
+        // plcf->upstream.preserve_output, set by ngx_http_proxy_v2_handler
+        preserve_output: c.http_version.get_or(crate::NGX_HTTP_VERSION_11) == crate::NGX_HTTP_VERSION_20,
         ignore_input: false,
         ssl: c.upstream_ssl.clone(),
         module: "proxy",
@@ -1359,6 +1360,31 @@ fn proxy_send_lowat_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn An
     rc
 }
 
+/// ngx_http_proxy_rewrite_redirect: a "Location" or "Refresh" header of the
+/// response by the rules of proxy_redirect
+pub(crate) fn rewrite_redirect(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, h: &Header, prefix: usize) -> i64 {
+    let redirects = match lcf.borrow().redirects.clone() {
+        Some(v) if !v.is_empty() => v,
+        _ => return NGX_DECLINED,
+    };
+
+    let value = h.value.borrow().clone();
+
+    match try_redirect_rewrite(r, &value, prefix, &redirects) {
+        Some(v) => {
+            *h.value.borrow_mut() = v;
+            NGX_OK
+        }
+        None => NGX_DECLINED,
+    }
+}
+
+/// u->rewrite_cookie is set: plcf->cookie_domains, cookie_paths or
+/// cookie_flags
+pub(crate) fn has_rewrite_cookie(c: &NgxHttpProxyLocConf) -> bool {
+    !c.cookie_domains.is_empty() || !c.cookie_paths.is_empty() || c.cookie_flags.iter().any(|r| !matches!(r.matcher, CookieMatcher::Off))
+}
+
 /// The request's ngx_http_proxy_ctx_t, if the proxy handles it.
 fn proxy_ctx(r: &R) -> Option<Rc<RefCell<ProxyCtx>>> {
     r.get_ctx::<ProxyCtx>(ctx_index())
@@ -1543,6 +1569,10 @@ struct ProxyModule {
 async fn proxy_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
 
+    if lcf.borrow().http_version.get_or(crate::NGX_HTTP_VERSION_11) == crate::NGX_HTTP_VERSION_20 {
+        return crate::proxy_v2::proxy_v2_handler(r).await;
+    }
+
     let conf = match lcf.borrow().upstream_conf.clone() {
         Some(c) => c,
         None => return crate::NGX_HTTP_INTERNAL_SERVER_ERROR,
@@ -1603,7 +1633,7 @@ async fn proxy_handler(r: R) -> i64 {
 
 /// ngx_http_proxy_eval: the URL of proxy_pass with variables, its vars and
 /// the upstream it names (u->resolved).
-fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::script::Part], u: &mut crate::upstream_rt::Upstream) -> i64 {
+pub(crate) fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::script::Part], u: &mut crate::upstream_rt::Upstream) -> i64 {
     let proxy = match crate::script::script_run(r, codes) {
         Some(p) => p,
         None => return NGX_ERROR,
@@ -1877,7 +1907,7 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
 /// ngx_http_proxy_create_key: proxy_cache_key, or the URL of proxy_pass
 /// (ctx->vars.key_start) and the URI of the request as the upstream
 /// request has it.
-fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let plcf = lcf.borrow();
 
@@ -2089,25 +2119,11 @@ impl crate::upstream_rt::UpstreamModule for ProxyModule {
 
     /// ngx_http_proxy_rewrite_redirect
     fn rewrite_redirect(&mut self, r: &R, h: &Header, prefix: usize) -> i64 {
-        let redirects = match self.lcf.borrow().redirects.clone() {
-            Some(v) if !v.is_empty() => v,
-            _ => return NGX_DECLINED,
-        };
-
-        let value = h.value.borrow().clone();
-
-        match try_redirect_rewrite(r, &value, prefix, &redirects) {
-            Some(v) => {
-                *h.value.borrow_mut() = v;
-                NGX_OK
-            }
-            None => NGX_DECLINED,
-        }
+        rewrite_redirect(r, &self.lcf, h, prefix)
     }
 
     fn has_rewrite_cookie(&self) -> bool {
-        let c = self.lcf.borrow();
-        !c.cookie_domains.is_empty() || !c.cookie_paths.is_empty() || c.cookie_flags.iter().any(|r| !matches!(r.matcher, CookieMatcher::Off))
+        has_rewrite_cookie(&self.lcf.borrow())
     }
 
     /// ngx_http_proxy_rewrite_cookie
@@ -2662,11 +2678,11 @@ pub fn proxy_module() -> ModuleDef {
         ngx_core::cmd!("proxy_pass_request_body", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, pass_request_body, set_flag),
         cmd_fn!("proxy_method", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, proxy_method_handler),
         cmd_fn!("proxy_http_version", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |cf: &mut Conf, cmd, conf: Option<Rc<dyn Any>>| {
-            // ngx_conf_set_enum_slot with ngx_http_proxy_http_version
-            // ("2" is ngx_http_proxy_v2_module, not ported)
+            // ngx_conf_set_enum_slot with ngx_http_proxy_http_version ("2"
+            // is ngx_http_proxy_v2_module)
             let cell = conf_rc::<NgxHttpProxyLocConf>(conf.as_ref().unwrap());
             let mut c = cell.borrow_mut();
-            set_enum(cf, cmd, &mut c.http_version, &[("1.0", crate::NGX_HTTP_VERSION_10), ("1.1", crate::NGX_HTTP_VERSION_11)])
+            set_enum(cf, cmd, &mut c.http_version, &[("1.0", crate::NGX_HTTP_VERSION_10), ("1.1", crate::NGX_HTTP_VERSION_11), ("2", crate::NGX_HTTP_VERSION_20)])
         }),
         ngx_core::cmd!("proxy_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, NgxHttpProxyLocConf, socket_keepalive, set_flag),
         cmd_fn!("proxy_cookie_domain", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, proxy_cookie_domain_handler),
@@ -3001,7 +3017,7 @@ fn cookie_rewrite_off() -> CookieRewrite {
 /// "Set-Cookie" rewritten with proxy_cookie_domain and proxy_cookie_path,
 /// then its flags with proxy_cookie_flags; the value made anew if any was
 /// changed. NGX_OK, or NGX_DECLINED if not rewritten.
-fn rewrite_cookie(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, h: &Header) -> i64 {
+pub(crate) fn rewrite_cookie(r: &R, lcf: &Rc<RefCell<NgxHttpProxyLocConf>>, h: &Header) -> i64 {
     let value = h.value.borrow().clone();
 
     let mut attrs = parse_cookie(&value);
