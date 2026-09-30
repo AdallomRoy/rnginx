@@ -732,6 +732,14 @@ pub struct StreamUpstream {
     pub connected: Cell<bool>,
     pub proxy_protocol: Cell<u32>,
     pub half_closed: Cell<bool>,
+
+    /// u->upstream_out and b->last - b->start of u->downstream_buf: the
+    /// client's data read while the upstream is not connected, to be sent
+    /// once it is
+    pub upstream_out: RefCell<std::collections::VecDeque<Vec<u8>>>,
+    pub downstream_size: Cell<usize>,
+    /// c->read->eof: the client's end (or a read error) seen then
+    pub client_eof: Cell<bool>,
 }
 
 impl StreamUpstream {
@@ -768,6 +776,9 @@ impl StreamUpstream {
             connected: Cell::new(false),
             proxy_protocol: Cell::new(0),
             half_closed: Cell::new(false),
+            upstream_out: RefCell::new(std::collections::VecDeque::new()),
+            downstream_size: Cell::new(0),
+            client_eof: Cell::new(false),
         }
     }
 

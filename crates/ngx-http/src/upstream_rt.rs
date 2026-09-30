@@ -1203,14 +1203,14 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
     let (rc, start_time) = {
         let g = u.peer.as_mut().expect("peer");
 
-        // a new state, and the peer (ngx_event_connect_peer's pc->get);
-        // "no live upstreams" is logged for NGX_BUSY
+        // a new state, and the peer (ngx_event_connect_peer's pc->get)
         let rc = g.u.connect(r);
 
         (rc, g.u.start_time)
     };
 
-    // u->peer.name for the error log
+    // u->peer.name for the error log: the peer, or the upstream's name
+    // when there is none (NGX_BUSY)
     set_log_peer(u);
 
     if rc == NGX_ERROR {
@@ -1218,6 +1218,7 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
     }
 
     if rc == NGX_BUSY {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no live upstreams");
         return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_NOLIVE));
     }
 

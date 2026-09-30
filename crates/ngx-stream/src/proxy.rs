@@ -311,14 +311,25 @@ async fn proxy_resolve(s: &S, u: &Rc<StreamUpstream>, ur: &UpstreamResolved) {
         }
     };
 
-    let res = tokio::select! {
-        r = resolver.resolve_host(host, resolver_timeout) => r,
-        _ = c.close_notify.notified() => {
-            if c.close.get() {
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "shutdown timeout");
+    // the client's read events are processed while the name is resolved
+    let resolve = resolver.resolve_host(host, resolver_timeout);
+    tokio::pin!(resolve);
+
+    let res = loop {
+        tokio::select! {
+            biased;
+
+            _ = downstream_event(s, u) => {}
+
+            r = &mut resolve => break r,
+
+            _ = c.close_notify.notified() => {
+                if c.close.get() {
+                    ngx_log_error!(NGX_LOG_INFO, c.log, None, "shutdown timeout");
+                }
+                proxy_finalize(s, NGX_STREAM_OK).await;
+                return;
             }
-            proxy_finalize(s, NGX_STREAM_OK).await;
-            return;
         }
     };
 
@@ -569,16 +580,33 @@ async fn connect_once(s: &S) -> Connected {
     *u.connection.borrow_mut() = Some(pc.clone());
 
     if rc == NGX_AGAIN {
-        // ngx_stream_proxy_connect_handler
+        // ngx_stream_proxy_connect_handler, on the write event or its
+        // timer. A timer of 0 expires at the end of the event loop
+        // iteration it was added in, before the connection's events (and
+        // the client's read event posted by ngx_stream_proxy_handler).
 
-        let res = tokio::select! {
-            r = tokio::time::timeout(Duration::from_millis(connect_timeout), pc.writable()) => r,
-            _ = c.close_notify.notified() => {
-                if c.close.get() {
-                    ngx_log_error!(NGX_LOG_INFO, c.log, None, "shutdown timeout");
+        let res = if connect_timeout == 0 {
+            Err(())
+        } else {
+            let wait = tokio::time::timeout(Duration::from_millis(connect_timeout), pc.writable());
+            tokio::pin!(wait);
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = downstream_event(s, &u) => {}
+
+                    r = &mut wait => break r.map(|_| ()).map_err(|_| ()),
+
+                    _ = c.close_notify.notified() => {
+                        if c.close.get() {
+                            ngx_log_error!(NGX_LOG_INFO, c.log, None, "shutdown timeout");
+                        }
+                        proxy_finalize(s, NGX_STREAM_OK).await;
+                        return Connected::Done;
+                    }
                 }
-                proxy_finalize(s, NGX_STREAM_OK).await;
-                return Connected::Done;
             }
         };
 
@@ -689,8 +717,22 @@ async fn send_proxy_protocol(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>)
 
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // NGX_AGAIN: ngx_stream_proxy_connect_handler on the write
-                // event with proxy_timeout
-                match tokio::time::timeout(Duration::from_millis(timeout), pc.writable()).await {
+                // event with proxy_timeout; the client's read events are
+                // processed meanwhile
+                let wait = tokio::time::timeout(Duration::from_millis(timeout), pc.writable());
+                tokio::pin!(wait);
+
+                let res = loop {
+                    tokio::select! {
+                        biased;
+
+                        _ = downstream_event(s, u) => {}
+
+                        r = &mut wait => break r,
+                    }
+                };
+
+                match res {
                     Ok(_) => continue,
                     Err(_) => {
                         ngx_log_error!(NGX_LOG_ERR, c.log, Some(libc::ETIMEDOUT), "upstream timed out");
@@ -807,11 +849,31 @@ async fn ssl_init_connection(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>,
     let mut rc = ngx_ssl_handshake(pc);
 
     if rc == NGX_AGAIN {
-        rc = match tokio::time::timeout(Duration::from_millis(connect_timeout), ngx_ssl_handshake_wait(pc)).await {
-            Ok(rc) => rc,
-            // the write timer: the handshake handler with the handshake
-            // not done
-            Err(_) => NGX_ERROR,
+        // the write timer (connect_timeout; one of 0 expires before the
+        // connection's events), the client's read events processed
+        // meanwhile
+        rc = if connect_timeout == 0 {
+            NGX_ERROR
+        } else {
+            let wait = tokio::time::timeout(Duration::from_millis(connect_timeout), ngx_ssl_handshake_wait(pc));
+            tokio::pin!(wait);
+
+            let res = loop {
+                tokio::select! {
+                    biased;
+
+                    _ = downstream_event(s, u) => {}
+
+                    r = &mut wait => break r,
+                }
+            };
+
+            match res {
+                Ok(rc) => rc,
+                // the write timer: the handshake handler with the handshake
+                // not done
+                Err(_) => NGX_ERROR,
+            }
         };
     }
 
@@ -1116,6 +1178,118 @@ fn proxy_log_error(s: &Session, buf: &mut Vec<u8>) {
     buf.extend_from_slice(format!(", bytes from/to client:{}/{}, bytes from/to upstream:{}/{}", s.received.get(), s.connection.sent.get(), u.received.get(), pc_sent).as_bytes());
 }
 
+/// The client's read event while the upstream is not connected: it comes
+/// with data, the end or an error (and the read event posted by
+/// ngx_stream_proxy_handler is this with the data already there). There
+/// is none if the read event is neither ready nor active yet (see
+/// client_read_active); the datagrams of a UDP session are left to the
+/// relay.
+async fn downstream_event(s: &Session, u: &StreamUpstream) {
+    if s.connection.ty != libc::SOCK_STREAM || !client_read_active(s) {
+        std::future::pending::<()>().await;
+    }
+
+    let buffer_size = *pscf_of(s).borrow().buffer_size;
+
+    loop {
+        // no more events after the end; with no room left the data waits
+        if u.client_eof.get() || u.downstream_size.get() >= buffer_size {
+            std::future::pending::<()>().await;
+        }
+
+        if s.connection.readable().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+
+        if process_unconnected(s, u) {
+            return;
+        }
+    }
+}
+
+/// c->read->ready or c->read->active at ngx_stream_proxy_handler: a phase
+/// before read from the client (the preread phase of ssl_preread, the TLS
+/// handshake, the PROXY protocol header). Otherwise the client's read
+/// event is added by ngx_stream_proxy_process() once the upstream is
+/// connected, and the data waits till then.
+fn client_read_active(s: &Session) -> bool {
+    let c = &s.connection;
+
+    c.ssl.borrow().is_some() || c.proxy_protocol.borrow().is_some() || *s.srv_conf::<crate::ssl_preread::SslPrereadSrvConf>(crate::ssl_preread::ctx_index()).borrow().enabled
+}
+
+/// ngx_stream_proxy_process(s, 0, 0) with no upstream connection yet
+/// (pc == NULL): the client's data is read into u->downstream_buf and
+/// queued in u->upstream_out, to be sent once the upstream is connected.
+/// False, with nothing changed, if there was nothing to read.
+fn process_unconnected(s: &Session, u: &StreamUpstream) -> bool {
+    let c = &s.connection;
+
+    let buffer_size = *pscf_of(s).borrow().buffer_size;
+
+    let action = c.log.action();
+
+    let mut event = false;
+
+    // for ( ;; ), with nothing to write to (dst == NULL); the rates are
+    // set by ngx_stream_proxy_init_upstream
+
+    loop {
+        let size = buffer_size.saturating_sub(u.downstream_size.get());
+
+        if size == 0 || u.client_eof.get() {
+            break;
+        }
+
+        c.log.set_action(Some("proxying and reading from client"));
+
+        let mut buf = vec![0u8; size];
+
+        let n = match c.try_recv(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+
+            Err(e) => {
+                // NGX_ERROR: c->recv() logged it
+                if !is_ssl_error_logged(&e) {
+                    c.connection_error(e.raw_os_error().unwrap_or(0), "recv() failed");
+                }
+                c.error.set(true);
+                u.client_eof.set(true);
+                0
+            }
+
+            Ok(n) => {
+                if n == 0 {
+                    u.client_eof.set(true);
+                }
+                n
+            }
+        };
+
+        event = true;
+
+        // a buffer with last_buf and no data is not sent
+        if n > 0 {
+            u.upstream_out.borrow_mut().push_back(buf[..n].to_vec());
+        }
+
+        u.requests.set(u.requests.get() + 1);
+        s.received.set(s.received.get() + n as i64);
+        u.downstream_size.set(u.downstream_size.get() + n);
+    }
+
+    if !event {
+        c.log.set_action(action);
+        return false;
+    }
+
+    c.log.set_action(Some("proxying connection"));
+
+    // ngx_stream_proxy_test_finalize: no upstream connection yet
+
+    true
+}
+
 // --- the relay ---
 
 /// The shared state of the two directions: c->read->eof, pc->read->eof,
@@ -1223,6 +1397,9 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
         upstream_out.push_back(preread);
     }
 
+    // u->upstream_out: what was read from the client meanwhile
+    upstream_out.extend(u.upstream_out.borrow_mut().drain(..));
+
     if u.proxy_protocol.get() != 0 {
         ngx_log_debug!(NGX_LOG_DEBUG_STREAM, c.log, "stream proxy add PROXY protocol header");
 
@@ -1272,7 +1449,7 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
         c: c.clone(),
         pc: pc.clone(),
         conf,
-        c_eof: Cell::new(false),
+        c_eof: Cell::new(u.client_eof.get()),
         pc_eof: Cell::new(false),
         c_buffered: Cell::new(false),
         pc_buffered: Cell::new(false),
@@ -1289,7 +1466,11 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
         tokio::pin!(downstream);
         tokio::pin!(upstream);
 
+        // ngx_stream_proxy_init_upstream runs ngx_stream_proxy_process(s,
+        // 0, 1) before the posted read event of the upstream
         tokio::select! {
+            biased;
+
             rc = &mut downstream => rc,
             rc = &mut upstream => rc,
             _ = r.timer() => proxy_timed_out(&r),
