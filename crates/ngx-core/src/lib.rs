@@ -45,6 +45,7 @@ pub mod inet;
 pub mod core_module;
 pub mod syslog;
 pub mod connection;
+pub mod control;
 pub mod event_connect;
 pub mod listen_event;
 pub mod process;

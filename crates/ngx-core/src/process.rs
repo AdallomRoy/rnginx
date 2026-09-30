@@ -685,6 +685,7 @@ fn reap_children(cycle: &Rc<Cycle>) -> bool {
                 if std::fs::rename(os::path(&oldpid), os::path(&pid)).is_err() {
                     ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "rename() {} back to {} failed after the new binary process \"{}\" exited", B(&oldpid), B(&pid), B(argv()[0].as_bytes()));
                 }
+                crate::control::reown(&cycle.log);
                 NEW_BINARY.store(0, Ordering::Relaxed);
                 globals_mut(|g| g.new_binary = 0);
                 if globals(|g| g.noaccepting) {
@@ -720,6 +721,7 @@ fn master_process_exit(cycle: &Rc<Cycle>) -> ! {
         }
     }
     crate::connection::close_listening_sockets(cycle);
+    crate::control::uninit(&cycle.log);
     std::process::exit(0);
 }
 
@@ -783,6 +785,20 @@ pub fn master_process_cycle(mut cycle: Rc<Cycle>) -> ! {
             process_get_status(&cycle.log);
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "reap children");
             live = reap_children(&cycle);
+        }
+
+        if SIG_IO.swap(false, Ordering::SeqCst) && crate::control::handle_events(&mut cycle) == crate::rc::NGX_DONE {
+            // the control API reloaded the configuration
+            let ccf = core_conf(&cycle);
+            worker_processes = *ccf.borrow().worker_processes;
+            start_worker_processes(&cycle, worker_processes, NGX_PROCESS_JUST_RESPAWN);
+            start_cache_manager_processes(&cycle, true);
+
+            // allow new processes to start
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            live = true;
+            signal_worker_processes(&cycle, libc::SIGQUIT);
         }
 
         let terminate = SIG_TERMINATE.load(Ordering::SeqCst);
@@ -885,6 +901,10 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
     let mut spare = b"SPARE=".to_vec();
     spare.resize(300, b'X');
     env.push(spare);
+
+    if let Some(e) = crate::control::handoff() {
+        env.push(e);
+    }
 
     for e in &env {
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "env: {}", B(e));

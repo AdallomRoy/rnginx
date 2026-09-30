@@ -338,6 +338,8 @@ fn flags_notify() -> Rc<tokio::sync::Notify> {
 
 /// Called after fork in a worker (ngx_worker_process_init).
 fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
+    crate::control::close_sockets();
+
     set_environment(cycle);
     let ccf = core_conf(cycle);
     let (priority, rlimit_nofile, rlimit_core, user, group, username, workdir, cpu_affinity, cpu_auto) = {
