@@ -681,6 +681,9 @@ pub struct UpstreamConn {
     pub requests: u64,
     /// ngx_current_msec at connect (c->start_time)
     pub start_time: u64,
+    /// the module's data of the connection, a cleanup of c->pool in C (the
+    /// HTTP/2 state of a gRPC connection)
+    pub data: Option<Rc<dyn std::any::Any>>,
 }
 
 /// ngx_peer_connection_t: the balancer's view of an upstream connection.

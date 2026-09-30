@@ -278,6 +278,26 @@ pub struct Upstream {
     /// cache
     conn_requests: u64,
     conn_start_time: u64,
+
+    /// u->writer.out: the output the connection did not take yet
+    /// (ngx_chain_writer), with u->conf->preserve_output
+    pub writer: Chain,
+    /// ngx_post_event(u->peer.connection->write): the module has output
+    /// (u->output.output_filter is to run with nothing new)
+    pub post_write: bool,
+    /// ngx_post_event(u->peer.connection->read)
+    pub post_read: bool,
+    /// u->request_body_blocked: the module holds a part of the body back
+    pub request_body_blocked: bool,
+    /// u->peer.cached: the connection is one of the keepalive cache
+    pub peer_cached: bool,
+    /// the module's data of the connection (a cleanup of c->pool in C),
+    /// cached with it
+    pub conn_data: Option<Rc<dyn std::any::Any>>,
+    /// the timers of the connection's events: c->write (send_timeout) and
+    /// c->read (read_timeout)
+    send_timer: Option<Instant>,
+    read_timer: Option<Instant>,
 }
 
 impl Upstream {
@@ -318,6 +338,14 @@ impl Upstream {
             stream_watch: None,
             conn_requests: 0,
             conn_start_time: 0,
+            writer: Chain::new(),
+            post_write: false,
+            post_read: false,
+            request_body_blocked: false,
+            peer_cached: false,
+            conn_data: None,
+            send_timer: None,
+            read_timer: None,
         }
     }
 
@@ -332,7 +360,7 @@ impl Upstream {
     }
 
     /// u->state
-    fn with_state<F: FnOnce(&mut UpstreamState)>(r: &R, f: F) {
+    pub fn with_state<F: FnOnce(&mut UpstreamState)>(r: &R, f: F) {
         if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
             f(st);
         }
@@ -349,6 +377,139 @@ impl Upstream {
         self.uri = uri.to_vec();
         *self.ucache.uri.borrow_mut() = uri.to_vec();
     }
+
+    /// ngx_chain_writer(&u->writer, out): the output goes after what the
+    /// connection did not take yet, and is written as far as it takes it
+    /// now. NGX_OK when all is out, NGX_AGAIN, NGX_ERROR.
+    pub fn chain_writer(&mut self, r: &R, out: Chain) -> i64 {
+        for b in out {
+            if b.buf_size() == 0 && !b.special_buf() {
+                continue;
+            }
+
+            ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_CORE, r.connection.log, "chain writer buf fl:{} s:{}", b.flush as i32, b.buf_size());
+
+            self.writer.push_back(b);
+        }
+
+        let size: i64 = self.writer.iter().map(|b| b.buf_size()).sum();
+
+        if size == 0 {
+            self.writer.clear();
+            return NGX_OK;
+        }
+
+        let (c, is_plain) = match self.sock.as_ref() {
+            Some(sock @ UpstreamSock::Conn(pc)) => (pc.c.clone(), plain(sock)),
+            _ => return NGX_ERROR,
+        };
+
+        match try_send_chain(&c, &mut self.writer) {
+            Ok(true) => {
+                self.writer.clear();
+                NGX_OK
+            }
+
+            Ok(false) => NGX_AGAIN,
+
+            Err(e) => {
+                if is_plain {
+                    let _ = c.connection_error(e.raw_os_error().unwrap_or(0), "writev() failed");
+                }
+
+                NGX_ERROR
+            }
+        }
+    }
+}
+
+/// c->send_chain of ngx_chain_writer: the buffers written without waiting,
+/// until the connection would block; true when all of them are out. A
+/// partly written buffer keeps its place (an SSL retry sends the same
+/// bytes).
+fn try_send_chain(c: &ngx_core::connection::Connection, chain: &mut Chain) -> std::io::Result<bool> {
+    loop {
+        while let Some(b) = chain.front() {
+            if b.buf_size() == 0 {
+                chain.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let b = match chain.front_mut() {
+            Some(b) => b,
+            None => return Ok(true),
+        };
+
+        let res = if b.in_file && !b.in_memory() {
+            let fd = match &b.data {
+                BufData::File(f) => f.fd,
+                _ => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+
+            let size = (b.file_last - b.file_pos) as usize;
+
+            if c.ssl.borrow().is_none() {
+                let mut off = b.file_pos as libc::off_t;
+
+                // SAFETY: a non-blocking sendfile() from an open file to the
+                // connection's socket
+                let n = unsafe { libc::sendfile(c.fd.get(), fd, &mut off, size) };
+
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    c.sent.set(c.sent.get() + n as u64);
+                    Ok(n as usize)
+                }
+            } else {
+                let mut data = vec![0u8; size.min(16384)];
+
+                // SAFETY: pread() into data of the file's open descriptor
+                let n = unsafe { libc::pread(fd, data.as_mut_ptr() as *mut libc::c_void, data.len(), b.file_pos) };
+
+                if n <= 0 {
+                    return Err(if n < 0 { std::io::Error::last_os_error() } else { std::io::Error::from_raw_os_error(libc::EIO) });
+                }
+
+                c.try_send(&data[..n as usize])
+            }
+        } else {
+            let data = match &b.data {
+                BufData::Memory(v) => &v[b.pos..b.last],
+                _ => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+
+            c.try_send(data)
+        };
+
+        match res {
+            Ok(n) => {
+                ngx_core::buf::chain_update_sent(chain, n as i64);
+            }
+
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// ngx_add_timer: a timer already set is moved, unless by less than
+/// NGX_TIMER_LAZY_DELAY
+fn add_timer(timer: &mut Option<Instant>, msec: u64) {
+    let key = Instant::now() + Duration::from_millis(msec);
+
+    if let Some(old) = *timer {
+        let diff = if key > old { key - old } else { old - key };
+
+        if diff < Duration::from_millis(300) {
+            return;
+        }
+    }
+
+    *timer = Some(key);
 }
 
 /// The callbacks of the module (those of ngx_http_upstream_t), on the
@@ -391,6 +552,13 @@ pub trait UpstreamModule {
     fn body_output_filter(&mut self, r: &R, u: &mut Upstream, bufs: Chain) -> Chain {
         let _ = (r, u);
         bufs
+    }
+
+    /// ngx_output_chain(&u->output, in) with u->conf->preserve_output: the
+    /// module's output filter writes what it lets go now with
+    /// u.chain_writer(); NGX_OK when all is out, NGX_AGAIN, NGX_ERROR.
+    fn output_filter(&mut self, r: &R, u: &mut Upstream, input: Option<Chain>) -> i64 {
+        u.chain_writer(r, input.unwrap_or_default())
     }
 
     /// u->rewrite_redirect: the "Location" or "Refresh" header copied to
@@ -1300,6 +1468,10 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
         return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_NOLIVE));
     }
 
+    u.writer.clear();
+    u.send_timer = None;
+    u.read_timer = None;
+
     let sock = if rc == NGX_DONE {
         // a cached keepalive connection; c->data = r
         let g = u.peer.as_mut().expect("peer");
@@ -1307,8 +1479,13 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
         g.u.attach_sock(&c.sock);
         u.conn_requests = c.requests;
         u.conn_start_time = c.start_time;
+        u.conn_data = c.data;
+        u.peer_cached = true;
         c.sock
     } else {
+        u.conn_data = None;
+        u.peer_cached = false;
+
         let sockaddr = match u.peer.as_ref().and_then(|g| g.u.pc.sockaddr.clone()) {
             Some(sa) => sa,
             None => return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR)),
@@ -1412,6 +1589,10 @@ fn reinit(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i64 {
 /// ngx_http_upstream_send_request and ngx_http_upstream_send_request_body,
 /// then ngx_http_upstream_process_header when the request is sent.
 async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start_time: u64) -> Result<(), Failure> {
+    if u.conf.preserve_output {
+        return send_request_duplex(r, u, m, start_time).await;
+    }
+
     http_debug!(r, "http upstream send request");
 
     Upstream::with_state(r, |st| {
@@ -2043,7 +2224,7 @@ fn finalize_peer(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, rc: i64) {
     if let Some(mut g) = u.peer.take() {
         if u.keepalive {
             if let Some(sock) = u.sock.take() {
-                g.conn = Some(UpstreamConn { sock, requests: u.conn_requests, start_time: u.conn_start_time });
+                g.conn = Some(UpstreamConn { sock, requests: u.conn_requests, start_time: u.conn_start_time, data: u.conn_data.take() });
                 g.keepalive = true;
             }
         }
@@ -2584,6 +2765,10 @@ async fn send_non_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) 
         do_write = false;
     }
 
+    if u.conf.preserve_output {
+        return process_non_buffered_duplex(r, u, m, do_write).await;
+    }
+
     process_non_buffered_request(r, u, m, do_write).await
 }
 
@@ -2702,6 +2887,657 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
         }
 
         do_write = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the request and the response of u->conf->preserve_output (gRPC)
+// ---------------------------------------------------------------------------
+
+/// What wakes a request of u->conf->preserve_output: the events whose
+/// handlers C runs while the request is sent and the response read.
+enum DuplexEvent {
+    /// the upstream's read event: data (n bytes in the buffer), the end of
+    /// the connection (0), or an error
+    Read(std::io::Result<usize>),
+    /// the upstream's write event: what u->writer held went out
+    Written(std::io::Result<()>),
+    /// the client's read event while the body is read
+    Body,
+    /// the timers of the upstream's write and read events and of the
+    /// client's read event (client_body_timeout)
+    SendTimeout,
+    ReadTimeout,
+    BodyTimeout,
+    /// the client closed the connection
+    /// (ngx_http_upstream_rd_check_broken_connection)
+    ClientClosed(i32),
+    /// the client's write event: the output to it went out, with the rc of
+    /// ngx_http_output_filter
+    Downstream(i64),
+}
+
+/// The output to the client in flight.
+type Downstream = std::pin::Pin<Box<dyn std::future::Future<Output = i64>>>;
+
+/// A read of the upstream connection.
+async fn peer_read(pc: &crate::upstream_ssl::PeerConn, buf: &mut [u8]) -> std::io::Result<usize> {
+    std::future::poll_fn(|cx| {
+        let mut rb = tokio::io::ReadBuf::new(&mut *buf);
+
+        match pc.poll_read(cx, &mut rb) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(rb.filled().len())),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+async fn sleep_until_opt(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next event of a request of u->conf->preserve_output: the upstream
+/// read (if `read`), the output held in u->writer going out, more of the
+/// body from the client, the output to the client done, a timer, or the
+/// client closing.
+async fn duplex_wait(r: &R, u: &mut Upstream, chunk: &mut [u8], read: bool, body_timer: Option<Instant>, down: &mut Option<Downstream>) -> DuplexEvent {
+    let pc = match u.sock.as_ref() {
+        Some(UpstreamSock::Conn(pc)) => pc,
+        _ => return DuplexEvent::Read(Err(std::io::Error::from_raw_os_error(libc::EBADF))),
+    };
+
+    let c = pc.c.clone();
+    let writing = !u.writer.is_empty();
+    let writer = &mut u.writer;
+    let reading_body = r.reading_body.get();
+    let watch = u.watch.clone();
+    let send_timer = u.send_timer;
+    let read_timer = u.read_timer;
+    let downstream = down.is_some();
+
+    tokio::select! {
+        biased;
+
+        rc = async {
+            match down.as_mut() {
+                Some(f) => f.await,
+                None => std::future::pending().await,
+            }
+        }, if downstream => DuplexEvent::Downstream(rc),
+
+        res = peer_read(pc, chunk), if read => DuplexEvent::Read(res),
+
+        res = c.drive_io(|| match try_send_chain(&c, writer) {
+            Ok(true) => ngx_core::connection::IoStep::Done(Ok(())),
+            Ok(false) => ngx_core::connection::IoStep::WantWrite,
+            Err(e) => ngx_core::connection::IoStep::Done(Err(e)),
+        }), if writing => DuplexEvent::Written(res.and_then(|r| r)),
+
+        _ = crate::request_body::wait_request_body(r), if reading_body => DuplexEvent::Body,
+
+        _ = sleep_until_opt(send_timer), if send_timer.is_some() => DuplexEvent::SendTimeout,
+
+        _ = sleep_until_opt(read_timer), if read_timer.is_some() => DuplexEvent::ReadTimeout,
+
+        _ = sleep_until_opt(body_timer), if reading_body && body_timer.is_some() => DuplexEvent::BodyTimeout,
+
+        err = client_closed(watch.as_deref()), if !reading_body => DuplexEvent::ClientClosed(err),
+    }
+}
+
+/// ngx_http_upstream_send_request_body with an unbuffered body going
+/// through the module's u->output.output_filter: what there is of the
+/// request is passed on (the first time u->request_bufs and the part of the
+/// body read), then what the client sends. NGX_OK when all is out,
+/// NGX_AGAIN, NGX_ERROR, or a status.
+async fn send_request_body_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, do_write: bool) -> i64 {
+    http_debug!(r, "http upstream send request body");
+
+    if !r.request_body_no_buffering.get() {
+        // buffered request body: in u->request_bufs
+
+        let out = if !u.request_sent {
+            u.request_sent = true;
+
+            if let Some(g) = u.peer.as_mut() {
+                g.u.request_sent = true;
+            }
+
+            Some(u.request_bufs.clone())
+        } else {
+            None
+        };
+
+        let rc = m.output_filter(r, u, out);
+
+        u.request_body_blocked = rc == NGX_AGAIN;
+
+        return rc;
+    }
+
+    let mut out = None;
+
+    if !u.request_sent {
+        u.request_sent = true;
+
+        if let Some(g) = u.peer.as_mut() {
+            g.u.request_sent = true;
+        }
+
+        let mut o = u.request_bufs.clone();
+
+        o.extend(take_request_body_bufs(r));
+
+        out = Some(o);
+
+        if *r.clcf().borrow().tcp_nodelay {
+            if let Some(c) = u.sock.as_ref().and_then(sock_conn) {
+                if !c.set_tcp_nodelay() {
+                    return NGX_ERROR;
+                }
+            }
+        }
+    }
+
+    let mut do_write = do_write;
+    let mut rc;
+
+    loop {
+        if do_write {
+            rc = m.output_filter(r, u, out.take());
+
+            if rc == NGX_ERROR {
+                return NGX_ERROR;
+            }
+
+            u.request_body_blocked = rc == NGX_AGAIN;
+
+            if rc == NGX_OK && !r.reading_body.get() {
+                break;
+            }
+        }
+
+        if r.reading_body.get() {
+            // read client request body
+
+            let rrc = crate::request_body::read_unbuffered_request_body(r).await;
+
+            if rrc >= NGX_HTTP_SPECIAL_RESPONSE {
+                return rrc;
+            }
+
+            let bufs = take_request_body_bufs(r);
+
+            out = if bufs.is_empty() { None } else { Some(bufs) };
+        }
+
+        // stop if there is nothing to send
+
+        if out.is_none() {
+            rc = NGX_AGAIN;
+            break;
+        }
+
+        do_write = true;
+    }
+
+    rc
+}
+
+/// ngx_http_upstream_send_request (the upstream's write event, and the
+/// client's read event of ngx_http_upstream_read_request_handler without
+/// `do_write`): the timers as the request goes out, and the read timer once
+/// it is out.
+async fn send_request_event(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, do_write: bool) -> Result<(), Failure> {
+    http_debug!(r, "http upstream send request");
+
+    let start_time = u.peer.as_ref().map(|g| g.u.start_time).unwrap_or(0);
+
+    Upstream::with_state(r, |st| {
+        if st.connect_time == u64::MAX {
+            st.connect_time = ngx_core::times::current_msec().saturating_sub(start_time);
+        }
+    });
+
+    r.connection.log.set_action(Some("sending request to upstream"));
+
+    let rc = send_request_body_duplex(r, u, m, do_write).await;
+
+    if rc == NGX_ERROR {
+        return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
+    }
+
+    if rc >= NGX_HTTP_SPECIAL_RESPONSE {
+        return Err(Failure::Finalize(rc));
+    }
+
+    if rc == NGX_AGAIN {
+        // !c->write->ready || u->request_body_blocked
+        if !u.writer.is_empty() || u.request_body_blocked {
+            add_timer(&mut u.send_timer, u.conf.send_timeout);
+        } else {
+            u.send_timer = None;
+        }
+
+        return Ok(());
+    }
+
+    // rc == NGX_OK
+
+    u.send_timer = None;
+
+    if tcp_push(u).is_err() {
+        return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR));
+    }
+
+    if !u.request_body_sent {
+        u.request_body_sent = true;
+
+        if u.header_sent {
+            return Ok(());
+        }
+
+        add_timer(&mut u.read_timer, u.conf.read_timeout);
+    }
+
+    Ok(())
+}
+
+/// The client's read events of the body re-arm client_body_timeout while
+/// it is read (ngx_http_read_unbuffered_request_body).
+fn body_timer_after_read(r: &R, body_timer: &mut Option<Instant>) {
+    if r.reading_body.get() {
+        let timeout = *r.clcf().borrow().client_body_timeout;
+        add_timer(body_timer, timeout);
+    } else {
+        *body_timer = None;
+    }
+}
+
+/// ngx_http_upstream_send_request and ngx_http_upstream_process_header of a
+/// module with u->conf->preserve_output: the request is sent (the body as
+/// the client sends it and the module lets it go) while the response header
+/// is read, each as its events come, up to a response header that
+/// ngx_http_upstream_test_next and ngx_http_upstream_intercept_errors let
+/// through.
+async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start_time: u64) -> Result<(), Failure> {
+    let _ = start_time;
+
+    u.post_write = false;
+    u.post_read = false;
+    u.request_body_blocked = false;
+
+    send_request_event(r, u, m, true).await?;
+
+    let mut body_timer = None;
+
+    body_timer_after_read(r, &mut body_timer);
+
+    let header_start = crate::file_cache::cache_of(r).map(|c| c.borrow().header_start).unwrap_or(0);
+    let buffer_size = u.conf.buffer_size.saturating_sub(header_start).max(1);
+
+    let mut chunk = vec![0u8; buffer_size];
+    let mut down = None;
+
+    loop {
+        if u.post_write {
+            // the write event the module posted
+            u.post_write = false;
+            send_request_event(r, u, m, true).await?;
+            continue;
+        }
+
+        let room = buffer_size.saturating_sub(u.resp.buf.len()).clamp(1, chunk.len());
+
+        match duplex_wait(r, u, &mut chunk[..room], true, body_timer, &mut down).await {
+            DuplexEvent::Read(res) => {
+                // ngx_http_upstream_process_header
+                http_debug!(r, "http upstream process header");
+
+                r.connection.log.set_action(Some("reading response header from upstream"));
+
+                let n = match res {
+                    Err(e) => {
+                        if plain(u.sock.as_ref().expect("connection")) {
+                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
+                        }
+
+                        return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
+                    }
+
+                    Ok(0) => {
+                        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
+                        return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
+                    }
+
+                    Ok(n) => n,
+                };
+
+                Upstream::with_state(r, |st| st.bytes_received += n as i64);
+
+                u.resp.buf.extend_from_slice(&chunk[..n]);
+
+                u.response_received = true;
+
+                let rc = loop {
+                    let prc = m.process_header(r, u);
+
+                    if prc == NGX_AGAIN {
+                        if u.resp.buf.len() >= buffer_size {
+                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent too big header");
+                            return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+                        }
+
+                        break None;
+                    }
+
+                    if prc == NGX_HTTP_UPSTREAM_EARLY_HINTS {
+                        if process_early_hints(r, u) == NGX_OK {
+                            continue;
+                        }
+
+                        break Some(NGX_ERROR);
+                    }
+
+                    break Some(prc);
+                };
+
+                let rc = match rc {
+                    Some(rc) => rc,
+                    None => continue,
+                };
+
+                if rc == NGX_HTTP_UPSTREAM_INVALID_HEADER {
+                    return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
+                }
+
+                if rc == NGX_ERROR {
+                    return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR));
+                }
+
+                // rc == NGX_OK
+
+                let start_time = u.peer.as_ref().map(|g| g.u.start_time).unwrap_or(0);
+
+                Upstream::with_state(r, |st| st.header_time = ngx_core::times::current_msec().saturating_sub(start_time));
+
+                *r.upstream_headers_in.borrow_mut() = u.resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
+
+                return test_next_and_intercept(r, u, m).await;
+            }
+
+            DuplexEvent::Written(Ok(())) => {
+                send_request_event(r, u, m, true).await?;
+            }
+
+            DuplexEvent::Written(Err(e)) => {
+                if plain(u.sock.as_ref().expect("connection")) {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "writev() failed");
+                }
+
+                return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
+            }
+
+            DuplexEvent::Body => {
+                // ngx_http_upstream_read_request_handler
+                http_debug!(r, "http upstream read request handler");
+
+                send_request_event(r, u, m, false).await?;
+
+                body_timer_after_read(r, &mut body_timer);
+            }
+
+            DuplexEvent::SendTimeout | DuplexEvent::ReadTimeout => {
+                // c->write->timedout, c->read->timedout
+                u.send_timer = None;
+                u.read_timer = None;
+
+                return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT));
+            }
+
+            DuplexEvent::BodyTimeout => {
+                r.connection.timedout.set(true);
+                return Err(Failure::Finalize(NGX_HTTP_REQUEST_TIME_OUT));
+            }
+
+            DuplexEvent::ClientClosed(err) => {
+                if let Some(rc) = check_broken_connection(r, u, err) {
+                    return Err(Failure::Finalize(rc));
+                }
+
+                u.watch = None;
+            }
+
+            DuplexEvent::Downstream(_) => {}
+        }
+    }
+}
+
+/// ngx_http_upstream_process_non_buffered_request and the event handlers
+/// around it for a module with u->conf->preserve_output: the response goes
+/// to the client as the input filter makes it, while the rest of the
+/// request and the module's output go to the upstream.
+async fn process_non_buffered_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, do_write: bool) -> i64 {
+    let buffer_size = u.conf.buffer_size.max(1);
+    let read_timeout = u.conf.read_timeout;
+
+    let mut chunk = vec![0u8; buffer_size];
+
+    let mut eof = false;
+    let mut read_error = false;
+
+    let mut down: Option<Downstream> = None;
+
+    let mut body_timer = None;
+
+    body_timer_after_read(r, &mut body_timer);
+
+    let mut do_write = do_write;
+
+    // ngx_http_upstream_process_non_buffered_request(r, do_write)
+    let mut process = true;
+
+    loop {
+        if process {
+            process = false;
+
+            do_write = do_write || u.length == 0;
+
+            if do_write {
+                if down.is_none() && !u.out_bufs.is_empty() {
+                    let out = std::mem::take(&mut u.out_bufs);
+                    let rr = r.clone();
+
+                    let mut f: Downstream = Box::pin(async move { crate::core_rt::output_filter(&rr, out).await });
+
+                    // ngx_http_output_filter() runs until the client
+                    // blocks it
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+                    match f.as_mut().poll(&mut cx) {
+                        std::task::Poll::Ready(rc) => {
+                            if rc == NGX_ERROR {
+                                return finalize(r, u, m, NGX_ERROR).await;
+                            }
+                        }
+
+                        std::task::Poll::Pending => down = Some(f),
+                    }
+                }
+
+                // u->busy_bufs == NULL
+
+                if down.is_none() {
+                    if u.length == 0 || (eof && u.length == -1) {
+                        return finalize(r, u, m, 0).await;
+                    }
+
+                    if eof {
+                        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
+
+                        return finalize(r, u, m, NGX_HTTP_BAD_GATEWAY).await;
+                    }
+
+                    if read_error || u.error {
+                        return finalize(r, u, m, NGX_HTTP_BAD_GATEWAY).await;
+                    }
+                }
+            }
+
+            do_write = false;
+
+            // the read timer, as the upstream's read event is waited for
+            if !eof && !read_error {
+                add_timer(&mut u.read_timer, read_timeout);
+            } else {
+                u.read_timer = None;
+            }
+        }
+
+        if u.post_write {
+            // the write event the module posted
+            u.post_write = false;
+
+            if let Err(f) = send_request_event(r, u, m, true).await {
+                return duplex_failure(r, u, m, f).await;
+            }
+
+            continue;
+        }
+
+        if u.post_read {
+            // ngx_http_upstream_process_non_buffered_upstream(r, u)
+            u.post_read = false;
+
+            r.connection.log.set_action(Some("reading upstream"));
+
+            process = true;
+            continue;
+        }
+
+        let read = down.is_none() && !eof && !read_error;
+
+        match duplex_wait(r, u, &mut chunk, read, body_timer, &mut down).await {
+            DuplexEvent::Downstream(rc) => {
+                // ngx_http_upstream_process_non_buffered_downstream
+                down = None;
+
+                r.connection.log.set_action(Some("sending to client"));
+
+                if rc == NGX_ERROR {
+                    return finalize(r, u, m, NGX_ERROR).await;
+                }
+
+                do_write = true;
+                process = true;
+            }
+
+            DuplexEvent::Read(res) => {
+                // ngx_http_upstream_process_non_buffered_upstream
+                r.connection.log.set_action(Some("reading upstream"));
+
+                match res {
+                    Err(e) => {
+                        if plain(u.sock.as_ref().expect("connection")) {
+                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
+                        }
+
+                        read_error = true;
+                    }
+
+                    Ok(0) => eof = true,
+
+                    Ok(n) => {
+                        Upstream::with_state(r, |st| {
+                            st.bytes_received += n as i64;
+                            st.response_length += n as i64;
+                        });
+
+                        if m.input_filter(r, u, &chunk[..n]) == NGX_ERROR {
+                            return finalize(r, u, m, NGX_ERROR).await;
+                        }
+                    }
+                }
+
+                do_write = true;
+                process = true;
+            }
+
+            DuplexEvent::Written(Ok(())) => {
+                if let Err(f) = send_request_event(r, u, m, true).await {
+                    return duplex_failure(r, u, m, f).await;
+                }
+            }
+
+            DuplexEvent::Written(Err(e)) => {
+                if plain(u.sock.as_ref().expect("connection")) {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "writev() failed");
+                }
+
+                return duplex_failure(r, u, m, Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR)).await;
+            }
+
+            DuplexEvent::Body => {
+                // ngx_http_upstream_read_request_handler
+                http_debug!(r, "http upstream read request handler");
+
+                if let Err(f) = send_request_event(r, u, m, false).await {
+                    return duplex_failure(r, u, m, f).await;
+                }
+
+                body_timer_after_read(r, &mut body_timer);
+            }
+
+            DuplexEvent::SendTimeout => {
+                // ngx_http_upstream_send_request_handler: c->write->timedout
+                u.send_timer = None;
+
+                return duplex_failure(r, u, m, Failure::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT)).await;
+            }
+
+            DuplexEvent::ReadTimeout => {
+                // ngx_http_upstream_process_non_buffered_upstream:
+                // c->read->timedout
+                u.read_timer = None;
+
+                r.connection.log.set_action(Some("reading upstream"));
+
+                upstream_timed_out(r, u);
+
+                return finalize(r, u, m, NGX_HTTP_GATEWAY_TIME_OUT).await;
+            }
+
+            DuplexEvent::BodyTimeout => {
+                r.connection.timedout.set(true);
+                return finalize(r, u, m, NGX_HTTP_REQUEST_TIME_OUT).await;
+            }
+
+            DuplexEvent::ClientClosed(err) => {
+                if let Some(rc) = check_broken_connection(r, u, err) {
+                    return finalize(r, u, m, rc).await;
+                }
+
+                u.watch = None;
+            }
+        }
+    }
+}
+
+/// A failure of the request's output after the response header: what
+/// ngx_http_upstream_next or ngx_http_upstream_finalize_request does then.
+async fn duplex_failure(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, f: Failure) -> i64 {
+    match f {
+        Failure::Next(ft) => match next(r, u, m, ft).await {
+            Some(rc) => rc,
+            None => finalize(r, u, m, NGX_HTTP_BAD_GATEWAY).await,
+        },
+        Failure::Finalize(rc) => finalize(r, u, m, rc).await,
+        Failure::Done(rc) => rc,
     }
 }
 
