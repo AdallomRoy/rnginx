@@ -95,6 +95,7 @@ pub mod uwsgi;
 pub mod slice;
 pub mod scgi;
 pub mod grpc;
+pub mod tunnel;
 
 pub use request::{Request, R};
 
@@ -613,7 +614,7 @@ pub fn modules() -> Vec<ModuleDef> {
         scgi::scgi_module(),
         grpc::grpc_module(),
         stubs::proxy_v2_module(),
-        stubs::tunnel_module(),
+        tunnel::tunnel_module(),
         stubs::perl_module(),
         memcached::memcached_module(),
         empty_gif::empty_gif_module(),

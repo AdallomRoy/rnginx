@@ -282,24 +282,6 @@ pub fn proxy_v2_module() -> ModuleDef {
     ])
 }
 
-pub fn tunnel_module() -> ModuleDef {
-    stub("ngx_http_tunnel_module", vec![
-        Command::new("tunnel_pass", NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_NOARGS | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::None, accept),
-        Command::new("tunnel_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::None, accept),
-        Command::new("tunnel_socket_rcvbuf", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_socket_sndbuf", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_send_lowat", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_next_upstream", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::None, accept),
-        Command::new("tunnel_next_upstream_tries", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-        Command::new("tunnel_next_upstream_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-    ])
-}
-
 pub fn perl_module() -> ModuleDef {
     stub("ngx_http_perl_module", vec![
         Command::new("perl_modules", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
