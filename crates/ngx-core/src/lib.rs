@@ -10,6 +10,10 @@ pub mod module;
 pub mod os;
 pub mod parse;
 pub mod string;
+pub mod data;
+pub mod json;
+pub mod json_parse;
+pub mod json_unescape;
 pub mod times;
 
 pub const NGINX_VERSION: &str = "1.31.7";

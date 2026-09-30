@@ -96,6 +96,7 @@ pub mod slice;
 pub mod scgi;
 pub mod grpc;
 pub mod tunnel;
+pub mod json;
 
 pub use request::{Request, R};
 
@@ -600,7 +601,7 @@ pub fn modules() -> Vec<ModuleDef> {
         limit_conn::limit_conn_module(),
         limit_req::limit_req_module(),
         realip::realip_module(),
-        stubs::json_module(),
+        json::json_module(),
         geo::geo_module(),
         geoip::geoip_module(),
         map::map_module(),

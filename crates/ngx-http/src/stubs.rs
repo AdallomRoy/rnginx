@@ -118,13 +118,6 @@ pub fn limit_req_module() -> ModuleDef {
     ])
 }
 
-pub fn json_module() -> ModuleDef {
-    stub("ngx_http_json_module", vec![
-        Command::new("json_set", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE3, ConfLevel::None, accept),
-        Command::new("json_max_depth", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::None, accept),
-    ])
-}
-
 pub fn geo_module() -> ModuleDef {
     stub("ngx_http_geo_module", vec![
         Command::new("geo", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE12, ConfLevel::None, skip_block),
