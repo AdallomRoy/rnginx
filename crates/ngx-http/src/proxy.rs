@@ -8,11 +8,9 @@ use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 use ngx_core::cmd_fn;
 use ngx_core::conf::{NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_CONF_TAKE12, NGX_CONF_TAKE123, NGX_CONF_TAKE1234, NGX_CONF_1MORE, NGX_CONF_2MORE};
-use tokio::net::TcpStream;
 
 pub use crate::upstream::UpstreamSock;
 
-use tokio::io::AsyncWriteExt;
 use std::cell::RefCell;
 
 use ngx_core::event_openssl::{
@@ -24,7 +22,7 @@ use crate::core::*;
 use crate::request::*;
 use crate::variables::VarDef;
 use crate::get_loc_conf;
-use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, NGX_HTTP_BAD_GATEWAY, HttpModuleDef, http_module_def};
+use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_SRV_CONF, NGX_HTTP_LOC_CONF, NGX_HTTP_LIF_CONF, NGX_HTTP_LMT_CONF, HttpModuleDef, http_module_def};
 
 crate::http_module_index!("ngx_http_proxy_module");
 
@@ -2614,59 +2612,6 @@ fn process_trailer(
     }
 }
 
-/// The request body buffers read so far (rb->bufs), taken to be sent.
-pub(crate) fn take_request_body_bufs(r: &R) -> ngx_core::buf::Chain {
-    match r.request_body.borrow().as_ref() {
-        Some(rb) => std::mem::take(&mut rb.borrow_mut().bufs),
-        None => ngx_core::buf::Chain::new(),
-    }
-}
-
-/// ngx_http_upstream_send_request_body for an unbuffered body, once the
-/// header and the body read so far are sent: read the rest of the body as
-/// the client sends it (ngx_http_read_unbuffered_request_body) and send it
-/// on, framed by the module's `output` filter, until it is complete. Returns the bytes sent, or the status to
-/// finalize with: a client body error, 408 when the client times out
-/// (ngx_http_upstream_read_request_handler), 502 when the upstream write
-/// fails. Returns early if the upstream responds (or closes) first.
-pub(crate) async fn send_request_body(r: &R, upstream: &mut UpstreamSock, output: &dyn Fn(&mut Vec<u8>, &ngx_core::buf::Chain)) -> Result<i64, i64> {
-    let timeout = *r.clcf().borrow().client_body_timeout;
-    let mut sent = 0i64;
-    loop {
-        let rc = crate::request_body::read_unbuffered_request_body(r).await;
-        if rc >= crate::NGX_HTTP_SPECIAL_RESPONSE {
-            return Err(rc);
-        }
-        let bufs = take_request_body_bufs(r);
-        if !bufs.is_empty() {
-            let mut out = Vec::new();
-            output(&mut out, &bufs);
-            if !out.is_empty() {
-                if upstream.write_all(&out).await.is_err() {
-                    return Err(NGX_HTTP_BAD_GATEWAY as i64);
-                }
-                sent += out.len() as i64;
-            }
-            if !r.reading_body.get() {
-                return Ok(sent);
-            }
-            continue;
-        }
-        if !r.reading_body.get() {
-            return Ok(sent);
-        }
-        tokio::select! {
-            res = tokio::time::timeout(std::time::Duration::from_millis(timeout), crate::request_body::wait_request_body(r)) => {
-                if res.is_err() {
-                    r.connection.timedout.set(true);
-                    return Err(crate::NGX_HTTP_REQUEST_TIME_OUT);
-                }
-            }
-            _ = upstream.wait_readable() => return Ok(sent),
-        }
-    }
-}
-
 /// The values of proxy_ssl_protocols (ngx_http_proxy_ssl_protocols).
 const SSL_PROTOCOLS: &[(&str, u32)] = &[
     ("SSLv2", 0x0002),
@@ -3219,80 +3164,6 @@ pub(crate) enum ConnectError {
     Internal,
 }
 
-
-/// Connect to the upstream within proxy_connect_timeout; for https (`ssl`,
-/// with the request's upstream `u`) ngx_event_connect_peer and
-/// ngx_http_upstream_ssl_init_connection (upstream_ssl::connect).
-pub(crate) async fn connect_upstream(
-    r: &R,
-    sockaddr: &ngx_core::inet::SockAddr,
-    bind: Option<std::net::SocketAddr>,
-    ssl: Option<&crate::upstream_ssl::SslSetup>,
-    u: Option<&mut crate::upstream::UpstreamPeer>,
-    timeout: u64,
-) -> Result<UpstreamSock, ConnectError> {
-    let log = r.connection.log.clone();
-    let action = log.action();
-
-    if let (Some(ssl), Some(u)) = (ssl, u) {
-        // proxy_bind
-        let local = bind.map(|a| ngx_core::event_connect::LocalAddr {
-            sockaddr: match a {
-                std::net::SocketAddr::V4(a) => ngx_core::inet::SockAddr::V4(a),
-                std::net::SocketAddr::V6(a) => ngx_core::inet::SockAddr::V6(a),
-            },
-            name: a.to_string().into_bytes(),
-        });
-
-        return crate::upstream_ssl::connect(r, u, sockaddr, local.as_ref(), ssl, timeout).await.map(UpstreamSock::Conn);
-    }
-
-    let connect = async {
-        connect_with_optional_bind(sockaddr, bind).await.map_err(|e| {
-            let action = log.action();
-            log.set_action(Some("connecting to upstream"));
-            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, e.raw_os_error(), "connect() failed");
-            log.set_action(action);
-            ConnectError::Error
-        })
-    };
-
-    match tokio::time::timeout(std::time::Duration::from_millis(timeout), connect).await {
-        Ok(rc) => rc,
-        Err(_) => {
-            log.set_action(Some("connecting to upstream"));
-            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-            log.set_action(action);
-            Err(ConnectError::Timeout)
-        }
-    }
-}
-
-async fn connect_with_optional_bind(
-    sockaddr: &ngx_core::inet::SockAddr,
-    bind: Option<std::net::SocketAddr>,
-) -> std::io::Result<UpstreamSock> {
-    let remote = match sockaddr {
-        ngx_core::inet::SockAddr::Unix(path) => {
-            let path = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path);
-            return tokio::net::UnixStream::connect(path).await.map(UpstreamSock::Unix);
-        }
-        ngx_core::inet::SockAddr::V4(a) => std::net::SocketAddr::V4(*a),
-        ngx_core::inet::SockAddr::V6(a) => std::net::SocketAddr::V6(*a),
-    };
-    match bind {
-        None => TcpStream::connect(remote).await.map(UpstreamSock::Tcp),
-        Some(local) => {
-            let sock = match local {
-                std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-                std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-            };
-            let _ = sock.set_reuseaddr(true);
-            sock.bind(local)?;
-            sock.connect(remote).await.map(UpstreamSock::Tcp)
-        }
-    }
-}
 
 /// ngx_http_proxy_store
 fn proxy_store_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
