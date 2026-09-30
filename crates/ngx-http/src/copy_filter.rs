@@ -63,7 +63,10 @@ async fn copy_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         return next(r, input).await;
     }
     let conf = r.loc_conf::<CopyConf>(ctx_index());
-    let size = conf.borrow().bufs.size.max(1);
+    let (size, num) = {
+        let c = conf.borrow();
+        (c.bufs.size.max(1), c.bufs.num)
+    };
     let mut out = Chain::new();
     while let Some(b) = input.pop_front() {
         if !(b.in_file && !b.in_memory()) {
@@ -79,7 +82,12 @@ async fn copy_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         let mut first = true;
         while pos < end || first {
             first = false;
-            let want = ((end - pos) as usize).min(size);
+            // ngx_output_chain_get_buf: the buffers are recycled (which the
+            // write filter takes for a flush) but for a small last buffer
+            // of the chain, or its small last part
+            let bsize = (end - pos) as usize;
+            let recycled = !(b.last_in_chain && (bsize < size || (num == 1 && bsize < size + size / 4)));
+            let want = bsize.min(size);
             let mut buf = vec![0u8; want];
             let n = if want > 0 { unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, want, pos as libc::off_t) } } else { 0 };
             if n < 0 {
@@ -97,6 +105,7 @@ async fn copy_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
             let mut nb = Buf::from_vec(buf);
             nb.memory = true;
             nb.temporary = true;
+            nb.recycled = recycled;
             if last_piece {
                 nb.last_buf = b.last_buf;
                 nb.last_in_chain = b.last_in_chain;

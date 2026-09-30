@@ -31,6 +31,8 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     }
     let mut size: i64 = 0;
     let mut flush = false;
+    // a flush asked for, not that of a recycled buffer
+    let mut flush_buf = false;
     let mut sync = false;
     let mut last = false;
     {
@@ -39,6 +41,9 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             size += b.buf_size();
             if b.flush || b.recycled {
                 flush = true;
+            }
+            if b.flush {
+                flush_buf = true;
             }
             if b.sync {
                 sync = true;
@@ -55,6 +60,9 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         size += b.buf_size();
         if b.flush || b.recycled {
             flush = true;
+        }
+        if b.flush {
+            flush_buf = true;
         }
         if b.sync {
             sync = true;
@@ -124,10 +132,11 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     // HTTP/2: queue what the flow control windows allow and let the body
     // producer go on while the output in flight stays below the output
     // buffers, as C does when ngx_http_v2_send_chain returns the rest to
-    // r->out and the copy filter reads its next buffer. The remainder joins
-    // later output in the same DATA frame. The last buffer, flushes and
-    // rate limited output are sent in full below.
-    if r.stream.borrow().is_some() && !last && !flush && !sync && limit_rate == 0 {
+    // r->out and the copy filter reads its next buffer (a recycled buffer
+    // flushes, but does not stop it). The remainder joins later output in
+    // the same DATA frame. The last buffer, flushes and rate limited output
+    // are sent in full below.
+    if r.stream.borrow().is_some() && !last && !flush_buf && !sync && limit_rate == 0 {
         match crate::v2::filter::send_nowait(&r).await {
             Err(()) => {
                 c.error.set(true);
