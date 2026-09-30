@@ -1349,19 +1349,20 @@ pub fn free(r: &R, tf: Option<&CacheTempFile>) {
 
 /// The cache free of ngx_http_upstream_finalize_request on the ways out of
 /// an upstream request which do not call finalize() (the request finalized
-/// before a response, the client closing the connection): the cache of the
-/// request when the upstream starts.
-pub struct CacheGuard(Option<Rc<RefCell<HttpCache>>>);
+/// before a response, the client closing the connection): r->cache as it
+/// is then, so a cache an internal redirect took from the request (an
+/// error page) is left to the cleanup of the request's pool.
+pub struct CacheGuard(R);
 
 impl CacheGuard {
     pub fn new(r: &R) -> CacheGuard {
-        CacheGuard(cache_of(r))
+        CacheGuard(r.clone())
     }
 }
 
 impl Drop for CacheGuard {
     fn drop(&mut self) {
-        if let Some(c) = self.0.take() {
+        if let Some(c) = cache_of(&self.0) {
             if let Ok(mut c) = c.try_borrow_mut() {
                 file_cache_free(&mut c, None);
             }

@@ -1186,6 +1186,8 @@ pub fn free_request(r: &R, rc: i64) {
     *r.log_ctx.current_request.borrow_mut() = None;
     r.request_line.borrow_mut().clear();
     r.connection.destroyed.set(true);
+    // ngx_destroy_pool(r->pool)
+    r.run_pool_cleanups();
 }
 
 /// ngx_http_log_request: run log phase handlers.

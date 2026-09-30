@@ -452,6 +452,9 @@ pub struct Request {
     pub err_status: Cell<i64>,
 
     pub cleanup: RefCell<Vec<CleanupFn>>,
+    /// ngx_pool_cleanup_add(r->pool): run when the pool of the request is
+    /// destroyed, at the end of ngx_http_free_request
+    pub pool_cleanup: RefCell<Vec<CleanupFn>>,
     pub port: Cell<u16>,
 
     pub count: Cell<u32>,
@@ -618,6 +621,18 @@ impl Request {
         self.cleanup.borrow_mut().push(f);
     }
 
+    pub fn add_pool_cleanup(&self, f: CleanupFn) {
+        self.pool_cleanup.borrow_mut().push(f);
+    }
+
+    /// ngx_destroy_pool: the pool cleanups, the last added first
+    pub fn run_pool_cleanups(&self) {
+        let v: Vec<CleanupFn> = std::mem::take(&mut *self.pool_cleanup.borrow_mut());
+        for f in v.into_iter().rev() {
+            f();
+        }
+    }
+
     pub fn run_cleanups(&self) {
         let v: Vec<CleanupFn> = std::mem::take(&mut *self.cleanup.borrow_mut());
         for f in v {
@@ -754,6 +769,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         request_length: Cell::new(0),
         err_status: Cell::new(0),
         cleanup: RefCell::new(Vec::new()),
+        pool_cleanup: RefCell::new(Vec::new()),
         port: Cell::new(0),
         count: Cell::new(1),
         subrequests: Cell::new(NGX_HTTP_MAX_SUBREQUESTS + 1),

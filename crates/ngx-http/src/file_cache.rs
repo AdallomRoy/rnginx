@@ -595,7 +595,7 @@ pub fn file_cache_new(r: &R) -> Rc<RefCell<HttpCache>> {
 fn add_cleanup(r: &R, c: &Rc<RefCell<HttpCache>>) {
     let c = c.clone();
 
-    r.main().add_cleanup(Box::new(move || {
+    r.main().add_pool_cleanup(Box::new(move || {
         let mut c = c.borrow_mut();
         file_cache_cleanup(&mut c);
         c.close_file();

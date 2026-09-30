@@ -245,7 +245,7 @@ fn pool_cleanup_add(r: &R, mut cleanups: Vec<LimitConnCleanup>) {
         return;
     }
 
-    r.main().add_cleanup(Box::new(move || {
+    r.main().add_pool_cleanup(Box::new(move || {
         while let Some(lccln) = cleanups.pop() {
             limit_conn_cleanup(&lccln);
         }

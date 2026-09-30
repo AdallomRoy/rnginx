@@ -728,6 +728,13 @@ pub async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
 /// closed the connection: Some(499) to finalize the upstream request with,
 /// or None to go on (a cacheable response still read from the upstream).
 fn check_broken_connection(r: &R, u: &Upstream, err: i32) -> Option<i64> {
+    // the read event of the client connection goes to c->data: a request
+    // that is not active (a background subrequest, a subrequest waiting for
+    // its turn) does not see it
+    if !crate::postpone_filter::is_active(r) {
+        return None;
+    }
+
     let c = &r.connection;
 
     c.read_eof.set(true);
@@ -1352,11 +1359,14 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
     }
 
     let send_timeout = u.conf.send_timeout;
-    let watch = u.watch.clone();
+    let mut watch = if no_buffering { None } else { u.watch.clone() };
+
+    // the bytes sent: what the chain had less what is left of it
+    let total: i64 = out.iter().map(|b| b.buf_size()).sum();
 
     let mut bytes_sent: i64;
 
-    {
+    loop {
         let sock = u.sock.as_mut().expect("connection");
         let is_plain = plain(sock);
 
@@ -1365,7 +1375,7 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 
             tokio::select! {
                 res = write => Some(res),
-                err = client_closed(if no_buffering { None } else { watch.as_deref() }) => {
+                err = client_closed(watch.as_deref()) => {
                     let _ = err;
                     None
                 }
@@ -1378,10 +1388,18 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
                     return Err(Failure::Finalize(rc));
                 }
 
-                return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
+                // the request goes on without the check (a cacheable
+                // response, or the event went to another request)
+                u.watch = None;
+                watch = None;
+
+                continue;
             }
 
-            Some(Ok(n)) => bytes_sent = n,
+            Some(Ok(_)) => {
+                bytes_sent = total - out.iter().map(|b| b.buf_size()).sum::<i64>();
+                break;
+            }
 
             Some(Err(Some(e))) => {
                 if is_plain {
@@ -3063,8 +3081,6 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 /// is done (the client took it all, or an error), taken as the write event
 /// handler takes it.
 fn poll_writer(writer: &mut Option<PipeWriter<'_>>, p: &mut crate::event_pipe::EventPipe) {
-    use std::future::Future;
-
     let done = match writer.as_mut() {
         Some((fut, _)) => {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
