@@ -1351,7 +1351,8 @@ fn proxy_send_lowat_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn An
     let mut slot = std::mem::take(&mut cell.borrow_mut().send_lowat);
     let rc = set_size(cf, cmd, &mut slot);
 
-    if rc.is_ok() && *slot.get() != 0 {
+    // ngx_http_proxy_lowat_check without NGX_HAVE_SO_SNDLOWAT
+    if rc.is_ok() {
         cf.warn(format_args!("\"proxy_send_lowat\" is not supported, ignored"));
         slot = Val::set(0);
     }
