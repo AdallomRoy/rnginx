@@ -448,7 +448,8 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
     }
     let trailers = conf.borrow().trailers.clone();
     if let Some(ts) = &trailers {
-        if !ts.is_empty() && !r.header_only.get() {
+        // a trailer for the status (or "always") expects trailers
+        if ts.iter().any(|(_, _, always)| safe || *always) {
             r.expect_trailers.set(true);
         }
     }
