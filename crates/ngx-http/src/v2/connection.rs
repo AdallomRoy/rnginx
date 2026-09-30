@@ -49,6 +49,9 @@ pub struct Driver {
 
 const WBUF_SIZE: usize = 64 * 1024;
 
+/// NGX_TIMER_LAZY_DELAY
+const TIMER_LAZY_DELAY: u64 = 300;
+
 impl Driver {
     fn new() -> Driver {
         Driver {
@@ -218,6 +221,13 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
         let used = h2c.state.buffer_used.get();
         let available = rbuf.len() - NGX_HTTP_V2_STATE_BUFFER_SIZE;
         let has_output = d.buffered();
+
+        // frames the streams queued go out below: the send timer of
+        // ngx_http_v2_send_output_queue when they do not all go at once
+        if has_output && d.write_timer.get().is_none() {
+            add_write_timer(h2c, d);
+        }
+
         let read_timer = h2c.read_timer.get();
         let write_timer = d.write_timer.get();
 
@@ -545,10 +555,27 @@ fn written(h2c: &Rc<H2Connection>, d: &Driver, n: usize) {
 
     if !has_output(h2c, d) {
         d.write_timer.set(None);
-    } else if d.write_timer.get().is_none() {
-        let send_timeout = *clcf(h2c).borrow().send_timeout;
-        d.write_timer.set(Some(Instant::now() + Duration::from_millis(send_timeout)));
+    } else {
+        add_write_timer(h2c, d);
     }
+}
+
+/// ngx_add_timer(c->write, clcf->send_timeout) when the output did not all
+/// go (!wev->ready): a timer already set moves unless by less than
+/// NGX_TIMER_LAZY_DELAY
+fn add_write_timer(h2c: &H2Connection, d: &Driver) {
+    let send_timeout = *clcf(h2c).borrow().send_timeout;
+    let key = Instant::now() + Duration::from_millis(send_timeout);
+
+    if let Some(old) = d.write_timer.get() {
+        let diff = if key > old { key - old } else { old - key };
+
+        if diff < Duration::from_millis(TIMER_LAZY_DELAY) {
+            return;
+        }
+    }
+
+    d.write_timer.set(Some(key));
 }
 
 /// ngx_http_v2_write_handler after write_output completed.
@@ -596,6 +623,11 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
         return Err(());
     }
 
+    // !wev->ready: the socket did not take all of the last write, no
+    // attempt now (the timer stays as it is)
+    let ready = d.write_timer.get().is_none();
+    let mut sent = false;
+
     loop {
         fill_wbuf(h2c, d);
 
@@ -610,6 +642,7 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
 
         match res {
             Ok(n) => {
+                sent = true;
                 written(h2c, d, n);
                 if d.buffered() {
                     break;
@@ -627,9 +660,8 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
         }
     }
 
-    if has_output(h2c, d) && d.write_timer.get().is_none() {
-        let send_timeout = *clcf(h2c).borrow().send_timeout;
-        d.write_timer.set(Some(Instant::now() + Duration::from_millis(send_timeout)));
+    if has_output(h2c, d) && (ready || sent) {
+        add_write_timer(h2c, d);
     }
 
     if c.error.get() {
