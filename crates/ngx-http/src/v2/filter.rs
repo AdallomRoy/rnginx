@@ -304,42 +304,12 @@ async fn header_filter(r: &R) -> i64 {
         }
     }
 
-    // Headers kept in typed headers_out slots only (C has them in the
-    // list): emitted like list entries.
-    let typed: Vec<(&[u8], Option<Header>)> = {
-        let ho = r.headers_out.borrow();
-        vec![
-            (&b"server"[..], ho.server.clone()),
-            (&b"date"[..], ho.date.clone()),
-            (&b"content-range"[..], ho.content_range.clone()),
-            (&b"content-encoding"[..], ho.content_encoding.clone()),
-            (&b"last-modified"[..], ho.last_modified.clone()),
-            (&b"etag"[..], ho.etag.clone()),
-        ]
-    };
-
-    // those also in the list are skipped there and keep their hash, as
-    // the list entries C writes in place do ($sent_http_etag etc.)
-    let mut written: Vec<Header> = Vec::new();
-
-    for (name, h) in typed {
-        if let Some(h) = h {
-            if h.hash.get() == 0 {
-                continue;
-            }
-            let value = h.value.borrow().clone();
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"{}: {}\"", B(name), B(&value));
-            pos.push(0);
-            write_name(&mut pos, name);
-            write_value(&mut pos, &value);
-            written.push(h);
-        }
-    }
-
+    // the headers of the list, in their order: the typed slots (an
+    // upstream's Server and Date, ETag, Content-Encoding, ...) are in it
     let headers: Vec<Header> = r.headers_out.borrow().headers.clone();
 
     for h in headers.iter() {
-        if h.hash.get() == 0 || written.iter().any(|w| Rc::ptr_eq(w, h)) {
+        if h.hash.get() == 0 {
             continue;
         }
 
