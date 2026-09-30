@@ -163,6 +163,48 @@ pub fn time() -> i64 {
     CACHED.with(|c| c.borrow().sec)
 }
 
+/// ngx_next_time: the next moment `when` seconds after a local midnight
+/// (today's if still to come, else tomorrow's), -1 if mktime() fails.
+pub fn next_time(when: i64) -> i64 {
+    let now = time();
+
+    // SAFETY: tm is a plain struct filled by localtime_r() and normalized
+    // by mktime().
+    unsafe {
+        let t = now as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+
+        libc::localtime_r(&t, &mut tm);
+
+        tm.tm_hour = (when / 3600) as libc::c_int;
+        let when = when % 3600;
+        tm.tm_min = (when / 60) as libc::c_int;
+        tm.tm_sec = (when % 60) as libc::c_int;
+
+        let next = libc::mktime(&mut tm);
+
+        if next == -1 {
+            return -1;
+        }
+
+        if next as i64 - now > 0 {
+            return next as i64;
+        }
+
+        tm.tm_mday += 1;
+
+        // mktime() should normalize a date (Jan 32, etc)
+
+        let next = libc::mktime(&mut tm);
+
+        if next != -1 {
+            return next as i64;
+        }
+
+        -1
+    }
+}
+
 /// Current time in milliseconds since epoch (wall clock).
 pub fn msec() -> u64 {
     update();
@@ -219,6 +261,23 @@ pub fn localtime(t: i64) -> Tm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_next_time() {
+        let now = time();
+
+        for when in [0, 1, 3600, 55833, 86399, 86400] {
+            let next = next_time(when);
+
+            // later than now, within a day (and the DST hour)
+            assert!(next > now, "{when}: {next} <= {now}");
+            assert!(next - now <= 86400 + 3600, "{when}: {next} - {now}");
+
+            // at `when` after a local midnight
+            let local = next + gmtoff(next) * 60;
+            assert_eq!(local.rem_euclid(86400), when % 86400, "{when}");
+        }
+    }
 
     #[test]
     fn gm() {
