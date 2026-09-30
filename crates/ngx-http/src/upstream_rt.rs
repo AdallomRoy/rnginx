@@ -2520,7 +2520,7 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
             }
         };
 
-        match res {
+        let res = match res {
             None => {
                 if let Some(rc) = check_broken_connection(r, u, 0) {
                     return finalize(r, u, m, rc).await;
@@ -2530,17 +2530,21 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
                 continue;
             }
 
-            Some(Err(_)) => {
-                // ngx_http_upstream_process_non_buffered_upstream:
-                // c->read->timedout
-                r.connection.log.set_action(Some("reading upstream"));
+            Some(res) => res,
+        };
 
+        // ngx_http_upstream_process_non_buffered_upstream: the read event
+        r.connection.log.set_action(Some("reading upstream"));
+
+        match res {
+            Err(_) => {
+                // c->read->timedout
                 upstream_timed_out(r, u);
 
                 return finalize(r, u, m, NGX_HTTP_GATEWAY_TIME_OUT).await;
             }
 
-            Some(Ok(Err(e))) => {
+            Ok(Err(e)) => {
                 if plain(u.sock.as_ref().expect("connection")) {
                     ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
                 }
@@ -2548,9 +2552,9 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
                 read_error = true;
             }
 
-            Some(Ok(Ok(0))) => eof = true,
+            Ok(Ok(0)) => eof = true,
 
-            Some(Ok(Ok(n))) => {
+            Ok(Ok(n)) => {
                 Upstream::with_state(r, |st| {
                     st.bytes_received += n as i64;
                     st.response_length += n as i64;
@@ -2561,8 +2565,6 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
                 }
             }
         }
-
-        r.connection.log.set_action(Some("reading upstream"));
 
         do_write = true;
     }
@@ -3488,6 +3490,232 @@ pub fn hide_headers_hash(cf: &mut ngx_core::conf::Conf, conf: HideHeaders, prev:
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// the params of the CGI-like modules (fastcgi, scgi, uwsgi)
+// ---------------------------------------------------------------------------
+
+/// ngx_http_upstream_param_t: a *_param
+#[derive(Clone, Debug)]
+pub struct ParamSource {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub skip_empty: bool,
+}
+
+/// A param of params->lengths and params->values: the key, "if_not_empty"
+/// and the codes of the value.
+pub struct Param {
+    pub key: Vec<u8>,
+    pub skip_empty: bool,
+    pub codes: Vec<Part>,
+}
+
+/// ngx_http_fastcgi_params_t, ngx_http_scgi_params_t, ngx_http_uwsgi_params_t
+pub struct Params {
+    /// params->flushes: the variables of the values
+    pub flushes: Vec<usize>,
+    /// params->lengths and params->values
+    pub params: Vec<Param>,
+    /// params->number: the HTTP_* params
+    pub number: usize,
+    /// params->hash: the names of the HTTP_* params after "HTTP_",
+    /// lowercase; the request headers of these names are not sent
+    pub hash: Hash<()>,
+}
+
+impl Params {
+    /// params->number && ngx_hash_find(&params->hash, ...): the request
+    /// header of this name (lower case, '-' as '_') is not sent, a HTTP_*
+    /// param of the name is.
+    pub fn hides(&self, lowcase_key: &[u8]) -> bool {
+        self.number != 0 && self.hash.find(hash_key(lowcase_key), lowcase_key).is_some()
+    }
+}
+
+/// ngx_http_upstream_param_set_slot: "*_param key value [if_not_empty]"
+pub fn param_set_slot(cf: &mut ngx_core::conf::Conf, list: &mut Option<Rc<Vec<ParamSource>>>) -> ngx_core::conf::ConfResult {
+    let value = cf.args.clone();
+
+    let mut param = ParamSource { key: value[1].clone(), value: value[2].clone(), skip_empty: false };
+
+    if value.len() == 4 {
+        if value[3] != b"if_not_empty" {
+            return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(&value[3]))));
+        }
+
+        param.skip_empty = true;
+    }
+
+    let mut v: Vec<ParamSource> = match list.take() {
+        Some(l) => Rc::try_unwrap(l).unwrap_or_else(|l| l.as_ref().clone()),
+        None => Vec::new(),
+    };
+
+    v.push(param);
+
+    *list = Some(Rc::new(v));
+
+    Ok(())
+}
+
+/// The init_params of the modules (ngx_http_fastcgi_init_params and the
+/// like): the params of *_param, then those of
+/// `default_params` it does not set (sent only if not empty); the names of
+/// the HTTP_* ones go to the hash (the request headers of these names are
+/// not sent), and the params with a value are compiled.
+pub fn init_params(cf: &mut ngx_core::conf::Conf, params_source: Option<&Rc<Vec<ParamSource>>>, default_params: &[(&[u8], &[u8])], name: &'static str) -> Result<Rc<Params>, ngx_core::conf::ConfError> {
+    use ngx_core::hash::{hash_key_lc, HashInit, HashKey};
+
+    let src = merge_params(params_source.map(|s| s.as_slice()).unwrap_or(&[]), default_params);
+
+    let mut headers_names: Vec<HashKey<()>> = Vec::new();
+    let mut params: Vec<Param> = Vec::new();
+    let mut flushes: Vec<usize> = Vec::new();
+
+    for s in src {
+        if s.key.len() > "HTTP_".len() && s.key.starts_with(b"HTTP_") {
+            let name = &s.key[5..];
+
+            // the hash keys are lowercased by ngx_hash_init()
+            headers_names.push(HashKey { key: name.to_ascii_lowercase(), key_hash: hash_key_lc(name), value: () });
+
+            if s.value.is_empty() {
+                continue;
+            }
+        }
+
+        let codes = crate::script::script_compile(cf, &s.value)?;
+
+        flushes.extend(crate::proxy::script_flushes(&codes));
+
+        params.push(Param { key: s.key, skip_empty: s.skip_empty, codes });
+    }
+
+    let number = headers_names.len();
+
+    let hinit = HashInit { name, max_size: 512, bucket_size: 64, log: &cf.log };
+
+    let hash = match Hash::init(&hinit, headers_names) {
+        Ok(h) => h,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "{}", e);
+            return Err(ngx_core::conf::ConfError::Logged);
+        }
+    };
+
+    Ok(Rc::new(Params { flushes, params, number, hash }))
+}
+
+/// params_merged of the init_params: the params of *_param,
+/// then the default params of names they do not have (compared
+/// case-insensitively), sent only if not empty.
+pub fn merge_params(source: &[ParamSource], default_params: &[(&[u8], &[u8])]) -> Vec<ParamSource> {
+    let mut src: Vec<ParamSource> = source.to_vec();
+
+    for (key, value) in default_params {
+        if src.iter().any(|s| s.key.eq_ignore_ascii_case(key)) {
+            continue;
+        }
+
+        src.push(ParamSource { key: key.to_vec(), value: value.to_vec(), skip_empty: true });
+    }
+
+    src
+}
+
+/// The status of a "Status" header: ngx_atoi() of its first 3 characters
+/// (the value is null-terminated: a shorter one is invalid).
+pub fn cgi_status(value: &[u8]) -> Option<i64> {
+    if value.len() < 3 {
+        return None;
+    }
+
+    ngx_core::string::atoi(&value[..3])
+}
+
+/// The key of a request header as a param: "HTTP_" and the name in upper
+/// case, '-' as '_'.
+pub fn header_param_key(name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity("HTTP_".len() + name.len());
+
+    key.extend_from_slice(b"HTTP_");
+
+    for &ch in name {
+        let ch = if ch.is_ascii_lowercase() {
+            ch & !0x20
+        } else if ch == b'-' {
+            b'_'
+        } else {
+            ch
+        };
+
+        key.push(ch);
+    }
+
+    key
+}
+
+/// The name of a request header as the params hash has it: lower case,
+/// '-' as '_'.
+pub fn header_hash_key(name: &[u8]) -> Vec<u8> {
+    name.iter()
+        .map(|&ch| {
+            if ch.is_ascii_uppercase() {
+                ch | 0x20
+            } else if ch == b'-' {
+                b'_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+/// The request headers as params: ngx_http_link_multi_headers() links the
+/// headers of a name (compared case-insensitively) to the first one, which
+/// is sent with the values of all, joined with "; " for "Cookie" and ", "
+/// otherwise; a header is not sent when `hidden` says so of its name in
+/// lower case with '-' as '_' (the params hash).
+pub fn header_params(headers: &[Header], hidden: &dyn Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+
+    // the headers of the params hash, and the linked ones
+    let mut ignored = vec![false; headers.len()];
+
+    for i in 0..headers.len() {
+        if ignored[i] {
+            continue;
+        }
+
+        let h = &headers[i];
+
+        if hidden(&header_hash_key(&h.key)) {
+            ignored[i] = true;
+            continue;
+        }
+
+        let mut value = h.value.borrow().clone();
+
+        let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
+
+        for j in i + 1..headers.len() {
+            let hn = &headers[j];
+
+            if hn.key.len() == h.key.len() && hn.key.eq_ignore_ascii_case(&h.key) {
+                ignored[j] = true;
+
+                value.push(sep);
+                value.push(b' ');
+                value.extend_from_slice(&hn.value.borrow());
+            }
+        }
+
+        out.push((header_param_key(&h.key), value));
+    }
+
+    out
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ use ngx_core::event_openssl::{
     ngx_ssl_trusted_certificate, NgxSsl, NGX_SSL_DEFAULT_PROTOCOLS,
 };
 use ngx_core::event_connect::LocalAddr;
-use ngx_core::hash::{hash_key, hash_key_lc, Hash, HashInit, HashKey};
+use ngx_core::hash::{hash_key_lc, Hash, HashInit, HashKey};
 use ngx_core::inet::Url;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
@@ -41,7 +41,7 @@ use crate::request::*;
 use crate::script::{ComplexValue, Part};
 use crate::upstream::*;
 use crate::upstream_cache::{UpstreamCacheConf, UpstreamCacheLocConf, UpstreamCacheMainConf, NGX_CONF_BITMASK_SET, NGX_HTTP_UPSTREAM_INVALID_HEADER};
-use crate::upstream_rt::{Upstream, UpstreamConf, UpstreamModule};
+use crate::upstream_rt::{cgi_status, Upstream, UpstreamConf, UpstreamModule};
 use crate::upstream_ssl::UpstreamSslConf;
 use crate::*;
 
@@ -89,36 +89,7 @@ const UWSGI_CACHE_HEADERS: &[(&[u8], &[u8])] = &[
     (b"HTTP_IF_RANGE", b""),
 ];
 
-/// ngx_http_upstream_param_t: a uwsgi_param
-#[derive(Clone, Debug)]
-pub struct ParamSource {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-    pub skip_empty: bool,
-}
-
-/// A param of params->lengths and params->values: the key, "if_not_empty"
-/// and the codes of the value.
-pub struct UwsgiParam {
-    pub key: Vec<u8>,
-    pub skip_empty: bool,
-    pub codes: Vec<Part>,
-}
-
-/// ngx_http_uwsgi_params_t
-pub struct UwsgiParams {
-    /// params->flushes: the variables of the values
-    pub flushes: Vec<usize>,
-    /// params->lengths and params->values
-    pub params: Vec<UwsgiParam>,
-    /// params->number: the HTTP_* params
-    pub number: usize,
-    /// params->hash: the names of the HTTP_* params after "HTTP_",
-    /// lowercase; the request headers of these names are not sent
-    pub hash: Hash<()>,
-}
-
-pub use crate::upstream_rt::UpstreamLocal;
+pub use crate::upstream_rt::{Param as UwsgiParam, ParamSource, Params as UwsgiParams, UpstreamLocal};
 
 /// ngx_http_uwsgi_loc_conf_t, with the fields of ngx_http_upstream_conf_t
 /// the module uses.
@@ -492,93 +463,10 @@ fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
     NGX_OK
 }
 
-/// The key of a request header as a param: "HTTP_" and the name in upper
-/// case, '-' as '_'.
-fn header_param_key(name: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity("HTTP_".len() + name.len());
-
-    key.extend_from_slice(b"HTTP_");
-
-    for &ch in name {
-        let ch = if ch.is_ascii_lowercase() {
-            ch & !0x20
-        } else if ch == b'-' {
-            b'_'
-        } else {
-            ch
-        };
-
-        key.push(ch);
-    }
-
-    key
-}
-
-/// The name of a request header as the params hash has it: lower case,
-/// '-' as '_'.
-fn header_hash_key(name: &[u8]) -> Vec<u8> {
-    name.iter()
-        .map(|&ch| {
-            if ch.is_ascii_uppercase() {
-                ch | 0x20
-            } else if ch == b'-' {
-                b'_'
-            } else {
-                ch
-            }
-        })
-        .collect()
-}
-
 /// The start of the packet: modifier1, the 16-bit little-endian size of
 /// the data, modifier2.
 fn packet_header(modifier1: i64, len: usize, modifier2: i64) -> [u8; 4] {
     [modifier1 as u8, (len & 0xff) as u8, ((len >> 8) & 0xff) as u8, modifier2 as u8]
-}
-
-/// The request headers as params: ngx_http_link_multi_headers() links the
-/// headers of a name (compared case-insensitively) to the first one, which
-/// is sent with the values of all, joined with "; " for "Cookie" and ", "
-/// otherwise; a header is not sent when `hidden` says so of its name in
-/// lower case with '-' as '_' (the params hash).
-fn header_params(headers: &[Header], hidden: &dyn Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut out = Vec::new();
-
-    // the headers of the params hash, and the linked ones
-    let mut ignored = vec![false; headers.len()];
-
-    for i in 0..headers.len() {
-        if ignored[i] {
-            continue;
-        }
-
-        let h = &headers[i];
-
-        if hidden(&header_hash_key(&h.key)) {
-            ignored[i] = true;
-            continue;
-        }
-
-        let mut value = h.value.borrow().clone();
-
-        let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
-
-        for j in i + 1..headers.len() {
-            let hn = &headers[j];
-
-            if hn.key.len() == h.key.len() && hn.key.eq_ignore_ascii_case(&h.key) {
-                ignored[j] = true;
-
-                value.push(sep);
-                value.push(b' ');
-                value.extend_from_slice(&hn.value.borrow());
-            }
-        }
-
-        out.push((header_param_key(&h.key), value));
-    }
-
-    out
 }
 
 /// A param as the packet has it: the 16-bit little-endian length and the
@@ -633,9 +521,9 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     let header_params = if *uwcf.pass_request_headers {
         let headers = r.headers_in.borrow().headers.clone();
 
-        let hidden = |lowcase_key: &[u8]| params.number != 0 && params.hash.find(hash_key(lowcase_key), lowcase_key).is_some();
+        let hidden = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        header_params(&headers, &hidden)
+        crate::upstream_rt::header_params(&headers, &hidden)
     } else {
         Vec::new()
     };
@@ -861,16 +749,6 @@ fn input_length(status_n: i64, head: bool, content_length_n: i64) -> i64 {
     }
 }
 
-/// The status of a "Status" header: ngx_atoi() of its first 3 characters
-/// (the value is null-terminated: a shorter one is invalid).
-fn cgi_status(value: &[u8]) -> Option<i64> {
-    if value.len() < 3 {
-        return None;
-    }
-
-    ngx_core::string::atoi(&value[..3])
-}
-
 // ---------------------------------------------------------------------------
 // the configuration
 // ---------------------------------------------------------------------------
@@ -1087,12 +965,12 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     }
 
     if c.params.is_none() {
-        let params = init_params(cf, c.params_source.as_ref(), UWSGI_HEADERS)?;
+        let params = crate::upstream_rt::init_params(cf, c.params_source.as_ref(), UWSGI_HEADERS, "uwsgi_params_hash")?;
         c.params = Some(params);
     }
 
     if c.cache.enabled() && c.params_cache.is_none() {
-        let params = init_params(cf, c.params_source.as_ref(), UWSGI_CACHE_HEADERS)?;
+        let params = crate::upstream_rt::init_params(cf, c.params_source.as_ref(), UWSGI_CACHE_HEADERS, "uwsgi_params_hash")?;
         c.params_cache = Some(params);
     }
 
@@ -1159,68 +1037,6 @@ fn upstream_conf(c: &NgxHttpUwsgiLocConf) -> UpstreamConf {
         ssl: c.upstream_ssl.clone(),
         module: "uwsgi",
     }
-}
-
-/// ngx_http_uwsgi_init_params: the params of uwsgi_param, then those of
-/// `default_params` it does not set (sent only if not empty); the names of
-/// the HTTP_* ones go to the hash (the request headers of these names are
-/// not sent), and the params with a value are compiled.
-fn init_params(cf: &mut Conf, params_source: Option<&Rc<Vec<ParamSource>>>, default_params: &[(&[u8], &[u8])]) -> Result<Rc<UwsgiParams>, ConfError> {
-    let src = merge_params(params_source.map(|s| s.as_slice()).unwrap_or(&[]), default_params);
-
-    let mut headers_names: Vec<HashKey<()>> = Vec::new();
-    let mut params: Vec<UwsgiParam> = Vec::new();
-    let mut flushes: Vec<usize> = Vec::new();
-
-    for s in src {
-        if s.key.len() > "HTTP_".len() && s.key.starts_with(b"HTTP_") {
-            let name = &s.key[5..];
-
-            // the hash keys are lowercased by ngx_hash_init()
-            headers_names.push(HashKey { key: name.to_ascii_lowercase(), key_hash: hash_key_lc(name), value: () });
-
-            if s.value.is_empty() {
-                continue;
-            }
-        }
-
-        let codes = crate::script::script_compile(cf, &s.value)?;
-
-        flushes.extend(crate::proxy::script_flushes(&codes));
-
-        params.push(UwsgiParam { key: s.key, skip_empty: s.skip_empty, codes });
-    }
-
-    let number = headers_names.len();
-
-    let hinit = HashInit { name: "uwsgi_params_hash", max_size: 512, bucket_size: 64, log: &cf.log };
-
-    let hash = match Hash::init(&hinit, headers_names) {
-        Ok(h) => h,
-        Err(e) => {
-            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "{}", e);
-            return Err(ConfError::Logged);
-        }
-    };
-
-    Ok(Rc::new(UwsgiParams { flushes, params, number, hash }))
-}
-
-/// params_merged of ngx_http_uwsgi_init_params: the params of uwsgi_param,
-/// then the default params of names they do not have (compared
-/// case-insensitively), sent only if not empty.
-fn merge_params(source: &[ParamSource], default_params: &[(&[u8], &[u8])]) -> Vec<ParamSource> {
-    let mut src: Vec<ParamSource> = source.to_vec();
-
-    for (key, value) in default_params {
-        if src.iter().any(|s| s.key.eq_ignore_ascii_case(key)) {
-            continue;
-        }
-
-        src.push(ParamSource { key: key.to_vec(), value: value.to_vec(), skip_empty: true });
-    }
-
-    src
 }
 
 /// Two lists of upstream.hide_headers or pass_headers are the same one
@@ -1693,31 +1509,10 @@ fn uwsgi_str_array(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> C
 /// uwsgi_param: ngx_http_upstream_param_set_slot
 fn uwsgi_param(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = uwcf_of(&conf);
-
-    let value = cf.args.clone();
-
-    let mut param = ParamSource { key: value[1].clone(), value: value[2].clone(), skip_empty: false };
-
-    if value.len() == 4 {
-        if value[3] != b"if_not_empty" {
-            return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(&value[3]))));
-        }
-
-        param.skip_empty = true;
-    }
-
-    let mut c = cell.borrow_mut();
-
-    let mut list: Vec<ParamSource> = match c.params_source.take() {
-        Some(l) => Rc::try_unwrap(l).unwrap_or_else(|l| l.as_ref().clone()),
-        None => Vec::new(),
-    };
-
-    list.push(param);
-
-    c.params_source = Some(Rc::new(list));
-
-    Ok(())
+    let mut list = cell.borrow_mut().params_source.take();
+    let rc = crate::upstream_rt::param_set_slot(cf, &mut list);
+    cell.borrow_mut().params_source = list;
+    rc
 }
 
 /// uwsgi_bind: ngx_http_upstream_bind_set_slot
@@ -1929,7 +1724,7 @@ pub fn uwsgi_module() -> ModuleDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream_rt::{content_type_charset, status_failure};
+    use crate::upstream_rt::{content_type_charset, header_hash_key, header_param_key, header_params, merge_params, status_failure};
 
     #[test]
     fn test_packet_header() {
