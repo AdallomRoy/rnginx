@@ -2846,12 +2846,20 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
         p.read_length += n as i64;
 
-        if raw.full() {
+        let full = raw.full();
+
+        if full {
             if m.pipe_input_filter(r, u, p, raw) == NGX_ERROR {
                 return (PipeEnd::Finalize(NGX_ERROR), None);
             }
         } else {
             p.put_back(raw);
+        }
+
+        // the read of the header filled u->buffer, rev->ready is still set:
+        // ngx_event_pipe_read_upstream reads on before anything is written
+        if full && read_ready(r, u, m, p, true, &mut delayed) == NGX_ERROR {
+            return (PipeEnd::Finalize(NGX_ERROR), None);
         }
 
         if let Some(rc) = pipe_after_read(r, u, m, p) {

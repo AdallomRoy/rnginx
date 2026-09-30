@@ -211,6 +211,9 @@ pub struct Connection {
     pub pipeline: Cell<bool>,
     pub read_delayed: Cell<bool>,
     pub write_delayed: Cell<bool>,
+    /// the timer of a delayed write event: the output waits until then
+    /// (ngx_http_write_filter's limit_rate delay after a send)
+    pub write_delay_until: Cell<Option<std::time::Instant>>,
     pub unexpected_eof: Cell<bool>,
     pub write_ready: Cell<bool>,
     pub read_eof: Cell<bool>,
@@ -301,6 +304,7 @@ impl Connection {
             pipeline: Cell::new(false),
             read_delayed: Cell::new(false),
             write_delayed: Cell::new(false),
+            write_delay_until: Cell::new(None),
             unexpected_eof: Cell::new(false),
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),
@@ -394,6 +398,7 @@ impl Connection {
             pipeline: Cell::new(false),
             read_delayed: Cell::new(false),
             write_delayed: Cell::new(false),
+            write_delay_until: Cell::new(None),
             unexpected_eof: Cell::new(false),
             write_ready: Cell::new(false),
             read_eof: Cell::new(false),

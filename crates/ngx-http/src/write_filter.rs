@@ -147,6 +147,30 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     }
 
     loop {
+        // c->write->delayed by the last send: the output waits for the
+        // timer (the read event is ngx_http_test_reading meanwhile)
+        if let Some(until) = c.write_delay_until.get() {
+            if std::time::Instant::now() < until {
+                c.write_delayed.set(true);
+
+                let closed = {
+                    let watch = TestReading::new(&r);
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => None,
+                        err = watch.closed() => Some(err),
+                    }
+                };
+
+                c.write_delayed.set(false);
+
+                if let Some(err) = closed {
+                    return test_reading_closed(&r, err);
+                }
+            }
+
+            c.write_delay_until.set(None);
+        }
+
         let mut limit: i64;
         if limit_rate > 0 {
             let now = ngx_core::times::time();
@@ -209,7 +233,18 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             }
             Ok(Ok(_)) => {}
         }
-        let _ = sent_now;
+        if limit_rate > 0 {
+            // delay = (nsent - sent) * 1000 / r->limit_rate, the counts
+            // past limit_rate_after
+            let lra = limit_rate_after as u64;
+            let sent = before.saturating_sub(lra);
+            let nsent = (before + sent_now).saturating_sub(lra);
+            let delay = (nsent - sent) * 1000 / limit_rate as u64;
+
+            if delay > 0 {
+                c.write_delay_until.set(Some(std::time::Instant::now() + std::time::Duration::from_millis(delay)));
+            }
+        }
         let remaining: i64 = r.out.borrow().iter().map(|b| b.buf_size()).sum();
         if remaining == 0 {
             // drop special (sync/flush/last) buffers as sent
