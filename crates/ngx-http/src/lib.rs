@@ -309,6 +309,7 @@ pub type RequestBodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> BoxFut<i64>>;
 
 thread_local! {
     static TOP_HEADER_FILTER: RefCell<Option<HeaderFilter>> = const { RefCell::new(None) };
+    static TOP_EARLY_HINTS_FILTER: RefCell<Option<HeaderFilter>> = const { RefCell::new(None) };
     static TOP_BODY_FILTER: RefCell<Option<BodyFilter>> = const { RefCell::new(None) };
     static TOP_REQUEST_BODY_FILTER: RefCell<Option<RequestBodyFilter>> = const { RefCell::new(None) };
 }
@@ -319,6 +320,30 @@ pub fn top_header_filter() -> HeaderFilter {
 
 pub fn set_top_header_filter(f: HeaderFilter) {
     TOP_HEADER_FILTER.with(|t| *t.borrow_mut() = Some(f));
+}
+
+/// ngx_http_top_early_hints_filter
+pub fn top_early_hints_filter() -> HeaderFilter {
+    TOP_EARLY_HINTS_FILTER.with(|t| t.borrow().clone().expect("early hints filter chain not initialized"))
+}
+
+pub fn set_top_early_hints_filter(f: HeaderFilter) {
+    TOP_EARLY_HINTS_FILTER.with(|t| *t.borrow_mut() = Some(f));
+}
+
+/// Install an early hints filter wrapping the current top.
+pub fn install_early_hints_filter<F, Fut>(f: F)
+where
+    F: Fn(R, HeaderFilter) -> Fut + 'static,
+    Fut: Future<Output = i64> + 'static,
+{
+    let next = top_early_hints_filter();
+    let f = Rc::new(f);
+    set_top_early_hints_filter(Rc::new(move |r| {
+        let f = f.clone();
+        let next = next.clone();
+        Box::pin(async move { f(r, next).await })
+    }));
 }
 
 pub fn top_body_filter() -> BodyFilter {

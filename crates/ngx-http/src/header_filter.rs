@@ -21,7 +21,57 @@ pub fn header_filter_module() -> ModuleDef {
 
 fn init(_cf: &mut Conf) -> ConfResult {
     set_top_header_filter(Rc::new(|r| Box::pin(header_filter(r))));
+    set_top_early_hints_filter(Rc::new(|r| Box::pin(early_hints_filter(r))));
     Ok(())
+}
+
+/// ngx_http_early_hints_filter: "103 Early Hints" with the headers of
+/// r->headers_out, flushed
+pub async fn early_hints_filter(r: R) -> i64 {
+    if !r.is_main() {
+        return NGX_OK;
+    }
+
+    if r.http_version.get() < NGX_HTTP_VERSION_11 {
+        return NGX_OK;
+    }
+
+    let mut headers: Vec<u8> = Vec::new();
+
+    for h in r.headers_out.borrow().headers.iter() {
+        if h.hash.get() == 0 {
+            continue;
+        }
+
+        headers.extend_from_slice(&h.key);
+        headers.extend_from_slice(b": ");
+        headers.extend_from_slice(&h.value.borrow());
+        headers.extend_from_slice(b"\r\n");
+    }
+
+    if headers.is_empty() {
+        return NGX_OK;
+    }
+
+    // ngx_http_early_hints_status_line
+    let mut out = b"HTTP/1.1 103 Early Hints\r\n".to_vec();
+
+    out.extend_from_slice(&headers);
+
+    http_debug!(r, "{}", B(&out));
+
+    // the end of HTTP early hints
+    out.extend_from_slice(b"\r\n");
+
+    r.header_size.set(out.len());
+
+    let mut b = Buf::from_vec(out);
+    b.flush = true;
+
+    let mut chain = Chain::new();
+    chain.push_back(b);
+
+    crate::write_filter::write_filter(r.clone(), chain).await
 }
 
 pub const SERVER_STRING: &[u8] = b"Server: nginx\r\n";

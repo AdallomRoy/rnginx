@@ -47,7 +47,89 @@ fn filter_init(_cf: &mut ngx_core::conf::Conf) -> ngx_core::conf::ConfResult {
         }
         header_filter(&r).await
     });
+    install_early_hints_filter(|r: R, next: HeaderFilter| async move {
+        if request_stream(&r).is_none() {
+            return next(r).await;
+        }
+        early_hints_filter(&r).await
+    });
     Ok(())
+}
+
+/// ngx_http_v2_early_hints_filter: a HEADERS frame of ":status: 103" and
+/// the headers of r->headers_out
+async fn early_hints_filter(r: &R) -> i64 {
+    let stream = match request_stream(r) {
+        Some(s) => s,
+        None => return NGX_ERROR,
+    };
+
+    if !r.is_main() {
+        return NGX_OK;
+    }
+
+    let fc = stream.fc.clone();
+
+    if fc.error.get() {
+        return NGX_ERROR;
+    }
+
+    let headers: Vec<(Vec<u8>, Vec<u8>)> = r.headers_out.borrow().headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect();
+
+    for (key, value) in headers.iter() {
+        if key.len() > NGX_HTTP_V2_MAX_FIELD {
+            ngx_log_error!(NGX_LOG_CRIT, fc.log, None, "too long response header name: \"{}\"", B(key));
+            return NGX_ERROR;
+        }
+
+        if value.len() > NGX_HTTP_V2_MAX_FIELD {
+            ngx_log_error!(NGX_LOG_CRIT, fc.log, None, "too long response header value: \"{}: {}\"", B(key), B(value));
+            return NGX_ERROR;
+        }
+    }
+
+    if headers.is_empty() {
+        return NGX_OK;
+    }
+
+    let h2c = stream.connection.clone();
+
+    let mut pos: Vec<u8> = Vec::with_capacity(256);
+
+    if h2c.table_update.get() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 table size update: 0");
+        pos.push((1 << 5) | 0);
+        h2c.table_update.set(false);
+    }
+
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \":status: {:03}\"", NGX_HTTP_EARLY_HINTS);
+
+    pos.push(inc_indexed(NGX_HTTP_V2_STATUS_INDEX));
+    pos.push(NGX_HTTP_V2_ENCODE_RAW | 3);
+    pos.extend_from_slice(format!("{:03}", NGX_HTTP_EARLY_HINTS).as_bytes());
+
+    for (key, value) in headers.iter() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"{}: {}\"", B(&ngx_core::string::to_lower_vec(key)), B(value));
+
+        pos.push(0);
+
+        write_name(&mut pos, key);
+
+        write_value(&mut pos, value);
+    }
+
+    let frame = create_headers_frame(&stream, &pos, false);
+
+    h2c.queue_blocked_frame(frame);
+
+    stream.queued.set(stream.queued.get() + 1);
+
+    init_stream(r, &stream);
+
+    match filter_send(&stream).await {
+        Ok(()) => NGX_OK,
+        Err(()) => NGX_ERROR,
+    }
 }
 
 /// ngx_http_v2_header_filter

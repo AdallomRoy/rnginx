@@ -545,6 +545,31 @@ pub fn weak_etag(r: &R) {
     etag.set_value(&nv);
 }
 
+/// ngx_http_send_early_hints: the early hints of r->headers_out, if the
+/// "early_hints" predicates let them go
+pub async fn send_early_hints(r: &R) -> i64 {
+    if r.post_action.get() {
+        return NGX_OK;
+    }
+
+    if r.header_sent.get() {
+        ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ALERT, r.connection.log, None, "header already sent");
+        return NGX_ERROR;
+    }
+
+    let early_hints = r.clcf().borrow().early_hints.get_or(None);
+
+    let rc = crate::script::test_predicates(r, &early_hints);
+
+    if rc != NGX_DECLINED {
+        return rc;
+    }
+
+    ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http send early hints \"{}?{}\"", ngx_core::string::B(&r.uri.borrow()), ngx_core::string::B(&r.args.borrow()));
+
+    crate::top_early_hints_filter()(r.clone()).await
+}
+
 /// ngx_http_send_header
 pub async fn send_header(r: &R) -> i64 {
     if r.post_action.get() {

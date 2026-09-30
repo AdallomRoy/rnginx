@@ -1877,7 +1877,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                 }
 
                 if prc == NGX_HTTP_UPSTREAM_EARLY_HINTS {
-                    if process_early_hints(r, u) == NGX_OK {
+                    if process_early_hints(r, u).await == NGX_OK {
                         continue;
                     }
 
@@ -1913,23 +1913,42 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
     Ok(())
 }
 
-/// ngx_http_upstream_process_early_hints. The early hints filters of
-/// ngx_http_send_early_hints() are not ported: the 103 is sent to the
-/// client only with the "early_hints" directive, and without it nothing is
-/// sent, so the headers are dropped as C drops them then.
-fn process_early_hints(r: &R, u: &mut Upstream) -> i64 {
+/// ngx_http_upstream_process_early_hints: the headers of a 103 response
+/// (but the hidden ones) go to the client as early hints, as the
+/// "early_hints" directive lets them, and the response header is read anew
+/// after them.
+async fn process_early_hints(r: &R, u: &mut Upstream) -> i64 {
     http_debug!(r, "http upstream early hints");
 
     if u.conf.pass_early_hints {
         u.early_hints_length += u.resp.pos as i64;
 
-        if u.early_hints_length > u.conf.buffer_size as i64 {
+        if u.early_hints_length <= u.conf.buffer_size as i64 {
+            {
+                let mut ho = r.headers_out.borrow_mut();
+
+                for h in u.resp.headers.iter() {
+                    if u.conf.hidden(&h.lowcase_key) {
+                        continue;
+                    }
+
+                    ho.headers.push(h.clone());
+                }
+            }
+
+            // what the client does not take now goes out before the
+            // response (ngx_http_upstream_early_hints_writer)
+            if crate::core_rt::send_early_hints(r).await == NGX_ERROR {
+                return NGX_ERROR;
+            }
+        } else {
             ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "upstream sent too big early hints");
         }
     }
 
-    // ngx_http_clean_header(r); u->headers_in anew; the rest of the buffer
-    // moved to its start
+    crate::special_response::clean_header(r);
+
+    // u->headers_in anew; the rest of the buffer moved to its start
     let rest = u.resp.buf.split_off(u.resp.pos.min(u.resp.buf.len()));
 
     u.resp.clear_headers();
@@ -3237,7 +3256,7 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
                     }
 
                     if prc == NGX_HTTP_UPSTREAM_EARLY_HINTS {
-                        if process_early_hints(r, u) == NGX_OK {
+                        if process_early_hints(r, u).await == NGX_OK {
                             continue;
                         }
 
