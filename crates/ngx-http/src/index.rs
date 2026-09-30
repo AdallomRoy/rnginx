@@ -174,10 +174,10 @@ async fn index_handler(r: R) -> i64 {
                 if of.err == 0 {
                     return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
-                // Match C: ENOTDIR / ENAMETOOLONG / EACCES on the candidate
-                // go straight to index_error (which returns 404 or 403 and
-                // conditionally logs via log_not_found). test_dir only runs
-                // when open fails with ENOENT.
+                // NGX_HAVE_OPENAT
+                if of.err == libc::EMLINK || of.err == libc::ELOOP {
+                    return NGX_HTTP_FORBIDDEN;
+                }
                 if of.err == libc::ENOTDIR
                     || of.err == libc::ENAMETOOLONG
                     || of.err == libc::EACCES
@@ -185,7 +185,8 @@ async fn index_handler(r: R) -> i64 {
                     return index_error(&r, &clcf, &full, of.err);
                 }
                 if !dir_tested {
-                    let rc = test_dir(&r, &clcf, &path[..dir_len], root_len).await;
+                    let _ = root_len;
+                    let rc = test_dir(&r, &clcf, &full, dir_len).await;
                     if rc != NGX_OK {
                         return rc;
                     }
@@ -216,42 +217,61 @@ fn index_error(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, file: &[u8], e
     NGX_HTTP_NOT_FOUND
 }
 
-async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, dir: &[u8], root_len: usize) -> i64 {
+/// ngx_http_index_test_dir: the directory of the index file `path` (the
+/// name at `name`) exists. As in C, the "is not found" and "is not a
+/// directory" messages show `path`: the directory name is terminated in
+/// place, and the byte is restored before they are logged.
+async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, path: &[u8], name: usize) -> i64 {
     let log = r.connection.log.clone();
-    let mut d = dir.to_vec();
-    if d.len() > 1 && d.last() == Some(&b'/') && d.len() > root_len {
-        d.pop();
+
+    // c = *last; if (c != '/' || path == last) { /* "alias" without
+    // trailing slash */ c = *(++last); } *last = '\0'
+    let mut last = name - 1;
+
+    if path[last] != b'/' || last == 0 {
+        last += 1;
     }
-    http_debug!(r, "http index check dir: \"{}\"", B(&d));
+
+    let dir = &path[..last];
+
+    http_debug!(r, "http index check dir: \"{}\"", B(dir));
+
     let mut of = {
         let c = clcf.borrow();
         crate::static_module::open_file_info(r, &c)
     };
     of.test_dir = true;
     of.test_only = true;
-    if crate::core_rt::set_disable_symlinks(r, clcf, &d, &mut of) != NGX_OK {
+    if crate::core_rt::set_disable_symlinks(r, clcf, dir, &mut of) != NGX_OK {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
     let cache = clcf.borrow().open_file_cache.get().clone();
-    match open_cached_file(cache.as_ref(), &d, &mut of, &log) {
+    match open_cached_file(cache.as_ref(), dir, &mut of, &log) {
         Ok(_) => {
-            if !of.is_dir {
-                ngx_log_error!(NGX_LOG_ALERT, log, None, "\"{}\" is not a directory", B(&d));
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            if of.is_dir {
+                return NGX_OK;
             }
-            NGX_OK
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "\"{}\" is not a directory", B(path));
+            NGX_HTTP_INTERNAL_SERVER_ERROR
         }
         Err(()) => {
-            // Route ENOENT / ENOTDIR through index_error so log_not_found is
-            // respected.
-            if of.err == libc::ENOENT || of.err == libc::ENOTDIR {
-                return index_error(r, clcf, &d, of.err);
+            if of.err != 0 {
+                // NGX_HAVE_OPENAT
+                if of.err == libc::EMLINK || of.err == libc::ELOOP {
+                    return NGX_HTTP_FORBIDDEN;
+                }
+                if of.err == libc::ENOENT {
+                    return index_error(r, clcf, path, libc::ENOENT);
+                }
+                if of.err == libc::EACCES {
+                    // ngx_http_index_test_dir() is called after the first
+                    // index file testing has returned an error distinct from
+                    // NGX_EACCES. This means that directory searching is
+                    // allowed.
+                    return NGX_OK;
+                }
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(of.err), "{} \"{}\" failed", of.failed, B(dir));
             }
-            if of.err == libc::EACCES {
-                let _ = index_error(r, clcf, &d, of.err);
-                return NGX_HTTP_FORBIDDEN;
-            }
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&d));
             NGX_HTTP_INTERNAL_SERVER_ERROR
         }
     }

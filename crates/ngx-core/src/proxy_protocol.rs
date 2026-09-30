@@ -62,9 +62,8 @@ pub fn read(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()>
     }
 
     // Check for v1 "PROXY " prefix
-    if len < 6 || &buf[..6] != b"PROXY " {
-        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{:.*}\"",
-                       find_line_len(buf), B(buf));
+    if len < 8 || &buf[..6] != b"PROXY " {
+        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{}\"", B(&buf[..find_line_len(buf)]));
         return Err(());
     }
 
@@ -87,15 +86,13 @@ fn read_v1(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> 
             }
             p += 1;
         }
-        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{:.*}\"",
-                       find_line_len(buf), B(buf));
+        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{}\"", B(&buf[..find_line_len(buf)]));
         return Err(());
     }
 
     // TCP4 or TCP6
     if end - p < 5 || &buf[p..p + 3] != b"TCP" || (buf[p + 3] != b'4' && buf[p + 3] != b'6') || buf[p + 4] != b' ' {
-        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{:.*}\"",
-                       find_line_len(buf), B(buf));
+        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{}\"", B(&buf[..find_line_len(buf)]));
         return Err(());
     }
 
@@ -119,8 +116,7 @@ fn read_v1(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> 
 
     // Expect LF
     if p >= end || buf[p] != b'\n' {
-        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{:.*}\"",
-                       find_line_len(buf), B(buf));
+        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{}\"", B(&buf[..find_line_len(buf)]));
         return Err(());
     }
     p += 1;
@@ -183,8 +179,7 @@ fn read_v2(log: &Log, buf: &[u8]) -> Result<(Option<ProxyProtocol>, usize), ()> 
 
     // V2 header minimum: 16 bytes (sig 12 + version/command 1 + family/transport 1 + length 2)
     if len < 16 {
-        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{:.*}\"",
-                       find_line_len(buf), B(buf));
+        ngx_log_error!(NGX_LOG_ERR, log, None, "broken header: \"{}\"", B(&buf[..find_line_len(buf)]));
         return Err(());
     }
 
@@ -294,7 +289,7 @@ fn find_line_len(buf: &[u8]) -> usize {
             return i;
         }
     }
-    buf.len().min(100)
+    buf.len()
 }
 
 /// Write v1 PROXY protocol header

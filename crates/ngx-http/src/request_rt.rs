@@ -677,7 +677,7 @@ async fn run_request(r: &R) -> End {
             let p = r.parse.borrow();
             let end = p.header_end.min(b.last);
             let ch = b.data.get(end).copied().unwrap_or(0);
-            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\\x{:02X}...\"", B(&b.data[p.header_name_start..end]), ch);
+            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\\x{:02x}...\"", B(&b.data[p.header_name_start..end]), ch);
         }
         return finalize_and_end(r, NGX_HTTP_BAD_REQUEST).await;
     }
