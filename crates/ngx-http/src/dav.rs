@@ -349,9 +349,7 @@ fn check_delete_depth(uri: &[u8], min_delete_depth: i64) -> Result<(), i64> {
 /// ngx_http_dav_delete_path; `path` is the C string and `len` the
 /// path.len the tree walk appends the names at
 fn dav_delete_path(r: &R, path: &[u8], len: usize, dir: bool) -> i64 {
-    let failed;
-
-    if dir {
+    let (failed, err) = if dir {
         let mut tree = TreeCtx::new(TreeOp::Delete, &r.connection.log);
 
         /* TODO: 207 */
@@ -360,20 +358,18 @@ fn dav_delete_path(r: &R, path: &[u8], len: usize, dir: bool) -> i64 {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        if delete_dir(path).is_ok() {
-            return NGX_OK;
+        match delete_dir(path) {
+            Ok(()) => return NGX_OK,
+            Err(err) => ("rmdir()", err),
         }
-
-        failed = "rmdir()";
     } else {
-        if ngx_core::os::unlink(path).is_ok() {
-            return NGX_OK;
+        match ngx_core::os::unlink(path) {
+            Ok(()) => return NGX_OK,
+            Err(err) => ("unlink()", err),
         }
+    };
 
-        failed = "unlink()";
-    }
-
-    dav_error(&r.connection.log, ngx_core::os::errno(), NGX_HTTP_NOT_FOUND, failed, path)
+    dav_error(&r.connection.log, err, NGX_HTTP_NOT_FOUND, failed, path)
 }
 
 fn dav_mkcol_handler(r: &R, access: u32) -> i64 {
@@ -397,13 +393,14 @@ fn dav_mkcol_handler(r: &R, access: u32) -> i64 {
 
     http_debug!(r, "http mkcol path: \"{}\"", B(&path));
 
-    if ngx_core::os::mkdir(&path, dir_access(access)).is_ok() {
-        dav_location(r);
+    match ngx_core::os::mkdir(&path, dir_access(access)) {
+        Ok(()) => {
+            dav_location(r);
 
-        return NGX_HTTP_CREATED;
+            NGX_HTTP_CREATED
+        }
+        Err(err) => dav_error(&r.connection.log, err, NGX_HTTP_CONFLICT, "mkdir()", &path),
     }
-
-    dav_error(&r.connection.log, ngx_core::os::errno(), NGX_HTTP_CONFLICT, "mkdir()", &path)
 }
 
 fn dav_invalid_destination(r: &R, dest: &[u8]) -> i64 {
@@ -599,8 +596,8 @@ fn dav_copy_move_handler(r: &R) -> i64 {
             return NGX_HTTP_CREATED;
         }
 
-        if ngx_core::os::mkdir(&copy_path, file_access(&fi)).is_err() {
-            return dav_error(log, ngx_core::os::errno(), NGX_HTTP_NOT_FOUND, "mkdir()", &copy_path);
+        if let Err(err) = ngx_core::os::mkdir(&copy_path, file_access(&fi)) {
+            return dav_error(log, err, NGX_HTTP_NOT_FOUND, "mkdir()", &copy_path);
         }
 
         let copy = DavCopyCtx { path: copy_path.clone(), len };
@@ -774,10 +771,10 @@ impl<'a> TreeCtx<'a> {
 fn dav_delete_dir(ctx: &TreeCtx, path: &[u8]) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, ctx.log, "http delete dir: \"{}\"", B(path));
 
-    if delete_dir(path).is_err() {
+    if let Err(err) = delete_dir(path) {
         /* TODO: add to 207 */
 
-        dav_error(ctx.log, ngx_core::os::errno(), 0, "rmdir()", path);
+        dav_error(ctx.log, err, 0, "rmdir()", path);
     }
 
     NGX_OK
@@ -1070,16 +1067,19 @@ fn ext_rename_file(src: &[u8], to: &[u8], ext: &ExtRenameFile) -> i64 {
             name.extend_from_slice(format!(".{:010}", n).as_bytes());
 
             if copy_file(src, &name, &cf) == NGX_OK {
-                if rename_file(&name, to).is_ok() {
-                    if let Err(e) = ngx_core::os::unlink(src) {
-                        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(src));
-                        return NGX_ERROR;
+                match rename_file(&name, to) {
+                    Ok(()) => {
+                        if let Err(e) = ngx_core::os::unlink(src) {
+                            ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(src));
+                            return NGX_ERROR;
+                        }
+
+                        return NGX_OK;
                     }
-
-                    return NGX_OK;
+                    Err(e) => {
+                        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "rename() \"{}\" to \"{}\" failed", B(&name), B(to));
+                    }
                 }
-
-                ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "rename() \"{}\" to \"{}\" failed", B(&name), B(to));
 
                 if let Err(e) = ngx_core::os::unlink(&name) {
                     ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(&name));
