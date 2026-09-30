@@ -321,3 +321,42 @@ impl Drop for Dir {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_entries() {
+        let d = std::env::temp_dir().join(format!("ngx-os-dir-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("file"), b"x").unwrap();
+        let name = d.as_os_str().as_bytes().to_vec();
+
+        let mut dir = Dir::open(&name).unwrap();
+        let mut names = Vec::new();
+        loop {
+            match dir.read() {
+                Ok(n) => names.push(n),
+                Err(e) => {
+                    assert_eq!(e, 0, "the end of the directory is errno 0");
+                    break;
+                }
+            }
+        }
+        dir.close().unwrap();
+        names.sort();
+        assert_eq!(names, vec![b".".to_vec(), b"..".to_vec(), b"file".to_vec(), b"sub".to_vec()]);
+
+        let mut file = name.clone();
+        file.extend_from_slice(b"/file");
+        assert_eq!(Dir::open(&file).err(), Some(libc::ENOTDIR));
+        file.extend_from_slice(b"/x");
+        assert_eq!(Dir::open(&file).err(), Some(libc::ENOTDIR));
+        let mut missing = name.clone();
+        missing.extend_from_slice(b"/missing");
+        assert_eq!(Dir::open(&missing).err(), Some(libc::ENOENT));
+
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+}
