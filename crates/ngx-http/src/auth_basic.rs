@@ -310,7 +310,7 @@ async fn auth_basic_handler(r: R) -> i64 {
         Err(_) => return NGX_ERROR,
     };
 
-    let fd = match ngx_core::os::open(&user_file, libc::O_RDONLY, 0) {
+    let fd = match ngx_core::os::open(c_str(&user_file), libc::O_RDONLY, 0) {
         Ok(fd) => fd,
         Err(err) => {
             let (level, rc) = if err == libc::ENOENT {
