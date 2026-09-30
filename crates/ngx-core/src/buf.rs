@@ -333,7 +333,7 @@ pub fn create_temp_file(
     // (matching ngx_next_temp_number(1)), bump the counter by a pseudo-random
     // stride so retries don't just re-collide on the next slot.
     let mode = if access == 0 { 0o600 } else { access };
-    let mut num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut num = crate::file::next_temp_number(false) as u64;
     loop {
         let key_str = format!("{:010}", num);
         let filename = path.hashed_filename(key_str.as_bytes());
@@ -344,8 +344,7 @@ pub fn create_temp_file(
             Ok(fd) => return Ok(TempFile::new(filename, fd, mode, clean)),
             Err(err) if err == libc::EEXIST => {
                 // Random increment stride (nginx's ngx_random_number).
-                let stride = 123456u64;
-                num = stats.temp_number.fetch_add(stride, std::sync::atomic::Ordering::Relaxed) + stride;
+                num = crate::file::next_temp_number(true) as u64;
                 continue;
             }
             Err(err) => {

@@ -547,32 +547,47 @@ pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
     NGX_OK
 }
 
+/// ngx_http_write_request_body: the buffers of the body written to the
+/// temporary file of client_body_temp_path, created on the first write
+/// ("a client request body is buffered to a temporary file" at
+/// r->request_body_file_log_level), or at once for an empty body with
+/// client_body_in_file_only.
 fn write_request_body(r: &R, b: &mut RequestBody) -> i64 {
     http_debug!(r, "http write client request body, bufs {}", b.bufs.len());
     if b.temp_file.is_none() {
         let clcf = r.clcf();
         let path = clcf.borrow().client_body_temp_path.get().clone();
-        let access = if r.request_body_file_group_access.get() { 0o660 } else { 0 };
-        match ngx_core::buf::create_temp_file(&path, r.request_body_in_persistent_file.get(), r.request_body_in_clean_file.get(), access, &r.connection.log) {
-            Ok(tf) => {
-                let level = r.request_body_file_log_level.get();
-                if level != 0 {
-                    ngx_log_error!(level, r.connection.log, None, "a client request body is buffered to a temporary file {}", ngx_core::string::B(&tf.name));
-                }
-                b.temp_file = Some(tf);
-            }
-            Err(_) => return NGX_ERROR,
+        let mut tf = ngx_core::file::TempFile::new(path, &r.connection.log);
+        tf.warn = "a client request body is buffered to a temporary file";
+        tf.log_level = r.request_body_file_log_level.get();
+        tf.persistent = r.request_body_in_persistent_file.get();
+        tf.clean = r.request_body_in_clean_file.get();
+        if r.request_body_file_group_access.get() {
+            tf.access = 0o660;
         }
+        if b.bufs.is_empty() {
+            // empty body with r->request_body_in_file_only
+            if tf.create().is_err() {
+                b.temp_file = Some(tf);
+                return NGX_ERROR;
+            }
+            b.temp_file = Some(tf);
+            return NGX_OK;
+        }
+        b.temp_file = Some(tf);
     }
-    let mem: Chain = b.bufs.drain(..).filter(|x| x.in_memory()).collect();
-    if mem.is_empty() {
+    if b.bufs.is_empty() {
         return NGX_OK;
     }
     let tf = b.temp_file.as_mut().unwrap();
-    match ngx_core::buf::write_chain_to_temp_file(tf, &mem, &r.connection.log) {
-        Ok(_) => NGX_OK,
-        Err(_) => NGX_ERROR,
-    }
+    let n = match tf.write_chain(&b.bufs) {
+        Ok(n) => n,
+        Err(()) => return NGX_ERROR,
+    };
+    tf.offset += n;
+    // mark all buffers as written
+    b.bufs.clear();
+    NGX_OK
 }
 
 /// ngx_http_discard_request_body: start discarding; may complete later.

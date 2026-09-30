@@ -1794,9 +1794,7 @@ impl CacheTempFile {
     pub fn create(r: &R, path: &PathConf, cache_file: Option<&[u8]>) -> Result<CacheTempFile, ()> {
         let log = &r.connection.log;
 
-        let stats = ngx_core::connection::stats();
-
-        let mut n = stats.temp_number.fetch_add(1, Ordering::Relaxed) as u32;
+        let mut n = ngx_core::file::next_temp_number(false);
 
         loop {
             let name = match cache_file {
@@ -1817,8 +1815,7 @@ impl CacheTempFile {
                     return Ok(CacheTempFile { name, fd, offset: 0 });
                 }
                 Err(err) if err == libc::EEXIST => {
-                    // ngx_next_temp_number(1)
-                    n = stats.temp_number.fetch_add(123456, Ordering::Relaxed).wrapping_add(123456) as u32;
+                    n = ngx_core::file::next_temp_number(true);
                     continue;
                 }
                 Err(err) => {
@@ -1959,7 +1956,7 @@ pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u
 
         if err == libc::EXDEV {
             // the copy of ngx_copy_file() to "to.NNNNNNNNNN", renamed
-            let n = ngx_core::connection::stats().temp_number.fetch_add(1, Ordering::Relaxed) as u32;
+            let n = ngx_core::file::next_temp_number(false);
 
             let mut name = to.to_vec();
             name.push(b'.');

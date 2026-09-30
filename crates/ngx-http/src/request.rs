@@ -203,7 +203,7 @@ impl HeadersOut {
 
 /// ngx_http_request_body_t
 pub struct RequestBody {
-    pub temp_file: Option<ngx_core::buf::TempFile>,
+    pub temp_file: Option<ngx_core::file::TempFile>,
     pub bufs: Chain,
     pub buf: Option<ngx_core::buf::Buf>,
     pub rest: i64,
