@@ -1,329 +1,616 @@
-//! ngx_http_memcached_module: minimal memcached upstream content handler.
+//! ngx_http_memcached_module
 //!
-//! Sends `get <key>\r\n`, parses `VALUE <key> <flags> <bytes>\r\n<data>\r\nEND\r\n`
-//! or `END\r\n` (not found). Enough for the test suite's use of a mock daemon.
+//! The request is "get <$memcached_key escaped>" (ngx_http_memcached_create_request),
+//! the response "VALUE <key> <flags> <length>" and the data with the
+//! "CRLF END CRLF" trailer (ngx_http_memcached_process_header and
+//! ngx_http_memcached_filter), or "END" for a key not found (404). The
+//! response is not buffered; the request lifecycle is that of
+//! crate::upstream_rt.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use ngx_core::buf::{Buf, Chain};
 use ngx_core::conf::*;
+use ngx_core::inet::Url;
+use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ngx_core::string::B;
+use ngx_core::{cmd_fn, ngx_log_error};
 
+use crate::core::CoreLocConf;
+use crate::event_pipe::EventPipe;
 use crate::request::*;
+use crate::upstream::*;
+use crate::upstream_cache::{UpstreamCacheConf, NGX_CONF_BITMASK_SET, NGX_HTTP_UPSTREAM_INVALID_HEADER};
+use crate::upstream_rt::{Upstream, UpstreamConf, UpstreamLocal, UpstreamModule};
+use crate::upstream_ssl::UpstreamSslConf;
 use crate::variables::*;
 use crate::*;
 
 crate::http_module_index!("ngx_http_memcached_module");
 
-pub struct MemcachedLocConf {
-    pub upstream: Option<Vec<u8>>,  // host:port
-    /// the upstream of memcached_pass (ngx_http_upstream_add)
-    pub upstream_conf: Option<Rc<crate::upstream::UpstreamSrvConf>>,
-    pub gzip_flag: Val<u32>,
-    pub next_upstream_not_found: Val<bool>,
-    /// the index of $memcached_key (mlcf->index)
+/// ngx_http_memcached_next_upstream_masks
+const MEMCACHED_NEXT_UPSTREAM_MASKS: &[(&str, u32)] = &[
+    ("error", NGX_HTTP_UPSTREAM_FT_ERROR),
+    ("timeout", NGX_HTTP_UPSTREAM_FT_TIMEOUT),
+    ("invalid_response", NGX_HTTP_UPSTREAM_FT_INVALID_HEADER),
+    ("not_found", NGX_HTTP_UPSTREAM_FT_HTTP_404),
+    ("off", NGX_HTTP_UPSTREAM_FT_OFF),
+];
+
+/// ngx_http_memcached_end
+const MEMCACHED_END: &[u8] = b"\r\nEND\r\n";
+
+/// NGX_HTTP_MEMCACHED_END
+const NGX_HTTP_MEMCACHED_END: i64 = MEMCACHED_END.len() as i64;
+
+/// ngx_http_memcached_loc_conf_t, with the fields of ngx_http_upstream_conf_t
+/// the module sets.
+pub struct NgxHttpMemcachedLocConf {
+    /// upstream.upstream: the upstream of memcached_pass
+    pub upstream: Option<Rc<UpstreamSrvConf>>,
+
+    /// upstream.local: unset, NULL ("off") or the address
+    pub local: Val<Option<Rc<UpstreamLocal>>>,
+    pub socket_keepalive: Val<bool>,
+    pub next_upstream_tries: Val<i64>,
+    pub connect_timeout: Val<u64>,
+    pub send_timeout: Val<u64>,
+    pub read_timeout: Val<u64>,
+    pub next_upstream_timeout: Val<u64>,
+    pub buffer_size: Val<usize>,
+
+    /// upstream.next_upstream: a bitmask, 0 when not set
+    pub next_upstream: u32,
+
+    /// the index of $memcached_key (NGX_CONF_UNSET: none)
     pub index: Option<usize>,
+    pub gzip_flag: Val<i64>,
+
+    /// mlcf->upstream as a request uses it, once merged
+    pub upstream_conf: Option<Rc<UpstreamConf>>,
 }
 
-impl Default for MemcachedLocConf {
-    fn default() -> Self {
-        MemcachedLocConf {
-            upstream: None,
-            upstream_conf: None,
-            gzip_flag: Val::unset(),
-            next_upstream_not_found: Val::unset(),
-            index: None,
-        }
+/// ngx_http_memcached_create_loc_conf
+fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> {
+    make_slot(new_loc_conf())
+}
+
+fn new_loc_conf() -> NgxHttpMemcachedLocConf {
+    // set by ngx_pcalloc(): bufs.num = 0, next_upstream = 0, temp_path = NULL
+    NgxHttpMemcachedLocConf {
+        upstream: None,
+        local: Val::unset(),
+        socket_keepalive: Val::unset(),
+        next_upstream_tries: Val::unset(),
+        connect_timeout: Val::unset(),
+        send_timeout: Val::unset(),
+        read_timeout: Val::unset(),
+        next_upstream_timeout: Val::unset(),
+        buffer_size: Val::unset(),
+        next_upstream: 0,
+        index: None,
+        gzip_flag: Val::unset(),
+        upstream_conf: None,
     }
 }
 
-fn create_loc_conf(_cf: &mut Conf) -> Rc<dyn Any> { make_slot(MemcachedLocConf::default()) }
-
+/// ngx_http_memcached_merge_loc_conf
 fn merge_loc_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
-    let p = conf_cell::<MemcachedLocConf>(prev).borrow();
-    let mut c = conf_cell::<MemcachedLocConf>(conf).borrow_mut();
+    let p = conf_cell::<NgxHttpMemcachedLocConf>(prev).borrow();
+    let mut c = conf_cell::<NgxHttpMemcachedLocConf>(conf).borrow_mut();
+
+    crate::upstream_ssl::merge_ptr(&mut c.local, &p.local);
+
+    c.socket_keepalive.merge(&p.socket_keepalive, false);
+
+    c.next_upstream_tries.merge(&p.next_upstream_tries, 0);
+
+    c.connect_timeout.merge(&p.connect_timeout, 60000);
+
+    c.send_timeout.merge(&p.send_timeout, 60000);
+
+    c.read_timeout.merge(&p.read_timeout, 60000);
+
+    c.next_upstream_timeout.merge(&p.next_upstream_timeout, 0);
+
+    c.buffer_size.merge(&p.buffer_size, ngx_core::os::pagesize());
+
+    if c.next_upstream == 0 {
+        c.next_upstream = if p.next_upstream == 0 { NGX_CONF_BITMASK_SET | NGX_HTTP_UPSTREAM_FT_ERROR | NGX_HTTP_UPSTREAM_FT_TIMEOUT } else { p.next_upstream };
+    }
+
+    if c.next_upstream & NGX_HTTP_UPSTREAM_FT_OFF != 0 {
+        c.next_upstream = NGX_CONF_BITMASK_SET | NGX_HTTP_UPSTREAM_FT_OFF;
+    }
+
     if c.upstream.is_none() {
         c.upstream = p.upstream.clone();
-        c.upstream_conf = p.upstream_conf.clone();
     }
+
     if c.index.is_none() {
         c.index = p.index;
     }
+
     c.gzip_flag.merge(&p.gzip_flag, 0);
-    c.next_upstream_not_found.merge(&p.next_upstream_not_found, false);
+
+    c.upstream_conf = Some(Rc::new(upstream_conf(&c)));
+
     Ok(())
 }
 
-pub fn memcached_module() -> ModuleDef {
-    let def = HttpModuleDef {
-        create_loc_conf: Some(create_loc_conf),
-        merge_loc_conf: Some(merge_loc_conf),
-        ..Default::default()
-    };
-    let commands = vec![
-        ngx_core::cmd_fn!("memcached_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, set_memcached_pass),
-        ngx_core::cmd_fn!("memcached_bind", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_socket_keepalive", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_connect_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_send_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_buffer_size", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_read_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_next_upstream", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_1MORE, ConfLevel::Loc, set_next_upstream),
-        ngx_core::cmd_fn!("memcached_next_upstream_tries", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_next_upstream_timeout", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
-        ngx_core::cmd_fn!("memcached_gzip_flag", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, set_gzip_flag),
-    ];
-    http_module_def("ngx_http_memcached_module", def, commands)
+/// mlcf->upstream, with the hardcoded values of
+/// ngx_http_memcached_create_loc_conf
+fn upstream_conf(c: &NgxHttpMemcachedLocConf) -> UpstreamConf {
+    UpstreamConf {
+        upstream: c.upstream.clone(),
+        connect_timeout: *c.connect_timeout,
+        send_timeout: *c.send_timeout,
+        read_timeout: *c.read_timeout,
+        next_upstream_timeout: *c.next_upstream_timeout,
+        send_lowat: 0,
+        buffer_size: *c.buffer_size,
+        limit_rate: None,
+        busy_buffers_size: 0,
+        max_temp_file_size: 0,
+        temp_file_write_size: 0,
+        bufs: Bufs::default(),
+        next_upstream: c.next_upstream,
+        store_access: 0,
+        next_upstream_tries: *c.next_upstream_tries as u32,
+        buffering: false,
+        request_buffering: true,
+        pass_request_headers: false,
+        pass_request_body: false,
+        pass_trailers: false,
+        pass_early_hints: false,
+        ignore_client_abort: false,
+        intercept_errors: true,
+        cyclic_temp_file: false,
+        force_ranges: true,
+        temp_path: None,
+        hide_headers_hash: None,
+        local: c.local.as_option().cloned().flatten(),
+        socket_keepalive: *c.socket_keepalive,
+        socket_rcvbuf: 0,
+        socket_sndbuf: 0,
+        cache: UpstreamCacheConf::default(),
+        store: false,
+        store_values: None,
+        intercept_404: true,
+        change_buffering: false,
+        preserve_output: false,
+        ignore_input: false,
+        ssl: UpstreamSslConf::default(),
+        module: "",
+    }
 }
 
-fn set_memcached_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let cell = conf_rc::<MemcachedLocConf>(conf.as_ref().unwrap());
+// ---------------------------------------------------------------------------
+// the request
+// ---------------------------------------------------------------------------
+
+/// ngx_http_memcached_ctx_t: the key sent, and what is left of the trailer
+struct MemcachedModule {
+    lcf: Rc<RefCell<NgxHttpMemcachedLocConf>>,
+    /// ctx->rest
+    rest: i64,
+    /// ctx->key: the key as sent (escaped)
+    key: Vec<u8>,
+}
+
+/// ngx_http_memcached_handler
+async fn memcached_handler(r: R) -> i64 {
+    if r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD) == 0 {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    let rc = crate::request_body::discard_request_body(&r).await;
+
+    if rc != NGX_OK {
+        return rc;
+    }
+
+    if crate::core_rt::set_content_type(&r) != NGX_OK {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    let lcf = r.loc_conf::<NgxHttpMemcachedLocConf>(ctx_index());
+
+    let conf = match lcf.borrow().upstream_conf.clone() {
+        Some(c) => c,
+        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+    };
+
+    // ngx_http_upstream_create; u->schema = "memcached://"
+    let u = Upstream::create(&r, conf, Rc::new(Vec::new()), b"memcached://");
+
+    let mut m = MemcachedModule { lcf, rest: 0, key: Vec::new() };
+
+    // r->main->count++; ngx_http_upstream_init(r)
+    crate::upstream_rt::init(r, u, &mut m).await
+}
+
+impl UpstreamModule for MemcachedModule {
+    fn create_key(&self, _r: &R, _keys: &mut Vec<Vec<u8>>) -> i64 {
+        NGX_OK
+    }
+
+    /// ngx_http_memcached_create_request: "get <key>" CRLF
+    fn create_request(&mut self, r: &R, u: &mut Upstream) -> i64 {
+        let index = self.lcf.borrow().index;
+
+        let vv = index.and_then(|i| get_indexed_variable(r, i));
+
+        let value = match vv {
+            Some(v) if !v.not_found && !v.data.is_empty() => v.data,
+            _ => {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the \"$memcached_key\" variable is not set");
+                return NGX_ERROR;
+            }
+        };
+
+        let mut b = b"get ".to_vec();
+
+        self.key = ngx_core::string::escape_uri(&value, ngx_core::string::NGX_ESCAPE_MEMCACHED);
+
+        b.extend_from_slice(&self.key);
+
+        http_debug!(r, "http memcached request: \"{}\"", B(&self.key));
+
+        b.extend_from_slice(b"\r\n");
+
+        let mut bufs = Chain::new();
+        bufs.push_back(Buf::from_vec(b));
+
+        u.request_bufs = bufs;
+
+        NGX_OK
+    }
+
+    /// ngx_http_memcached_reinit_request
+    fn reinit_request(&mut self, _r: &R, _u: &mut Upstream) -> i64 {
+        NGX_OK
+    }
+
+    /// ngx_http_memcached_process_header
+    fn process_header(&mut self, r: &R, u: &mut Upstream) -> i64 {
+        let buf = &u.resp.buf;
+
+        let lf = match buf.iter().position(|&c| c == b'\n') {
+            Some(p) => p,
+            None => return NGX_AGAIN,
+        };
+
+        // found:
+
+        if lf == 0 || buf[lf - 1] != b'\r' {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid response: \"{}\"", B(&buf[..lf]));
+            return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+        }
+
+        // the line without the CR; "*p = '\0'" at the LF
+        let line = buf[..lf - 1].to_vec();
+
+        http_debug!(r, "memcached: \"{}\"", B(&line));
+
+        let no_valid = |r: &R| {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid response: \"{}\"", B(&line));
+            NGX_HTTP_UPSTREAM_INVALID_HEADER
+        };
+
+        // the line and its CR, as the C string up to the LF
+        let s = &buf[..lf];
+
+        if let Some(rest) = s.strip_prefix(b"VALUE ") {
+            if !rest.starts_with(&self.key) {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid key in response \"{}\" for key \"{}\"", B(&line), B(&self.key));
+                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+
+            let mut p = "VALUE ".len() + self.key.len();
+
+            if s.get(p) != Some(&b' ') {
+                return no_valid(r);
+            }
+
+            p += 1;
+
+            // flags
+
+            let start = p;
+
+            let space = match s[p..].iter().position(|&c| c == b' ') {
+                Some(n) => p + n,
+                None => return no_valid(r),
+            };
+
+            p = space + 1;
+
+            let gzip_flag = *self.lcf.borrow().gzip_flag;
+
+            if gzip_flag != 0 {
+                // flags:
+
+                let flags = match ngx_core::string::atoi(&s[start..space]) {
+                    Some(f) => f,
+                    None => {
+                        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid flags in response \"{}\" for key \"{}\"", B(&line), B(&self.key));
+                        return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                    }
+                };
+
+                if flags & gzip_flag != 0 {
+                    let h = TableElt::new(b"Content-Encoding", b"gzip");
+
+                    let mut ho = r.headers_out.borrow_mut();
+
+                    ho.headers.push(h.clone());
+                    ho.content_encoding = Some(h);
+                }
+            }
+
+            // length:
+
+            let length = &line[p.min(line.len())..];
+
+            let n = atoof(length);
+
+            if n == NGX_ERROR || n > i64::MAX - NGX_HTTP_MEMCACHED_END {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid length in response \"{}\" for key \"{}\"", B(&line), B(&self.key));
+                return NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+
+            u.resp.content_length_n = n;
+            u.resp.status_n = 200;
+
+            if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+                state.status = 200;
+            }
+
+            u.resp.pos = lf + 1;
+
+            return NGX_OK;
+        }
+
+        if s == b"END\r" {
+            ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "key: \"{}\" was not found by memcached", B(&self.key));
+
+            u.resp.content_length_n = 0;
+            u.resp.status_n = 404;
+
+            if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+                state.status = 404;
+            }
+
+            u.resp.pos = lf + 1;
+            u.keepalive = true;
+
+            return NGX_OK;
+        }
+
+        no_valid(r)
+    }
+
+    /// ngx_http_memcached_filter_init
+    fn input_filter_init(&mut self, _r: &R, u: &mut Upstream, _p: Option<&mut EventPipe>) -> i64 {
+        if u.resp.status_n != 404 {
+            u.length = u.resp.content_length_n + NGX_HTTP_MEMCACHED_END;
+            self.rest = NGX_HTTP_MEMCACHED_END;
+        } else {
+            u.length = 0;
+        }
+
+        NGX_OK
+    }
+
+    /// ngx_http_memcached_filter: the data up to the trailer, which is
+    /// checked
+    fn input_filter(&mut self, r: &R, u: &mut Upstream, data: &[u8]) -> i64 {
+        let bytes = data.len() as i64;
+
+        if u.length == self.rest {
+            let end = (NGX_HTTP_MEMCACHED_END - self.rest) as usize;
+
+            if bytes > u.length || data != &MEMCACHED_END[end..end + data.len()] {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid trailer");
+
+                u.length = 0;
+                self.rest = 0;
+
+                return NGX_OK;
+            }
+
+            u.length -= bytes;
+            self.rest -= bytes;
+
+            if u.length == 0 {
+                u.keepalive = true;
+            }
+
+            return NGX_OK;
+        }
+
+        http_debug!(r, "memcached filter bytes:{} size:{} length:{} rest:{}", bytes, bytes, u.length, self.rest);
+
+        if bytes <= u.length - NGX_HTTP_MEMCACHED_END {
+            u.length -= bytes;
+
+            push_buf(u, data);
+
+            return NGX_OK;
+        }
+
+        let last = (u.length - NGX_HTTP_MEMCACHED_END) as usize;
+
+        if bytes > u.length || data[last..] != MEMCACHED_END[..data.len() - last] {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "memcached sent invalid trailer");
+
+            push_buf(u, &data[..last]);
+
+            u.length = 0;
+            self.rest = 0;
+
+            return NGX_OK;
+        }
+
+        self.rest -= (data.len() - last) as i64;
+
+        push_buf(u, &data[..last]);
+
+        u.length = self.rest;
+
+        if u.length == 0 {
+            u.keepalive = true;
+        }
+
+        NGX_OK
+    }
+
+    /// ngx_http_memcached_finalize_request
+    fn finalize_request(&mut self, r: &R, _u: &mut Upstream, _rc: i64) {
+        http_debug!(r, "finalize http memcached request");
+    }
+}
+
+/// A buffer of the data to u->out_bufs (flush, memory)
+fn push_buf(u: &mut Upstream, data: &[u8]) {
+    let mut b = Buf::from_vec(data.to_vec());
+    b.flush = true;
+    b.memory = true;
+    b.temporary = false;
+
+    u.out_bufs.push_back(b);
+}
+
+/// ngx_atoof: a non-negative decimal number, NGX_ERROR otherwise
+fn atoof(v: &[u8]) -> i64 {
+    if v.is_empty() {
+        return NGX_ERROR;
+    }
+
+    let mut n: i64 = 0;
+
+    for &c in v {
+        if !c.is_ascii_digit() {
+            return NGX_ERROR;
+        }
+
+        let d = (c - b'0') as i64;
+
+        if n > (i64::MAX - d) / 10 {
+            return NGX_ERROR;
+        }
+
+        n = n * 10 + d;
+    }
+
+    n
+}
+
+// ---------------------------------------------------------------------------
+// the directives
+// ---------------------------------------------------------------------------
+
+fn mlcf_of(conf: &Option<Rc<dyn Any>>) -> Rc<RefCell<NgxHttpMemcachedLocConf>> {
+    conf_rc::<NgxHttpMemcachedLocConf>(conf.as_ref().expect("conf"))
+}
+
+/// ngx_http_memcached_pass
+fn memcached_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = mlcf_of(&conf);
+
     if cell.borrow().upstream.is_some() {
         return Err(msg("is duplicate"));
     }
-    let mut u = ngx_core::inet::Url::new(&cf.args[1]);
+
+    let mut u = Url::new(&cf.args[1]);
     u.no_resolve = true;
-    let uscf = crate::upstream::upstream_add(cf, &mut u, 0)?;
-    cell.borrow_mut().upstream_conf = Some(uscf);
-    cell.borrow_mut().upstream = Some(cf.args[1].clone());
-    let loc = crate::get_loc_conf::<crate::core::CoreLocConf>(cf, crate::core::ctx_index());
+
+    let uscf = upstream_add(cf, &mut u, 0)?;
+
+    cell.borrow_mut().upstream = Some(uscf);
+
+    let clcf = get_loc_conf::<CoreLocConf>(cf, crate::core::ctx_index());
+
     {
-        let mut clcf = loc.borrow_mut();
-        clcf.handler = Some(Rc::new(|r| Box::pin(handler(r))));
-        if clcf.name.last() == Some(&b'/') {
-            clcf.auto_redirect = true;
+        let mut lc = clcf.borrow_mut();
+
+        lc.handler = Some(Rc::new(|r| Box::pin(memcached_handler(r))));
+
+        if lc.name.last() == Some(&b'/') {
+            lc.auto_redirect = true;
         }
     }
-    // $memcached_key is not defined by the module: a "set" or another
-    // module has to define it, or ngx_http_variables_init_vars() fails
+
     let index = get_variable_index(cf, b"memcached_key")?;
+
     cell.borrow_mut().index = Some(index);
+
     Ok(())
 }
 
-fn set_next_upstream(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let cell = conf_rc::<MemcachedLocConf>(conf.as_ref().unwrap());
+/// memcached_bind: ngx_http_upstream_bind_set_slot
+fn memcached_bind(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = mlcf_of(&conf);
+    let mut local = std::mem::take(&mut cell.borrow_mut().local);
+    let rc = crate::upstream_rt::bind_set_slot(cf, &mut local);
+    cell.borrow_mut().local = local;
+    rc
+}
+
+/// memcached_next_upstream: ngx_conf_set_bitmask_slot
+fn memcached_next_upstream(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let cell = mlcf_of(&conf);
     let mut c = cell.borrow_mut();
-    for a in cf.args.iter().skip(1) {
-        if a.as_slice() == b"not_found" {
-            c.next_upstream_not_found = Val::set(true);
-        }
-    }
-    Ok(())
+    set_bitmask(cf, cmd, &mut c.next_upstream, MEMCACHED_NEXT_UPSTREAM_MASKS)
 }
 
-fn set_gzip_flag(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let cell = conf_rc::<MemcachedLocConf>(conf.as_ref().unwrap());
-    let v: u32 = std::str::from_utf8(&cf.args[1]).ok().and_then(|s| s.parse().ok())
-        .ok_or_else(|| msg("invalid gzip flag"))?;
-    cell.borrow_mut().gzip_flag = Val::set(v);
-    Ok(())
+pub fn memcached_module() -> ModuleDef {
+    use ngx_core::cmd;
+
+    type C = NgxHttpMemcachedLocConf;
+
+    const F: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
+
+    let commands = vec![
+        cmd_fn!("memcached_pass", NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1, ConfLevel::Loc, memcached_pass),
+        cmd_fn!("memcached_bind", F | NGX_CONF_TAKE12, ConfLevel::Loc, memcached_bind),
+        cmd!("memcached_socket_keepalive", F | NGX_CONF_FLAG, ConfLevel::Loc, C, socket_keepalive, set_flag),
+        cmd!("memcached_connect_timeout", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, connect_timeout, set_msec),
+        cmd!("memcached_send_timeout", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, send_timeout, set_msec),
+        cmd!("memcached_buffer_size", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, buffer_size, set_size),
+        cmd!("memcached_read_timeout", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, read_timeout, set_msec),
+        cmd_fn!("memcached_next_upstream", F | NGX_CONF_1MORE, ConfLevel::Loc, memcached_next_upstream),
+        cmd!("memcached_next_upstream_tries", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, next_upstream_tries, set_num),
+        cmd!("memcached_next_upstream_timeout", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, next_upstream_timeout, set_msec),
+        cmd!("memcached_gzip_flag", F | NGX_CONF_TAKE1, ConfLevel::Loc, C, gzip_flag, set_num),
+    ];
+
+    let def = HttpModuleDef { create_loc_conf: Some(create_loc_conf), merge_loc_conf: Some(merge_loc_conf), ..Default::default() };
+
+    http_module_def("ngx_http_memcached_module", def, commands)
 }
 
-async fn handler(r: R) -> i64 {
-    // ngx_http_memcached_create_request
-    let index = r.loc_conf::<MemcachedLocConf>(ctx_index()).borrow().index;
-    let key = match index.and_then(|i| get_indexed_variable(&r, i)) {
-        Some(v) if !v.not_found && !v.data.is_empty() => v.data,
-        _ => {
-            ngx_core::ngx_log_error!(NGX_LOG_ERR, r.connection.log, None,
-                "the \"$memcached_key\" variable is not set");
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-    };
-    let (uscf, next_not_found, gzip_flag, tag) = {
-        let conf = r.loc_conf::<MemcachedLocConf>(ctx_index());
-        let c = conf.borrow();
-        let uscf = match &c.upstream_conf {
-            Some(u) => u.clone(),
-            None => return NGX_DECLINED,
-        };
-        (uscf, c.next_upstream_not_found.get_or(false), *c.gzip_flag, Rc::as_ptr(&conf) as *const () as usize)
-    };
-    // Discard body — we don't proxy any body to memcached.
-    let rc = crate::request_body::discard_request_body(&r).await;
-    if rc != NGX_OK { return rc; }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    use crate::upstream::{UpstreamConn, UpstreamPeer, NGX_HTTP_UPSTREAM_FT_ERROR, NGX_HTTP_UPSTREAM_FT_NOLIVE, NGX_HTTP_UPSTREAM_FT_TIMEOUT};
-
-    let mut u = match UpstreamPeer::init(&r, &uscf, NGX_HTTP_UPSTREAM_FT_ERROR | NGX_HTTP_UPSTREAM_FT_TIMEOUT, 0, 0, tag) {
-        Ok(u) => u,
-        Err(rc) => return rc,
-    };
-
-    let mut cmd = b"get ".to_vec();
-    ngx_core::string::escape_uri_into(&mut cmd, &key, ngx_core::string::NGX_ESCAPE_MEMCACHED);
-    cmd.extend_from_slice(b"\r\n");
-
-    let (conn, buf) = loop {
-        // ngx_http_upstream_connect
-        let rc = u.connect(&r);
-
-        if rc == NGX_ERROR {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-
-        if rc == NGX_BUSY {
-            match u.next(&r, NGX_HTTP_UPSTREAM_FT_NOLIVE) {
-                Ok(()) => continue,
-                Err(st) => return st,
-            }
-        }
-
-        let start = u.start_time;
-
-        let (mut stream, requests, start_time) = if rc == NGX_DONE {
-            let c = u.pc.connection.take().unwrap();
-            (c.sock, c.requests, c.start_time)
-        } else {
-            let sockaddr = match u.pc.sockaddr.clone() {
-                Some(sa) => sa,
-                None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
-            };
-            match crate::proxy::connect_upstream(&r, &sockaddr, None, None, None, 60000).await {
-                Ok(s) => (s, 0, ngx_core::times::current_msec()),
-                Err(_) => match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
-                    Ok(()) => continue,
-                    Err(st) => return st,
-                },
-            }
-        };
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.connect_time = ngx_core::times::current_msec().saturating_sub(start);
-        }
-
-        u.request_sent = true;
-
-        if stream.write_all(&cmd).await.is_err() {
-            match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
-                Ok(()) => continue,
-                Err(st) => return st,
-            }
-        }
-
-        let mut buf = Vec::new();
-        // Read enough to see the framing. memcached responses start with either
-        // `VALUE …\r\n<data>\r\nEND\r\n` or `END\r\n` (or an error string). We
-        // read until we see the closing END or the connection closes.
-        let mut tmp = [0u8; 4096];
-        let mut failed = false;
-        loop {
-            match stream.read(&mut tmp).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    // Look for terminating END\r\n or an error line.
-                    if let Some(end) = find_seq(&buf, b"\r\nEND\r\n") {
-                        buf.truncate(end + 7);
-                        break;
-                    }
-                    if buf.starts_with(b"END\r\n") {
-                        buf.truncate(5);
-                        break;
-                    }
-                    if buf.starts_with(b"ERROR") || buf.starts_with(b"CLIENT_ERROR") || buf.starts_with(b"SERVER_ERROR") {
-                        // Read until \r\n
-                        if let Some(_p) = find_seq(&buf, b"\r\n") { break; }
-                    }
-                    if buf.len() > 1 << 20 { break; }
-                }
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-
-        if failed || buf.is_empty() {
-            match u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
-                Ok(()) => continue,
-                Err(st) => return st,
-            }
-        }
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.header_time = ngx_core::times::current_msec().saturating_sub(start);
-            st.bytes_received = buf.len() as i64;
-        }
-
-        break (UpstreamConn { sock: stream, requests: requests + 1, start_time }, buf);
-    };
-
-    // u->keepalive: set by ngx_http_memcached_process_header for "END"
-    // (not found), and by ngx_http_memcached_filter at the end of a value,
-    // which does not run for a header only request: its connection is
-    // closed, as the value is not read
-    // (r->header_only, set for HEAD by the header filter)
-    let header_only = r.header_only.get() || r.method.get() == NGX_HTTP_HEAD;
-    let complete = buf.ends_with(b"END\r\n") && !(header_only && buf.starts_with(b"VALUE "));
-    u.finalize(&r, Some(conn), complete, true);
-
-    if buf.starts_with(b"END\r\n") {
-        // not found
-        if next_not_found {
-            return NGX_HTTP_NOT_FOUND;
-        }
-        return NGX_HTTP_NOT_FOUND;
+    #[test]
+    fn test_atoof() {
+        assert_eq!(atoof(b"5"), 5);
+        assert_eq!(atoof(b""), NGX_ERROR);
+        assert_eq!(atoof(b"5 "), NGX_ERROR);
     }
-    if !buf.starts_with(b"VALUE ") {
-        return NGX_HTTP_BAD_GATEWAY;
-    }
-    // Parse status line: VALUE <key> <flags> <bytes>\r\n
-    let nl = match buf.iter().position(|&b| b == b'\n') {
-        Some(i) => i,
-        None => return NGX_HTTP_BAD_GATEWAY,
-    };
-    let status_line = &buf[..nl];
-    let status_line = if status_line.last() == Some(&b'\r') { &status_line[..status_line.len()-1] } else { status_line };
-    // parts: VALUE key flags bytes
-    let parts: Vec<&[u8]> = status_line.split(|&b| b == b' ').collect();
-    if parts.len() < 4 { return NGX_HTTP_BAD_GATEWAY; }
-    let flags: u32 = std::str::from_utf8(parts[2]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let bytes: usize = match std::str::from_utf8(parts[3]).ok().and_then(|s| s.parse().ok()) {
-        Some(n) => n,
-        None => return NGX_HTTP_BAD_GATEWAY,
-    };
-    // Data starts right after \r\n
-    let data_start = nl + 1;
-    if buf.len() < data_start + bytes {
-        return NGX_HTTP_BAD_GATEWAY;
-    }
-    let data = buf[data_start..data_start + bytes].to_vec();
 
-    {
-        let mut ho = r.headers_out.borrow_mut();
-        ho.status = NGX_HTTP_OK;
-        ho.content_length_n = bytes as i64;
-        if ho.content_type.is_empty() {
-            ho.content_type = b"text/plain".to_vec();
-            ho.content_type_len = 10;
-        }
-        // gzip_flag: set Content-Encoding: gzip when the memcached flags
-        // include the configured bit (matches ngx_http_memcached_process
-        // _header). Enables gunzip_static-style downstream decoding.
-        if gzip_flag != 0 && (flags & gzip_flag) != 0 {
-            let h = crate::request::TableElt::new(b"Content-Encoding", b"gzip");
-            ho.headers.push(h.clone());
-            ho.content_encoding = Some(h);
-        }
+    #[test]
+    fn test_new_loc_conf_unset() {
+        let c = new_loc_conf();
+        assert!(!c.gzip_flag.is_set());
+        assert!(c.index.is_none());
+        assert_eq!(c.next_upstream, 0);
     }
-    let rc = crate::core_rt::send_header(&r).await;
-    if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
-        return rc;
-    }
-    let mut b = Buf::from_vec(data);
-    b.memory = true;
-    b.last_buf = r.is_main();
-    b.last_in_chain = true;
-    let mut chain = Chain::new();
-    chain.push_back(b);
-    crate::core_rt::output_filter(&r, chain).await
-}
-
-fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
