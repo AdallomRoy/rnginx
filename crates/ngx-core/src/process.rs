@@ -70,6 +70,11 @@ pub static SIG_REAP: AtomicBool = AtomicBool::new(false);
 pub static DEBUG_QUIT: AtomicBool = AtomicBool::new(false);
 pub static DAEMONIZED: AtomicBool = AtomicBool::new(false);
 pub static NEW_BINARY: AtomicI32 = AtomicI32::new(0);
+/// the event loop is blocked in epoll_wait(): the runtime of a worker,
+/// helper or single process is parked
+pub static EVENTS_PARKED: AtomicBool = AtomicBool::new(false);
+/// a signal interrupted epoll_wait() (EINTR in ngx_epoll_process_events())
+pub static EVENTS_EINTR: AtomicBool = AtomicBool::new(false);
 static PROCESS_KIND: AtomicI32 = AtomicI32::new(0); // 0 single, 1 master, 3 worker, 4 helper
 static WAKE_PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
 
@@ -170,6 +175,10 @@ extern "C" fn signal_handler(signo: libc::c_int, info: *mut libc::siginfo_t, _ct
         SIGRING_SIGNO[h].store(if ignore { -signo } else { signo }, Ordering::Relaxed);
         SIGRING_PID[h].store(pid, Ordering::Relaxed);
         SIGRING_HEAD.store(next, Ordering::Release);
+    }
+    // not the timer alarm: ngx_event_timer_alarm
+    if signo != libc::SIGALRM && EVENTS_PARKED.load(Ordering::Relaxed) {
+        EVENTS_EINTR.store(true, Ordering::Relaxed);
     }
     // wake the event loop
     let w = WAKE_PIPE[1].load(Ordering::Relaxed);

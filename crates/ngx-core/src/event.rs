@@ -495,7 +495,7 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
     worker_process_init(&cycle, -1);
     let name: &[u8] = if data == 0 { b"cache manager process" } else { b"cache loader process" };
     setproctitle(name);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
     local.block_on(&rt, async move {
@@ -1092,8 +1092,70 @@ fn start_accepting(cycle: &Rc<Cycle>) {
     }
 }
 
+/// The runtime of a process running ngx_process_events_and_timers(): its
+/// park is the epoll_wait() of ngx_epoll_process_events()
+fn event_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(|| EVENTS_PARKED.store(true, Ordering::SeqCst))
+        .on_thread_unpark(events_unparked)
+        .build()
+        .expect("tokio runtime")
+}
+
+/// epoll_wait() returned: a signal which interrupted it is logged as
+/// ngx_signal_handler() and ngx_epoll_process_events() do, and the process
+/// ends on ngx_terminate (ngx_quit for a single or helper process) before
+/// any event is handled, as the cycles check it after
+/// ngx_process_events_and_timers()
+fn events_unparked() {
+    EVENTS_PARKED.store(false, Ordering::SeqCst);
+
+    let pt = process_type();
+    let exit = SIG_TERMINATE.load(Ordering::SeqCst) || (pt != ProcessType::Worker && SIG_QUIT.load(Ordering::SeqCst));
+
+    if !EVENTS_EINTR.load(Ordering::SeqCst) && !exit {
+        return;
+    }
+
+    let cycle = match try_cycle() {
+        Some(c) => c,
+        None => return,
+    };
+
+    drain_signal_log(&cycle.log);
+
+    if EVENTS_EINTR.swap(false, Ordering::SeqCst) {
+        ngx_log_error!(NGX_LOG_INFO, cycle.log, Some(libc::EINTR), "epoll_wait() failed");
+    }
+
+    if !exit {
+        return;
+    }
+
+    match pt {
+        ProcessType::Single => {
+            for m in cycle.modules.iter() {
+                if let Some(f) = m.def.exit_process {
+                    f(&cycle);
+                }
+            }
+            master_exit_single(&cycle);
+        }
+        ProcessType::Worker => {
+            ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "exiting");
+            worker_process_exit(&cycle);
+        }
+        _ => {
+            // ngx_cache_manager_process_cycle
+            ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
 fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
     local.block_on(&rt, async move {
