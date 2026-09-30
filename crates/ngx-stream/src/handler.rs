@@ -215,9 +215,14 @@ pub fn close_connection(c: &Rc<Connection>) {
 
         let c = c.clone();
 
+        // the session (in c->pool) lives until the connection is closed:
+        // the log context of the shutdown's messages
+        let s = session_of(&c);
+
         ngx_core::event::spawn(async move {
             ngx_core::event_openssl::ngx_ssl_shutdown_wait(&c).await;
             close_connection(&c);
+            drop(s);
         });
 
         return;
