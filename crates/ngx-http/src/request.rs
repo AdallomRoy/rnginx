@@ -621,22 +621,27 @@ impl Request {
         self.cleanup.borrow_mut().push(f);
     }
 
-    pub fn add_pool_cleanup(&self, f: CleanupFn) {
-        self.pool_cleanup.borrow_mut().push(f);
-    }
-
-    /// ngx_destroy_pool: the pool cleanups, the last added first
-    pub fn run_pool_cleanups(&self) {
-        let v: Vec<CleanupFn> = std::mem::take(&mut *self.pool_cleanup.borrow_mut());
-        for f in v.into_iter().rev() {
-            f();
-        }
-    }
-
     pub fn run_cleanups(&self) {
         let v: Vec<CleanupFn> = std::mem::take(&mut *self.cleanup.borrow_mut());
         for f in v {
             f();
+        }
+    }
+
+    /// ngx_pool_cleanup_add(r->pool); subrequests share the pool of the
+    /// main request
+    pub fn add_pool_cleanup(self: &Rc<Self>, f: CleanupFn) {
+        self.main().pool_cleanup.borrow_mut().push(f);
+    }
+
+    /// The cleanups of ngx_destroy_pool(r->pool), the last added first.
+    pub fn run_pool_cleanups(&self) {
+        loop {
+            let f = self.pool_cleanup.borrow_mut().pop();
+            match f {
+                Some(f) => f(),
+                None => break,
+            }
         }
     }
 

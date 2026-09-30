@@ -70,6 +70,11 @@ pub static SIG_REAP: AtomicBool = AtomicBool::new(false);
 pub static DEBUG_QUIT: AtomicBool = AtomicBool::new(false);
 pub static DAEMONIZED: AtomicBool = AtomicBool::new(false);
 pub static NEW_BINARY: AtomicI32 = AtomicI32::new(0);
+/// the event loop is blocked in epoll_wait(): the runtime of a worker,
+/// helper or single process is parked
+pub static EVENTS_PARKED: AtomicBool = AtomicBool::new(false);
+/// a signal interrupted epoll_wait() (EINTR in ngx_epoll_process_events())
+pub static EVENTS_EINTR: AtomicBool = AtomicBool::new(false);
 static PROCESS_KIND: AtomicI32 = AtomicI32::new(0); // 0 single, 1 master, 3 worker, 4 helper
 static WAKE_PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
 
@@ -170,6 +175,10 @@ extern "C" fn signal_handler(signo: libc::c_int, info: *mut libc::siginfo_t, _ct
         SIGRING_SIGNO[h].store(if ignore { -signo } else { signo }, Ordering::Relaxed);
         SIGRING_PID[h].store(pid, Ordering::Relaxed);
         SIGRING_HEAD.store(next, Ordering::Release);
+    }
+    // not the timer alarm: ngx_event_timer_alarm
+    if signo != libc::SIGALRM && EVENTS_PARKED.load(Ordering::Relaxed) {
+        EVENTS_EINTR.store(true, Ordering::Relaxed);
     }
     // wake the event loop
     let w = WAKE_PIPE[1].load(Ordering::Relaxed);
@@ -354,7 +363,7 @@ pub fn read_channel(s: i32, log: &Log) -> Result<Option<Channel>, ()> {
                 let cm = libc::CMSG_FIRSTHDR(&msg);
                 if (*cm).cmsg_level != libc::SOL_SOCKET || (*cm).cmsg_type != libc::SCM_RIGHTS {
                     ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned invalid ancillary data level {} or type {}", (*cm).cmsg_level, (*cm).cmsg_type);
-                    ch.fd = -1;
+                    return Err(());
                 } else {
                     let mut fd: i32 = -1;
                     std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cm), &mut fd as *mut i32 as *mut u8, std::mem::size_of::<i32>());
@@ -362,7 +371,9 @@ pub fn read_channel(s: i32, log: &Log) -> Result<Option<Channel>, ()> {
                 }
             }
         }
-        if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        // not MSG_CTRUNC: a descriptor which could not be received (EMFILE)
+        // is the "too small ancillary data" above
+        if msg.msg_flags & libc::MSG_TRUNC != 0 {
             ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() truncated data");
         }
         Ok(Some(ch))
@@ -1291,5 +1302,83 @@ mod tests {
         });
         PARENT_PID.store(0, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// sendmsg() of a channel message with SCM_RIGHTS descriptors
+    fn send_channel(s: i32, ch: &Channel, fds: &[i32]) {
+        unsafe {
+            let mut iov = libc::iovec { iov_base: ch as *const Channel as *mut libc::c_void, iov_len: std::mem::size_of::<Channel>() };
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            let mut buf = [0u64; 8];
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if !fds.is_empty() {
+                let len = std::mem::size_of_val(fds) as u32;
+                msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = libc::CMSG_SPACE(len) as usize;
+                let cm = libc::CMSG_FIRSTHDR(&msg);
+                (*cm).cmsg_len = libc::CMSG_LEN(len) as usize;
+                (*cm).cmsg_level = libc::SOL_SOCKET;
+                (*cm).cmsg_type = libc::SCM_RIGHTS;
+                std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cm), len as usize);
+            }
+            assert_eq!(libc::sendmsg(s, &msg, 0), std::mem::size_of::<Channel>() as isize);
+        }
+    }
+
+    fn inode(fd: i32) -> Option<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } == -1 {
+            return None;
+        }
+        Some((st.st_dev, st.st_ino))
+    }
+
+    /// ngx_read_channel: the descriptor of NGX_CMD_OPEN_CHANNEL; a message
+    /// whose descriptors did not all fit (MSG_CTRUNC, as when the file
+    /// table is full) is not "truncated data"
+    #[test]
+    fn channel_ancillary_data() {
+        let mut sp = [0; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sp.as_mut_ptr()) }, 0);
+        os::set_nonblocking(sp[1]).unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let pipe_inode = inode(pipe[0]);
+
+        let (log, l) = capture();
+        let open = Channel { command: NGX_CMD_OPEN_CHANNEL, pid: 1, slot: 2, fd: -1 };
+
+        send_channel(sp[0], &Channel { command: NGX_CMD_QUIT, pid: 0, slot: 0, fd: -1 }, &[]);
+        let ch = read_channel(sp[1], &log).unwrap().unwrap();
+        assert_eq!((ch.command, ch.fd), (NGX_CMD_QUIT, -1));
+
+        send_channel(sp[0], &open, &[pipe[0]]);
+        let ch = read_channel(sp[1], &log).unwrap().unwrap();
+        assert_eq!((ch.command, ch.pid, ch.slot), (NGX_CMD_OPEN_CHANNEL, 1, 2));
+        assert!(ch.fd != -1 && ch.fd != pipe[0] && inode(ch.fd) == pipe_inode);
+        os::close(ch.fd);
+
+        // room for two descriptors in CMSG_SPACE(sizeof(int)): the third
+        // one is discarded
+        send_channel(sp[0], &open, &[pipe[0], pipe[0], pipe[0]]);
+        let ch = read_channel(sp[1], &log).unwrap().unwrap();
+        assert!(ch.fd != -1 && inode(ch.fd) == pipe_inode);
+        if inode(ch.fd + 1) == pipe_inode && ch.fd + 1 != pipe[1] {
+            os::close(ch.fd + 1);
+        }
+        os::close(ch.fd);
+
+        send_channel(sp[0], &open, &[]);
+        let ch = read_channel(sp[1], &log).unwrap().unwrap();
+        assert_eq!(ch.fd, -1);
+
+        assert!(read_channel(sp[1], &log).unwrap().is_none());
+
+        assert_eq!(messages(&l), vec!["[alert] recvmsg() returned too small ancillary data"]);
+
+        for fd in sp.iter().chain(pipe.iter()) {
+            os::close(*fd);
+        }
     }
 }

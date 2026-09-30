@@ -1123,10 +1123,22 @@ async fn finalize_connection(r: &R) -> End {
         let b = r.http_connection.buffer.borrow();
         b.pos < b.last
     };
-    if lc == NGX_HTTP_LINGERING_ALWAYS || (lc == NGX_HTTP_LINGERING_ON && (r.lingering_close.get() || has_unread || socket_has_data(&c) || c.pipeline.get())) {
+    if lc == NGX_HTTP_LINGERING_ALWAYS || (lc == NGX_HTTP_LINGERING_ON && (r.lingering_close.get() || has_unread || read_ready(&c) || c.pipeline.get())) {
         return End::Lingering;
     }
     End::Close
+}
+
+/// r->connection->read->ready: data to read, or on an SSL connection the
+/// last SSL_read() of ngx_ssl_recv() did not want to read (the data came
+/// with the peer's close_notify or an error, or filled the buffer)
+fn read_ready(c: &Connection) -> bool {
+    if let Some(sc) = c.ssl.borrow().as_ref() {
+        if sc.state.ngx.get() && sc.state.last.get() != NGX_AGAIN {
+            return true;
+        }
+    }
+    socket_has_data(c)
 }
 
 fn socket_has_data(c: &Connection) -> bool {
@@ -1327,7 +1339,7 @@ async fn lingering_close(r: &R) {
         return;
     }
     if let Err(e) = c.shutdown_write() {
-        ngx_log_error!(NGX_LOG_INFO, c.log, e.raw_os_error(), "shutdown() failed");
+        c.connection_error(e.raw_os_error().unwrap_or(0), "shutdown() failed");
         return;
     }
     c.close.set(false);
