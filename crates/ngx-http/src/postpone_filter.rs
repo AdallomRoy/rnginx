@@ -82,18 +82,21 @@ fn key(r: &R) -> usize {
 }
 
 fn main_state(r: &R) -> Rc<RefCell<PostponeMain>> {
-    let main = r.main();
-
-    match main.get_ctx::<PostponeMain>(ctx_index()) {
-        Some(st) => st,
-        None => main.set_ctx(ctx_index(), PostponeMain::default()),
+    if let Some(st) = main_state_if_any(r) {
+        return st;
     }
+
+    let st = Rc::new(RefCell::new(PostponeMain::default()));
+    *r.main().posted_subrequests.borrow_mut() = Some(st.clone());
+    st
 }
 
 /// The state if there is one: without posted subrequests so far, c->data
-/// is the main request.
+/// is the main request. It is kept in r->main->posted_subrequests, not in
+/// the module context an internal redirect of the main request clears.
 fn main_state_if_any(r: &R) -> Option<Rc<RefCell<PostponeMain>>> {
-    r.main().get_ctx::<PostponeMain>(ctx_index())
+    let st = r.main().posted_subrequests.borrow().clone();
+    st.and_then(|st| st.downcast::<RefCell<PostponeMain>>().ok())
 }
 
 /// The request that stands for r as c->data: r itself when it is the main
