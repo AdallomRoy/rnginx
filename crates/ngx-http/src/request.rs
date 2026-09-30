@@ -546,6 +546,10 @@ pub struct Request {
     pub postponed: RefCell<std::collections::VecDeque<PostponedRequest>>,
     /// the post_subrequest handler of the subrequest when it sends output
     pub post_subrequest_async: RefCell<Option<PostSubrequestAsync>>,
+    /// What crate::postpone_filter keeps in the main request for the posted
+    /// subrequests (c->data, r->main->count of theirs): not a module
+    /// context, which an internal redirect clears.
+    pub posted_subrequests: RefCell<Option<Rc<dyn Any>>>,
 }
 
 impl Request {
@@ -830,6 +834,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         weak_self: RefCell::new(Weak::new()),
         postponed: RefCell::new(std::collections::VecDeque::new()),
         post_subrequest_async: RefCell::new(None),
+        posted_subrequests: RefCell::new(None),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is
