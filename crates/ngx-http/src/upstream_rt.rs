@@ -3243,6 +3243,11 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
 
                 u.response_received = true;
 
+                // the upstream's write event comes with its read event (the
+                // connection is edge-triggered for both, and writable): its
+                // handler runs after the read handler
+                u.post_write = true;
+
                 let rc = loop {
                     let prc = m.process_header(r, u);
 
@@ -3480,6 +3485,10 @@ async fn process_non_buffered_duplex(r: &R, u: &mut Upstream, m: &mut dyn Upstre
                         if m.input_filter(r, u, &chunk[..n]) == NGX_ERROR {
                             return finalize(r, u, m, NGX_ERROR).await;
                         }
+
+                        // the upstream's write event comes with its read
+                        // event
+                        u.post_write = true;
                     }
                 }
 
@@ -3572,6 +3581,9 @@ enum PipeEnd {
     TimedOut,
     /// ngx_http_upstream_finalize_request with this rc
     Finalize(i64),
+    /// the request's output failed (u->conf->preserve_output):
+    /// ngx_http_upstream_next or ngx_http_upstream_finalize_request
+    Failure(Failure),
 }
 
 /// The event pipe of ngx_http_upstream_send_response, and
@@ -3657,7 +3669,7 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
 
     let timed_out = matches!(end, PipeEnd::TimedOut);
 
-    if let PipeEnd::Finalize(rc) = end {
+    if let PipeEnd::Finalize(_) | PipeEnd::Failure(_) = end {
         drop(inflight);
 
         if let crate::event_pipe::PipeTempFile::Cache(w) = &p.temp_file {
@@ -3666,7 +3678,11 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
 
         u.pipe_downstream_error = p.downstream_error;
 
-        return finalize(r, u, m, rc).await;
+        return match end {
+            PipeEnd::Failure(f) => duplex_failure(r, u, m, f).await,
+            PipeEnd::Finalize(rc) => finalize(r, u, m, rc).await,
+            _ => unreachable!(),
+        };
     }
 
     // ngx_http_upstream_finalize_request's u->state: the bytes of the body
@@ -3831,7 +3847,49 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
         }
     }
 
+    // u->conf->preserve_output: the rest of the request and the module's
+    // output go on while the response is read (the upstream's write handler
+    // stays ngx_http_upstream_send_request_handler), and the upstream's read
+    // timer is the pipe's, not re-armed by those events
+    let duplex = u.conf.preserve_output;
+    let mut read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+    let mut body_timer = None;
+
+    if duplex {
+        body_timer_after_read(r, &mut body_timer);
+    }
+
     loop {
+        if duplex && u.post_write {
+            // the write event the module posted
+            u.post_write = false;
+
+            if let Err(f) = send_request_event(r, u, m, true).await {
+                return (PipeEnd::Failure(f), None);
+            }
+
+            // u->pipe->length of the module's output filter
+            if u.length == 0 {
+                p.length = 0;
+            }
+
+            continue;
+        }
+
+        if duplex && u.post_read {
+            // ngx_http_upstream_process_upstream: ngx_event_pipe(p, 0) with
+            // nothing to read
+            u.post_read = false;
+
+            r.connection.log.set_action(Some("reading upstream"));
+
+            if let Some(rc) = pipe_after_read(r, u, m, p) {
+                return (PipeEnd::Finalize(rc), None);
+            }
+
+            read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+        }
+
         // ngx_event_pipe_write_to_downstream: what can be written now
         while writer.is_none() && !p.upstream_finished() {
             match p.write_batch() {
@@ -3887,6 +3945,8 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
             Read(Option<Result<std::io::Result<usize>, tokio::time::error::Elapsed>>),
             Delayed,
             ClientClosed(i32),
+            /// u->conf->preserve_output: the events of the request's output
+            Duplex(DuplexEvent),
         }
 
         let room = match &raw {
@@ -3899,7 +3959,49 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
         let mut rbuf = vec![0u8; room];
 
-        let ev = {
+        let ev = if duplex {
+            let pc = match u.sock.as_ref() {
+                Some(UpstreamSock::Conn(pc)) => pc,
+                _ => return (PipeEnd::Finalize(NGX_ERROR), None),
+            };
+
+            let c = pc.c.clone();
+            let writing = !u.writer.is_empty();
+            let upstream_writer = &mut u.writer;
+            let reading_body = r.reading_body.get();
+            let send_timer = u.send_timer;
+            let reading = raw.is_some();
+            let downstream = writer.is_some();
+
+            tokio::select! {
+                biased;
+
+                rc = async {
+                    match writer.as_mut() {
+                        Some((fut, _)) => fut.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                }, if downstream => Ev::Written(rc),
+
+                res = tokio::time::timeout_at(read_deadline, peer_read(pc, &mut rbuf)), if reading => Ev::Read(Some(res)),
+
+                _ = sleep_until_opt(delayed), if delayed.is_some() => Ev::Delayed,
+
+                res = c.drive_io(|| match try_send_chain(&c, upstream_writer) {
+                    Ok(true) => ngx_core::connection::IoStep::Done(Ok(())),
+                    Ok(false) => ngx_core::connection::IoStep::WantWrite,
+                    Err(e) => ngx_core::connection::IoStep::Done(Err(e)),
+                }), if writing => Ev::Duplex(DuplexEvent::Written(res.and_then(|r| r))),
+
+                _ = crate::request_body::wait_request_body(r), if reading_body => Ev::Duplex(DuplexEvent::Body),
+
+                _ = sleep_until_opt(send_timer), if send_timer.is_some() => Ev::Duplex(DuplexEvent::SendTimeout),
+
+                _ = sleep_until_opt(body_timer), if reading_body && body_timer.is_some() => Ev::Duplex(DuplexEvent::BodyTimeout),
+
+                err = client_closed(watch.as_deref()), if !reading_body => Ev::ClientClosed(err),
+            }
+        } else {
             let sock = u.sock.as_mut().expect("connection");
             let read_timeout = p.read_timeout;
             let reading = raw.is_some();
@@ -3957,6 +4059,10 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                     p.downstream_error = true;
                     p.drain_chains();
                 }
+
+                if duplex {
+                    read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+                }
             }
 
             Ev::Delayed => delayed = None,
@@ -3969,8 +4075,55 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 u.watch = None;
             }
 
+            Ev::Duplex(DuplexEvent::Written(Ok(()))) => {
+                if let Err(f) = send_request_event(r, u, m, true).await {
+                    return (PipeEnd::Failure(f), None);
+                }
+
+                if u.length == 0 {
+                    p.length = 0;
+                }
+            }
+
+            Ev::Duplex(DuplexEvent::Written(Err(e))) => {
+                if plain(u.sock.as_ref().expect("connection")) {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "writev() failed");
+                }
+
+                return (PipeEnd::Failure(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR)), None);
+            }
+
+            Ev::Duplex(DuplexEvent::Body) => {
+                // ngx_http_upstream_read_request_handler
+                http_debug!(r, "http upstream read request handler");
+
+                if let Err(f) = send_request_event(r, u, m, false).await {
+                    return (PipeEnd::Failure(f), None);
+                }
+
+                body_timer_after_read(r, &mut body_timer);
+            }
+
+            Ev::Duplex(DuplexEvent::SendTimeout) => {
+                // ngx_http_upstream_send_request_handler: c->write->timedout
+                u.send_timer = None;
+
+                return (PipeEnd::Failure(Failure::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT)), None);
+            }
+
+            Ev::Duplex(DuplexEvent::BodyTimeout) => {
+                r.connection.timedout.set(true);
+                return (PipeEnd::Finalize(NGX_HTTP_REQUEST_TIME_OUT), None);
+            }
+
+            Ev::Duplex(_) => {}
+
             Ev::Read(res) => {
                 r.connection.log.set_action(Some("reading upstream"));
+
+                if duplex {
+                    read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+                }
 
                 let mut b = b.expect("raw buffer");
 
@@ -4008,6 +4161,12 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                         b.data.extend_from_slice(&rbuf[..n]);
 
                         p.read_length += n as i64;
+
+                        if duplex {
+                            // the upstream's write event comes with its read
+                            // event
+                            u.post_write = true;
+                        }
 
                         let full = b.full();
 
