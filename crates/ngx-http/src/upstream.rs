@@ -1066,92 +1066,103 @@ impl Drop for PeerGuard {
 // VARIABLE GETTERS
 // ============================================================================
 
-fn upstream_addr_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    // Comma-separated peer addresses per try. Empty peer means the try wasn't
-    // dispatched (matches C which emits "-" in that case).
-    let states = r.upstream_states.borrow();
-    if states.is_empty() {
-        v.not_found = true;
-        return NGX_OK;
-    }
-    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
-        if s.peer.is_empty() { b"-".to_vec() } else { s.peer.clone() }
-    }).collect();
-    v.data = parts.join(&b", "[..]);
-    v.valid = true;
-    v.no_cacheable = false;
-    v.not_found = false;
-    NGX_OK
-}
+/// The values of r->upstream_states as the $upstream_* variables join them:
+/// ", " before the state of another try, " : " where the request went to
+/// another upstream (a zeroed state, without a peer, which is skipped).
+fn join_states(states: &[crate::request::UpstreamState], value: &dyn Fn(&crate::request::UpstreamState) -> Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
 
-fn upstream_status_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    let states = r.upstream_states.borrow();
-    if states.is_empty() {
-        v.not_found = true;
-        return NGX_OK;
-    }
-    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
-        if s.status == 0 { b"-".to_vec() } else { s.status.to_string().into_bytes() }
-    }).collect();
-    v.data = parts.join(&b", "[..]);
-    v.valid = true;
-    v.no_cacheable = false;
-    v.not_found = false;
-    NGX_OK
-}
+    loop {
+        out.extend_from_slice(&value(&states[i]));
 
-fn format_upstream_times(r: &R, field: fn(&crate::request::UpstreamState) -> u64) -> Vec<u8> {
-    let states = r.upstream_states.borrow();
-    if states.is_empty() {
-        return Vec::new();
-    }
-    // C's ngx_http_upstream_response_time_variable prints "-" when the state
-    // was never measured (ms == -1). We use u64::MAX as the same sentinel;
-    // any smaller value is a real millisecond count.
-    let parts: Vec<Vec<u8>> = states.iter().map(|s| {
-        let ms = field(s);
-        if ms == u64::MAX {
-            b"-".to_vec()
-        } else {
-            format!("{}.{:03}", ms / 1000, ms % 1000).into_bytes()
+        i += 1;
+
+        if i == states.len() {
+            break;
         }
-    }).collect();
-    parts.join(&b", "[..])
+
+        if !states[i].peer.is_empty() {
+            out.extend_from_slice(b", ");
+        } else {
+            out.extend_from_slice(b" : ");
+
+            i += 1;
+
+            if i == states.len() {
+                break;
+            }
+        }
+    }
+
+    out
 }
 
-fn upstream_connect_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    let data = format_upstream_times(r, |s| s.connect_time);
-    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
-    NGX_OK
-}
-
-fn upstream_header_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    let data = format_upstream_times(r, |s| s.header_time);
-    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
-    NGX_OK
-}
-
-fn upstream_response_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    let data = format_upstream_times(r, |s| s.response_time);
-    if data.is_empty() { v.not_found = true; } else { v.data = data; v.valid = true; }
-    NGX_OK
-}
-
-fn upstream_zero_variable(r: &R, v: &mut crate::request::VariableValue, data: usize) -> i64 {
-    // Aggregate the requested counter across all upstream states. `data`
-    // selects the field: 0=response_length, 1=bytes_received, 2=bytes_sent.
-    let states = r.upstream_states.borrow();
-    let sum: i64 = states.iter().map(|s| match data {
-        0 => s.response_length,
-        1 => s.bytes_received,
-        2 => s.bytes_sent,
-        _ => 0,
-    }).sum();
-    v.data = sum.to_string().into_bytes();
+/// A $upstream_* variable of the states: not found without any.
+fn states_variable(r: &R, v: &mut crate::request::VariableValue, value: &dyn Fn(&crate::request::UpstreamState) -> Vec<u8>) -> i64 {
     v.valid = true;
     v.no_cacheable = false;
     v.not_found = false;
+
+    let states = r.upstream_states.borrow();
+
+    if states.is_empty() {
+        v.not_found = true;
+        return NGX_OK;
+    }
+
+    v.data = join_states(&states, value);
+
     NGX_OK
+}
+
+/// ngx_http_upstream_addr_variable
+fn upstream_addr_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    states_variable(r, v, &|s| s.peer.clone())
+}
+
+/// ngx_http_upstream_status_variable
+fn upstream_status_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    states_variable(r, v, &|s| if s.status != 0 { s.status.to_string().into_bytes() } else { b"-".to_vec() })
+}
+
+/// ngx_http_upstream_response_time_variable: the time in seconds with
+/// milliseconds, "-" if it was not measured (-1, here u64::MAX)
+fn upstream_time(ms: u64) -> Vec<u8> {
+    if ms == u64::MAX {
+        b"-".to_vec()
+    } else {
+        format!("{}.{:03}", ms / 1000, ms % 1000).into_bytes()
+    }
+}
+
+/// $upstream_connect_time
+fn upstream_connect_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    states_variable(r, v, &|s| upstream_time(s.connect_time))
+}
+
+/// $upstream_header_time
+fn upstream_header_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    states_variable(r, v, &|s| upstream_time(s.header_time))
+}
+
+/// $upstream_response_time
+fn upstream_response_time_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
+    states_variable(r, v, &|s| upstream_time(s.response_time))
+}
+
+/// ngx_http_upstream_response_length_variable: `data` 0 the response
+/// length, 1 the bytes received, 2 the bytes sent, of each state
+fn upstream_response_length_variable(r: &R, v: &mut crate::request::VariableValue, data: usize) -> i64 {
+    states_variable(r, v, &|s| {
+        let n = match data {
+            1 => s.bytes_received,
+            2 => s.bytes_sent,
+            _ => s.response_length,
+        };
+
+        n.to_string().into_bytes()
+    })
 }
 
 // ============================================================================
@@ -1198,21 +1209,21 @@ fn preconfiguration(cf: &mut Conf) -> ConfResult {
         },
         VarDef {
             name: "upstream_response_length",
-            get: Some(upstream_zero_variable),
+            get: Some(upstream_response_length_variable),
             set: None,
             data: 0, // response body length
             flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_bytes_received",
-            get: Some(upstream_zero_variable),
+            get: Some(upstream_response_length_variable),
             set: None,
             data: 1, // total bytes received from upstream
             flags: NGX_HTTP_VAR_NOCACHEABLE,
         },
         VarDef {
             name: "upstream_bytes_sent",
-            get: Some(upstream_zero_variable),
+            get: Some(upstream_response_length_variable),
             set: None,
             data: 2, // total bytes sent to upstream
             flags: NGX_HTTP_VAR_NOCACHEABLE,
@@ -1364,6 +1375,34 @@ pub fn upstream_log_info(r: &Request) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state(peer: &[u8], status: i64) -> crate::request::UpstreamState {
+        crate::request::UpstreamState { peer: peer.to_vec(), status, ..Default::default() }
+    }
+
+    #[test]
+    fn test_join_states() {
+        let addr = |s: &crate::request::UpstreamState| s.peer.clone();
+        let status = |s: &crate::request::UpstreamState| if s.status != 0 { s.status.to_string().into_bytes() } else { b"-".to_vec() };
+
+        // the tries of an upstream
+        let states = vec![state(b"a:1", 502), state(b"b:1", 200)];
+        assert_eq!(join_states(&states, &addr), b"a:1, b:1");
+        assert_eq!(join_states(&states, &status), b"502, 200");
+
+        // another upstream: the zeroed state is " : "
+        let states = vec![state(b"a:1", 200), state(b"", 0), state(b"c:1", 404)];
+        assert_eq!(join_states(&states, &addr), b"a:1 : c:1");
+        assert_eq!(join_states(&states, &status), b"200 : 404");
+
+        // the other upstream never connected
+        let states = vec![state(b"a:1", 200), state(b"", 0)];
+        assert_eq!(join_states(&states, &status), b"200 : ");
+
+        // two in a row: the second one is printed
+        let states = vec![state(b"a:1", 200), state(b"", 0), state(b"", 0), state(b"c:1", 200)];
+        assert_eq!(join_states(&states, &status), b"200 : -, 200");
+    }
 
     #[test]
     fn test_upstream_flags() {
