@@ -325,13 +325,13 @@ async fn poll_once<F: std::future::Future + Unpin>(f: &mut F) -> Option<F::Outpu
 /// While its output waits, the read event handler of the request the
 /// connection's events go to (c->data) is ngx_http_test_reading
 /// (ngx_http_set_write_handler), unless it discards the request body
-/// (ngx_http_discarded_request_body_handler), or it is a request of an
-/// upstream, not served from the cache, whose read event handler is
-/// ngx_http_upstream_rd_check_broken_connection (or none).
+/// (ngx_http_discarded_request_body_handler), or its upstream has the
+/// handler until it is finalized (ngx_http_upstream_rd_check_broken_connection,
+/// or none).
 fn test_reading_on(r: &R) -> bool {
     let a = crate::postpone_filter::connection_data(r);
 
-    !a.discard_body.get() && (a.upstream.borrow().is_none() || a.cached.get())
+    !a.discard_body.get() && !a.upstream_handler.get()
 }
 
 /// r->read_event_handler = ngx_http_test_reading on an HTTP/2 stream, for

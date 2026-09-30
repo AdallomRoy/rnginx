@@ -1098,6 +1098,7 @@ pub async fn init(r: R, mut u: Upstream, m: &mut dyn UpstreamModule) -> i64 {
     // r->read_event_handler = ngx_http_block_reading
     u.watch = None;
     u.stream_watch = None;
+    r.upstream_handler.set(false);
 
     rc
 }
@@ -1145,6 +1146,8 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
     u.store = u.conf.store;
 
     let check = !u.store && !r.post_action.get() && !u.conf.ignore_client_abort;
+
+    r.upstream_handler.set(true);
 
     // an HTTP/2 stream's main request: the fake connection's read event
     // goes to the upstream (ngx_http_block_reading if it does not check)
@@ -1978,6 +1981,7 @@ pub async fn finalize(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, rc: i
     // r->read_event_handler = ngx_http_block_reading
     u.watch = None;
     u.stream_watch = None;
+    r.upstream_handler.set(false);
 
     if rc == NGX_DECLINED {
         return NGX_DECLINED;
@@ -2869,6 +2873,7 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
 
     u.watch = None;
     u.stream_watch = None;
+    r.upstream_handler.set(false);
 
     // the rest of p->out and p->in (ngx_event_pipe_write_to_downstream when
     // the upstream is done)

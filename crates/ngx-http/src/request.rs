@@ -402,6 +402,10 @@ pub struct Request {
     pub loc_conf: RefCell<Rc<ConfSlots>>,
 
     pub upstream: RefCell<Option<Rc<dyn Any>>>,
+    /// The upstream has the read event handler: from
+    /// ngx_http_upstream_init_request (ngx_http_upstream_rd_check_broken_connection,
+    /// or ngx_http_block_reading it leaves) to ngx_http_upstream_finalize_request
+    pub upstream_handler: Cell<bool>,
     /// Upstream response headers, populated by proxy/fastcgi/etc. Read by $upstream_http_* variables.
     pub upstream_headers_in: RefCell<Vec<Header>>,
     pub upstream_states: RefCell<Vec<UpstreamState>>,
@@ -736,6 +740,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         srv_conf: RefCell::new(ctx.srv.clone().unwrap()),
         loc_conf: RefCell::new(ctx.loc.clone().unwrap()),
         upstream: RefCell::new(None),
+        upstream_handler: Cell::new(false),
         upstream_headers_in: RefCell::new(Vec::new()),
         upstream_states: RefCell::new(Vec::new()),
         upstream_states_init: Cell::new(false),
