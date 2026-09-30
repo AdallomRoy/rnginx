@@ -269,7 +269,7 @@ async fn subrequest_finalize(pr: &R, r: &R) {
             http_debug!(r, "http writer handler: \"{}?{}\"", B(&r.uri.borrow()), B(&r.args.borrow()));
 
             // ngx_http_output_filter(r, NULL)
-            if is_active(r) && !r.postponed.borrow().is_empty() && postpone_filter_wake(r).await == NGX_ERROR {
+            if crate::core_rt::output_filter(r, Chain::new()).await == NGX_ERROR {
                 r.connection.error.set(true);
             }
 
@@ -343,7 +343,12 @@ pub async fn run_posted_requests(r: &R) -> i64 {
             return NGX_ERROR;
         }
 
-        if is_active(r) && !r.postponed.borrow().is_empty() && postpone_filter_wake(r).await == NGX_ERROR {
+        http_debug!(r, "http writer handler: \"{}?{}\"", B(&r.uri.borrow()), B(&r.args.borrow()));
+
+        // ngx_http_writer: ngx_http_output_filter(r, NULL), the whole chain
+        // (a filter above this one may go on with the response, as the
+        // slice filter makes its next subrequest)
+        if crate::core_rt::output_filter(r, Chain::new()).await == NGX_ERROR {
             return NGX_ERROR;
         }
     }
