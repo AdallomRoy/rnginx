@@ -261,8 +261,11 @@ async fn realip_handler(r: R) -> i64 {
         return NGX_DECLINED;
     }
 
-    // Already processed this request
-    if r.get_ctx::<RealipCtx>(idx).is_some() {
+    // Already processed this request (ngx_http_realip_get_module_ctx: if
+    // the ctx was reset, the original address is still in the cleanup)
+    if r.get_ctx::<RealipCtx>(idx).is_some()
+        || ((r.internal.get() || r.filter_finalize.get()) && r.connection.original_sockaddr.borrow().is_some())
+    {
         return NGX_DECLINED;
     }
 
@@ -374,12 +377,19 @@ async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
     let idx = ctx_index();
 
     // Save original address on the connection (survives internal_redirect,
-    // which clears per-request ctx).
+    // which clears per-request ctx) until the request is freed: the pool
+    // cleanup puts it back.
     if r.connection.original_sockaddr.borrow().is_none() {
         *r.connection.original_sockaddr.borrow_mut() =
             Some(r.connection.sockaddr.borrow().clone());
         *r.connection.original_addr_text.borrow_mut() =
             Some(r.connection.addr_text.borrow().clone());
+        let c = Rc::downgrade(&r.connection);
+        r.add_pool_cleanup(Box::new(move || {
+            if let Some(c) = c.upgrade() {
+                realip_cleanup(&c);
+            }
+        }));
     }
     let original_sockaddr = r.connection.original_sockaddr.borrow().clone().unwrap();
     let original_addr_text = r.connection.original_addr_text.borrow().clone().unwrap();
@@ -392,6 +402,16 @@ async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
     *r.connection.addr_text.borrow_mut() = new_text;
 
     NGX_DECLINED
+}
+
+/// ngx_http_realip_cleanup
+fn realip_cleanup(c: &ngx_core::connection::Connection) {
+    if let Some(sockaddr) = c.original_sockaddr.borrow_mut().take() {
+        *c.sockaddr.borrow_mut() = sockaddr;
+    }
+    if let Some(addr_text) = c.original_addr_text.borrow_mut().take() {
+        *c.addr_text.borrow_mut() = addr_text;
+    }
 }
 
 fn realip_remote_addr_var(r: &R, v: &mut VariableValue, _data: usize) -> i64 {

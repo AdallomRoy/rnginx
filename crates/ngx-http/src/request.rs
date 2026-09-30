@@ -452,6 +452,8 @@ pub struct Request {
     pub err_status: Cell<i64>,
 
     pub cleanup: RefCell<Vec<CleanupFn>>,
+    /// the cleanups of r->pool, run when the request is freed
+    pub pool_cleanup: RefCell<Vec<CleanupFn>>,
     pub port: Cell<u16>,
 
     pub count: Cell<u32>,
@@ -625,6 +627,23 @@ impl Request {
         }
     }
 
+    /// ngx_pool_cleanup_add(r->pool); subrequests share the pool of the
+    /// main request
+    pub fn add_pool_cleanup(self: &Rc<Self>, f: CleanupFn) {
+        self.main().pool_cleanup.borrow_mut().push(f);
+    }
+
+    /// The cleanups of ngx_destroy_pool(r->pool), the last added first.
+    pub fn run_pool_cleanups(&self) {
+        loop {
+            let f = self.pool_cleanup.borrow_mut().pop();
+            match f {
+                Some(f) => f(),
+                None => break,
+            }
+        }
+    }
+
     /// The request line of a request whose line was not parsed, for
     /// $request: from r->request_start to CR or LF in the header buffer.
     pub fn partial_request_line(&self) -> Option<Vec<u8>> {
@@ -754,6 +773,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         request_length: Cell::new(0),
         err_status: Cell::new(0),
         cleanup: RefCell::new(Vec::new()),
+        pool_cleanup: RefCell::new(Vec::new()),
         port: Cell::new(0),
         count: Cell::new(1),
         subrequests: Cell::new(NGX_HTTP_MAX_SUBREQUESTS + 1),
