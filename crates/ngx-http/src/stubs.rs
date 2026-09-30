@@ -615,7 +615,7 @@ fn slice_range_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
 
 // --- hooks the core calls into not-yet-ported modules ---
 
-pub fn upstream_log_info(_r: &Request) -> Option<Vec<u8>> {
-    None
+pub fn upstream_log_info(r: &Request) -> Option<Vec<u8>> {
+    crate::upstream_rt::log_info(r)
 }
 

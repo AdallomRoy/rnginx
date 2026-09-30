@@ -70,6 +70,7 @@ pub mod upstream_round_robin;
 pub mod upstream_ssl;
 pub mod fastcgi;
 pub mod event_pipe;
+pub mod upstream_rt;
 pub mod ssl_module;
 pub mod gzip_filter;
 pub mod gzip_static;

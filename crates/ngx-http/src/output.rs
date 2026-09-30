@@ -58,6 +58,10 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
         let mut iov: Vec<&[u8]> = Vec::new();
         let mut gathered: i64 = 0;
         for b in chain.iter() {
+            // ngx_output_chain_to_iovec: special buffers are skipped
+            if b.special_buf() {
+                continue;
+            }
             if !b.in_memory() {
                 break;
             }

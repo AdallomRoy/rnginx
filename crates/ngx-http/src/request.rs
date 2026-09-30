@@ -24,6 +24,9 @@ pub struct TableElt {
     pub key: Vec<u8>,
     pub value: RefCell<Vec<u8>>,
     pub lowcase_key: Vec<u8>,
+    /// value.data == NULL: the special empty "Server" and "Date" headers
+    /// of ngx_http_proxy_process_header
+    pub null: Cell<bool>,
 }
 
 pub type Header = Rc<TableElt>;
@@ -35,11 +38,12 @@ impl TableElt {
             key: key.to_vec(),
             value: RefCell::new(value.to_vec()),
             lowcase_key: ngx_core::string::to_lower_vec(key),
+            null: Cell::new(false),
         })
     }
 
     pub fn with_hash(key: &[u8], value: &[u8], hash: u32, lowcase_key: Vec<u8>) -> Header {
-        Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key })
+        Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key, null: Cell::new(false) })
     }
 
     pub fn value(&self) -> Vec<u8> {
@@ -401,6 +405,8 @@ pub struct Request {
     /// Upstream response headers, populated by proxy/fastcgi/etc. Read by $upstream_http_* variables.
     pub upstream_headers_in: RefCell<Vec<Header>>,
     pub upstream_states: RefCell<Vec<UpstreamState>>,
+    /// r->upstream_states is not NULL: an upstream was started
+    pub upstream_states_init: Cell<bool>,
     pub cache: RefCell<Option<Rc<dyn Any>>>,
 
     pub headers_in: RefCell<HeadersIn>,
@@ -708,6 +714,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         upstream: RefCell::new(None),
         upstream_headers_in: RefCell::new(Vec::new()),
         upstream_states: RefCell::new(Vec::new()),
+        upstream_states_init: Cell::new(false),
         cache: RefCell::new(None),
         headers_in: RefCell::new(HeadersIn::new()),
         headers_out: RefCell::new(HeadersOut::new()),

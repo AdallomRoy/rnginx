@@ -857,6 +857,13 @@ impl UpstreamPeer {
     /// 404, NGX_PEER_FAILED otherwise), then Ok(()) to connect to the next
     /// one, or Err(status) to finalize with.
     pub fn next(&mut self, r: &R, ft: u32) -> Result<(), i64> {
+        self.next_free(r, ft);
+        self.next_decide(r, ft)
+    }
+
+    /// The start of ngx_http_upstream_next: the peer is freed
+    /// (NGX_PEER_NEXT for 403 and 404, NGX_PEER_FAILED otherwise).
+    pub fn next_free(&mut self, r: &R, ft: u32) {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http next upstream, {:x}", ft);
 
         if self.pc.sockaddr.is_some() {
@@ -872,7 +879,11 @@ impl UpstreamPeer {
             self.pc.sockaddr = None;
             self.pc.sid = None;
         }
+    }
 
+    /// The rest of ngx_http_upstream_next after the peer is freed: Ok(())
+    /// to connect to the next one, or Err(status) to finalize with.
+    pub fn next_decide(&mut self, r: &R, ft: u32) -> Result<(), i64> {
         if self.pc.cached && ft == NGX_HTTP_UPSTREAM_FT_ERROR {
             // TODO: inform balancer instead
             self.pc.tries += 1;

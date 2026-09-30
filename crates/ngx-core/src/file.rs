@@ -121,9 +121,15 @@ impl TempFile {
     }
 }
 
-impl Drop for TempFile {
+impl TempFile {
+    /// ngx_pool_run_cleanup_file(): the file closed (and deleted if
+    /// clean) now, its name kept.
+    pub fn close(&mut self) {
+        self.cleanup();
+    }
+
     /// ngx_pool_cleanup_file, or ngx_pool_delete_file for a clean file
-    fn drop(&mut self) {
+    fn cleanup(&mut self) {
         if self.fd == -1 {
             return;
         }
@@ -142,6 +148,12 @@ impl Drop for TempFile {
         }
 
         self.fd = -1;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 

@@ -419,6 +419,13 @@ pub struct UpstreamCache {
     pub cacheable: Cell<bool>,
     /// u->method: GET instead of HEAD to cache the response
     pub method: RefCell<Option<&'static [u8]>>,
+
+    /// u->schema, u->uri, u->peer.name, and whether u->peer.sockaddr is a
+    /// unix socket: the upstream part of the error log
+    pub schema: RefCell<Vec<u8>>,
+    pub uri: RefCell<Vec<u8>>,
+    pub peer_name: RefCell<Option<Vec<u8>>>,
+    pub peer_unix: Cell<bool>,
 }
 
 /// ngx_http_upstream_create: r->upstream anew, r->cache NULL.
@@ -431,6 +438,10 @@ pub fn upstream_create(r: &R, conf: UpstreamCacheConf, caches: Rc<Vec<Rc<FileCac
         cache_status: Cell::new(0),
         cacheable: Cell::new(false),
         method: RefCell::new(None),
+        schema: RefCell::new(Vec::new()),
+        uri: RefCell::new(Vec::new()),
+        peer_name: RefCell::new(None),
+        peer_unix: Cell::new(false),
     });
 
     let any: Rc<dyn Any> = u.clone();
@@ -854,9 +865,7 @@ pub fn process_header_line(r: &R, hin: &mut CacheHeadersIn, lowcase_key: &[u8], 
 
         b"last-modified" => {
             // ngx_http_upstream_process_last_modified
-            if u.as_ref().is_some_and(|u| u.cacheable.get()) {
-                hin.last_modified_time = ngx_core::parse::parse_http_time(value).unwrap_or(-1);
-            }
+            hin.last_modified_time = ngx_core::parse::parse_http_time(value).unwrap_or(-1);
         }
 
         b"etag" => {
@@ -1433,6 +1442,38 @@ impl CacheWriter {
 
         if self.tf.write(data, &r.connection.log).is_err() {
             self.failed = true;
+        }
+    }
+
+    /// finish() with the file kept open: the rest of the response is sent
+    /// from it.
+    pub fn finish_ref(&mut self, r: &R, done: bool, eof: bool, content_length_n: i64) {
+        if !cacheable(r) {
+            return;
+        }
+
+        let c_rc = match cache_of(r) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut c = c_rc.borrow_mut();
+
+        if self.failed {
+            file_cache_free(&mut c, Some(&self.tf));
+            return;
+        }
+
+        if done {
+            file_cache_update(r, &mut c, &self.tf);
+        } else if eof {
+            if content_length_n == -1 || content_length_n == self.tf.offset - c.body_start as i64 {
+                file_cache_update(r, &mut c, &self.tf);
+            } else {
+                file_cache_free(&mut c, Some(&self.tf));
+            }
+        } else {
+            file_cache_free(&mut c, Some(&self.tf));
         }
     }
 
