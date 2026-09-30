@@ -36,12 +36,11 @@ use ngx_core::{cmd_fn, ngx_log_error};
 
 use crate::core::CoreLocConf;
 use crate::event_pipe::EventPipe;
-use crate::parse::{ParseRequest, Status, NGX_HTTP_PARSE_HEADER_DONE};
 use crate::request::*;
 use crate::script::{ComplexValue, Part};
 use crate::upstream::*;
 use crate::upstream_cache::{UpstreamCacheConf, UpstreamCacheLocConf, UpstreamCacheMainConf, NGX_CONF_BITMASK_SET, NGX_HTTP_UPSTREAM_INVALID_HEADER};
-use crate::upstream_rt::{cgi_status, Upstream, UpstreamConf, UpstreamModule};
+use crate::upstream_rt::{Upstream, UpstreamConf, UpstreamModule};
 use crate::upstream_ssl::UpstreamSslConf;
 use crate::*;
 
@@ -272,7 +271,7 @@ fn new_loc_conf() -> NgxHttpUwsgiLocConf {
 /// configuration, ngx_http_status_t and r->state of the header parser.
 struct UwsgiModule {
     lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>,
-    st: HeaderParse,
+    st: crate::upstream_rt::CgiHeaderParse,
 }
 
 /// ngx_http_uwsgi_handler
@@ -332,7 +331,7 @@ async fn uwsgi_handler(r: R) -> i64 {
         return rc;
     }
 
-    let mut m = UwsgiModule { lcf, st: HeaderParse::new() };
+    let mut m = UwsgiModule { lcf, st: crate::upstream_rt::CgiHeaderParse::new("uwsgi") };
 
     crate::upstream_rt::init(r, u, &mut m).await
 }
@@ -410,13 +409,13 @@ impl UpstreamModule for UwsgiModule {
 
     /// ngx_http_uwsgi_reinit_request
     fn reinit_request(&mut self, _r: &R, _u: &mut Upstream) -> i64 {
-        self.st = HeaderParse::new();
+        self.st = crate::upstream_rt::CgiHeaderParse::new("uwsgi");
         NGX_OK
     }
 
     /// ngx_http_uwsgi_process_status_line, then ngx_http_uwsgi_process_header
     fn process_header(&mut self, r: &R, u: &mut Upstream) -> i64 {
-        match process_status_line(r, u, &mut self.st) {
+        match crate::upstream_rt::cgi_process_status_line(r, u, &mut self.st) {
             Ok(true) => NGX_OK,
             Ok(false) => NGX_AGAIN,
             Err(_) => NGX_HTTP_UPSTREAM_INVALID_HEADER,
@@ -427,7 +426,7 @@ impl UpstreamModule for UwsgiModule {
     fn input_filter_init(&mut self, r: &R, u: &mut Upstream, p: Option<&mut EventPipe>) -> i64 {
         http_debug!(r, "http uwsgi filter init s:{} l:{}", u.resp.status_n, u.resp.content_length_n);
 
-        let length = input_length(u.resp.status_n, r.method.get() == NGX_HTTP_HEAD, u.resp.content_length_n);
+        let length = crate::upstream_rt::cgi_input_length(u.resp.status_n, r.method.get() == NGX_HTTP_HEAD, u.resp.content_length_n);
 
         if let Some(p) = p {
             p.length = length;
@@ -568,185 +567,6 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     b.extend_from_slice(uwsgi_string);
 
     Ok(b)
-}
-
-/// ngx_http_uwsgi_reinit_request and the rest of
-/// ngx_http_upstream_reinit: the status and the header parser anew,
-/// u->process_header = ngx_http_uwsgi_process_status_line.
-struct HeaderParse {
-    /// u->process_header is ngx_http_uwsgi_process_header
-    status_done: bool,
-    /// r->state and the header parser
-    pr: ParseRequest,
-    /// u->buffer.pos
-    pos: usize,
-}
-
-impl HeaderParse {
-    fn new() -> HeaderParse {
-        HeaderParse { status_done: false, pr: ParseRequest { upstream: true, ..Default::default() }, pos: 0 }
-    }
-}
-
-/// ngx_http_uwsgi_process_status_line: an HTTP status line, or, if there is
-/// none, the CGI style header of ngx_http_uwsgi_process_header from the
-/// start. Ok(true) when the header is done, Ok(false) for more
-/// (NGX_AGAIN), Err with the failure type of
-/// NGX_HTTP_UPSTREAM_INVALID_HEADER.
-fn process_status_line(r: &R, up: &mut Upstream, st: &mut HeaderParse) -> Result<bool, u32> {
-    if st.status_done {
-        return process_header(r, up, st);
-    }
-
-    let u = &mut up.resp;
-
-    let mut p = st.pos;
-    let mut status = Status::default();
-
-    let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
-
-    if rc == NGX_AGAIN {
-        return Ok(false);
-    }
-
-    if rc == NGX_ERROR {
-        // u->process_header = ngx_http_uwsgi_process_header;
-        // u->buffer.pos = status->line_start; r->state = 0
-        st.status_done = true;
-        st.pr = ParseRequest { upstream: true, ..Default::default() };
-
-        return process_header(r, up, st);
-    }
-
-    if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
-        if state.status == 0 {
-            state.status = status.code as i64;
-        }
-    }
-
-    u.status_n = status.code as i64;
-    u.status_line = u.buf[status.start..status.end].to_vec();
-
-    http_debug!(r, "http uwsgi status {} \"{}\"", u.status_n, B(&u.status_line));
-
-    st.pos = p;
-    st.status_done = true;
-
-    process_header(r, up, st)
-}
-
-/// ngx_http_uwsgi_process_header: the header lines, each with the handler
-/// of ngx_http_upstream_headers_in[]; when the header is done, the status
-/// of the status line, of "Status", 302 with "Location", or 200.
-fn process_header(r: &R, up: &mut Upstream, st: &mut HeaderParse) -> Result<bool, u32> {
-    let invalid = NGX_HTTP_UPSTREAM_FT_INVALID_HEADER;
-
-    loop {
-        let rc = crate::parse::parse_header_line(&mut st.pr, &up.resp.buf, &mut st.pos, true);
-
-        let u = &mut up.resp;
-
-        if rc == NGX_OK {
-            // a header line has been parsed successfully
-
-            let pr = &st.pr;
-
-            let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
-            let value = u.buf[pr.header_start..pr.header_end].to_vec();
-
-            let lowcase_key = if key.len() == pr.lowcase_index { pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
-
-            let h = TableElt::with_hash(&key, &value, pr.header_hash, lowcase_key);
-
-            u.headers.push(h.clone());
-
-            // hh->handler(r, h, hh->offset)
-            crate::upstream_rt::process_header_line(r, up, &h)?;
-
-            http_debug!(r, "http uwsgi header: \"{}: {}\"", B(&h.key), B(&h.value.borrow()));
-
-            continue;
-        }
-
-        if rc == NGX_HTTP_PARSE_HEADER_DONE {
-            // a whole header has been parsed successfully
-
-            http_debug!(r, "http uwsgi header done");
-
-            if u.status_n == 0 {
-                if let Some(status) = u.header(b"status") {
-                    let status_line = status.value.borrow().clone();
-
-                    // ngx_atoi(status_line->data, 3): the value is
-                    // null-terminated
-                    let status = match cgi_status(&status_line) {
-                        Some(s) => s,
-                        None => {
-                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid status \"{}\"", B(&status_line));
-                            return Err(invalid);
-                        }
-                    };
-
-                    u.status_n = status;
-
-                    if status_line.len() > 3 {
-                        u.status_line = status_line;
-                    }
-                } else if u.header(b"location").is_some() {
-                    u.status_n = 302;
-                    u.status_line = b"302 Moved Temporarily".to_vec();
-                } else {
-                    u.status_n = 200;
-                    u.status_line = b"200 OK".to_vec();
-                }
-
-                if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
-                    if state.status == 0 {
-                        state.status = u.status_n;
-                    }
-                }
-            }
-
-            // done:
-
-            if u.status_n == NGX_HTTP_SWITCHING_PROTOCOLS && !r.headers_in.borrow().upgrade.is_empty() {
-                up.upgrade = true;
-            }
-
-            up.resp.pos = st.pos;
-
-            return Ok(true);
-        }
-
-        if rc == NGX_AGAIN {
-            return Ok(false);
-        }
-
-        // rc == NGX_HTTP_PARSE_INVALID_HEADER
-
-        let pr = &st.pr;
-
-        let end = pr.header_end.min(u.buf.len());
-        let start = pr.header_name_start.min(end);
-        let ch = u.buf.get(end).copied().unwrap_or(0);
-
-        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid header: \"{}\\x{:02x}...\"", B(&u.buf[start..end]), ch);
-
-        return Err(invalid);
-    }
-}
-
-/// The length of ngx_http_uwsgi_input_filter_init: none for 204 and 304,
-/// up to the end of the connection for HEAD, else the "Content-Length"
-/// (-1 if none).
-fn input_length(status_n: i64, head: bool, content_length_n: i64) -> i64 {
-    if status_n == NGX_HTTP_NO_CONTENT || status_n == NGX_HTTP_NOT_MODIFIED {
-        0
-    } else if head {
-        -1
-    } else {
-        content_length_n
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,7 +1544,7 @@ pub fn uwsgi_module() -> ModuleDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream_rt::{content_type_charset, header_hash_key, header_param_key, header_params, merge_params, status_failure};
+    use crate::upstream_rt::{cgi_input_length as input_length, cgi_status, content_type_charset, header_hash_key, header_param_key, header_params, merge_params, status_failure};
 
     #[test]
     fn test_packet_header() {

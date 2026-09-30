@@ -3829,6 +3829,190 @@ pub fn cgi_status(value: &[u8]) -> Option<i64> {
     ngx_core::string::atoi(&value[..3])
 }
 
+/// The status line and CGI header parser of the scgi and uwsgi modules
+/// (ngx_http_status_t and r->state): anew with their reinit_request and
+/// the rest of ngx_http_upstream_reinit, u->process_header being their
+/// process_status_line.
+pub struct CgiHeaderParse {
+    /// the module, for the debug messages
+    name: &'static str,
+    /// u->process_header is the module's process_header
+    status_done: bool,
+    /// r->state and the header parser
+    pr: crate::parse::ParseRequest,
+    /// u->buffer.pos
+    pos: usize,
+}
+
+impl CgiHeaderParse {
+    pub fn new(name: &'static str) -> CgiHeaderParse {
+        CgiHeaderParse { name, status_done: false, pr: crate::parse::ParseRequest { upstream: true, ..Default::default() }, pos: 0 }
+    }
+}
+
+/// ngx_http_scgi_process_status_line and ngx_http_uwsgi_process_status_line:
+/// an HTTP status line, or, if there is none, the CGI style header of
+/// cgi_process_header from the start. Ok(true) when the header is done, Ok(false) for more
+/// (NGX_AGAIN), Err with the failure type of
+/// NGX_HTTP_UPSTREAM_INVALID_HEADER.
+pub fn cgi_process_status_line(r: &R, up: &mut Upstream, st: &mut CgiHeaderParse) -> Result<bool, u32> {
+    if st.status_done {
+        return cgi_process_header(r, up, st);
+    }
+
+    let u = &mut up.resp;
+
+    let mut p = st.pos;
+    let mut status = crate::parse::Status::default();
+
+    let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
+
+    if rc == NGX_AGAIN {
+        return Ok(false);
+    }
+
+    if rc == NGX_ERROR {
+        // u->process_header = ngx_http_*_process_header;
+        // u->buffer.pos = status->line_start; r->state = 0
+        st.status_done = true;
+        st.pr = crate::parse::ParseRequest { upstream: true, ..Default::default() };
+
+        return cgi_process_header(r, up, st);
+    }
+
+    if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+        if state.status == 0 {
+            state.status = status.code as i64;
+        }
+    }
+
+    u.status_n = status.code as i64;
+    u.status_line = u.buf[status.start..status.end].to_vec();
+
+    http_debug!(r, "http {} status {} \"{}\"", st.name, u.status_n, B(&u.status_line));
+
+    st.pos = p;
+    st.status_done = true;
+
+    cgi_process_header(r, up, st)
+}
+
+/// ngx_http_scgi_process_header and ngx_http_uwsgi_process_header: the
+/// header lines, each with the handler
+/// of ngx_http_upstream_headers_in[]; when the header is done, the status
+/// of the status line, of "Status", 302 with "Location", or 200.
+pub fn cgi_process_header(r: &R, up: &mut Upstream, st: &mut CgiHeaderParse) -> Result<bool, u32> {
+    let invalid = NGX_HTTP_UPSTREAM_FT_INVALID_HEADER;
+
+    loop {
+        let rc = crate::parse::parse_header_line(&mut st.pr, &up.resp.buf, &mut st.pos, true);
+
+        let u = &mut up.resp;
+
+        if rc == NGX_OK {
+            // a header line has been parsed successfully
+
+            let pr = &st.pr;
+
+            let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
+            let value = u.buf[pr.header_start..pr.header_end].to_vec();
+
+            let lowcase_key = if key.len() == pr.lowcase_index { pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
+
+            let h = TableElt::with_hash(&key, &value, pr.header_hash, lowcase_key);
+
+            u.headers.push(h.clone());
+
+            // hh->handler(r, h, hh->offset)
+            process_header_line(r, up, &h)?;
+
+            http_debug!(r, "http {} header: \"{}: {}\"", st.name, B(&h.key), B(&h.value.borrow()));
+
+            continue;
+        }
+
+        if rc == crate::parse::NGX_HTTP_PARSE_HEADER_DONE {
+            // a whole header has been parsed successfully
+
+            http_debug!(r, "http {} header done", st.name);
+
+            if u.status_n == 0 {
+                if let Some(status) = u.header(b"status") {
+                    let status_line = status.value.borrow().clone();
+
+                    // ngx_atoi(status_line->data, 3): the value is
+                    // null-terminated
+                    let status = match cgi_status(&status_line) {
+                        Some(s) => s,
+                        None => {
+                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid status \"{}\"", B(&status_line));
+                            return Err(invalid);
+                        }
+                    };
+
+                    u.status_n = status;
+
+                    if status_line.len() > 3 {
+                        u.status_line = status_line;
+                    }
+                } else if u.header(b"location").is_some() {
+                    u.status_n = 302;
+                    u.status_line = b"302 Moved Temporarily".to_vec();
+                } else {
+                    u.status_n = 200;
+                    u.status_line = b"200 OK".to_vec();
+                }
+
+                if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
+                    if state.status == 0 {
+                        state.status = u.status_n;
+                    }
+                }
+            }
+
+            // done:
+
+            if u.status_n == NGX_HTTP_SWITCHING_PROTOCOLS && !r.headers_in.borrow().upgrade.is_empty() {
+                up.upgrade = true;
+            }
+
+            up.resp.pos = st.pos;
+
+            return Ok(true);
+        }
+
+        if rc == NGX_AGAIN {
+            return Ok(false);
+        }
+
+        // rc == NGX_HTTP_PARSE_INVALID_HEADER
+
+        let pr = &st.pr;
+
+        let end = pr.header_end.min(u.buf.len());
+        let start = pr.header_name_start.min(end);
+        let ch = u.buf.get(end).copied().unwrap_or(0);
+
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid header: \"{}\\x{:02x}...\"", B(&u.buf[start..end]), ch);
+
+        return Err(invalid);
+    }
+}
+
+/// The length of ngx_http_scgi_input_filter_init and
+/// ngx_http_uwsgi_input_filter_init: none for 204 and 304,
+/// up to the end of the connection for HEAD, else the "Content-Length"
+/// (-1 if none).
+pub fn cgi_input_length(status_n: i64, head: bool, content_length_n: i64) -> i64 {
+    if status_n == NGX_HTTP_NO_CONTENT || status_n == NGX_HTTP_NOT_MODIFIED {
+        0
+    } else if head {
+        -1
+    } else {
+        content_length_n
+    }
+}
+
 /// The key of a request header as a param: "HTTP_" and the name in upper
 /// case, '-' as '_'.
 pub fn header_param_key(name: &[u8]) -> Vec<u8> {
