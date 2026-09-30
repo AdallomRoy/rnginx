@@ -1288,6 +1288,8 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         };
         match res {
             None => return Err(()),
+            // c->close (ngx_close_idle_connections) is tested first
+            Some(_) if c.close.get() => return Err(()),
             Some(Err(_)) => {
                 // timed out
                 if !idle_phase && rest > 0 && !ngx_core::event::is_exiting() {
