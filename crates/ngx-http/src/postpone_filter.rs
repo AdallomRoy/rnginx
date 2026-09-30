@@ -75,6 +75,8 @@ struct PostponeMain {
     notify: HashMap<usize, Rc<Notify>>,
     /// the tasks of the posted subrequests
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// notified when a task is over, or the main request is terminated
+    tasks_done: Rc<Notify>,
 }
 
 fn key(r: &R) -> usize {
@@ -187,14 +189,16 @@ fn is_terminated(r: &R) -> bool {
 fn terminate_posted(r: &R) {
     let st = main_state(r);
 
-    let (notify, tasks) = {
+    let (notify, tasks, tasks_done) = {
         let mut st = st.borrow_mut();
-        (st.notify.values().cloned().collect::<Vec<_>>(), std::mem::take(&mut st.tasks))
+        (st.notify.values().cloned().collect::<Vec<_>>(), std::mem::take(&mut st.tasks), st.tasks_done.clone())
     };
 
     for n in notify {
         n.notify_one();
     }
+
+    tasks_done.notify_one();
 
     for t in tasks {
         t.abort();
@@ -242,6 +246,7 @@ async fn posted_request(pr: R, sr: R) {
     let mut st = st.borrow_mut();
     st.posted.remove(&key(&sr));
     st.notify.remove(&key(&sr));
+    st.tasks_done.notify_one();
 }
 
 /// The subrequest part of ngx_http_finalize_request() after the handler and
@@ -349,6 +354,9 @@ pub async fn run_posted_requests(r: &R) -> i64 {
 /// r->main->count of the posted subrequests, NGX_HTTP_SUBREQUEST_BACKGROUND
 /// ones among them: the connection of the main request is not finalized
 /// (closed or kept alive, ngx_http_finalize_connection) before they are over.
+/// If the main request is terminated, they are not waited for: C closes it
+/// at once (ngx_http_terminate_handler), and the cleanups of their upstreams
+/// have run.
 pub async fn wait_posted_subrequests(r: &R) {
     let st = match main_state_if_any(r) {
         Some(st) => st,
@@ -356,20 +364,32 @@ pub async fn wait_posted_subrequests(r: &R) {
     };
 
     loop {
-        let tasks: Vec<tokio::task::JoinHandle<()>> = st.borrow_mut().tasks.drain(..).collect();
-
-        if tasks.is_empty() {
+        if is_terminated(r) {
+            terminate_posted(r);
             return;
         }
 
-        for t in tasks {
-            let _ = t.await;
+        let tasks_done = st.borrow().tasks_done.clone();
+        let done = tasks_done.notified();
+
+        {
+            let mut st = st.borrow_mut();
+            st.tasks.retain(|t| !t.is_finished());
+
+            if st.tasks.is_empty() {
+                return;
+            }
         }
+
+        done.await;
     }
 }
 
 /// Sets the log request of a subrequest's task whenever it runs, as C does
-/// before running a posted request (ngx_http_set_log_request).
+/// before running a posted request (ngx_http_set_log_request), and gives
+/// it back when the task waits: C sets it for the request of each event,
+/// and the request that goes on meanwhile (the main request while a
+/// background subrequest runs) logs with its own.
 struct LogRequest {
     r: R,
     f: Pin<Box<dyn Future<Output = ()>>>,
@@ -379,8 +399,14 @@ impl Future for LogRequest {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let prev = self.r.log_ctx.current_request.borrow().clone();
+
         self.r.set_log_request();
-        self.f.as_mut().poll(cx)
+        let rv = self.f.as_mut().poll(cx);
+
+        *self.r.log_ctx.current_request.borrow_mut() = prev;
+
+        rv
     }
 }
 
