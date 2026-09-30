@@ -1196,14 +1196,14 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
     let (rc, start_time) = {
         let g = u.peer.as_mut().expect("peer");
 
-        // a new state, and the peer (ngx_event_connect_peer's pc->get);
-        // "no live upstreams" is logged for NGX_BUSY
+        // a new state, and the peer (ngx_event_connect_peer's pc->get)
         let rc = g.u.connect(r);
 
         (rc, g.u.start_time)
     };
 
-    // u->peer.name for the error log
+    // u->peer.name for the error log: the peer, or the upstream's name
+    // when there is none (NGX_BUSY)
     set_log_peer(u);
 
     if rc == NGX_ERROR {
@@ -1211,6 +1211,7 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
     }
 
     if rc == NGX_BUSY {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no live upstreams");
         return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_NOLIVE));
     }
 
@@ -1481,8 +1482,6 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, deadline: Instant) -> Result<(), Failure> {
     http_debug!(r, "http upstream process header");
 
-    r.connection.log.set_action(Some("reading response header from upstream"));
-
     // u->buffer: u->conf->buffer_size, from r->cache->header_start
     let header_start = crate::file_cache::cache_of(r).map(|c| c.borrow().header_start).unwrap_or(0);
     let buffer_size = u.conf.buffer_size.saturating_sub(header_start).max(1);
@@ -1490,10 +1489,18 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
     let rc;
 
     if u.conf.ignore_input {
+        r.connection.log.set_action(Some("reading response header from upstream"));
+
         rc = m.process_header(r, u);
     } else {
         let mut chunk = vec![0u8; buffer_size];
         let watch = u.watch.clone();
+
+        // the action is set when the upstream's read event (data, the end
+        // or the read timer) runs ngx_http_upstream_process_header; the
+        // client's events checking the connection before see the one of
+        // ngx_http_upstream_send_request
+        let mut action = false;
 
         'read: loop {
             let room = buffer_size.saturating_sub(u.resp.buf.len()).clamp(1, chunk.len());
@@ -1510,6 +1517,11 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                     }
                 }
             };
+
+            if res.is_some() && !action {
+                r.connection.log.set_action(Some("reading response header from upstream"));
+                action = true;
+            }
 
             let n = match res {
                 None => {

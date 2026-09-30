@@ -789,8 +789,9 @@ impl UpstreamPeer {
 
     /// The start of ngx_http_upstream_connect: a new state, and the peer
     /// (ngx_event_connect_peer's pc->get). NGX_OK, NGX_DONE with a cached
-    /// connection in pc.connection, or NGX_BUSY ("no live upstreams" is
-    /// logged, and the caller goes to next() with FT_NOLIVE).
+    /// connection in pc.connection, NGX_ERROR, or NGX_BUSY (the caller logs
+    /// "no live upstreams" with pc.name, the upstream's name, in the log
+    /// context, and goes to next() with FT_NOLIVE).
     pub fn connect(&mut self, r: &R) -> i64 {
         let now = ngx_core::times::current_msec();
 
@@ -817,12 +818,12 @@ impl UpstreamPeer {
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http upstream connect: {}", rc);
 
-        if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
-            last.peer = self.pc.name.clone();
+        if rc == NGX_ERROR {
+            return rc;
         }
 
-        if rc == NGX_BUSY {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no live upstreams");
+        if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
+            last.peer = self.pc.name.clone();
         }
 
         rc
