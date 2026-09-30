@@ -87,6 +87,7 @@ pub mod dav;
 pub mod gunzip;
 pub mod degradation;
 pub mod sub_filter;
+pub mod http_types;
 pub mod charset_filter;
 pub mod secure_link;
 pub mod geoip;

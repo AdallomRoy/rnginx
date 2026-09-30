@@ -31,6 +31,9 @@ const NGINX_VER_BUILD: &[u8] = NGINX_VER;
 /// "nginx", Huffman-coded, with its length prefix.
 const NGINX: [u8; 5] = [0x84, 0xaa, 0x63, 0x55, 0xe7];
 
+/// "Accept-Encoding", Huffman-coded, with its length prefix.
+const ACCEPT_ENCODING: [u8; 12] = [0x8b, 0x84, 0x84, 0x2d, 0x69, 0x5b, 0x05, 0x44, 0x3c, 0x86, 0xaa, 0x6f];
+
 pub fn v2_filter_module() -> ModuleDef {
     let def = HttpModuleDef { postconfiguration: Some(filter_init), ..Default::default() };
     http_module_def("ngx_http_v2_filter_module", def, Vec::new())
@@ -101,9 +104,7 @@ async fn header_filter(r: &R) -> i64 {
                 ho.content_length_n = -1;
 
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = indexed(NGX_HTTP_V2_STATUS_204_INDEX);
             }
@@ -117,9 +118,7 @@ async fn header_filter(r: &R) -> i64 {
 
             _ => {
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = match ho.status {
                     NGX_HTTP_BAD_REQUEST => indexed(NGX_HTTP_V2_STATUS_400_INDEX),
@@ -290,6 +289,18 @@ async fn header_filter(r: &R) -> i64 {
 
             pos.push(inc_indexed(NGX_HTTP_V2_LOCATION_INDEX));
             write_value(&mut pos, &value);
+        }
+    }
+
+    // NGX_HTTP_GZIP
+    if r.gzip_vary.get() {
+        if *clcf.borrow().gzip_vary {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"vary: Accept-Encoding\"");
+
+            pos.push(inc_indexed(NGX_HTTP_V2_VARY_INDEX));
+            pos.extend_from_slice(&ACCEPT_ENCODING);
+        } else {
+            r.gzip_vary.set(false);
         }
     }
 
