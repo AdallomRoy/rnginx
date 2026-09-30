@@ -366,6 +366,7 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         request_done: Cell::new(false),
         closed: Cell::new(false),
         authority: RefCell::new(None),
+        test_reading: RefCell::new(None),
     });
 
     let any: Rc<dyn std::any::Any> = stream.clone();
@@ -1087,6 +1088,18 @@ fn terminate_request_now(stream: &Rc<H2Stream>, rc: i64) {
         // already closing: wake it up to notice fc->error / queued
         stream.notify.notify_one();
         return;
+    }
+
+    // the read event handler of a request waiting with it:
+    // ngx_http_test_reading, which tests c->error on a stream
+    if rc == NGX_HTTP_CLIENT_CLOSED_REQUEST {
+        let waiting = stream.test_reading.borrow_mut().take().and_then(|w| w.upgrade());
+
+        if let Some(wr) = waiting {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, wr.connection.log, "http test reading");
+            wr.set_log_request();
+            crate::write_filter::test_reading_closed(&wr, 0);
+        }
     }
 
     let task = stream.task.borrow_mut().take();

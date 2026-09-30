@@ -286,6 +286,10 @@ pub struct H2Stream {
     pub closed: Cell<bool>,
     /// The :authority value (r->host_start..host_end in C).
     pub authority: RefCell<Option<Vec<u8>>>,
+    /// The request waiting with ngx_http_test_reading as its read event
+    /// handler (a limit_req delay): the fake connection's read event runs
+    /// it, and it tests c->error.
+    pub test_reading: RefCell<Option<Weak<crate::request::Request>>>,
 }
 
 /// What to do when an output frame has been written out

@@ -280,11 +280,13 @@ async fn limit_req_handler(r: R) -> i64 {
 /// handler, which declines as r->main->limit_req_status is set.
 async fn limit_req_delay(r: &R, delay: u64) -> i64 {
     // the read event is posted at once; ngx_http_test_reading of an
-    // HTTP/2 stream only tests c->error
+    // HTTP/2 stream only tests c->error, which the stream's read events
+    // set (see crate::v2::stream::terminate_request_now)
     let closed = if r.stream.borrow().is_some() && r.connection.error.get() {
         Some(0)
     } else {
         let watch = TestReading::new(r);
+        let _stream = StreamTestReading::new(r);
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(delay)) => None,
@@ -300,6 +302,30 @@ async fn limit_req_delay(r: &R, delay: u64) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit_req delay");
 
     NGX_DECLINED
+}
+
+/// r->read_event_handler = ngx_http_test_reading on an HTTP/2 stream, for
+/// the time of the delay
+struct StreamTestReading(Option<Rc<crate::v2::H2Stream>>);
+
+impl StreamTestReading {
+    fn new(r: &R) -> StreamTestReading {
+        let stream = crate::v2::stream::request_stream(r);
+
+        if let Some(s) = &stream {
+            *s.test_reading.borrow_mut() = Some(Rc::downgrade(r));
+        }
+
+        StreamTestReading(stream)
+    }
+}
+
+impl Drop for StreamTestReading {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            s.test_reading.borrow_mut().take();
+        }
+    }
 }
 
 /// ngx_http_limit_req_rbtree_insert_value
