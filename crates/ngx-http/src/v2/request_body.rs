@@ -88,8 +88,10 @@ pub async fn read_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
 
     // rb->buf
     stream.body_cap.set(len);
+    rb.borrow_mut().buf_size = len;
     stream.body_buf.borrow_mut().clear();
     stream.body_last.set(0);
+    rb.borrow_mut().buf_last = stream.body_last.get();
 
     let preread = stream.preread.borrow_mut().take();
 
@@ -229,6 +231,7 @@ async fn process(r: &R, stream: &Rc<H2Stream>, rb: &Rc<RefCell<RequestBody>>, da
                 }
 
                 stream.body_last.set(0);
+                rb.borrow_mut().buf_last = stream.body_last.get();
             }
 
             // copy body data to the buffer
@@ -239,6 +242,7 @@ async fn process(r: &R, stream: &Rc<H2Stream>, rb: &Rc<RefCell<RequestBody>>, da
             if n > 0 {
                 stream.body_buf.borrow_mut().extend_from_slice(&data[pos..pos + n]);
                 stream.body_last.set(stream.body_last.get() + n);
+                rb.borrow_mut().buf_last = stream.body_last.get();
                 pos += n;
                 size -= n;
             }
@@ -331,6 +335,7 @@ pub async fn read_unbuffered_request_body(r: &R) -> i64 {
     }
 
     stream.body_last.set(0);
+    rb.borrow_mut().buf_last = stream.body_last.get();
 
     let h2c = stream.connection.clone();
 

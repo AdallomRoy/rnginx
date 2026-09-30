@@ -774,7 +774,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         request_body_in_persistent_file: Cell::new(false),
         request_body_in_clean_file: Cell::new(false),
         request_body_file_group_access: Cell::new(false),
-        request_body_file_log_level: Cell::new(NGX_LOG_WARN),
+        request_body_file_log_level: Cell::new(0),
         request_body_no_buffering: Cell::new(false),
         subrequest_in_memory: Cell::new(false),
         waited: Cell::new(false),
