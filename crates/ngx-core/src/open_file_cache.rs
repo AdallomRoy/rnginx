@@ -709,7 +709,9 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
                 }
 
                 if of.directio > 0 && st.st_size as usize >= of.directio {
-                    if directio_on(fd) == 0 {
+                    if os::directio_on(fd) == -1 {
+                        ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "{} \"{}\" failed", os::DIRECTIO_ON_N, B(name));
+                    } else {
                         of.is_directio = true;
                     }
                 }
@@ -998,24 +1000,6 @@ fn current_time() -> i64 {
 
 fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32 {
     unsafe { libc::posix_fadvise(fd, offset, len, advice) }
-}
-
-fn directio_on(fd: i32) -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe {
-            let flags = libc::O_DIRECT;
-            if libc::fcntl(fd, libc::F_SETFL, flags) == -1 {
-                return -1;
-            }
-        }
-        0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = fd;
-        0
-    }
 }
 
 #[cfg(test)]

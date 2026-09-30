@@ -225,6 +225,34 @@ pub fn set_blocking(fd: i32) -> Result<(), i32> {
     Ok(())
 }
 
+/// ngx_directio_on_n
+pub const DIRECTIO_ON_N: &str = "fcntl(O_DIRECT)";
+
+/// ngx_directio_on: O_DIRECT added to the file status flags, -1 on error
+pub fn directio_on(fd: i32) -> i32 {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+
+    if flags == -1 {
+        return -1;
+    }
+
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT) }
+}
+
+/// ngx_directio_off_n
+pub const DIRECTIO_OFF_N: &str = "fcntl(!O_DIRECT)";
+
+/// ngx_directio_off: O_DIRECT taken off the file status flags, -1 on error
+pub fn directio_off(fd: i32) -> i32 {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+
+    if flags == -1 {
+        return -1;
+    }
+
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_DIRECT) }
+}
+
 pub fn set_cloexec(fd: i32) -> Result<(), i32> {
     unsafe {
         if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
