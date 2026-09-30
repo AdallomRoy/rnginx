@@ -426,7 +426,7 @@ unsafe fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mu
                 return NGX_OK;
             }
 
-            (*lr).count += 1;
+            (*lr).count = (*lr).count.wrapping_add(1);
 
             ctx.node.set(lr);
 
@@ -534,7 +534,7 @@ fn limit_req_account(limits: &[LimitReqLimit], mut n: usize, ep: &mut usize, lim
             }
 
             (*lr).excess = excess as usize;
-            (*lr).count -= 1;
+            (*lr).count = (*lr).count.wrapping_sub(1);
 
             shpool.unlock();
         }
@@ -575,7 +575,7 @@ fn limit_req_unlock(limits: &[LimitReqLimit], mut n: usize) {
 
             shpool.lock();
 
-            (*lr).count -= 1;
+            (*lr).count = (*lr).count.wrapping_sub(1);
 
             shpool.unlock();
         }
@@ -870,7 +870,7 @@ fn limit_req(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRes
         return Err(msg("is duplicate"));
     }
 
-    limits.push(LimitReqLimit { shm_zone, burst: (burst * 1000) as usize, delay: (delay * 1000) as usize });
+    limits.push(LimitReqLimit { shm_zone, burst: burst.wrapping_mul(1000) as usize, delay: delay.wrapping_mul(1000) as usize });
 
     Ok(())
 }

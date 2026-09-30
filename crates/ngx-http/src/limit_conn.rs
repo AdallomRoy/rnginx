@@ -218,7 +218,7 @@ async fn limit_conn_handler(r: R) -> i64 {
                     return *lccf.status_code;
                 }
 
-                (*lc).conn += 1;
+                (*lc).conn = (*lc).conn.wrapping_add(1);
             }
 
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit conn: {:08X} {}", (*node).key, (*lc_of(node)).conn);
@@ -338,7 +338,7 @@ fn limit_conn_cleanup(lccln: &LimitConnCleanup) {
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "limit conn cleanup: {:08X} {}", (*node).key, (*lc).conn);
         }
 
-        (*lc).conn -= 1;
+        (*lc).conn = (*lc).conn.wrapping_sub(1);
 
         if (*lc).conn == 0 {
             (*ctx.sh.get()).rbtree.delete(node);
