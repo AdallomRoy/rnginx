@@ -271,6 +271,9 @@ pub struct Upstream {
     pipe_downstream_error: bool,
     /// ngx_http_upstream_rd_check_broken_connection is the read handler
     watch: Option<Rc<ClientWatch>>,
+    /// the read handler of an HTTP/2 stream's main request while the
+    /// upstream runs (H2Stream.upstream_watch)
+    stream_watch: Option<Rc<crate::v2::StreamWatch>>,
     /// c->requests and c->start_time of the connection, for the keepalive
     /// cache
     conn_requests: u64,
@@ -312,6 +315,7 @@ impl Upstream {
             cleanup: false,
             pipe_downstream_error: false,
             watch: None,
+            stream_watch: None,
             conn_requests: 0,
             conn_start_time: 0,
         }
@@ -639,18 +643,24 @@ pub fn process_header_line(r: &R, u: &mut Upstream, h: &Header) -> Result<(), u3
 /// ngx_http_upstream_rd_check_broken_connection as the Linux build runs it
 /// (epoll with EPOLLRDHUP), on a duplicate of the client socket: its
 /// readiness is its own, so the request's reading of the body and of
-/// pipelined requests is not disturbed. An HTTP/2 or HTTP/3 stream is not
-/// checked.
+/// pipelined requests is not disturbed. For the main request of an HTTP/2
+/// stream, the fake connection's read event (fc->error set); the
+/// subrequests of a stream and HTTP/3 are not checked.
 pub struct ClientWatch {
     afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    stream: Option<Rc<crate::v2::StreamWatch>>,
 }
 
 impl ClientWatch {
-    pub fn new(r: &R) -> ClientWatch {
+    pub fn new(r: &R, stream: Option<&Rc<crate::v2::StreamWatch>>) -> ClientWatch {
         use std::os::fd::FromRawFd;
 
+        if let Some(w) = stream {
+            return ClientWatch { afd: None, stream: Some(w.clone()) };
+        }
+
         if r.stream.borrow().is_some() || r.http_version.get() >= NGX_HTTP_VERSION_20 || r.connection.fd.get() < 0 {
-            return ClientWatch { afd: None };
+            return ClientWatch { afd: None, stream: None };
         }
 
         // SAFETY: dup() of the connection's open socket; the duplicate is
@@ -658,12 +668,12 @@ impl ClientWatch {
         let dup = unsafe { libc::dup(r.connection.fd.get()) };
 
         if dup < 0 {
-            return ClientWatch { afd: None };
+            return ClientWatch { afd: None, stream: None };
         }
 
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
 
-        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok() }
+        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), stream: None }
     }
 
     /// Resolves with the pending socket error (0 if none) when the client
@@ -671,6 +681,11 @@ impl ClientWatch {
     /// be read.
     pub async fn closed(&self) -> i32 {
         use std::os::fd::AsRawFd;
+
+        if let Some(w) = &self.stream {
+            w.closed().await;
+            return 0;
+        }
 
         let afd = match &self.afd {
             Some(a) => a,
@@ -728,6 +743,12 @@ pub async fn client_closed(watch: Option<&ClientWatch>) -> i32 {
 /// closed the connection: Some(499) to finalize the upstream request with,
 /// or None to go on (a cacheable response still read from the upstream).
 fn check_broken_connection(r: &R, u: &Upstream, err: i32) -> Option<i64> {
+    broken_connection(r, u.cacheable(), u.connected(), err)
+}
+
+/// check_broken_connection with u->cacheable and whether u->peer.connection
+/// is set
+fn broken_connection(r: &R, cacheable: bool, connected: bool, err: i32) -> Option<i64> {
     // the read event of the client connection goes to c->data: a request
     // that is not active (a background subrequest, a subrequest waiting for
     // its turn) does not see it
@@ -737,19 +758,28 @@ fn check_broken_connection(r: &R, u: &Upstream, err: i32) -> Option<i64> {
 
     let c = &r.connection;
 
+    // c->error: an HTTP/2 stream reset, or its connection closed
+    if r.stream.borrow().is_some() {
+        if !cacheable {
+            return Some(NGX_HTTP_CLIENT_CLOSED_REQUEST);
+        }
+
+        return None;
+    }
+
     c.read_eof.set(true);
     c.error.set(true);
 
     let err = if err != 0 { Some(err) } else { None };
 
-    if !u.cacheable() && u.connected() {
+    if !cacheable && connected {
         ngx_log_error!(NGX_LOG_INFO, c.log, err, "epoll_wait() reported that client prematurely closed connection, so upstream connection is closed too");
         return Some(NGX_HTTP_CLIENT_CLOSED_REQUEST);
     }
 
     ngx_log_error!(NGX_LOG_INFO, c.log, err, "epoll_wait() reported that client prematurely closed connection");
 
-    if !u.connected() {
+    if !connected {
         return Some(NGX_HTTP_CLIENT_CLOSED_REQUEST);
     }
 
@@ -1044,6 +1074,7 @@ pub async fn init(r: R, mut u: Upstream, m: &mut dyn UpstreamModule) -> i64 {
 
     // r->read_event_handler = ngx_http_block_reading
     u.watch = None;
+    u.stream_watch = None;
 
     rc
 }
@@ -1090,9 +1121,30 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
 
     u.store = u.conf.store;
 
-    if !u.store && !r.post_action.get() && !u.conf.ignore_client_abort {
+    let check = !u.store && !r.post_action.get() && !u.conf.ignore_client_abort;
+
+    // an HTTP/2 stream's main request: the fake connection's read event
+    // goes to the upstream (ngx_http_block_reading if it does not check)
+    if Rc::ptr_eq(r, &r.main()) {
+        if let Some(stream) = crate::v2::stream::request_stream(r) {
+            let cacheable: Option<Box<dyn Fn() -> bool>> = if check {
+                let ucache = u.ucache.clone();
+                Some(Box::new(move || ucache.cacheable.get()))
+            } else {
+                None
+            };
+
+            let w = Rc::new(crate::v2::StreamWatch { cacheable, closed: std::cell::Cell::new(false), notify: tokio::sync::Notify::new() });
+
+            *stream.upstream_watch.borrow_mut() = Some(Rc::downgrade(&w));
+
+            u.stream_watch = Some(w);
+        }
+    }
+
+    if check {
         // ngx_http_upstream_rd_check_broken_connection
-        u.watch = Some(Rc::new(ClientWatch::new(r)));
+        u.watch = Some(Rc::new(ClientWatch::new(r, u.stream_watch.as_ref())));
     }
 
     // u->request_bufs = r->request_body->bufs; u->create_request(r)
@@ -1236,28 +1288,37 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
             None => return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR)),
         };
 
-        let watch = u.watch.clone();
+        let mut watch = u.watch.clone();
+        let cacheable = u.cacheable();
 
         let connected = {
             let connect = connect_peer(r, u, &sockaddr, opts, ssl);
+            tokio::pin!(connect);
 
-            tokio::select! {
-                res = connect => Some(res),
-                err = client_closed(watch.as_deref()) => {
-                    // no connection yet: 499
-                    let _ = err;
-                    None
+            loop {
+                tokio::select! {
+                    res = &mut connect => break Ok(res),
+                    err = client_closed(watch.as_deref()) => {
+                        // u->peer.connection is there, connecting: a
+                        // cacheable response is waited for
+                        if let Some(rc) = broken_connection(r, cacheable, true, err) {
+                            break Err(rc);
+                        }
+
+                        watch = None;
+                    }
                 }
             }
         };
 
+        if watch.is_none() {
+            u.watch = None;
+        }
+
         match connected {
-            None => {
-                let rc = check_broken_connection(r, u, 0).unwrap_or(NGX_HTTP_CLIENT_CLOSED_REQUEST);
-                return Err(Failure::Finalize(rc));
-            }
-            Some(Err(f)) => return Err(f),
-            Some(Ok(s)) => {
+            Err(rc) => return Err(Failure::Finalize(rc)),
+            Ok(Err(f)) => return Err(f),
+            Ok(Ok(s)) => {
                 u.conn_requests = 0;
                 u.conn_start_time = ngx_core::times::current_msec();
                 s
@@ -1876,6 +1937,7 @@ pub async fn finalize(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, rc: i
 
     // r->read_event_handler = ngx_http_block_reading
     u.watch = None;
+    u.stream_watch = None;
 
     if rc == NGX_DECLINED {
         return NGX_DECLINED;
@@ -2766,6 +2828,7 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
     finalize_peer(r, u, m, rc);
 
     u.watch = None;
+    u.stream_watch = None;
 
     // the rest of p->out and p->in (ngx_event_pipe_write_to_downstream when
     // the upstream is done)

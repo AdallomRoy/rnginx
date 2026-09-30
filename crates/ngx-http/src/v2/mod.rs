@@ -290,6 +290,46 @@ pub struct H2Stream {
     /// handler (a limit_req delay): the fake connection's read event runs
     /// it, and it tests c->error.
     pub test_reading: RefCell<Option<Weak<crate::request::Request>>>,
+    /// The main request's upstream as its read event handler: the fake
+    /// connection's read event goes to it.
+    pub upstream_watch: RefCell<Option<Weak<StreamWatch>>>,
+}
+
+/// The read event handler of a request that its upstream sets
+/// (H2Stream.upstream_watch).
+pub struct StreamWatch {
+    /// ngx_http_upstream_rd_check_broken_connection with c->error: the
+    /// upstream request ends unless its response is cacheable (u->cacheable
+    /// then); None for ngx_http_block_reading, when the upstream does not
+    /// check the client (ignore_client_abort, store, post_action)
+    pub cacheable: Option<Box<dyn Fn() -> bool>>,
+    /// fc->error has been set (RST_STREAM, the end of the connection)
+    pub closed: Cell<bool>,
+    pub notify: tokio::sync::Notify,
+}
+
+impl StreamWatch {
+    /// The event: false if the request ends (the upstream would finalize it
+    /// with 499 right away), true if it goes on and the upstream is told.
+    pub fn read_event(&self) -> bool {
+        if let Some(cacheable) = &self.cacheable {
+            if !cacheable() {
+                return false;
+            }
+        }
+
+        self.closed.set(true);
+        self.notify.notify_one();
+
+        true
+    }
+
+    /// Resolves once fc->error has been set.
+    pub async fn closed(&self) {
+        while !self.closed.get() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// What to do when an output frame has been written out

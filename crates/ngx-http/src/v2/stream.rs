@@ -367,6 +367,7 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         closed: Cell::new(false),
         authority: RefCell::new(None),
         test_reading: RefCell::new(None),
+        upstream_watch: RefCell::new(None),
     });
 
     let any: Rc<dyn std::any::Any> = stream.clone();
@@ -1137,7 +1138,27 @@ pub fn stream_rst_received(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
         return;
     }
 
+    if upstream_read_event(stream) {
+        return;
+    }
+
     terminate_request_now(stream, NGX_HTTP_CLIENT_CLOSED_REQUEST);
+}
+
+/// The read event when the request's upstream has the handler: true if
+/// the request goes on (a cacheable response is read on, or the upstream
+/// does not check the client).
+fn upstream_read_event(stream: &Rc<H2Stream>) -> bool {
+    if stream.request_done.get() {
+        return false;
+    }
+
+    let watch = stream.upstream_watch.borrow().as_ref().and_then(|w| w.upgrade());
+
+    match watch {
+        Some(w) => w.read_event(),
+        None => false,
+    }
 }
 
 /// ngx_http_v2_terminate_stream
@@ -1183,7 +1204,9 @@ pub fn finalize_streams(h2c: &Rc<H2Connection>) {
         };
 
         if !stream.request_done.get() && stream.task.borrow().is_some() && stream.request.borrow().is_some() {
-            terminate_request_now(&stream, rc);
+            if !upstream_read_event(&stream) {
+                terminate_request_now(&stream, rc);
+            }
         } else {
             if let Some(t) = stream.task.borrow_mut().take() {
                 t.abort();
