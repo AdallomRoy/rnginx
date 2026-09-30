@@ -2351,7 +2351,6 @@ fn add_listening(cf: &mut Conf, addr: &ConfAddr) -> Result<Rc<Listening>, ConfEr
     *ls.log.borrow_mut() = Log::new(chain);
     let mut ls = ls;
     ls.ty = addr.opt.ty;
-    *ls.protocol.borrow_mut() = "http";
     ls.backlog.set(addr.opt.backlog);
     ls.rcvbuf.set(addr.opt.rcvbuf);
     ls.sndbuf.set(addr.opt.sndbuf);

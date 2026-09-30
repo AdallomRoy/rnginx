@@ -1143,6 +1143,144 @@ fn setsockopt_int(fd: RawFd, level: i32, name: i32, value: i32) -> Result<(), i3
     Ok(())
 }
 
+/// getsockopt() of an int option; returns the option length
+fn getsockopt_int(fd: RawFd, level: i32, name: i32, value: &mut i32) -> Result<libc::socklen_t, i32> {
+    let mut olen = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: value points to an i32 of olen bytes
+    let r = unsafe { libc::getsockopt(fd, level, name, value as *mut i32 as *mut libc::c_void, &mut olen) };
+    if r == -1 {
+        return Err(os::errno());
+    }
+    Ok(olen)
+}
+
+/// ngx_set_inherited_sockets: the listening entries pushed by
+/// ngx_add_inherited_sockets (fd and inherited set) get the address and
+/// options of their socket.
+pub fn set_inherited_sockets(cycle: &mut Cycle) -> Result<(), ()> {
+    for i in 0..cycle.listening.len() {
+        let fd = cycle.listening[i].fd.get();
+
+        // ngx_sockaddr_t
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut socklen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: ss is a sockaddr_storage of socklen bytes
+        if unsafe { libc::getsockname(fd, &mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr, &mut socklen) } == -1 {
+            ngx_log_error!(NGX_LOG_CRIT, cycle.log, Some(os::errno()), "getsockname() of the inherited socket #{} failed", fd);
+            cycle.listening[i].ignore.set(true);
+            continue;
+        }
+
+        if socklen > std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t {
+            socklen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        }
+
+        let sockaddr = match ss.ss_family as i32 {
+            libc::AF_INET6 | libc::AF_UNIX | libc::AF_INET => SockAddr::from_libc(&ss as *const libc::sockaddr_storage as *const libc::sockaddr, socklen),
+            _ => None,
+        };
+
+        let sockaddr = match sockaddr {
+            Some(sa) => sa,
+            None => {
+                ngx_log_error!(NGX_LOG_CRIT, cycle.log, Some(os::errno()), "the inherited socket #{} has an unsupported protocol family", fd);
+                cycle.listening[i].ignore.set(true);
+                continue;
+            }
+        };
+
+        let mut ls = Listening::new(sockaddr, cycle.log.clone());
+        ls.fd.set(fd);
+        ls.inherited.set(cycle.listening[i].inherited.get());
+        ls.backlog.set(crate::listening::NGX_LISTEN_BACKLOG);
+
+        get_inherited_socket_options(&mut ls, &cycle.log);
+
+        cycle.listening[i] = Rc::new(ls);
+    }
+
+    Ok(())
+}
+
+/// The socket options part of the ngx_set_inherited_sockets loop; a return
+/// is a "continue" there.
+fn get_inherited_socket_options(ls: &mut Listening, log: &Log) {
+    let fd = ls.fd.get();
+    let mut value = 0;
+
+    if let Err(e) = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut ls.ty) {
+        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "getsockopt(SO_TYPE) {} failed", B(&ls.addr_text));
+        ls.ignore.set(true);
+        return;
+    }
+
+    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &mut value) {
+        Ok(_) => ls.rcvbuf.set(value),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_RCVBUF) {} failed, ignored", B(&ls.addr_text));
+            ls.rcvbuf.set(-1);
+        }
+    }
+
+    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &mut value) {
+        Ok(_) => ls.sndbuf.set(value),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_SNDBUF) {} failed, ignored", B(&ls.addr_text));
+            ls.sndbuf.set(-1);
+        }
+    }
+
+    let mut reuseport = 0;
+
+    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &mut reuseport) {
+        Ok(_) => ls.reuseport.set(reuseport != 0),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_REUSEPORT) {} failed, ignored", B(&ls.addr_text));
+        }
+    }
+
+    if ls.ty != libc::SOCK_STREAM {
+        return;
+    }
+
+    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL, &mut value) {
+        Ok(_) => ls.protocol.set(if value == libc::IPPROTO_TCP { 0 } else { value }),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_PROTOCOL) {} failed, ignored", B(&ls.addr_text));
+            ls.protocol.set(0);
+        }
+    }
+
+    match getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &mut value) {
+        Ok(_) => ls.fastopen.set(value),
+        Err(err) => {
+            if err != libc::EOPNOTSUPP && err != libc::ENOPROTOOPT && err != libc::EINVAL {
+                ngx_log_error!(NGX_LOG_NOTICE, log, Some(err), "getsockopt(TCP_FASTOPEN) {} failed, ignored", B(&ls.addr_text));
+            }
+            ls.fastopen.set(-1);
+        }
+    }
+
+    let mut timeout = 0;
+
+    match getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &mut timeout) {
+        Ok(olen) => {
+            if (olen as usize) < std::mem::size_of::<i32>() || timeout == 0 {
+                return;
+            }
+        }
+        Err(err) => {
+            if err == libc::EOPNOTSUPP {
+                return;
+            }
+            ngx_log_error!(NGX_LOG_NOTICE, log, Some(err), "getsockopt(TCP_DEFER_ACCEPT) for {} failed, ignored", B(&ls.addr_text));
+            return;
+        }
+    }
+
+    ls.deferred_accept.set(true);
+}
+
 /// ngx_open_listening_sockets
 pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
     let log = cycle.log.clone();
@@ -1166,7 +1304,7 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
             if ls.inherited.get() {
                 continue;
             }
-            let s = unsafe { libc::socket(ls.sockaddr.family(), ls.ty | libc::SOCK_CLOEXEC, 0) };
+            let s = unsafe { libc::socket(ls.sockaddr.family(), ls.ty | libc::SOCK_CLOEXEC, ls.protocol.get()) };
             if s == -1 {
                 ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "socket() {} failed", B(&ls.addr_text));
                 return Err(());
@@ -1350,12 +1488,16 @@ pub fn close_listening_sockets(cycle: &Cycle) {
             continue;
         }
         crate::event::stop_accepting(ls);
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "close listening {} #{} ", B(&ls.addr_text), fd);
         if unsafe { libc::close(fd) } == -1 {
             ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(os::errno()), "close() socket {} failed", B(&ls.addr_text));
         }
         if let SockAddr::Unix(path) = &ls.sockaddr {
             let pt = process_type();
-            if (pt == ProcessType::Master || pt == ProcessType::Single) && !globals(|g| g.new_binary != 0) && !ls.inherited.get() {
+            if (pt == ProcessType::Master || pt == ProcessType::Single)
+                && !globals(|g| g.new_binary != 0)
+                && (!ls.inherited.get() || os::getppid() != crate::process::parent_pid())
+            {
                 if let Err(e) = os::unlink(path) {
                     ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(e), "unlink() {} failed", B(path));
                 }
@@ -1371,5 +1513,199 @@ pub fn init_hooks() -> InitHooks {
         configure_listening_sockets,
         init_zone_pool: crate::slab::init_zone_pool,
         cmp_sockaddr: cmp_listening,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::os::unix::io::IntoRawFd;
+
+    fn capture() -> (Log, Rc<RefCell<Vec<u8>>>) {
+        let logged: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let lg = logged.clone();
+        let chain = LogChain::new();
+        chain.insert(LogEntry::new(NGX_LOG_INFO, LogWriter::Custom(Rc::new(move |_, line: &[u8]| lg.borrow_mut().extend_from_slice(line)))));
+        (Log::new(chain), logged)
+    }
+
+    fn logged(l: &RefCell<Vec<u8>>) -> String {
+        String::from_utf8_lossy(&l.borrow()).into_owned()
+    }
+
+    /// the listening entries of ngx_add_inherited_sockets
+    fn inherited_cycle(log: &Log, fds: &[RawFd]) -> Cycle {
+        let mut cycle = Cycle::init_cycle(log.clone(), Rc::new(Vec::new()));
+        for &fd in fds {
+            let mut ls = Listening::new(SockAddr::v4(Ipv4Addr::UNSPECIFIED, 0), log.clone());
+            ls.addr_text = Vec::new();
+            ls.fd.set(fd);
+            ls.inherited.set(true);
+            cycle.listening.push(Rc::new(ls));
+        }
+        cycle
+    }
+
+    fn tcp_socket(protocol: i32, reuseport: bool, defer: bool) -> Option<RawFd> {
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, protocol) };
+        if s == -1 {
+            return None;
+        }
+        if reuseport {
+            setsockopt_int(s, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1).unwrap();
+        }
+        if defer {
+            setsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1).unwrap();
+        }
+        let (ss, len) = SockAddr::v4(Ipv4Addr::LOCALHOST, 0).to_libc();
+        assert_eq!(unsafe { libc::bind(s, &ss as *const _ as *const libc::sockaddr, len) }, 0);
+        assert_eq!(unsafe { libc::listen(s, 16) }, 0);
+        Some(s)
+    }
+
+    fn local_port(fd: RawFd) -> u16 {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        assert_eq!(unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) }, 0);
+        SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len).unwrap().port()
+    }
+
+    #[test]
+    fn inherited_unix_socket() {
+        let path = std::env::temp_dir().join(format!("ngx-inherited-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let fd = std::os::unix::net::UnixListener::bind(&path).unwrap().into_raw_fd();
+        let name = path.to_str().unwrap().as_bytes().to_vec();
+
+        let (log, l) = capture();
+        let mut cycle = inherited_cycle(&log, &[fd]);
+        assert!(set_inherited_sockets(&mut cycle).is_ok());
+
+        // no SO_REUSEPORT, SO_PROTOCOL, TCP_FASTOPEN or TCP_DEFER_ACCEPT messages
+        assert_eq!(logged(&l), "");
+
+        let ls = &cycle.listening[0];
+        assert!(!ls.ignore.get());
+        assert!(ls.inherited.get());
+        assert_eq!(ls.fd.get(), fd);
+        assert_eq!(ls.sockaddr, SockAddr::Unix(name.clone()));
+        assert_eq!(ls.addr_text, [b"unix:".as_slice(), &name].concat());
+        assert_eq!(ls.ty, libc::SOCK_STREAM);
+        assert_eq!(ls.backlog.get(), crate::listening::NGX_LISTEN_BACKLOG);
+        assert!(ls.rcvbuf.get() > 0 && ls.sndbuf.get() > 0);
+        assert!(!ls.reuseport.get());
+        assert_eq!(ls.protocol.get(), 0);
+        assert_eq!(ls.fastopen.get(), -1);
+        assert!(!ls.deferred_accept.get());
+
+        // matches the "listen unix:" of a new configuration as is
+        let nls = Listening::new(SockAddr::Unix(name), log.clone());
+        assert!(cmp_listening(&nls, ls));
+        assert_eq!(nls.protocol.get(), ls.protocol.get());
+        assert!(!(nls.reuseport.get() && !ls.reuseport.get()));
+        assert_eq!(nls.backlog.get(), ls.backlog.get());
+
+        os::close(fd);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inherited_tcp_sockets() {
+        let plain = tcp_socket(0, false, false).unwrap();
+        let reuseport = tcp_socket(0, true, true).unwrap();
+
+        let (log, l) = capture();
+        let mut cycle = inherited_cycle(&log, &[plain, reuseport]);
+        assert!(set_inherited_sockets(&mut cycle).is_ok());
+        assert_eq!(logged(&l), "");
+
+        let ls = &cycle.listening[0];
+        assert!(!ls.ignore.get());
+        assert_eq!(ls.sockaddr, SockAddr::v4(Ipv4Addr::LOCALHOST, local_port(plain)));
+        assert_eq!(ls.addr_text, format!("127.0.0.1:{}", local_port(plain)).into_bytes());
+        assert_eq!(ls.ty, libc::SOCK_STREAM);
+        assert!(!ls.reuseport.get());
+        // IPPROTO_TCP is 0
+        assert_eq!(ls.protocol.get(), 0);
+        assert!(ls.fastopen.get() >= 0);
+        assert!(!ls.deferred_accept.get());
+
+        let ls = &cycle.listening[1];
+        assert!(!ls.ignore.get());
+        assert!(ls.reuseport.get());
+        assert_eq!(ls.protocol.get(), 0);
+        assert!(ls.deferred_accept.get());
+
+        os::close(plain);
+        os::close(reuseport);
+    }
+
+    #[test]
+    fn inherited_mptcp_socket() {
+        // not every kernel has MPTCP
+        let fd = match tcp_socket(libc::IPPROTO_MPTCP, false, false) {
+            Some(fd) => fd,
+            None => return,
+        };
+
+        let (log, _l) = capture();
+        let mut cycle = inherited_cycle(&log, &[fd]);
+        assert!(set_inherited_sockets(&mut cycle).is_ok());
+        assert_eq!(cycle.listening[0].protocol.get(), libc::IPPROTO_MPTCP);
+
+        os::close(fd);
+    }
+
+    #[test]
+    fn inherited_udp_socket() {
+        let fd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_fd();
+
+        let (log, l) = capture();
+        let mut cycle = inherited_cycle(&log, &[fd]);
+        assert!(set_inherited_sockets(&mut cycle).is_ok());
+        assert_eq!(logged(&l), "");
+
+        let ls = &cycle.listening[0];
+        assert!(!ls.ignore.get());
+        assert_eq!(ls.ty, libc::SOCK_DGRAM);
+        assert_eq!(ls.addr_text, format!("127.0.0.1:{}", local_port(fd)).into_bytes());
+        // not read for a datagram socket
+        assert_eq!(ls.fastopen.get(), -1);
+        assert!(!ls.deferred_accept.get());
+
+        os::close(fd);
+    }
+
+    #[test]
+    fn inherited_not_listening_sockets() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let netlink = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+        assert!(netlink != -1);
+        let tcp = tcp_socket(0, false, false).unwrap();
+
+        let (log, l) = capture();
+        let mut cycle = inherited_cycle(&log, &[pipe[0], netlink, tcp]);
+        assert!(set_inherited_sockets(&mut cycle).is_ok());
+
+        let text = logged(&l);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", text);
+        assert!(lines[0].contains("[crit] ") && lines[0].contains(&format!("getsockname() of the inherited socket #{} failed (88: Socket operation on non-socket)", pipe[0])), "{}", text);
+        assert!(lines[1].contains("[crit] ") && lines[1].contains(&format!("the inherited socket #{} has an unsupported protocol family", netlink)), "{}", text);
+
+        assert!(cycle.listening[0].ignore.get());
+        assert!(cycle.listening[1].ignore.get());
+        assert!(!cycle.listening[2].ignore.get());
+
+        // the socket still gets closed with the old cycle
+        assert_eq!(cycle.listening[1].fd.get(), netlink);
+        assert!(cycle.listening[1].addr_text.is_empty());
+
+        os::close(pipe[0]);
+        os::close(pipe[1]);
+        os::close(netlink);
+        os::close(tcp);
     }
 }

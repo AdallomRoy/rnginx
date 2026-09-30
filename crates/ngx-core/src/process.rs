@@ -55,7 +55,6 @@ thread_local! {
     pub static PROCESS_SLOT: Cell<usize> = const { Cell::new(0) };
     pub static CHANNEL: Cell<i32> = const { Cell::new(-1) };
     static ARGV: RefCell<Vec<CString>> = RefCell::new(Vec::new());
-    static PARENT: Cell<i32> = const { Cell::new(0) };
 }
 
 // --- signal flags (set from the async-signal handler) ---
@@ -183,6 +182,7 @@ extern "C" fn signal_handler(signo: libc::c_int, info: *mut libc::siginfo_t, _ct
     unsafe { *libc::__errno_location() = saved };
 }
 
+/// ngx_parent
 static PARENT_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Log queued "signal received" notices (called outside the handler).
@@ -443,7 +443,7 @@ pub fn spawn_process(cycle: &Rc<Cycle>, proc_fn: ProcFn, data: i64, name: &'stat
             return -1;
         }
         0 => {
-            PARENT.with(|p| p.set(os::getppid()));
+            PARENT_PID.store(os::getppid(), Ordering::Relaxed);
             update_pid();
             proc_fn(cycle.clone(), data);
         }
@@ -857,6 +857,8 @@ pub fn single_process_cycle(cycle: Rc<Cycle>) -> ! {
 
 /// ngx_exec_new_binary: start a new binary with inherited listening sockets.
 pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
+    let mut env = environment(cycle);
+
     let mut var = b"NGINX=".to_vec();
     for ls in cycle.listening.iter() {
         if ls.ignore.get() || ls.fd.get() == -1 {
@@ -864,6 +866,19 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
         }
         var.extend_from_slice(format!("{};", ls.fd.get()).as_bytes());
     }
+
+    env.push(var);
+
+    // NGX_SETPROCTITLE_USES_ENV: allocate the spare 300 bytes for the new
+    // binary process title
+    let mut spare = b"SPARE=".to_vec();
+    spare.resize(300, b'X');
+    env.push(spare);
+
+    for e in &env {
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "env: {}", B(e));
+    }
+
     let ccf = core_conf(cycle);
     let (pid, oldpid) = {
         let c = ccf.borrow();
@@ -883,6 +898,7 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
             }
         }
     }
+    PENDING_EXEC_ENV.with(|e| *e.borrow_mut() = Some(env));
     let child = spawn_process(cycle, exec_proc_stub, 0, "new binary process", NGX_PROCESS_DETACHED);
     if child == -1 {
         if let Err(e) = std::fs::rename(os::path(&oldpid), os::path(&pid)) {
@@ -900,28 +916,15 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
 }
 
 thread_local! {
-    static PENDING_EXEC_ENV: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// ctx.envp of the new binary process
+    static PENDING_EXEC_ENV: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) };
 }
 
+/// ngx_execute_proc
 fn exec_proc_stub(cycle: Rc<Cycle>, _data: i64) -> ! {
-    // in the child: exec the same binary with NGINX env
-    let mut var = b"NGINX=".to_vec();
-    for ls in cycle.listening.iter() {
-        if ls.ignore.get() || ls.fd.get() == -1 {
-            continue;
-        }
-        var.extend_from_slice(format!("{};", ls.fd.get()).as_bytes());
-    }
     let args = argv();
     let argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    let mut envs: Vec<CString> = std::env::vars_os().map(|(k, v)| {
-        use std::os::unix::ffi::OsStrExt;
-        let mut s = k.as_bytes().to_vec();
-        s.push(b'=');
-        s.extend_from_slice(v.as_bytes());
-        CString::new(s).unwrap()
-    }).filter(|c| !c.as_bytes().starts_with(b"NGINX=")).collect();
-    envs.push(CString::new(var).unwrap());
+    let envs: Vec<CString> = PENDING_EXEC_ENV.with(|e| e.borrow().iter().flatten().map(|v| os::cstr(v)).collect());
     let env_ptrs: Vec<*const libc::c_char> = envs.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
     unsafe {
         libc::execve(args[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
@@ -932,6 +935,7 @@ fn exec_proc_stub(cycle: Rc<Cycle>, _data: i64) -> ! {
 
 /// ngx_daemon
 pub fn daemon(log: &Log) -> Result<(), ()> {
+    let pid = os::getpid();
     match unsafe { libc::fork() } {
         -1 => {
             ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "fork() failed");
@@ -941,7 +945,8 @@ pub fn daemon(log: &Log) -> Result<(), ()> {
         _ => std::process::exit(0),
     }
     update_pid();
-    PARENT.with(|p| p.set(os::getppid()));
+    // ngx_parent = ngx_pid
+    PARENT_PID.store(pid, Ordering::Relaxed);
     if unsafe { libc::setsid() } == -1 {
         ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "setsid() failed");
         return Err(());
@@ -966,6 +971,35 @@ pub fn daemon(log: &Log) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+/// ngx_set_environment(cycle, &last): the variables of the "env" directives
+/// and TZ as "NAME=value", the environment is not changed.
+fn environment(cycle: &Rc<Cycle>) -> Vec<Vec<u8>> {
+    let ccf = core_conf(cycle);
+    let mut vars = ccf.borrow().env.clone();
+
+    if !vars.iter().any(|(name, _)| name == b"TZ") {
+        vars.push((b"TZ".to_vec(), None));
+    }
+
+    let mut env = Vec::new();
+
+    for (name, full) in vars {
+        match full {
+            Some(f) => env.push(f),
+            None => {
+                if let Some(v) = std::env::var_os(std::ffi::OsStr::from_bytes(&name)) {
+                    let mut var = name;
+                    var.push(b'=');
+                    var.extend_from_slice(v.as_bytes());
+                    env.push(var);
+                }
+            }
+        }
+    }
+
+    env
 }
 
 /// ngx_set_environment: restrict the environment to "env" directives (+TZ).
@@ -1084,61 +1118,178 @@ pub fn setproctitle(title: &[u8]) {
     }
 }
 
-/// ngx_add_inherited_sockets: parse NGINX env var listing inherited listening fds.
+/// ngx_add_inherited_sockets: the listening sockets passed by
+/// ngx_exec_new_binary in the NGINX environment variable.
 pub fn add_inherited_sockets(cycle: &mut Cycle) -> Result<(), ()> {
     let inherited = match std::env::var_os("NGINX") {
         Some(v) => v.as_bytes().to_vec(),
         None => return Ok(()),
     };
+
     ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "using inherited sockets from \"{}\"", B(&inherited));
-    let mut v: i64 = 0;
-    let mut digits = false;
-    for &c in &inherited {
-        if c.is_ascii_digit() {
-            v = v * 10 + (c - b'0') as i64;
-            digits = true;
-            continue;
-        }
-        if c == b';' && digits {
-            let fd = v as i32;
-            v = 0;
-            digits = false;
-            // fetch sockaddr for the fd
-            let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            if unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) } == -1 {
-                ngx_log_error!(NGX_LOG_CRIT, cycle.log, Some(os::errno()), "getsockname() of the inherited socket #{} failed", fd);
-                continue;
-            }
-            let sa = match crate::inet::SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len) {
-                Some(s) => s,
-                None => continue,
-            };
-            let ls = crate::listening::Listening::new(sa, cycle.log.clone());
-            ls.fd.set(fd);
-            ls.inherited.set(true);
-            ls.listen.set(true);
-            let mut ty: libc::c_int = 0;
-            let mut olen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            unsafe {
-                libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut ty as *mut _ as *mut libc::c_void, &mut olen);
-            }
-            let mut ls = ls;
-            ls.ty = ty;
-            cycle.listening.push(Rc::new(ls));
-            globals_mut(|g| g.inherited = true);
-        } else {
-            ngx_log_error!(NGX_LOG_EMERG, cycle.log, None, "invalid socket number \"{}\" in NGINX environment variable, ignoring the rest of the variable", B(&inherited));
-            break;
-        }
+
+    for s in inherited_sockets(&inherited, &cycle.log) {
+        // the address is set by ngx_set_inherited_sockets
+        let mut ls = crate::listening::Listening::new(crate::inet::SockAddr::v4(std::net::Ipv4Addr::UNSPECIFIED, 0), cycle.log.clone());
+        ls.addr_text = Vec::new();
+        ls.fd.set(s);
+        ls.inherited.set(true);
+        cycle.listening.push(Rc::new(ls));
     }
-    if digits {
-        ngx_log_error!(NGX_LOG_EMERG, cycle.log, None, "invalid socket number \"{}\" in NGINX environment variable, ignoring", B(&inherited));
-    }
-    Ok(())
+
+    globals_mut(|g| g.inherited = true);
+
+    crate::connection::set_inherited_sockets(cycle)
 }
 
-/// Close inherited/unneeded listening sockets in a helper process etc.
+/// The socket numbers of the NGINX variable, as the ngx_add_inherited_sockets
+/// loop parses them.
+fn inherited_sockets(inherited: &[u8], log: &Log) -> Vec<i32> {
+    let mut fds = Vec::new();
+    let mut v = 0;
+    let mut p = 0;
+
+    while p < inherited.len() {
+        if inherited[p] == b':' || inherited[p] == b';' {
+            let s = match crate::string::atoi(&inherited[v..p]) {
+                Some(s) => s,
+                None => {
+                    ngx_log_error!(NGX_LOG_EMERG, log, None, "invalid socket number \"{}\" in NGINX environment variable, ignoring the rest of the variable", B(&inherited[v..]));
+                    break;
+                }
+            };
+
+            v = p + 1;
+
+            fds.push(s as i32);
+        }
+
+        p += 1;
+    }
+
+    if v != p {
+        ngx_log_error!(NGX_LOG_EMERG, log, None, "invalid socket number \"{}\" in NGINX environment variable, ignoring", B(&inherited[v..]));
+    }
+
+    fds
+}
+
+/// ngx_parent
 pub fn parent_pid() -> i32 {
-    PARENT.with(|p| p.get())
+    PARENT_PID.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inet::SockAddr;
+    use crate::listening::Listening;
+    use std::os::unix::io::IntoRawFd;
+
+    fn capture() -> (Log, Rc<RefCell<Vec<u8>>>) {
+        let logged: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let lg = logged.clone();
+        let chain = LogChain::new();
+        chain.insert(LogEntry::new(NGX_LOG_INFO, LogWriter::Custom(Rc::new(move |_, line: &[u8]| lg.borrow_mut().extend_from_slice(line)))));
+        (Log::new(chain), logged)
+    }
+
+    /// the messages without the time and pid
+    fn messages(l: &RefCell<Vec<u8>>) -> Vec<String> {
+        String::from_utf8_lossy(&l.borrow())
+            .lines()
+            .map(|line| {
+                let level = &line[line.find(" [").unwrap() + 1..];
+                let (level, rest) = level.split_at(level.find(' ').unwrap());
+                format!("{} {}", level, &rest[rest.find(": ").unwrap() + 2..])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nginx_variable() {
+        let invalid = "in NGINX environment variable";
+        let cases: Vec<(&str, Vec<i32>, Vec<String>)> = vec![
+            ("", vec![], vec![]),
+            ("6;", vec![6], vec![]),
+            ("6;7:8;", vec![6, 7, 8], vec![]),
+            ("6;7", vec![6], vec![format!("[emerg] invalid socket number \"7\" {}, ignoring", invalid)]),
+            (";", vec![], vec![format!("[emerg] invalid socket number \";\" {}, ignoring the rest of the variable", invalid)]),
+            (
+                "6;x;7;",
+                vec![6],
+                vec![
+                    format!("[emerg] invalid socket number \"x;7;\" {}, ignoring the rest of the variable", invalid),
+                    format!("[emerg] invalid socket number \"x;7;\" {}, ignoring", invalid),
+                ],
+            ),
+            (
+                "0x5;",
+                vec![],
+                vec![
+                    format!("[emerg] invalid socket number \"0x5;\" {}, ignoring the rest of the variable", invalid),
+                    format!("[emerg] invalid socket number \"0x5;\" {}, ignoring", invalid),
+                ],
+            ),
+        ];
+
+        for (var, fds, msgs) in cases {
+            let (log, l) = capture();
+            assert_eq!(inherited_sockets(var.as_bytes(), &log), fds, "{:?}", var);
+            assert_eq!(messages(&l), msgs, "{:?}", var);
+        }
+    }
+
+    /// ngx_close_listening_sockets deletes a unix socket file only in the
+    /// master (or single) process, unless a new binary uses it: the one it
+    /// has started, or the old binary it has inherited it from and which is
+    /// still running.
+    #[test]
+    fn unix_socket_file_on_close() {
+        let path = std::env::temp_dir().join(format!("ngx-close-listening-{}.sock", std::process::id()));
+        let name = path.to_str().unwrap().as_bytes().to_vec();
+        let ppid = os::getppid();
+
+        let cases = [
+            // process, new binary, inherited, ngx_parent, deleted
+            (ProcessType::Master, 0, false, ppid, true),
+            (ProcessType::Single, 0, false, ppid, true),
+            (ProcessType::Worker, 0, false, ppid, false),
+            (ProcessType::Helper, 0, false, ppid, false),
+            (ProcessType::Master, 1234, false, ppid, false),
+            (ProcessType::Master, 0, true, ppid, false),
+            (ProcessType::Master, 0, true, ppid + 1, true),
+            (ProcessType::Master, 1234, true, ppid + 1, false),
+        ];
+
+        for (process, new_binary, inherited, parent, deleted) in cases {
+            let _ = std::fs::remove_file(&path);
+            let fd = std::os::unix::net::UnixListener::bind(&path).unwrap().into_raw_fd();
+
+            let (log, _l) = capture();
+            let mut cycle = Cycle::init_cycle(log.clone(), Rc::new(Vec::new()));
+            let ls = Listening::new(SockAddr::Unix(name.clone()), log.clone());
+            ls.fd.set(fd);
+            ls.inherited.set(inherited);
+            cycle.listening.push(Rc::new(ls));
+
+            globals_mut(|g| {
+                g.process = process;
+                g.new_binary = new_binary;
+            });
+            PARENT_PID.store(parent, Ordering::Relaxed);
+
+            crate::connection::close_listening_sockets(&cycle);
+
+            assert_eq!(cycle.listening[0].fd.get(), -1);
+            assert_eq!(!path.exists(), deleted, "{:?} {} {} {}", process, new_binary, inherited, parent);
+        }
+
+        globals_mut(|g| {
+            g.process = ProcessType::Single;
+            g.new_binary = 0;
+        });
+        PARENT_PID.store(0, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&path);
+    }
 }

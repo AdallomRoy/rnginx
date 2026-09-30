@@ -622,7 +622,7 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
                 if (hooks.cmp_sockaddr)(nls, ls) {
                     nls.fd.set(ls.fd.get());
                     *nls.previous.borrow_mut() = Some(ls.clone());
-                    if *ls.protocol.borrow() != *nls.protocol.borrow() {
+                    if ls.protocol.get() != nls.protocol.get() {
                         nls.change_protocol.set(true);
                     } else {
                         nls.inherited.set(ls.inherited.get());

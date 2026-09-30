@@ -8,6 +8,9 @@ use std::rc::Rc;
 use crate::inet::SockAddr;
 use crate::log::Log;
 
+/// NGX_LISTEN_BACKLOG (ngx_linux_config.h)
+pub const NGX_LISTEN_BACKLOG: i32 = 511;
+
 pub struct Listening {
     pub fd: Cell<RawFd>,
     pub sockaddr: SockAddr,
@@ -48,8 +51,8 @@ pub struct Listening {
     pub delete_deferred: Cell<bool>,
     pub add_deferred: Cell<bool>,
     pub fastopen: Cell<i32>,
-    /// protocol identifier (e.g. "http", "stream", "mail", "quic") used to detect changes on reload
-    pub protocol: RefCell<&'static str>,
+    /// the socket protocol (ls->protocol): 0 or IPPROTO_MPTCP
+    pub protocol: Cell<i32>,
     pub change_protocol: Cell<bool>,
 }
 
@@ -61,7 +64,7 @@ impl Listening {
             addr_text,
             ty: libc::SOCK_STREAM,
             sockaddr,
-            backlog: Cell::new(511),
+            backlog: Cell::new(NGX_LISTEN_BACKLOG),
             rcvbuf: Cell::new(-1),
             sndbuf: Cell::new(-1),
             keepidle: Cell::new(0),
@@ -93,7 +96,7 @@ impl Listening {
             delete_deferred: Cell::new(false),
             add_deferred: Cell::new(false),
             fastopen: Cell::new(-1),
-            protocol: RefCell::new(""),
+            protocol: Cell::new(0),
             change_protocol: Cell::new(false),
         }
     }
@@ -143,7 +146,7 @@ impl Listening {
             delete_deferred: Cell::new(false),
             add_deferred: Cell::new(false),
             fastopen: Cell::new(self.fastopen.get()),
-            protocol: RefCell::new(*self.protocol.borrow()),
+            protocol: Cell::new(self.protocol.get()),
             change_protocol: Cell::new(false),
         }
     }
