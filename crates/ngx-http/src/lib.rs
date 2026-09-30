@@ -92,6 +92,7 @@ pub mod secure_link;
 pub mod geoip;
 pub mod uwsgi;
 pub mod slice;
+pub mod scgi;
 
 pub use request::{Request, R};
 
@@ -607,7 +608,7 @@ pub fn modules() -> Vec<ModuleDef> {
         proxy::proxy_module(),
         fastcgi::fastcgi_module(),
         uwsgi::uwsgi_module(),
-        stubs::scgi_module(),
+        scgi::scgi_module(),
         stubs::grpc_module(),
         stubs::proxy_v2_module(),
         stubs::tunnel_module(),
