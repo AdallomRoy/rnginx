@@ -333,7 +333,8 @@ pub fn create_temp_file(
     // (matching ngx_next_temp_number(1)), bump the counter by a pseudo-random
     // stride so retries don't just re-collide on the next slot.
     let mode = if access == 0 { 0o600 } else { access };
-    let mut num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // ngx_next_temp_number(0): the first file is 0000000001
+    let mut num = stats.temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     loop {
         let key_str = format!("{:010}", num);
         let filename = path.hashed_filename(key_str.as_bytes());

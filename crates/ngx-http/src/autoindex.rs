@@ -3,7 +3,6 @@
 
 use std::any::Any;
 use std::cmp::Ordering;
-use std::ffi::CStr;
 use std::rc::Rc;
 
 use ngx_core::buf::{Buf, Chain};
@@ -14,6 +13,7 @@ use ngx_core::rc::*;
 use ngx_core::string::{escape_html_into, escape_json_into, escape_uri_count, escape_uri_into, utf8_cpystrn, utf8_length, B, NGX_ESCAPE_URI_COMPONENT};
 use ngx_core::times::{gmtime, http_time, MONTHS};
 use ngx_core::ngx_log_error;
+use ngx_core::os::Dir;
 
 use crate::*;
 
@@ -101,66 +101,6 @@ fn autoindex_format_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn An
 fn init(cf: &mut Conf) -> ConfResult {
     crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(autoindex_handler(r))));
     Ok(())
-}
-
-/// ngx_dir_t: opendir()/readdir()/closedir() as ngx_open_dir, ngx_read_dir
-/// and ngx_close_dir use them
-struct Dir {
-    dir: *mut libc::DIR,
-}
-
-impl Dir {
-    fn open(name: &[u8]) -> Result<Dir, i32> {
-        let c = ngx_core::os::cstr(name);
-
-        // SAFETY: c is a NUL-terminated string that outlives the call
-        let dir = unsafe { libc::opendir(c.as_ptr()) };
-
-        if dir.is_null() {
-            return Err(ngx_core::os::errno());
-        }
-
-        Ok(Dir { dir })
-    }
-
-    /// The next entry name; Err(errno) when readdir() returns NULL, the
-    /// errno being 0 (NGX_ENOMOREFILES) at the end of the directory
-    fn read(&mut self) -> Result<Vec<u8>, i32> {
-        // SAFETY: errno is thread-local; self.dir is an open DIR stream
-        // (set to NULL only by close(), which consumes self), and the
-        // dirent returned stays valid until the next readdir() on it
-        unsafe {
-            *libc::__errno_location() = 0;
-
-            let de = libc::readdir(self.dir);
-
-            if de.is_null() {
-                return Err(ngx_core::os::errno());
-            }
-
-            Ok(CStr::from_ptr((*de).d_name.as_ptr()).to_bytes().to_vec())
-        }
-    }
-
-    fn close(mut self) -> Result<(), i32> {
-        let dir = std::mem::replace(&mut self.dir, std::ptr::null_mut());
-
-        // SAFETY: dir is the open stream, closed exactly once
-        if unsafe { libc::closedir(dir) } == -1 {
-            return Err(ngx_core::os::errno());
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        if !self.dir.is_null() {
-            // SAFETY: the stream was not closed (close() nulls the pointer)
-            unsafe { libc::closedir(self.dir) };
-        }
-    }
 }
 
 fn close_dir(r: &R, dir: Dir, path: &[u8]) {
