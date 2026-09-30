@@ -417,6 +417,9 @@ pub struct H2Connection {
     // Async driver state (C keeps these in the connection's events).
     /// Stream tasks queued output (the connection's write event).
     pub out_notify: tokio::sync::Notify,
+    /// Streams were woken because their frames went out (h2c->posted):
+    /// their write handlers run before the connection reads on.
+    pub streams_posted: Cell<bool>,
     /// Effects of the frame just parsed that C runs inline; the driver runs
     /// them before parsing the next frame.
     pub posted: RefCell<VecDeque<Posted>>,

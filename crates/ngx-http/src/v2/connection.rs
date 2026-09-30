@@ -141,6 +141,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         blocked: Cell::new(false),
         goaway: Cell::new(false),
         out_notify: tokio::sync::Notify::new(),
+        streams_posted: Cell::new(false),
         posted: RefCell::new(VecDeque::new()),
         posted_reads: RefCell::new(Vec::new()),
         finalized: Cell::new(false),
@@ -217,6 +218,13 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
         }
 
         fill_wbuf(h2c, d);
+
+        // the streams whose frames went out run their write handlers
+        // (h2c->posted) before the connection reads on
+        if h2c.streams_posted.replace(false) {
+            tokio::task::yield_now().await;
+            continue;
+        }
 
         let used = h2c.state.buffer_used.get();
         let available = rbuf.len() - NGX_HTTP_V2_STATE_BUFFER_SIZE;

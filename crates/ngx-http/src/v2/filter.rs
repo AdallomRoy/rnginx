@@ -924,7 +924,7 @@ fn handle_frame(stream: &Rc<H2Stream>, frame: &OutFrame) {
 }
 
 /// ngx_http_v2_handle_stream: post the stream's write event.
-fn handle_stream(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
+fn handle_stream(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
     if stream.waiting.get() || stream.blocked.get() {
         return;
     }
@@ -934,6 +934,8 @@ fn handle_stream(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
     }
 
     stream.notify.notify_one();
+
+    h2c.streams_posted.set(true);
 }
 
 /// ngx_http_v2_filter_cleanup: drop the stream's frames not yet started
