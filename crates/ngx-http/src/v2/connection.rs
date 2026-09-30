@@ -367,9 +367,20 @@ async fn read_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>, us
 
     let n = match res {
         Ok(n) if n > 0 => n,
-        Ok(_) | Err(_) => {
-            if h2c.state.incomplete.get() || h2c.processing.get() > 0 {
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+        res => {
+            match res {
+                Ok(_) => {
+                    if h2c.state.incomplete.get() || h2c.processing.get() > 0 {
+                        ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+                    }
+                }
+                Err(e) => {
+                    // ngx_unix_recv(): ngx_connection_error(); ngx_ssl_recv()
+                    // has logged its error
+                    if !ngx_core::event_openssl::is_ssl_error_logged(&e) {
+                        c.connection_error(e.raw_os_error().unwrap_or(0), "recv() failed");
+                    }
+                }
             }
             c.error.set(true);
             finalize_connection(h2c, 0);

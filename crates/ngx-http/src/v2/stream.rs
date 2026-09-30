@@ -1231,6 +1231,27 @@ pub fn post_drain_waiting(h2c: &Rc<H2Connection>) {
     h2c.posted.borrow_mut().push_back(Posted::DrainWaiting);
 }
 
+/// Let the tasks spawned or woken so far run before this one goes on, as C
+/// runs a stream's request inline, the I/O driver not being polled in
+/// between: tokio::task::yield_now() waits for it to be, which lets the
+/// events of other connections (an upstream connected meanwhile) be handled
+/// before the rest of what was read (the client's close).
+async fn run_queued() {
+    let mut yielded = false;
+
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+
+        yielded = true;
+        cx.waker().wake_by_ref();
+
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Run the effects the last frame posted, in order, letting each woken
 /// stream task run (and queue its output) before the next.
 pub async fn run_posted(h2c: &Rc<H2Connection>) {
@@ -1240,7 +1261,7 @@ pub async fn run_posted(h2c: &Rc<H2Connection>) {
         match ev {
             None => return,
 
-            Some(Posted::Run) => tokio::task::yield_now().await,
+            Some(Posted::Run) => run_queued().await,
 
             Some(Posted::Write(stream)) => {
                 if !stream.closed.get() {
@@ -1270,3 +1291,27 @@ pub async fn run_posted(h2c: &Rc<H2Connection>) {
 
 #[allow(dead_code)]
 fn _core_srv(_: &CoreSrvConf) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_queued() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async {
+            let ran = Rc::new(std::cell::Cell::new(false));
+            let r = ran.clone();
+
+            // a stream task spawned by a state handler runs before the
+            // driver goes on
+            tokio::task::spawn_local(async move { r.set(true) });
+            assert!(!ran.get());
+
+            run_queued().await;
+            assert!(ran.get());
+        });
+    }
+}
