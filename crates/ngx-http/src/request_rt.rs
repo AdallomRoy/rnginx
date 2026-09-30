@@ -1252,14 +1252,18 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         ngx_core::event_openssl::ngx_ssl_free_buffer(&c);
     }
     c.log.set_action(Some("keepalive"));
-    if c.tcp_nopush.get() == TcpNopush::Set {
+    let tcp_nodelay = if c.tcp_nopush.get() == TcpNopush::Set {
         if let Err(e) = c.tcp_push_off() {
-            ngx_log_error!(NGX_LOG_CRIT, c.log, e.raw_os_error(), "tcp_push failed");
+            c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(!TCP_CORK) failed");
             return Err(());
         }
         c.tcp_nopush.set(TcpNopush::Unset);
-    }
-    if *clcf.borrow().tcp_nodelay && !c.set_tcp_nodelay() {
+        // ngx_tcp_nodelay_and_tcp_nopush is 0 on Linux
+        false
+    } else {
+        true
+    };
+    if tcp_nodelay && *clcf.borrow().tcp_nodelay && !c.set_tcp_nodelay() {
         return Err(());
     }
     let (min_to, ka_to) = {

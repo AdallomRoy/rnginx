@@ -24,7 +24,7 @@ use tokio::time::Instant;
 
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::{Bufs, PathConf};
-use ngx_core::connection::NGX_ERROR_ERR;
+use ngx_core::connection::{TcpNopush, NGX_ERROR_ERR};
 use ngx_core::event_connect::{event_connect_peer, LocalAddr, PeerConnect, PeerSocket};
 use ngx_core::hash::{hash_key, Hash};
 use ngx_core::inet::{SockAddr, Url};
@@ -855,6 +855,29 @@ fn sock_conn(sock: &UpstreamSock) -> Option<&Rc<ngx_core::connection::Connection
     }
 }
 
+/// ngx_tcp_push of ngx_http_upstream_send_request once what there was to
+/// send went out (c->write->ready): the TCP_CORK set for a header before a
+/// file is removed. Err: NGX_HTTP_INTERNAL_SERVER_ERROR.
+fn tcp_push(u: &Upstream) -> Result<(), ()> {
+    let c = match u.sock.as_ref().and_then(sock_conn) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    if c.tcp_nopush.get() != TcpNopush::Set {
+        return Ok(());
+    }
+
+    if let Err(e) = c.tcp_push_off() {
+        ngx_log_error!(NGX_LOG_CRIT, c.log, e.raw_os_error(), "setsockopt(!TCP_CORK) failed");
+        return Err(());
+    }
+
+    c.tcp_nopush.set(TcpNopush::Unset);
+
+    Ok(())
+}
+
 /// ngx_event_connect_peer to the chosen peer, the connect timer
 /// (u->conf->connect_timeout) and, on the connection,
 /// ngx_http_upstream_ssl_init_connection, or the ngx_http_upstream_test_connect
@@ -1328,6 +1351,14 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
 
     u.sock = Some(sock);
 
+    // no TCP_CORK on the upstream connection if the client's has none
+    // (tcp_nopush off)
+    if r.connection.tcp_nopush.get() == TcpNopush::Disabled {
+        if let Some(c) = u.sock.as_ref().and_then(sock_conn) {
+            c.tcp_nopush.set(TcpNopush::Disabled);
+        }
+    }
+
     // c->requests++
     u.conn_requests += 1;
 
@@ -1460,6 +1491,11 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 
             Some(Ok(_)) => {
                 bytes_sent = total - out.iter().map(|b| b.buf_size()).sum::<i64>();
+
+                if tcp_push(u).is_err() {
+                    return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR));
+                }
+
                 break;
             }
 
@@ -1504,6 +1540,10 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
                     Ok(n) => bytes_sent += n,
                     Err(Some(_)) => return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR)),
                     Err(None) => return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT)),
+                }
+
+                if tcp_push(u).is_err() {
+                    return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR));
                 }
 
                 if !r.reading_body.get() {
