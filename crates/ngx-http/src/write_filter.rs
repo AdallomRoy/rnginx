@@ -182,12 +182,17 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
 
                 // the write event timer; meanwhile the read event handler is
                 // ngx_http_test_reading (ngx_http_set_write_handler)
-                let closed = {
+                let closed = if test_reading_on(&r) {
                     let watch = TestReading::new(&r);
+                    let _stream = StreamTestReading::new(&r);
+
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => None,
                         err = watch.closed() => Some(err),
                     }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    None
                 };
 
                 c.write_delayed.set(false);
@@ -206,14 +211,13 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         }
         let mut out = std::mem::take(&mut *r.out.borrow_mut());
         let before = c.sent.get();
-        let res = if r.stream.borrow().is_some() {
-            // fc->send_chain = ngx_http_v2_send_chain
-            tokio::time::timeout(std::time::Duration::from_millis(send_timeout), crate::v2::filter::send_chain(&r, &mut out, limit)).await
-        } else {
-            tokio::time::timeout(std::time::Duration::from_millis(send_timeout), crate::output::send_chain(&c, &mut out, limit)).await
-        };
+        let sent = send_out(&r, &mut out, limit, send_timeout).await;
         let sent_now = c.sent.get() - before;
         *r.out.borrow_mut() = out;
+        let res = match sent {
+            Sent::Done(res) => res,
+            Sent::Closed(err) => return test_reading_closed(&r, err),
+        };
         match res {
             Err(_) => {
                 ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
@@ -256,6 +260,102 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             continue;
         }
         // partial due to sendfile_max_chunk: keep looping
+    }
+}
+
+/// What c->send_chain() came to.
+enum Sent {
+    Done(Result<std::io::Result<i64>, tokio::time::error::Elapsed>),
+    /// ngx_http_test_reading: the client closed the connection meanwhile,
+    /// with this pending socket error
+    Closed(i32),
+}
+
+/// c->send_chain() within send_timeout. If the write would block, the
+/// request waits for the write event (ngx_http_set_write_handler), with
+/// ngx_http_test_reading as its read event handler if test_reading_on():
+/// the client closing the connection ends the request, before the write
+/// fails, as epoll reports the read event of a connection first.
+async fn send_out(r: &R, out: &mut Chain, limit: i64, send_timeout: u64) -> Sent {
+    let h2 = r.stream.borrow().is_some();
+
+    let chain = async {
+        if h2 {
+            // fc->send_chain = ngx_http_v2_send_chain
+            crate::v2::filter::send_chain(r, out, limit).await
+        } else {
+            crate::output::send_chain(&r.connection, out, limit).await
+        }
+    };
+
+    let send = tokio::time::timeout(std::time::Duration::from_millis(send_timeout), chain);
+    tokio::pin!(send);
+
+    if let Some(res) = poll_once(&mut send).await {
+        return Sent::Done(res);
+    }
+
+    if !test_reading_on(r) {
+        return Sent::Done(send.await);
+    }
+
+    if h2 {
+        let _stream = StreamTestReading::new(r);
+        return Sent::Done(send.await);
+    }
+
+    let watch = TestReading::new(r);
+
+    tokio::select! {
+        biased;
+        err = watch.closed() => Sent::Closed(err),
+        res = &mut send => Sent::Done(res),
+    }
+}
+
+/// The output of the future if it is ready without waiting.
+async fn poll_once<F: std::future::Future + Unpin>(f: &mut F) -> Option<F::Output> {
+    std::future::poll_fn(|cx| match std::pin::Pin::new(&mut *f).poll(cx) {
+        std::task::Poll::Ready(v) => std::task::Poll::Ready(Some(v)),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
+}
+
+/// While its output waits, the read event handler of the request the
+/// connection's events go to (c->data) is ngx_http_test_reading
+/// (ngx_http_set_write_handler), unless it discards the request body
+/// (ngx_http_discarded_request_body_handler), or it is a request of an
+/// upstream, not served from the cache, whose read event handler is
+/// ngx_http_upstream_rd_check_broken_connection (or none).
+fn test_reading_on(r: &R) -> bool {
+    let a = crate::postpone_filter::connection_data(r);
+
+    !a.discard_body.get() && (a.upstream.borrow().is_none() || a.cached.get())
+}
+
+/// r->read_event_handler = ngx_http_test_reading on an HTTP/2 stream, for
+/// as long as it lives: the fake connection's read event runs it (see
+/// crate::v2::stream::terminate_request_now).
+pub(crate) struct StreamTestReading(Option<Rc<crate::v2::H2Stream>>);
+
+impl StreamTestReading {
+    pub(crate) fn new(r: &R) -> StreamTestReading {
+        let stream = crate::v2::stream::request_stream(r);
+
+        if let Some(s) = &stream {
+            *s.test_reading.borrow_mut() = Some(Rc::downgrade(r));
+        }
+
+        StreamTestReading(stream)
+    }
+}
+
+impl Drop for StreamTestReading {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            s.test_reading.borrow_mut().take();
+        }
     }
 }
 
@@ -359,3 +459,25 @@ pub async fn flush(r: &R) -> i64 {
 }
 
 use ngx_core::conf::{Conf, ConfResult};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_poll_once() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        rt.block_on(async {
+            let mut ready = std::pin::pin!(async { 7 });
+            assert_eq!(poll_once(&mut ready).await, Some(7));
+
+            // a write that would block: polled again later
+            let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+            let mut pending = std::pin::pin!(rx);
+            assert!(poll_once(&mut pending).await.is_none());
+            tx.send(3).unwrap();
+            assert_eq!(pending.await.unwrap(), 3);
+        });
+    }
+}

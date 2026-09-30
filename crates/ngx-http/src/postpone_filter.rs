@@ -140,6 +140,15 @@ pub fn is_active(r: &R) -> bool {
     Rc::ptr_eq(&data, &anchor(&st, r))
 }
 
+/// c->data: the request the events of the connection go to, the main
+/// request unless a posted subrequest is.
+pub fn connection_data(r: &R) -> R {
+    match main_state_if_any(r) {
+        Some(st) => st.borrow().data.as_ref().and_then(|w| w.upgrade()).unwrap_or_else(|| r.main()),
+        None => r.main(),
+    }
+}
+
 /// c->data = r
 fn set_data(r: &R) {
     let st = main_state(r);
