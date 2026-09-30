@@ -1479,10 +1479,6 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 /// u->buffer and parsed by u->process_header. The read timer is the one
 /// ngx_http_upstream_send_request armed: the reads do not arm it again.
 async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, deadline: Instant) -> Result<(), Failure> {
-    http_debug!(r, "http upstream process header");
-
-    r.connection.log.set_action(Some("reading response header from upstream"));
-
     // u->buffer: u->conf->buffer_size, from r->cache->header_start
     let header_start = crate::file_cache::cache_of(r).map(|c| c.borrow().header_start).unwrap_or(0);
     let buffer_size = u.conf.buffer_size.saturating_sub(header_start).max(1);
@@ -1490,6 +1486,10 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
     let rc;
 
     if u.conf.ignore_input {
+        http_debug!(r, "http upstream process header");
+
+        r.connection.log.set_action(Some("reading response header from upstream"));
+
         rc = m.process_header(r, u);
     } else {
         let mut chunk = vec![0u8; buffer_size];
@@ -1511,7 +1511,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                 }
             };
 
-            let n = match res {
+            let res = match res {
                 None => {
                     if let Some(rc) = check_broken_connection(r, u, 0) {
                         return Err(Failure::Finalize(rc));
@@ -1522,12 +1522,22 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                     continue;
                 }
 
-                Some(Err(_)) => {
+                Some(res) => res,
+            };
+
+            // ngx_http_upstream_process_header, the read event handler (the
+            // action is "sending request to upstream" until then)
+            http_debug!(r, "http upstream process header");
+
+            r.connection.log.set_action(Some("reading response header from upstream"));
+
+            let n = match res {
+                Err(_) => {
                     // c->read->timedout
                     return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT));
                 }
 
-                Some(Ok(Err(e))) => {
+                Ok(Err(e)) => {
                     if plain(u.sock.as_ref().expect("connection")) {
                         ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
                     }
@@ -1535,12 +1545,12 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                     return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
                 }
 
-                Some(Ok(Ok(0))) => {
+                Ok(Ok(0)) => {
                     ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
                     return Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
                 }
 
-                Some(Ok(Ok(n))) => n,
+                Ok(Ok(n)) => n,
             };
 
             Upstream::with_state(r, |st| st.bytes_received += n as i64);
@@ -2832,11 +2842,16 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
     }
 
     loop {
-        // ngx_event_pipe_write_to_downstream
-        if writer.is_none() && !p.upstream_finished() {
-            if let Some(batch) = p.write_batch() {
-                let slots = crate::event_pipe::batch_slots(&batch);
-                writer = Some((Box::pin(crate::core_rt::output_filter(r, batch)), slots));
+        // ngx_event_pipe_write_to_downstream: what can be written now
+        while writer.is_none() && !p.upstream_finished() {
+            match p.write_batch() {
+                Some(batch) => {
+                    let slots = crate::event_pipe::batch_slots(&batch);
+                    writer = Some((Box::pin(crate::core_rt::output_filter(r, batch)), slots));
+
+                    poll_writer(&mut writer, p);
+                }
+                None => break,
             }
         }
 
@@ -3004,7 +3019,9 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
                         p.read_length += n as i64;
 
-                        if b.full() {
+                        let full = b.full();
+
+                        if full {
                             if m.pipe_input_filter(r, u, p, b) == NGX_ERROR {
                                 return (PipeEnd::Finalize(NGX_ERROR), None);
                             }
@@ -3019,11 +3036,164 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                                 delayed = Some(Instant::now() + Duration::from_millis(delay));
                             }
                         }
+
+                        // the buffer filled, rev->ready stays set: the loop of
+                        // ngx_event_pipe_read_upstream reads on
+                        if full {
+                            poll_writer(&mut writer, p);
+
+                            let downstream_ready = writer.is_none();
+
+                            if read_ready(r, u, m, p, downstream_ready, &mut delayed) == NGX_ERROR {
+                                return (PipeEnd::Finalize(NGX_ERROR), None);
+                            }
+                        }
                     }
                 }
 
                 if let Some(rc) = pipe_after_read(r, u, m, p) {
                     return (PipeEnd::Finalize(rc), None);
+                }
+            }
+        }
+    }
+}
+
+/// p->downstream->write->ready: the output in flight polled once, and if it
+/// is done (the client took it all, or an error), taken as the write event
+/// handler takes it.
+fn poll_writer(writer: &mut Option<PipeWriter<'_>>, p: &mut crate::event_pipe::EventPipe) {
+    use std::future::Future;
+
+    let done = match writer.as_mut() {
+        Some((fut, _)) => {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(rc) => Some(rc),
+                std::task::Poll::Pending => None,
+            }
+        }
+        None => None,
+    };
+
+    if let Some(rc) = done {
+        let (_, slots) = writer.take().expect("writer");
+
+        p.sent(&slots);
+
+        if rc == NGX_ERROR {
+            p.downstream_error = true;
+            p.drain_chains();
+        }
+    }
+}
+
+/// The rest of the loop of ngx_event_pipe_read_upstream while the upstream
+/// stays ready (each read filled its raw buffer): the next reads at once,
+/// into the free raw buffers or a new one, each full buffer to the input
+/// filter, until a read would block (NGX_AGAIN), the upstream is done, or
+/// there is no buffer to read into. The checks after the loop
+/// (pipe_after_read) come after these reads, so the input filter sees what
+/// follows the end of the body (p->length 0) as C's does.
+fn read_ready(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, p: &mut crate::event_pipe::EventPipe, downstream_ready: bool, delayed: &mut Option<Instant>) -> i64 {
+    use std::future::Future;
+
+    loop {
+        if p.upstream_finished() || delayed.is_some() {
+            return NGX_OK;
+        }
+
+        let mut limit = 0usize;
+
+        if p.limit_rate > 0 {
+            let allowed = p.limit_rate as i64 * (ngx_core::times::time() - p.start_sec + 1) - p.read_length;
+
+            if allowed <= 0 {
+                let delay = (-allowed * 1000 / p.limit_rate as i64 + 1) as u64;
+                *delayed = Some(Instant::now() + Duration::from_millis(delay));
+                return NGX_OK;
+            }
+
+            limit = allowed as usize;
+        }
+
+        let mut raw = match p.raw_buf(downstream_ready) {
+            Ok(Some(b)) => b,
+            Ok(None) => return NGX_OK,
+            Err(()) => return NGX_ERROR,
+        };
+
+        let mut room = raw.size.saturating_sub(raw.data.len()).max(1);
+
+        if limit > 0 {
+            room = room.min(limit);
+        }
+
+        let mut rbuf = vec![0u8; room];
+
+        // recv_chain now, without waiting
+        let res = {
+            let sock = u.sock.as_mut().expect("connection");
+            let mut read = std::pin::pin!(sock.read(&mut rbuf));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+            match read.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(res) => Some(res),
+                std::task::Poll::Pending => None,
+            }
+        };
+
+        match res {
+            None => {
+                // NGX_AGAIN
+                p.put_back(raw);
+                return NGX_OK;
+            }
+
+            Some(Err(e)) => {
+                p.put_back(raw);
+
+                if plain(u.sock.as_ref().expect("connection")) {
+                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "readv() failed");
+                }
+
+                p.upstream_error = true;
+                return NGX_OK;
+            }
+
+            Some(Ok(0)) => {
+                p.put_back(raw);
+                p.upstream_eof = true;
+                return NGX_OK;
+            }
+
+            Some(Ok(n)) => {
+                raw.data.extend_from_slice(&rbuf[..n]);
+
+                p.read_length += n as i64;
+
+                let full = raw.full();
+
+                if full {
+                    if m.pipe_input_filter(r, u, p, raw) == NGX_ERROR {
+                        return NGX_ERROR;
+                    }
+                } else {
+                    p.put_back(raw);
+                }
+
+                if p.limit_rate > 0 {
+                    let delay = n as u64 * 1000 / p.limit_rate as u64;
+
+                    if delay > 0 {
+                        *delayed = Some(Instant::now() + Duration::from_millis(delay));
+                    }
+                }
+
+                if !full {
+                    // rev->ready = 0
+                    return NGX_OK;
                 }
             }
         }
