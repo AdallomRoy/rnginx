@@ -139,9 +139,10 @@ pub async fn static_handler(r: R) -> i64 {
     }
     let file = Rc::new(BufFile { fd: of.fd, name: path.clone(), directio: of.is_directio });
     let mut b = Buf::file(file, 0, of.size);
-    b.in_file = true;
+    b.in_file = b.file_last != 0;
     b.last_buf = r.is_main();
     b.last_in_chain = true;
+    b.sync = !(b.last_buf || b.in_file);
     let mut chain = Chain::new();
     chain.push_back(b);
     // keep the file handle alive until the body is sent
