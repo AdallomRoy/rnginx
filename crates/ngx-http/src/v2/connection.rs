@@ -49,12 +49,72 @@ pub struct Driver {
 
 const WBUF_SIZE: usize = 64 * 1024;
 
+/// How many idle receive buffers a worker keeps for reuse.
+const RECV_BUFFERS_KEPT: usize = 8;
+
+thread_local! {
+    /// h2mcf->recv_buffer: in C one buffer of http2_recv_buffer_size per
+    /// worker serves the read handlers of all its HTTP/2 connections, which
+    /// run one at a time; a connection keeps only its partial frame
+    /// (h2c->state.buffer). Here a read handler may wait for the streams it
+    /// starts, so the idle buffers are pooled: a connection holds one only
+    /// while it reads and processes, and none while it waits.
+    static RECV_BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A receive buffer from the worker's pool, back in the pool when dropped.
+struct RecvBuffer(Vec<u8>);
+
+impl RecvBuffer {
+    fn take(size: usize) -> RecvBuffer {
+        let pooled = RECV_BUFFERS.with(|p| {
+            let mut p = p.borrow_mut();
+            while let Some(b) = p.pop() {
+                // a buffer of a previous configuration's size is dropped
+                if b.len() == size {
+                    return Some(b);
+                }
+            }
+            None
+        });
+
+        RecvBuffer(pooled.unwrap_or_else(|| vec![0u8; size]))
+    }
+}
+
+impl Drop for RecvBuffer {
+    fn drop(&mut self) {
+        let b = std::mem::take(&mut self.0);
+
+        RECV_BUFFERS.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < RECV_BUFFERS_KEPT {
+                p.push(b);
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for RecvBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RecvBuffer {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+}
+
 impl Driver {
     fn new() -> Driver {
         Driver {
             mode: Cell::new(Mode::Read),
             write_timer: Cell::new(None),
-            wbuf: RefCell::new(Vec::with_capacity(WBUF_SIZE)),
+            wbuf: RefCell::new(Vec::new()),
             wpos: Cell::new(0),
         }
     }
@@ -170,12 +230,11 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
 
     reusable(&c, false);
 
-    let mut rbuf = vec![0u8; recv_buffer_size];
-
     if !preread.is_empty() {
+        // processed where it is, as C does with c->buffer
         let n = preread.len();
-        rbuf[..n].copy_from_slice(&preread);
-        if !process_batch(&h2c, &mut rbuf, n).await {
+        let mut preread = preread;
+        if !process_batch(&h2c, &mut preread, n).await {
             finish(&h2c, &driver).await;
             return;
         }
@@ -185,12 +244,12 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
     // the first read handler run
     after_read(&h2c, &driver).await;
 
-    run(&h2c, &driver, &mut rbuf).await;
+    run(&h2c, &driver, recv_buffer_size).await;
 }
 
 enum Ev {
     Close,
-    Read(io::Result<usize>),
+    Readable(io::Result<()>),
     Written(io::Result<usize>),
     Queued,
     ReadTimeout,
@@ -198,8 +257,11 @@ enum Ev {
 }
 
 /// The event loop standing in for the read and write handlers.
-async fn run(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
+async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
     let c = h2c.connection.clone();
+
+    // the read is to continue on the write event (ngx_ssl_write_handler)
+    let mut want_write = false;
 
     loop {
         if d.mode.get() == Mode::Close || h2c.finalized.get() && h2c.processing.get() == 0 && d.mode.get() != Mode::Lingering {
@@ -208,31 +270,29 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
         }
 
         if d.mode.get() == Mode::Lingering {
-            lingering_close_handler(h2c, d, rbuf).await;
+            lingering_close_handler(h2c, d).await;
             finish(h2c, d).await;
             return;
         }
 
         fill_wbuf(h2c, d);
 
-        let used = h2c.state.buffer_used.get();
-        let available = rbuf.len() - NGX_HTTP_V2_STATE_BUFFER_SIZE;
         let has_output = d.buffered();
         let read_timer = h2c.read_timer.get();
         let write_timer = d.write_timer.get();
+        let reading = !h2c.finalized.get();
 
-        let ev = {
-            let (_, tail) = rbuf.split_at_mut(used);
-            let rslice = &mut tail[..available];
-            tokio::select! {
-                biased;
-                _ = c.close_notify.notified() => Ev::Close,
-                r = c.recv(rslice), if !h2c.finalized.get() => Ev::Read(r),
-                w = write_output(h2c, d), if has_output => Ev::Written(w),
-                _ = h2c.out_notify.notified(), if !has_output => Ev::Queued,
-                _ = sleep_opt(read_timer), if read_timer.is_some() => Ev::ReadTimeout,
-                _ = sleep_opt(write_timer), if write_timer.is_some() => Ev::WriteTimeout,
-            }
+        // the read event is waited for without a buffer: one is taken from
+        // the worker's pool when there is something to read
+        let ev = tokio::select! {
+            biased;
+            _ = c.close_notify.notified() => Ev::Close,
+            r = c.readable(), if reading => Ev::Readable(r),
+            r = c.writable(), if reading && want_write => Ev::Readable(r),
+            w = write_output(h2c, d), if has_output => Ev::Written(w),
+            _ = h2c.out_notify.notified(), if !has_output => Ev::Queued,
+            _ = sleep_opt(read_timer), if read_timer.is_some() => Ev::ReadTimeout,
+            _ = sleep_opt(write_timer), if write_timer.is_some() => Ev::WriteTimeout,
         };
 
         match ev {
@@ -244,11 +304,12 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
                 on_close_event(h2c, d);
             }
 
-            Ev::Read(res) => {
+            Ev::Readable(r) => {
+                want_write = false;
                 if d.mode.get() == Mode::Idle && !idle_handler(h2c, d) {
                     continue;
                 }
-                read_handler(h2c, d, rbuf, used, res).await;
+                want_write = read_event(h2c, d, recv_buffer_size, r).await;
             }
 
             Ev::Written(res) => {
@@ -354,6 +415,56 @@ fn idle_handler(h2c: &Rc<H2Connection>, d: &Driver) -> bool {
     d.mode.set(Mode::Read);
 
     true
+}
+
+/// ngx_http_v2_read_handler on a read event: what the socket has is read
+/// into a receive buffer from the worker's pool and processed, until a read
+/// finds nothing more (the do-while on rev->ready, which an edge-triggered
+/// event keeps set until EAGAIN). Returns whether the read is to continue
+/// once the socket is writable (an SSL_read() that has to write).
+async fn read_event(h2c: &Rc<H2Connection>, d: &Driver, size: usize, mut r: io::Result<()>) -> bool {
+    let c = h2c.connection.clone();
+
+    let mut rbuf = RecvBuffer::take(size);
+    let available = rbuf.len() - NGX_HTTP_V2_STATE_BUFFER_SIZE;
+    let mut first = true;
+
+    loop {
+        let used = h2c.state.buffer_used.get();
+
+        let res = match std::mem::replace(&mut r, Ok(())) {
+            Ok(()) => c.try_recv(&mut rbuf[used..used + available]),
+            Err(e) => Err(e),
+        };
+
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // NGX_AGAIN
+                let want_write = c.ssl_want_write();
+
+                drop(rbuf);
+
+                if first {
+                    // nothing was read: the tail of the handler alone
+                    h2c.blocked.set(true);
+                    h2c.new_streams.set(0);
+
+                    after_read(h2c, d).await;
+                }
+
+                return want_write;
+            }
+            res => {
+                first = false;
+
+                read_handler(h2c, d, &mut rbuf, used, res).await;
+
+                if d.mode.get() != Mode::Read || h2c.finalized.get() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// ngx_http_v2_read_handler for one completed recv().
@@ -473,6 +584,13 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         d.wpos.set(0);
 
         let mut out = h2c.last_out.borrow_mut();
+
+        // released while the connection is idle; sized to what is queued
+        if wbuf.capacity() == 0 && !out.is_empty() {
+            let queued: usize = out.iter().map(|f| f.data.len() - f.sent).sum();
+            wbuf.reserve_exact(queued.min(WBUF_SIZE));
+        }
+
         while let Some(f) = out.last_mut() {
             let room = WBUF_SIZE.saturating_sub(wbuf.len());
             if room == 0 {
@@ -677,6 +795,12 @@ fn handle_connection(h2c: &Rc<H2Connection>, d: &Driver) {
     h2c.free_frames.set(0);
     h2c.frames.set(0);
 
+    // ngx_destroy_pool(h2c->pool), ngx_ssl_free_buffer(): an idle
+    // connection keeps no output buffers
+    *d.wbuf.borrow_mut() = Vec::new();
+    d.wpos.set(0);
+    ngx_core::event_openssl::ngx_ssl_free_buffer(c);
+
     c.destroyed.set(true);
 
     d.mode.set(Mode::Idle);
@@ -712,7 +836,7 @@ fn lingering_close(h2c: &Rc<H2Connection>, d: &Driver) {
 /// ngx_http_v2_lingering_close + ngx_http_v2_lingering_close_handler: shut
 /// down the write side and drain input until the client closes, the
 /// lingering timeout or lingering time expires, or on shutdown.
-async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>) {
+async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver) {
     let c = h2c.connection.clone();
     let (lingering_time, lingering_timeout) = {
         let cl = clcf(h2c);
@@ -751,6 +875,8 @@ async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut 
     c.close.set(false);
     reusable(&c, true);
 
+    let mut buffer = [0u8; NGX_HTTP_LINGERING_BUFFER_SIZE];
+
     loop {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http2 lingering close handler");
 
@@ -762,7 +888,7 @@ async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut 
         let t = (timer as u64 * 1000).min(lingering_timeout);
 
         let res = tokio::select! {
-            r = tokio::time::timeout(Duration::from_millis(t), c.recv(&mut rbuf[..NGX_HTTP_LINGERING_BUFFER_SIZE])) => r,
+            r = tokio::time::timeout(Duration::from_millis(t), c.recv(&mut buffer)) => r,
             _ = c.close_notify.notified() => {
                 // ngx_http_v2_lingering_close_handler closes on c->close,
                 // which lingering reset: ignore an earlier shutdown wakeup

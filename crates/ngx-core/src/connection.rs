@@ -662,6 +662,19 @@ impl Connection {
         Ok(n)
     }
 
+    /// SSL_want_write(): the last TLS operation could not write. A read
+    /// that returned WouldBlock this way continues on the write event
+    /// (ngx_ssl_handle_recv's SSL_ERROR_WANT_WRITE: ngx_ssl_write_handler).
+    pub fn ssl_want_write(&self) -> bool {
+        match self.ssl.borrow().as_ref() {
+            Some(sc) => {
+                let ssl = crate::event_openssl::ssl_ptr(sc);
+                !ssl.is_null() && unsafe { crate::openssl_ffi::SSL_want(ssl) } == crate::openssl_ffi::SSL_WRITING
+            }
+            None => false,
+        }
+    }
+
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.
     pub fn try_recv_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(udp) = self.udp_conn() {

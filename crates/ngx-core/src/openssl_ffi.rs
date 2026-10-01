@@ -90,6 +90,7 @@ extern "C" {
     pub fn SSL_get_ex_data(ssl: *const SSL, idx: c_int) -> *mut c_void;
     pub fn SSL_do_handshake(ssl: *mut SSL) -> c_int;
     pub fn SSL_get_error(ssl: *const SSL, ret: c_int) -> c_int;
+    pub fn SSL_want(ssl: *const SSL) -> c_int;
     pub fn SSL_read(ssl: *mut SSL, buf: *mut c_void, num: c_int) -> c_int;
     pub fn SSL_write(ssl: *mut SSL, buf: *const c_void, num: c_int) -> c_int;
     pub fn SSL_read_early_data(ssl: *mut SSL, buf: *mut c_void, num: usize, readbytes: *mut usize) -> c_int;
@@ -370,6 +371,9 @@ pub const SSL_ERROR_NONE: c_int = 0;
 pub const SSL_ERROR_SSL: c_int = 1;
 pub const SSL_ERROR_WANT_READ: c_int = 2;
 pub const SSL_ERROR_WANT_WRITE: c_int = 3;
+
+// SSL_want()
+pub const SSL_WRITING: c_int = 2;
 pub const SSL_ERROR_SYSCALL: c_int = 5;
 pub const SSL_ERROR_ZERO_RETURN: c_int = 6;
 
