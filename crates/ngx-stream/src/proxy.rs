@@ -1445,6 +1445,13 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
 
             c.log.set_action(Some(recv_action));
 
+            // a source that never runs dry would keep this task busy and
+            // the other sessions of the worker unserved: each read uses up
+            // the task's coop budget, and a spent budget yields to the
+            // runtime, as the C event loop goes on to the other events
+            // after a handler returns
+            tokio::task::consume_budget().await;
+
             let n = match src.try_recv(&mut buf[..size]) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
 

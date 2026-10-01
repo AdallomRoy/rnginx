@@ -612,67 +612,54 @@ impl Connection {
     /// data the socket no longer shows, so TLS is always tried first. A
     /// drained socket clears the retained readiness, as in drive_io, so a
     /// later readable() waits for a new event.
+    ///
+    /// The readiness is checked and cleared with AsyncFd::try_io, not
+    /// poll_read_ready(): that one counts against the task's coop budget
+    /// and, once the budget is spent, reports even a ready socket as
+    /// Pending (deferring a wakeup of the waker passed, a no-op one here).
+    /// readable() is not budgeted, so a caller alternating readable() and
+    /// try_recv() would then loop forever without yielding to the runtime.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
         if let Some(udp) = self.udp_conn() {
             return udp.try_recv(self, buf).ok_or_else(|| io::ErrorKind::WouldBlock.into());
         }
         let afd = self.afd()?;
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let Some(ssl) = self.ssl.borrow().clone() {
             match ssl.try_recv(self, buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 r => return r,
             }
-            if let std::task::Poll::Ready(Ok(mut guard)) = afd.poll_read_ready(&mut cx) {
-                match ssl.try_recv(self, buf) {
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => guard.clear_ready(),
-                    r => return r,
-                }
-            }
-            return Err(io::ErrorKind::WouldBlock.into());
+            // retried while the socket is read-ready: nothing again clears
+            // the readiness
+            return afd.try_io(Interest::READABLE, |_| ssl.try_recv(self, buf));
         }
+        let fd = self.fd.get();
+        let mut recv = || {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        };
         if self.ty == libc::SOCK_DGRAM {
             // recv() whatever the read readiness: the error of a connected
             // UDP socket comes without it (see readable())
-            let mut guard = match afd.poll_read_ready(&mut cx) {
-                std::task::Poll::Ready(Ok(g)) => Some(g),
-                std::task::Poll::Ready(Err(e)) => return Err(e),
-                std::task::Poll::Pending => None,
-            };
-            let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                if let Some(g) = guard.as_mut() {
-                    g.clear_ready();
-                }
-            }
-            return Err(e);
-        }
-        match afd.poll_read_ready(&mut cx) {
-            std::task::Poll::Ready(Ok(mut guard)) => match guard.try_io(|inner| {
-                let n = unsafe { libc::recv(inner.get_ref().0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+            let mut attempted = false;
+            return match afd.try_io(Interest::READABLE, |_| {
+                attempted = true;
+                recv()
             }) {
-                Ok(r) => {
-                    let n = r?;
-                    if n == 0 && self.ty != libc::SOCK_DGRAM {
-                        self.read_eof.set(true);
-                    }
-                    Ok(n)
-                }
-                Err(_) => Err(io::ErrorKind::WouldBlock.into()),
-            },
-            std::task::Poll::Ready(Err(e)) => Err(e),
-            std::task::Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && !attempted => recv(),
+                r => r,
+            };
         }
+        let n = afd.try_io(Interest::READABLE, |_| recv())?;
+        if n == 0 {
+            self.read_eof.set(true);
+        }
+        Ok(n)
     }
 
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.
