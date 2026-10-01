@@ -689,6 +689,16 @@ impl Connection {
         }
     }
 
+    /// Wait for a read event (data or the end of the stream) and return
+    /// what it reports, leaving the readiness to the connection's readers:
+    /// a handler that only looks at the event, as
+    /// ngx_http_upstream_check_broken_connection does at rev->pending_eof
+    pub async fn read_event(&self) -> io::Result<tokio::io::Ready> {
+        let afd = self.afd()?;
+        let guard = afd.readable().await?;
+        Ok(guard.ready())
+    }
+
     /// Wait until the socket is writable.
     pub async fn writable(&self) -> io::Result<()> {
         if self.is_quic_stream() {

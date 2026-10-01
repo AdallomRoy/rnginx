@@ -809,13 +809,18 @@ pub fn process_header_line(r: &R, u: &mut Upstream, h: &Header) -> Result<(), u3
 // ---------------------------------------------------------------------------
 
 /// ngx_http_upstream_rd_check_broken_connection as the Linux build runs it
-/// (epoll with EPOLLRDHUP), on a duplicate of the client socket: its
-/// readiness is its own, so the request's reading of the body and of
-/// pipelined requests is not disturbed. For the main request of an HTTP/2
-/// stream, the fake connection's read event (fc->error set); the
-/// subrequests of a stream and HTTP/3 are not checked.
+/// (epoll with EPOLLRDHUP): the end of the stream (rev->pending_eof) on the
+/// read event of the client connection, as in C. Its readiness is shared
+/// with the request's readers (of the body, of pipelined requests), so it
+/// is never cleared here; once the client sends data meanwhile, a duplicate
+/// of the client socket, whose readiness is its own, waits for the end of
+/// the stream. For the main request of an HTTP/2 stream, the fake
+/// connection's read event (fc->error set); the subrequests of a stream and
+/// HTTP/3 are not checked.
 pub struct ClientWatch {
-    afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    conn: Option<Rc<ngx_core::connection::Connection>>,
+    /// the duplicate, made when data came from the client
+    afd: RefCell<Option<Rc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>>>,
     stream: Option<Rc<crate::v2::StreamWatch>>,
     /// an HTTP/3 stream: its c->write->error
     quic: Option<Rc<ngx_core::quic::QuicStream>>,
@@ -823,38 +828,28 @@ pub struct ClientWatch {
 
 impl ClientWatch {
     pub fn new(r: &R, stream: Option<&Rc<crate::v2::StreamWatch>>) -> ClientWatch {
-        use std::os::fd::FromRawFd;
+        let none = || ClientWatch { conn: None, afd: RefCell::new(None), stream: None, quic: None };
 
         if let Some(w) = stream {
-            return ClientWatch { afd: None, stream: Some(w.clone()), quic: None };
+            return ClientWatch { stream: Some(w.clone()), ..none() };
         }
 
         if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(&r.connection) {
-            return ClientWatch { afd: None, stream: None, quic: Some(qs) };
+            return ClientWatch { quic: Some(qs), ..none() };
         }
 
         if r.stream.borrow().is_some() || r.http_version.get() >= NGX_HTTP_VERSION_20 || r.connection.fd.get() < 0 {
-            return ClientWatch { afd: None, stream: None, quic: None };
+            return none();
         }
 
-        // SAFETY: dup() of the connection's open socket; the duplicate is
-        // owned (and closed) by the OwnedFd.
-        let dup = unsafe { libc::dup(r.connection.fd.get()) };
-
-        if dup < 0 {
-            return ClientWatch { afd: None, stream: None, quic: None };
-        }
-
-        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
-
-        ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), stream: None, quic: None }
+        ClientWatch { conn: Some(r.connection.clone()), ..none() }
     }
 
     /// Resolves with the pending socket error (0 if none) when the client
     /// closes the connection (rev->pending_eof); data it sends is left to
     /// be read.
     pub async fn closed(&self) -> i32 {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsRawFd, FromRawFd};
 
         if let Some(w) = &self.stream {
             w.closed().await;
@@ -866,7 +861,51 @@ impl ClientWatch {
             return 0;
         }
 
-        let afd = match &self.afd {
+        let c = match &self.conn {
+            Some(c) => c,
+            None => return std::future::pending().await,
+        };
+
+        if self.afd.borrow().is_none() {
+            loop {
+                match c.read_event().await {
+                    // EPOLLRDHUP: ev->pending_eof
+                    Ok(ready) if ready.is_read_closed() => return so_error(c.fd.get()),
+                    Ok(_) => {}
+                    Err(_) => return std::future::pending().await,
+                }
+
+                // a read event without the end of the stream: data from the
+                // client, or the readiness a read of a whole buffer left
+                match peek_fd(c.fd.get()) {
+                    // nothing to read: the readiness is cleared, as a read
+                    // that finds the socket drained does (rev->ready = 0)
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => c.read_drained(),
+                    Ok(n) if n > 0 => break,
+                    _ => return so_error(c.fd.get()),
+                }
+            }
+
+            // data from the client: the readiness stays for its readers,
+            // the end of the stream is waited for on a duplicate
+
+            // SAFETY: dup() of the connection's open socket; the duplicate
+            // is owned (and closed) by the OwnedFd.
+            let dup = unsafe { libc::dup(c.fd.get()) };
+
+            if dup < 0 {
+                return std::future::pending().await;
+            }
+
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+
+            match tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE) {
+                Ok(a) => *self.afd.borrow_mut() = Some(Rc::new(a)),
+                Err(_) => return std::future::pending().await,
+            }
+        }
+
+        let afd = match self.afd.borrow().clone() {
             Some(a) => a,
             None => return std::future::pending().await,
         };
@@ -897,17 +936,35 @@ impl ClientWatch {
             guard.clear_ready();
         }
 
-        // getsockopt(SO_ERROR): the pending error, if any
-        let mut err: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-
-        // SAFETY: err and len are valid for getsockopt to write an int into.
-        unsafe {
-            libc::getsockopt(afd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
-        }
-
-        err
+        so_error(afd.as_raw_fd())
     }
+}
+
+/// recv(MSG_PEEK) of a byte, without waiting
+fn peek_fd(fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+    let mut b = [0u8; 1];
+
+    // SAFETY: a one byte peek into b.
+    let n = unsafe { libc::recv(fd, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(n as usize)
+}
+
+/// getsockopt(SO_ERROR): the pending error of the socket, if any
+fn so_error(fd: std::os::fd::RawFd) -> i32 {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+    // SAFETY: err and len are valid for getsockopt to write an int into.
+    unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
+    }
+
+    err
 }
 
 /// The client's close if watched, else never.
