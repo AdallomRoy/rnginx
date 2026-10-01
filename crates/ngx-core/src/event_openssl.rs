@@ -2100,6 +2100,9 @@ fn ngx_ssl_handle_recv(c: &Connection, sc: &SslConnection, n: c_int) -> (i64, bo
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL_get_error: {}", sslerr);
 
     if sslerr == SSL_ERROR_WANT_READ {
+        // c->read->ready = 0: OpenSSL's read found the socket drained, also
+        // when ngx_ssl_recv returns the data read before
+        c.read_drained();
         return (NGX_AGAIN, false);
     }
 
