@@ -30,15 +30,15 @@ const NGX_CACHELINE_SIZE: usize = 64;
 // Maximum bucket size (65536 - NGX_CACHELINE_SIZE).
 const MAX_BUCKET_SIZE: usize = 65536 - NGX_CACHELINE_SIZE;
 
-// Hash function: h = h*31 + c
+// Hash function: h = h*31 + c, in ngx_uint_t
 #[inline]
-fn ngx_hash(hash: u32, c: u8) -> u32 {
-    hash.wrapping_mul(31).wrapping_add(c as u32)
+pub fn ngx_hash(hash: usize, c: u8) -> usize {
+    hash.wrapping_mul(31).wrapping_add(c as usize)
 }
 
 /// Compute hash key for exact matches (case-sensitive by default).
-pub fn hash_key(data: &[u8]) -> u32 {
-    let mut key = 0u32;
+pub fn hash_key(data: &[u8]) -> usize {
+    let mut key = 0usize;
     for &c in data {
         key = ngx_hash(key, c);
     }
@@ -46,8 +46,8 @@ pub fn hash_key(data: &[u8]) -> u32 {
 }
 
 /// Compute hash key for exact matches (case-insensitive).
-pub fn hash_key_lc(data: &[u8]) -> u32 {
-    let mut key = 0u32;
+pub fn hash_key_lc(data: &[u8]) -> usize {
+    let mut key = 0usize;
     for &c in data {
         key = ngx_hash(key, tolower(c));
     }
@@ -55,8 +55,8 @@ pub fn hash_key_lc(data: &[u8]) -> u32 {
 }
 
 /// Lowercase a byte string and compute its hash key simultaneously.
-pub fn hash_strlow(dst: &mut [u8], src: &[u8]) -> u32 {
-    let mut key = 0u32;
+pub fn hash_strlow(dst: &mut [u8], src: &[u8]) -> usize {
+    let mut key = 0usize;
     let n = dst.len().min(src.len());
     for i in 0..n {
         dst[i] = tolower(src[i]);
@@ -77,7 +77,7 @@ pub struct HashInit<'a> {
 #[derive(Clone)]
 pub struct HashKey<V: Clone> {
     pub key: Vec<u8>,
-    pub key_hash: u32,
+    pub key_hash: usize,
     pub value: V,
 }
 
@@ -172,7 +172,7 @@ impl<V: Clone> HashKeysArrays<V> {
     }
 
     fn add_exact_key(&mut self, mut key: Vec<u8>, value: V, flags: u32, last: usize) -> i64 {
-        let mut k = 0u32;
+        let mut k = 0usize;
         for i in 0..last {
             if flags & NGX_HASH_READONLY_KEY == 0 {
                 key[i] = tolower(key[i]);
@@ -180,8 +180,7 @@ impl<V: Clone> HashKeysArrays<V> {
             k = ngx_hash(k, key[i]);
         }
 
-        k = (k % self.hsize as u32) as u32;
-        let k_idx = k as usize;
+        let k_idx = k % self.hsize;
 
         // Check for conflicts in exact hash
         let key_slice = &key[..last];
@@ -213,7 +212,7 @@ impl<V: Clone> HashKeysArrays<V> {
         let k = hash_strlow(&mut low, &key[skip..last]);
         key[skip..last].copy_from_slice(&low);
 
-        let k = (k % self.hsize as u32) as usize;
+        let k = k % self.hsize;
 
         if skip == 1 {
             // check conflicts in exact hash for ".example.com"
@@ -303,7 +302,7 @@ impl<V: Clone> HashKeysArrays<V> {
 
 /// A single hash table for exact-key lookups.
 pub struct Hash<V: Clone> {
-    buckets: Vec<Option<Vec<(u32, Vec<u8>, V)>>>,
+    buckets: Vec<Option<Vec<(usize, Vec<u8>, V)>>>,
     size: usize,
 }
 
@@ -366,7 +365,7 @@ impl<V: Clone> Hash<V> {
 
             let mut valid = true;
             for hk in &names {
-                let key = hk.key_hash % size as u32;
+                let key = hk.key_hash % size;
                 let len = test[key as usize] + compute_elt_size(hk.key.len());
 
                 if len > bucket_size_adjusted {
@@ -408,7 +407,7 @@ impl<V: Clone> Hash<V> {
         }
 
         for hk in &names {
-            let key = hk.key_hash % size as u32;
+            let key = hk.key_hash % size;
             let len = test[key as usize] + compute_elt_size(hk.key.len());
 
             if len > MAX_BUCKET_SIZE {
@@ -429,7 +428,7 @@ impl<V: Clone> Hash<V> {
         }
 
         // Build the actual hash table
-        let mut buckets: Vec<Option<Vec<(u32, Vec<u8>, V)>>> = vec![None; size];
+        let mut buckets: Vec<Option<Vec<(usize, Vec<u8>, V)>>> = vec![None; size];
         let mut bucket_offsets = vec![0usize; size];
 
         // Initialize bucket offsets
@@ -441,7 +440,7 @@ impl<V: Clone> Hash<V> {
 
         // Insert keys into buckets
         for hk in &names {
-            let key = hk.key_hash % size as u32;
+            let key = hk.key_hash % size;
             let key_idx = key as usize;
             let bucket = buckets[key_idx].get_or_insert_with(Vec::new);
             bucket.push((hk.key_hash, hk.key.clone(), hk.value.clone()));
@@ -454,8 +453,8 @@ impl<V: Clone> Hash<V> {
     }
 
     /// Find a key in the hash table. Returns the value if found, None otherwise.
-    pub fn find(&self, key_hash: u32, name: &[u8]) -> Option<&V> {
-        let bucket_idx = (key_hash % self.size as u32) as usize;
+    pub fn find(&self, key_hash: usize, name: &[u8]) -> Option<&V> {
+        let bucket_idx = key_hash % self.size;
         if let Some(bucket) = &self.buckets[bucket_idx] {
             for (_hash, key, value) in bucket {
                 if key.len() == name.len() && key == name {
@@ -602,7 +601,7 @@ impl<V: Clone> HashWildcard<V> {
             n -= 1;
         }
 
-        let mut key = 0u32;
+        let mut key = 0usize;
 
         for &c in &name[n..len] {
             key = ngx_hash(key, c);
@@ -650,7 +649,7 @@ impl<V: Clone> HashWildcard<V> {
     pub fn find_wc_tail(&self, name: &[u8]) -> Option<&V> {
         let len = name.len();
 
-        let mut key = 0u32;
+        let mut key = 0usize;
         let mut i = 0;
 
         while i < len {
@@ -696,7 +695,7 @@ pub struct HashCombined<V: Clone> {
 
 impl<V: Clone> HashCombined<V> {
     /// Find a key, checking exact first, then wildcard head, then wildcard tail.
-    pub fn find(&self, key_hash: u32, name: &[u8]) -> Option<&V> {
+    pub fn find(&self, key_hash: usize, name: &[u8]) -> Option<&V> {
         // Try exact first
         if let Some(v) = self.hash.find(key_hash, name) {
             return Some(v);
@@ -744,6 +743,11 @@ mod tests {
         let h1 = hash_key(key);
         let h2 = hash_key(key);
         assert_eq!(h1, h2);
+
+        // ngx_uint_t arithmetic: the buckets of a key longer than 6
+        // characters are those of C
+        assert_eq!(hash_key(b"http_x_forwarded_for"), 2810977803666258672);
+        assert_eq!(hash_key_lc(b"Content-Type"), 2609428126162509838);
     }
 
     #[test]

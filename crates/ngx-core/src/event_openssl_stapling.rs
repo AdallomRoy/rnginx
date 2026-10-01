@@ -2177,7 +2177,7 @@ fn ngx_ssl_ocsp_cache_lookup(ctx: &mut OcspCtx) -> i64 {
         None => return NGX_ERROR,
     };
 
-    let hash = crate::hash::hash_key(&ctx.key);
+    let hash = crate::hash::hash_key(&ctx.key) as u32;
 
     unsafe {
         (*shpool).lock();
@@ -2239,7 +2239,7 @@ fn ngx_ssl_ocsp_cache_store(ctx: &mut OcspCtx) -> i64 {
         None => return NGX_ERROR,
     };
 
-    let hash = crate::hash::hash_key(&ctx.key);
+    let hash = crate::hash::hash_key(&ctx.key) as u32;
 
     let size = std::mem::size_of::<SslOcspCacheNode>() + ctx.key.len();
 

@@ -851,7 +851,7 @@ fn add_listening(cf: &mut Conf, addr: &ConfAddr) -> Rc<Listening> {
     *ls.log.borrow_mut() = Log::new(chain);
 
     ls.ty = addr.opt.ty;
-    *ls.protocol.borrow_mut() = "stream";
+    ls.protocol.set(addr.opt.protocol);
     ls.backlog.set(addr.opt.backlog);
     ls.rcvbuf.set(addr.opt.rcvbuf);
     ls.sndbuf.set(addr.opt.sndbuf);

@@ -49,6 +49,9 @@ pub struct Driver {
 
 const WBUF_SIZE: usize = 64 * 1024;
 
+/// NGX_TIMER_LAZY_DELAY
+const TIMER_LAZY_DELAY: u64 = 300;
+
 /// How many idle receive buffers a worker keeps for reuse.
 const RECV_BUFFERS_KEPT: usize = 8;
 
@@ -198,6 +201,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         blocked: Cell::new(false),
         goaway: Cell::new(false),
         out_notify: tokio::sync::Notify::new(),
+        streams_posted: Cell::new(false),
         posted: RefCell::new(VecDeque::new()),
         posted_reads: RefCell::new(Vec::new()),
         finalized: Cell::new(false),
@@ -277,7 +281,21 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
 
         fill_wbuf(h2c, d);
 
+        // the streams whose frames went out run their write handlers
+        // (h2c->posted) before the connection reads on
+        if h2c.streams_posted.replace(false) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
         let has_output = d.buffered();
+
+        // frames the streams queued go out below: the send timer of
+        // ngx_http_v2_send_output_queue when they do not all go at once
+        if has_output && d.write_timer.get().is_none() {
+            add_write_timer(h2c, d);
+        }
+
         let read_timer = h2c.read_timer.get();
         let write_timer = d.write_timer.get();
         let reading = !h2c.finalized.get();
@@ -478,9 +496,20 @@ async fn read_handler(h2c: &Rc<H2Connection>, d: &Driver, rbuf: &mut Vec<u8>, us
 
     let n = match res {
         Ok(n) if n > 0 => n,
-        Ok(_) | Err(_) => {
-            if h2c.state.incomplete.get() || h2c.processing.get() > 0 {
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+        res => {
+            match res {
+                Ok(_) => {
+                    if h2c.state.incomplete.get() || h2c.processing.get() > 0 {
+                        ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+                    }
+                }
+                Err(e) => {
+                    // ngx_unix_recv(): ngx_connection_error(); ngx_ssl_recv()
+                    // has logged its error
+                    if !ngx_core::event_openssl::is_ssl_error_logged(&e) {
+                        c.connection_error(e.raw_os_error().unwrap_or(0), "recv() failed");
+                    }
+                }
             }
             c.error.set(true);
             finalize_connection(h2c, 0);
@@ -652,10 +681,27 @@ fn written(h2c: &Rc<H2Connection>, d: &Driver, n: usize) {
 
     if !has_output(h2c, d) {
         d.write_timer.set(None);
-    } else if d.write_timer.get().is_none() {
-        let send_timeout = *clcf(h2c).borrow().send_timeout;
-        d.write_timer.set(Some(Instant::now() + Duration::from_millis(send_timeout)));
+    } else {
+        add_write_timer(h2c, d);
     }
+}
+
+/// ngx_add_timer(c->write, clcf->send_timeout) when the output did not all
+/// go (!wev->ready): a timer already set moves unless by less than
+/// NGX_TIMER_LAZY_DELAY
+fn add_write_timer(h2c: &H2Connection, d: &Driver) {
+    let send_timeout = *clcf(h2c).borrow().send_timeout;
+    let key = Instant::now() + Duration::from_millis(send_timeout);
+
+    if let Some(old) = d.write_timer.get() {
+        let diff = if key > old { key - old } else { old - key };
+
+        if diff < Duration::from_millis(TIMER_LAZY_DELAY) {
+            return;
+        }
+    }
+
+    d.write_timer.set(Some(key));
 }
 
 /// ngx_http_v2_write_handler after write_output completed.
@@ -703,6 +749,11 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
         return Err(());
     }
 
+    // !wev->ready: the socket did not take all of the last write, no
+    // attempt now (the timer stays as it is)
+    let ready = d.write_timer.get().is_none();
+    let mut sent = false;
+
     loop {
         fill_wbuf(h2c, d);
 
@@ -717,6 +768,7 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
 
         match res {
             Ok(n) => {
+                sent = true;
                 written(h2c, d, n);
                 if d.buffered() {
                     break;
@@ -734,9 +786,8 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
         }
     }
 
-    if has_output(h2c, d) && d.write_timer.get().is_none() {
-        let send_timeout = *clcf(h2c).borrow().send_timeout;
-        d.write_timer.set(Some(Instant::now() + Duration::from_millis(send_timeout)));
+    if has_output(h2c, d) && (ready || sent) {
+        add_write_timer(h2c, d);
     }
 
     if c.error.get() {
@@ -922,7 +973,7 @@ async fn finish(h2c: &Rc<H2Connection>, d: &Driver) {
         let _ = send_output_queue(h2c, d);
     }
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "close http connection");
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "close http connection: {}", c.fd.get());
 
     // Break the reference cycles through the tree and the output queue.
     h2c.last_out.borrow_mut().clear();

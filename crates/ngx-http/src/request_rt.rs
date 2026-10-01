@@ -39,6 +39,16 @@ pub enum End {
 
 /// Listening socket handler: start the connection task.
 pub fn init_connection(c: Rc<Connection>) {
+    if c.listening().is_some_and(|ls| ls.quic.get()) && !c.is_quic_stream() {
+        // ngx_http_v3_init_stream of a QUIC connection: ngx_quic_run()
+        // handles its first datagram at once
+        match init_http_connection(&c) {
+            Some((hc, _)) => crate::v3::request::init_quic_connection(&c, &hc),
+            None => c.close(),
+        }
+        return;
+    }
+
     ngx_core::event::spawn(async move {
         connection_task(c).await;
     });
@@ -61,7 +71,46 @@ fn addr_conf_for(c: &Rc<Connection>) -> Option<Rc<AddrConf>> {
     port.addrs.first().map(|(_, c)| c.clone())
 }
 
+/// The part of ngx_http_init_connection before the connection reads:
+/// c->data (the http connection) and the log context.
+fn init_http_connection(c: &Rc<Connection>) -> Option<(Rc<HttpConnection>, Rc<HttpLogCtx>)> {
+    let addr_conf = addr_conf_for(c)?;
+    let conf_ctx = addr_conf.default_server.borrow().ctx.clone();
+    let cscf = srv_conf_from_ctx(&conf_ctx);
+    let hb_size = *cscf.borrow().client_header_buffer_size;
+    let hc = Rc::new(HttpConnection {
+        addr_conf: addr_conf.clone(),
+        conf_ctx: std::cell::RefCell::new(conf_ctx),
+        ssl: Cell::new(false),
+        proxy_protocol: Cell::new(false),
+        ssl_servername: std::cell::RefCell::new(None),
+        ssl_servername_regex: std::cell::RefCell::new(None),
+        keepalive_timeout: Cell::new(0),
+        buffer: std::cell::RefCell::new(HeaderBuf { data: Vec::new(), pos: 0, last: 0, allocated: false, cap: hb_size, nbusy: 0 }),
+        nbusy: Cell::new(0),
+        v3_session: std::cell::RefCell::new(None),
+    });
+    let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(c), request: std::cell::RefCell::new(None), current_request: std::cell::RefCell::new(None) });
+    // the log of a QUIC connection is that of the listening so far
+    c.log.set_connection(c.number);
+    c.log.set_context(Some(log_ctx.clone()));
+    c.log.set_action(Some("waiting for request"));
+    c.log_error.set(ngx_core::connection::NGX_ERROR_INFO);
+    let hc_any: Rc<dyn std::any::Any> = hc.clone();
+    *c.data.borrow_mut() = Some(hc_any);
+    Some((hc, log_ctx))
+}
+
 async fn connection_task(c: Rc<Connection>) {
+    if c.is_quic_stream() {
+        // ngx_http_init_connection of a QUIC stream: ngx_http_v3_init_stream
+        match init_http_connection(&c) {
+            Some((hc, log_ctx)) => crate::v3::request::init_stream(&c, &hc, &log_ctx).await,
+            None => c.close(),
+        }
+        return;
+    }
+
     let addr_conf = match addr_conf_for(&c) {
         Some(a) => a,
         None => {
@@ -82,6 +131,7 @@ async fn connection_task(c: Rc<Connection>) {
         keepalive_timeout: Cell::new(0),
         buffer: std::cell::RefCell::new(HeaderBuf { data: Vec::new(), pos: 0, last: 0, allocated: false, cap: hb_size, nbusy: 0 }),
         nbusy: Cell::new(0),
+        v3_session: std::cell::RefCell::new(None),
     });
     let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(&c), request: std::cell::RefCell::new(None), current_request: std::cell::RefCell::new(None) });
     c.log.set_context(Some(log_ctx.clone()));
@@ -173,6 +223,24 @@ async fn connection_task(c: Rc<Connection>) {
     }
 }
 
+/// A request stream of an hq-interop (HTTP/0.9 over QUIC) connection:
+/// ngx_http_wait_request_handler and the request, on the stream.
+pub async fn hq_request_stream(c: Rc<Connection>, hc: Rc<HttpConnection>, log_ctx: Rc<HttpLogCtx>) {
+    if wait_request(&c, &hc).await.is_err() {
+        close_connection(&c);
+        return;
+    }
+
+    c.log.set_action(Some("reading client request line"));
+
+    let r = create_request(&c, &hc, &log_ctx);
+
+    let _ = run_request(&r).await;
+
+    close_request_final(&r);
+    close_connection(&c);
+}
+
 /// c->close set and the connection woken (ngx_shutdown_timer_handler:
 /// c->close = 1, c->error = 1, then its read handler)
 async fn connection_close(c: &Connection) {
@@ -189,7 +257,15 @@ async fn connection_close(c: &Connection) {
 
 /// ngx_http_close_connection
 pub fn close_connection(c: &Rc<Connection>) {
-    http_debug_c(c, "close http connection");
+    http_debug_c(c, &format!("close http connection: {}", c.fd.get()));
+    if c.is_quic_stream() {
+        // ngx_ssl_shutdown() does nothing for a QUIC stream
+        crate::v3::request::reset_stream(c);
+        ngx_core::connection::stats().active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        c.destroyed.set(true);
+        c.close();
+        return;
+    }
     if !crate::ssl_module::ngx_http_ssl_close_connection(c, close_connection) {
         // closed once ngx_ssl_shutdown() completes
         return;
@@ -679,7 +755,7 @@ async fn run_request(r: &R) -> End {
             let p = r.parse.borrow();
             let end = p.header_end.min(b.last);
             let ch = b.data.get(end).copied().unwrap_or(0);
-            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\\x{:02X}...\"", B(&b.data[p.header_name_start..end]), ch);
+            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\\x{:02x}...\"", B(&b.data[p.header_name_start..end]), ch);
         }
         return finalize_and_end(r, NGX_HTTP_BAD_REQUEST).await;
     }
@@ -1092,6 +1168,10 @@ async fn finalize_connection(r: &R) -> End {
         // stream task once the request returns
         return End::Close;
     }
+    if r.connection.is_quic_stream() {
+        // ngx_http_close_request(r, 0), done by the stream task
+        return End::Close;
+    }
     let c = r.connection.clone();
     if r.terminated.get() || c.error.get() {
         return End::Close;
@@ -1125,10 +1205,22 @@ async fn finalize_connection(r: &R) -> End {
         let b = r.http_connection.buffer.borrow();
         b.pos < b.last
     };
-    if lc == NGX_HTTP_LINGERING_ALWAYS || (lc == NGX_HTTP_LINGERING_ON && (r.lingering_close.get() || has_unread || socket_has_data(&c) || c.pipeline.get())) {
+    if lc == NGX_HTTP_LINGERING_ALWAYS || (lc == NGX_HTTP_LINGERING_ON && (r.lingering_close.get() || has_unread || read_ready(&c) || c.pipeline.get())) {
         return End::Lingering;
     }
     End::Close
+}
+
+/// r->connection->read->ready: data to read, or on an SSL connection the
+/// last SSL_read() of ngx_ssl_recv() did not want to read (the data came
+/// with the peer's close_notify or an error, or filled the buffer)
+fn read_ready(c: &Connection) -> bool {
+    if let Some(sc) = c.ssl.borrow().as_ref() {
+        if sc.state.ngx.get() && sc.state.last.get() != NGX_AGAIN {
+            return true;
+        }
+    }
+    socket_has_data(c)
 }
 
 fn socket_has_data(c: &Connection) -> bool {
@@ -1178,7 +1270,7 @@ pub fn free_request(r: &R, rc: i64) {
         r.logged.set(true);
     }
     log.set_action(Some("closing request"));
-    if r.connection.timedout.get() {
+    if r.connection.timedout.get() && !r.connection.is_quic_stream() {
         let clcf = r.clcf();
         if *clcf.borrow().reset_timedout_connection {
             r.connection.set_linger_reset();
@@ -1188,6 +1280,8 @@ pub fn free_request(r: &R, rc: i64) {
     *r.log_ctx.current_request.borrow_mut() = None;
     r.request_line.borrow_mut().clear();
     r.connection.destroyed.set(true);
+    // ngx_destroy_pool(r->pool)
+    r.run_pool_cleanups();
 }
 
 /// ngx_http_log_request: run log phase handlers.
@@ -1240,14 +1334,18 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         ngx_core::event_openssl::ngx_ssl_free_buffer(&c);
     }
     c.log.set_action(Some("keepalive"));
-    if c.tcp_nopush.get() == TcpNopush::Set {
+    let tcp_nodelay = if c.tcp_nopush.get() == TcpNopush::Set {
         if let Err(e) = c.tcp_push_off() {
-            ngx_log_error!(NGX_LOG_CRIT, c.log, e.raw_os_error(), "tcp_push failed");
+            c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(!TCP_CORK) failed");
             return Err(());
         }
         c.tcp_nopush.set(TcpNopush::Unset);
-    }
-    if *clcf.borrow().tcp_nodelay && !c.set_tcp_nodelay() {
+        // ngx_tcp_nodelay_and_tcp_nopush is 0 on Linux
+        false
+    } else {
+        true
+    };
+    if tcp_nodelay && *clcf.borrow().tcp_nodelay && !c.set_tcp_nodelay() {
         return Err(());
     }
     let (min_to, ka_to) = {
@@ -1272,6 +1370,8 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         };
         match res {
             None => return Err(()),
+            // c->close (ngx_close_idle_connections) is tested first
+            Some(_) if c.close.get() => return Err(()),
             Some(Err(_)) => {
                 // timed out
                 if !idle_phase && rest > 0 && !ngx_core::event::is_exiting() {
@@ -1327,7 +1427,7 @@ async fn lingering_close(r: &R) {
         return;
     }
     if let Err(e) = c.shutdown_write() {
-        ngx_log_error!(NGX_LOG_INFO, c.log, e.raw_os_error(), "shutdown() failed");
+        c.connection_error(e.raw_os_error().unwrap_or(0), "shutdown() failed");
         return;
     }
     c.close.set(false);

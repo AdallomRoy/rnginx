@@ -455,15 +455,38 @@ impl GeoIPRecordPtr {
     }
 }
 
+/// (int64_t) d as x86-64 converts it (cvttsd2si): the "integer indefinite"
+/// INT64_MIN for NaN and what is out of range.
+fn c_f64_to_i64(d: f64) -> i64 {
+    if d.is_nan() || d >= 9223372036854775808.0 || d < -9223372036854775808.0 {
+        i64::MIN
+    } else {
+        d as i64
+    }
+}
+
+/// (uint64_t) d as gcc converts it on x86-64: cvttsd2si of d below 2^63
+/// (and of NaN), of d - 2^63 with the top bit flipped otherwise.
+fn c_f64_to_u64(d: f64) -> u64 {
+    const TWO63: f64 = 9223372036854775808.0;
+
+    if d >= TWO63 {
+        c_f64_to_i64(d - TWO63) as u64 ^ (1 << 63)
+    } else {
+        c_f64_to_i64(d) as u64
+    }
+}
+
 /// The "%.<frac_width>f" conversion of ngx_vslprintf(), as used for the
-/// float variables ("%.4f" of a float promoted to double).
+/// float variables ("%.4f" of a float promoted to double); the C casts of
+/// NaN, infinities and large values give what they give on x86-64.
 pub fn sprintf_float(buf: &mut Vec<u8>, mut f: f64, frac_width: u32) {
     if f < 0.0 {
         buf.push(b'-');
         f = -f;
     }
 
-    let mut ui64 = f as i64 as u64;
+    let mut ui64 = c_f64_to_i64(f) as u64;
     let mut frac: u64 = 0;
 
     if frac_width != 0 {
@@ -472,7 +495,7 @@ pub fn sprintf_float(buf: &mut Vec<u8>, mut f: f64, frac_width: u32) {
             scale *= 10;
         }
 
-        frac = ((f - ui64 as f64) * scale as f64 + 0.5) as u64;
+        frac = c_f64_to_u64((f - ui64 as f64) * scale as f64 + 0.5);
 
         if frac == scale {
             ui64 += 1;
@@ -515,6 +538,26 @@ mod tests {
         assert_eq!(fmt(-0.00996, 4), "-0.0100");
         assert_eq!(fmt(3.7, 0), "3");
         assert_eq!(fmt(123.0456, 3), "123.046");
+    }
+
+    #[test]
+    fn sprintf_float_casts_as_x86_64() {
+        // the output of the C code, built with the flags of nginx
+        assert_eq!(fmt(f64::INFINITY, 3), "9223372036854775808.000");
+        assert_eq!(fmt(f64::NAN, 3), "9223372036854775808.9223372036854775808");
+        assert_eq!(fmt(f64::NEG_INFINITY, 3), "-9223372036854775808.000");
+        assert_eq!(fmt(1e19, 3), "9223372036854775808.000");
+        assert_eq!(fmt(2e19, 3), "9223372036854775808.000");
+        assert_eq!(fmt(9.3e18, 3), "9223372036854775808.000");
+        assert_eq!(fmt(1.8446744073709552e19, 3), "9223372036854775808.000");
+        assert_eq!(fmt(1e30, 3), "9223372036854775808.000");
+        assert_eq!(fmt(12.3456, 3), "12.346");
+        assert_eq!(fmt(0.0005, 3), "0.001");
+        assert_eq!(fmt(0.9995, 3), "1.000");
+        assert_eq!(fmt(1.0e-10, 3), "0.000");
+        assert_eq!(fmt(4294967295.9999, 3), "4294967296.000");
+        assert_eq!(fmt(9.2e18, 3), "9200000000000000000.000");
+        assert_eq!(fmt(9.223372036854775e18, 3), "9223372036854774784.000");
     }
 
     #[test]

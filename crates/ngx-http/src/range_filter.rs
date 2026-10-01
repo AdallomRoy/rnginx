@@ -1,506 +1,710 @@
-//! ngx_http_range_filter_module - handles HTTP Range requests (206 Partial Content)
+//! ngx_http_range_filter_module: ngx_http_range_header_filter_module and
+//! ngx_http_range_body_filter_module
+
+/*
+ * the single part format:
+ *
+ * "HTTP/1.0 206 Partial Content" CRLF
+ * ... header ...
+ * "Content-Type: image/jpeg" CRLF
+ * "Content-Length: SIZE" CRLF
+ * "Content-Range: bytes START-END/SIZE" CRLF
+ * CRLF
+ * ... data ...
+ *
+ *
+ * the multipart format:
+ *
+ * "HTTP/1.0 206 Partial Content" CRLF
+ * ... header ...
+ * "Content-Type: multipart/byteranges; boundary=0123456789" CRLF
+ * CRLF
+ * CRLF
+ * "--0123456789" CRLF
+ * "Content-Type: image/jpeg" CRLF
+ * "Content-Range: bytes START0-END0/SIZE" CRLF
+ * CRLF
+ * ... data ...
+ * CRLF
+ * "--0123456789" CRLF
+ * "Content-Type: image/jpeg" CRLF
+ * "Content-Range: bytes START1-END1/SIZE" CRLF
+ * CRLF
+ * ... data ...
+ * CRLF
+ * "--0123456789--" CRLF
+ */
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::{Conf, ConfResult};
+use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
+use ngx_core::ngx_log_error;
 use ngx_core::rc::*;
 use ngx_core::string::B;
-use ngx_core::{ngx_log_debug, ngx_log_error};
 
 use crate::request::*;
 use crate::*;
 
-// Use body filter module name for the shared context index
+// the module ctx is that of ngx_http_range_body_filter_module
 crate::http_module_index!("ngx_http_range_body_filter_module");
 
-/// Range element: start-end (both inclusive for end in response, exclusive in code)
-#[derive(Clone, Debug)]
+const NGX_MAX_OFF_T_VALUE: i64 = i64::MAX;
+const NGX_MAX_INT32_VALUE: i64 = i32::MAX as i64;
+const NGX_ATOMIC_T_LEN: usize = "-9223372036854775808".len();
+
+/// ngx_http_range_t
+#[derive(Clone)]
 struct Range {
     start: i64,
     end: i64,
     content_range: Vec<u8>,
 }
 
-/// Context for range filtering
-struct RangeCtx {
+/// ngx_http_range_filter_ctx_t
+struct RangeFilterCtx {
     offset: i64,
     boundary_header: Vec<u8>,
     ranges: Vec<Range>,
 }
 
 pub fn range_header_filter_module() -> ModuleDef {
-    let def = HttpModuleDef {
-        postconfiguration: Some(init_header),
-        ..Default::default()
-    };
+    let def = HttpModuleDef { postconfiguration: Some(range_header_filter_init), ..Default::default() };
     http_module_def("ngx_http_range_header_filter_module", def, Vec::new())
 }
 
 pub fn range_body_filter_module() -> ModuleDef {
-    let def = HttpModuleDef {
-        postconfiguration: Some(init_body),
-        ..Default::default()
-    };
+    let def = HttpModuleDef { postconfiguration: Some(range_body_filter_init), ..Default::default() };
     http_module_def("ngx_http_range_body_filter_module", def, Vec::new())
 }
 
-fn init_header(cf: &mut Conf) -> ConfResult {
-    ngx_core::ngx_log_error!(NGX_LOG_NOTICE, &cf.log, None, "range_header_filter_module init_header called");
-    install_header_filter(|r, next| async move { range_header_filter(r, next).await });
-    Ok(())
-}
-
-fn init_body(_cf: &mut Conf) -> ConfResult {
-    install_body_filter(|r, chain, next| async move { range_body_filter(r, chain, next).await });
-    Ok(())
-}
-
+/// ngx_http_range_header_filter
 async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter called");
+    let (status, content_length_n, content_offset) = {
+        let ho = r.headers_out.borrow();
+        (ho.status, ho.content_length_n, ho.content_offset)
+    };
 
-    // Check preconditions
-    if r.http_version.get() < NGX_HTTP_VERSION_10 {
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter: http_version too old");
+    if r.http_version.get() < NGX_HTTP_VERSION_10
+        || status != NGX_HTTP_OK
+        || (!r.is_main() && !r.subrequest_ranges.get())
+        || content_length_n == -1
+        || !r.allow_ranges.get()
+    {
         return next(r).await;
     }
 
-    let status = r.headers_out.borrow().status;
-    let content_len_n = r.headers_out.borrow().content_length_n;
+    let max_ranges = *r.clcf().borrow().max_ranges;
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter: status={}, content_len_n={}, allow_ranges={}", status, content_len_n, r.allow_ranges.get());
-
-    if status != NGX_HTTP_OK || content_len_n == -1 || !r.allow_ranges.get() {
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter: preconditions failed");
-        return next(r).await;
-    }
-
-    if !r.is_main() && !r.subrequest_ranges.get() {
-        return next(r).await;
-    }
-
-    let clcf = r.clcf();
-    let max_ranges = *clcf.borrow().max_ranges;
     if max_ranges == 0 {
         return next(r).await;
     }
 
-    // Extract range header and metadata
-    let (range_header, if_range_val, content_length) = {
-        let headers_in = r.headers_in.borrow();
-        let rh = headers_in.range.first().map(|h| h.value());
-        let ifr = headers_in.if_range.as_ref().map(|h| h.value());
-        drop(headers_in);
-        let cl = r.headers_out.borrow().content_length_n;
-        (rh, ifr, cl)
-    };
+    'next_filter: {
+        let range = match r.headers_in.borrow().range.first() {
+            Some(h) => h.value(),
+            None => break 'next_filter,
+        };
 
-    let range_header = match range_header {
-        Some(h) => h,
-        None => return set_accept_ranges_and_pass(r, next).await,
-    };
-
-    if range_header.len() < 7 || &range_header[..6] != b"bytes=" {
-        return set_accept_ranges_and_pass(r, next).await;
-    }
-
-    // Handle If-Range - check upfront
-    if let Some(val) = &if_range_val {
-        if val.len() >= 2 && val[val.len() - 1] == b'"' {
-            // ETag comparison
-            let etag_val = r.headers_out.borrow().etag.as_ref().map(|h| h.value());
-            if etag_val.as_ref() != Some(val) {
-                return set_accept_ranges_and_pass(r, next).await;
-            }
-        } else {
-            // Date comparison against Last-Modified.
-            let lm_time = r.headers_out.borrow().last_modified_time;
-            match ngx_core::parse::parse_http_time(val) {
-                Some(t) if t == lm_time => {}
-                _ => return set_accept_ranges_and_pass(r, next).await,
-            }
+        if range.len() < 7 || !range[..6].eq_ignore_ascii_case(b"bytes=") {
+            break 'next_filter;
         }
-    }
-    let mut ctx = RangeCtx {
-        offset: 0,
-        boundary_header: Vec::new(),
-        ranges: Vec::new(),
-    };
 
-    match parse_ranges(&range_header[6..], content_length, max_ranges, &mut ctx.ranges) {
-        Ok(()) => {
-            if ctx.ranges.is_empty() {
-                return range_not_satisfiable(r, next).await;
-            }
+        let if_range = r.headers_in.borrow().if_range.as_ref().map(|h| h.value());
 
-            // Set status to 206 Partial Content
-            r.headers_out.borrow_mut().status = NGX_HTTP_PARTIAL_CONTENT;
-            r.headers_out.borrow_mut().status_line.clear();
+        if let Some(if_range) = if_range {
+            if if_range.len() >= 2 && if_range[if_range.len() - 1] == b'"' {
+                let etag = match r.headers_out.borrow().etag.as_ref() {
+                    Some(h) => h.value(),
+                    None => break 'next_filter,
+                };
 
-            if ctx.ranges.len() == 1 {
-                // Single-part range
-                let range = &ctx.ranges[0];
-                r.headers_out.borrow_mut().content_length_n = range.end - range.start;
-                r.headers_out.borrow_mut().content_offset = range.start;
+                http_debug!(r, "http ir:{} etag:{}", B(&if_range), B(&etag));
 
-                // Set Content-Range header
-                let content_range_str = format!("bytes {}-{}/{}", range.start, range.end - 1, content_length);
-                {
-                    let mut ho = r.headers_out.borrow_mut();
-                    if let Some(h) = ho.content_range.take() {
-                        h.hash.set(0);
-                    }
-                    // Drop any Content-Range that the upstream response
-                    // carried through into ho.headers so we don't emit
-                    // both our fresh one and the stale one. Matches
-                    // range_clearing.t.
-                    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
-                }
-                let cr_header = TableElt::new(b"Content-Range", content_range_str.as_bytes());
-                {
-                    let mut ho = r.headers_out.borrow_mut();
-                    ho.headers.push(cr_header.clone());
-                    ho.content_range = Some(cr_header);
+                if if_range != etag {
+                    break 'next_filter;
                 }
 
-                // Remove Content-Length header from list (will be set by core)
-                if let Some(h) = r.headers_out.borrow_mut().content_length.take() {
-                    h.hash.set(0);
-                }
+                // goto parse
+
             } else {
-                // ngx_http_range_multipart_header: the boundary header of
-                // each range, CRLF "--0123456789" CRLF "Content-Type: ..."
-                // CRLF "Content-Range: " (completed by the range's "bytes
-                // SSSS-EEEE/TTTT" CRLF CRLF), and the exact length
-                let boundary = ngx_core::connection::stats().temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let boundary = format!("{:020}", boundary);
+                let last_modified_time = r.headers_out.borrow().last_modified_time;
 
-                let mut bh = format!("\r\n--{}\r\n", boundary).into_bytes();
-                {
-                    let ho = r.headers_out.borrow();
-                    if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
-                        bh.extend_from_slice(b"Content-Type: ");
-                        bh.extend_from_slice(&ho.content_type);
-                        bh.extend_from_slice(b"; charset=");
-                        bh.extend_from_slice(&ho.charset);
-                        bh.extend_from_slice(b"\r\n");
-                    } else if !ho.content_type.is_empty() {
-                        bh.extend_from_slice(b"Content-Type: ");
-                        bh.extend_from_slice(&ho.content_type);
-                        bh.extend_from_slice(b"\r\n");
-                    }
-                }
-                bh.extend_from_slice(b"Content-Range: ");
-                ctx.boundary_header = bh;
-
-                // the size of the last boundary CRLF "--0123456789--" CRLF
-                let mut total_len = ("\r\n--".len() + boundary.len() + "--\r\n".len()) as i64;
-                for range in &ctx.ranges {
-                    total_len += (ctx.boundary_header.len() + range.content_range.len()) as i64;
-                    total_len += range.end - range.start;
+                if last_modified_time == -1 {
+                    break 'next_filter;
                 }
 
-                r.headers_out.borrow_mut().content_length_n = total_len;
+                let if_range_time = ngx_core::parse::parse_http_time(&if_range).unwrap_or(NGX_ERROR);
 
-                // Set Content-Type to multipart
-                let content_type = format!("multipart/byteranges; boundary={}", boundary);
-                {
-                    let mut ho = r.headers_out.borrow_mut();
-                    ho.content_type = content_type.into_bytes();
-                    ho.content_type_len = ho.content_type.len();
-                    ho.charset.clear();
-                    // Strip any Content-Range the upstream carried
-                    // through — each body part now carries its own.
-                    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
-                    if let Some(h) = ho.content_range.take() {
-                        h.hash.set(0);
-                    }
-                    if let Some(h) = ho.content_length.take() {
-                        h.hash.set(0);
-                    }
+                http_debug!(r, "http ir:{} lm:{}", if_range_time, last_modified_time);
+
+                if if_range_time != last_modified_time {
+                    break 'next_filter;
                 }
             }
-
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter: setting 206, ranges={}, first_range={:?}-{:?}",
-                ctx.ranges.len(),
-                if !ctx.ranges.is_empty() { ctx.ranges[0].start } else { 0 },
-                if !ctx.ranges.is_empty() { ctx.ranges[0].end } else { 0 });
-            r.set_ctx(ctx_index(), ctx);
-            next(r).await
         }
-        Err(NGX_HTTP_RANGE_NOT_SATISFIABLE) => {
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_header_filter: 416 not satisfiable");
-            range_not_satisfiable(r, next).await
-        },
-        Err(_) => set_accept_ranges_and_pass(r, next).await,
-    }
-}
 
-async fn set_accept_ranges_and_pass(r: R, next: HeaderFilter) -> i64 {
-    let mut ho = r.headers_out.borrow_mut();
-    if ho.accept_ranges.is_none() {
-        let ar = TableElt::new(b"Accept-Ranges", b"bytes");
-        // Also push into the general headers list so $sent_http_accept_ranges
-        // can find it (C sets both r->headers_out.accept_ranges and the same
-        // ngx_list_push entry in headers_out.headers).
-        ho.headers.push(ar.clone());
-        ho.accept_ranges = Some(ar);
+        // parse:
+
+        let mut ctx = RangeFilterCtx { offset: content_offset, boundary_header: Vec::new(), ranges: Vec::new() };
+
+        let ranges = if r.single_range.get() { 1 } else { max_ranges };
+
+        match range_parse(&r, &mut ctx, &range, ranges) {
+            NGX_OK => {
+                let single = ctx.ranges.len() == 1;
+
+                let ctx = r.set_ctx(ctx_index(), ctx);
+
+                {
+                    let mut ho = r.headers_out.borrow_mut();
+                    ho.status = NGX_HTTP_PARTIAL_CONTENT;
+                    ho.status_line.clear();
+                }
+
+                if single {
+                    return range_singlepart_header(r, &ctx, next).await;
+                }
+
+                return range_multipart_header(r, &ctx, next).await;
+            }
+
+            NGX_HTTP_RANGE_NOT_SATISFIABLE => return range_not_satisfiable(&r),
+
+            NGX_ERROR => return NGX_ERROR,
+
+            _ => {} // NGX_DECLINED
+        }
     }
-    drop(ho);
+
+    // next_filter:
+
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        let h = ho.add(b"Accept-Ranges", b"bytes");
+        ho.accept_ranges = Some(h);
+    }
+
     next(r).await
 }
 
-async fn range_not_satisfiable(r: R, next: HeaderFilter) -> i64 {
-    let content_len = r.headers_out.borrow().content_length_n;
-    r.headers_out.borrow_mut().status = NGX_HTTP_RANGE_NOT_SATISFIABLE;
-    // the 416 goes out as ngx_http_send_header() sends r->err_status: the
-    // status line of an upstream response is not used
-    r.headers_out.borrow_mut().status_line.clear();
-
-    let content_range_str = format!("bytes */{}", content_len);
-    let cr_header = TableElt::new(b"Content-Range", content_range_str.as_bytes());
-
-    let mut ho = r.headers_out.borrow_mut();
-    if let Some(h) = ho.content_range.take() {
-        h.hash.set(0);
+/// ngx_http_range_parse: `value` is the Range header, NUL-terminated in C
+fn range_parse(r: &R, ctx: &mut RangeFilterCtx, value: &[u8], mut ranges: i64) -> i64 {
+    if !r.is_main() {
+        if let Some(mctx) = r.main().get_ctx::<RangeFilterCtx>(ctx_index()) {
+            ctx.ranges = mctx.borrow().ranges.clone();
+            return NGX_OK;
+        }
     }
-    ho.headers.retain(|h| !h.lowcase_key.eq_ignore_ascii_case(b"content-range"));
-    ho.headers.push(cr_header.clone());
-    ho.content_range = Some(cr_header);
-    drop(ho);
+
+    let at = |p: usize| value.get(p).copied().unwrap_or(0);
+
+    let mut p = 6;
+    let mut size: i64 = 0;
+    let max_ranges = ranges;
+
+    let mut content_length = r.headers_out.borrow().content_length_n;
+
+    let cutoff = NGX_MAX_OFF_T_VALUE / 10;
+    let cutlim = NGX_MAX_OFF_T_VALUE % 10;
+
+    loop {
+        let mut start: i64 = 0;
+        let mut end: i64 = 0;
+        let mut suffix = false;
+
+        while at(p) == b' ' {
+            p += 1;
+        }
+
+        'found: {
+            if at(p) != b'-' {
+                if !at(p).is_ascii_digit() {
+                    return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+                }
+
+                while at(p).is_ascii_digit() {
+                    let d = (at(p) - b'0') as i64;
+
+                    if start >= cutoff && (start > cutoff || d > cutlim) {
+                        return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+                    }
+
+                    start = start * 10 + d;
+                    p += 1;
+                }
+
+                while at(p) == b' ' {
+                    p += 1;
+                }
+
+                if at(p) != b'-' {
+                    return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+                }
+
+                p += 1;
+
+                while at(p) == b' ' {
+                    p += 1;
+                }
+
+                if at(p) == b',' || at(p) == 0 {
+                    end = content_length;
+                    break 'found;
+                }
+
+            } else {
+                suffix = true;
+                p += 1;
+            }
+
+            if !at(p).is_ascii_digit() {
+                return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+            }
+
+            while at(p).is_ascii_digit() {
+                let d = (at(p) - b'0') as i64;
+
+                if end >= cutoff && (end > cutoff || d > cutlim) {
+                    return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+                }
+
+                end = end * 10 + d;
+                p += 1;
+            }
+
+            while at(p) == b' ' {
+                p += 1;
+            }
+
+            if at(p) != b',' && at(p) != 0 {
+                return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+            }
+
+            if suffix {
+                start = if end < content_length { content_length - end } else { 0 };
+                end = content_length - 1;
+            }
+
+            if end >= content_length {
+                end = content_length;
+
+            } else {
+                end += 1;
+            }
+        }
+
+        // found:
+
+        if start < end {
+            ctx.ranges.push(Range { start, end, content_range: Vec::new() });
+
+            if size > NGX_MAX_OFF_T_VALUE - (end - start) {
+                return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+            }
+
+            size += end - start;
+
+            if ranges == 0 {
+                return NGX_DECLINED;
+            }
+
+            ranges -= 1;
+
+        } else if start == 0 {
+            return NGX_DECLINED;
+        }
+
+        let c = at(p);
+        p += 1;
+
+        if c != b',' {
+            break;
+        }
+    }
+
+    if ctx.ranges.is_empty() {
+        return NGX_HTTP_RANGE_NOT_SATISFIABLE;
+    }
+
+    if ctx.ranges.len() == 1 {
+        return NGX_OK;
+    }
+
+    if size > content_length {
+        return NGX_DECLINED;
+    }
+
+    if max_ranges == NGX_MAX_INT32_VALUE {
+        size += ctx.ranges.len() as i64 * 256;
+        content_length += 4096;
+
+        if size > content_length {
+            return NGX_DECLINED;
+        }
+    }
+
+    NGX_OK
+}
+
+/// ngx_http_range_singlepart_header
+async fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: HeaderFilter) -> i64 {
+    if !r.is_main() {
+        return next(r).await;
+    }
+
+    {
+        let (start, end) = {
+            let ctx = ctx.borrow();
+            (ctx.ranges[0].start, ctx.ranges[0].end)
+        };
+
+        let mut ho = r.headers_out.borrow_mut();
+
+        if let Some(h) = &ho.content_range {
+            h.hash.set(0);
+        }
+
+        /* "Content-Range: bytes SSSS-EEEE/TTTT" header */
+
+        let value = format!("bytes {}-{}/{}", start, end - 1, ho.content_length_n);
+
+        let content_range = ho.add(b"Content-Range", value.as_bytes());
+        ho.content_range = Some(content_range);
+
+        ho.content_length_n = end - start;
+        ho.content_offset = start;
+
+        if let Some(h) = ho.content_length.take() {
+            h.hash.set(0);
+        }
+    }
+
+    next(r).await
+}
+
+/// ngx_http_range_multipart_header
+async fn range_multipart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: HeaderFilter) -> i64 {
+    // ngx_next_temp_number(0)
+    let boundary = ngx_core::connection::stats().temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let boundary = format!("{:0width$}", boundary, width = NGX_ATOMIC_T_LEN);
+
+    {
+        let mut ho = r.headers_out.borrow_mut();
+        let mut ctx = ctx.borrow_mut();
+
+        /*
+         * The boundary header of the range:
+         * CRLF
+         * "--0123456789" CRLF
+         * "Content-Type: image/jpeg" CRLF
+         * "Content-Range: bytes "
+         */
+
+        let mut bh = Vec::new();
+
+        bh.extend_from_slice(b"\r\n--");
+        bh.extend_from_slice(boundary.as_bytes());
+        bh.extend_from_slice(b"\r\n");
+
+        if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
+            bh.extend_from_slice(b"Content-Type: ");
+            bh.extend_from_slice(&ho.content_type);
+            bh.extend_from_slice(b"; charset=");
+            bh.extend_from_slice(&ho.charset);
+            bh.extend_from_slice(b"\r\n");
+
+        } else if !ho.content_type.is_empty() {
+            bh.extend_from_slice(b"Content-Type: ");
+            bh.extend_from_slice(&ho.content_type);
+            bh.extend_from_slice(b"\r\n");
+        }
+
+        bh.extend_from_slice(b"Content-Range: bytes ");
+
+        ctx.boundary_header = bh;
+
+        /* "Content-Type: multipart/byteranges; boundary=0123456789" */
+
+        ho.content_type = format!("multipart/byteranges; boundary={}", boundary).into_bytes();
+        ho.content_type_lowcase = None;
+        ho.content_type_len = ho.content_type.len();
+
+        ho.charset.clear();
+
+        /* the size of the last boundary CRLF "--0123456789--" CRLF */
+
+        let mut len = ("\r\n--".len() + NGX_ATOMIC_T_LEN + "--\r\n".len()) as i64;
+
+        let boundary_header_len = ctx.boundary_header.len() as i64;
+        let content_length_n = ho.content_length_n;
+
+        for range in ctx.ranges.iter_mut() {
+            /* the size of the range: "SSSS-EEEE/TTTT" CRLF CRLF */
+
+            range.content_range = format!("{}-{}/{}\r\n\r\n", range.start, range.end - 1, content_length_n).into_bytes();
+
+            len += boundary_header_len + range.content_range.len() as i64 + (range.end - range.start);
+        }
+
+        ho.content_length_n = len;
+
+        if let Some(h) = ho.content_length.take() {
+            h.hash.set(0);
+        }
+
+        if let Some(h) = ho.content_range.take() {
+            h.hash.set(0);
+        }
+    }
+
+    next(r).await
+}
+
+/// ngx_http_range_not_satisfiable: the header is not sent, the request is
+/// finalized with the status (a special response)
+fn range_not_satisfiable(r: &R) -> i64 {
+    {
+        let mut ho = r.headers_out.borrow_mut();
+
+        ho.status = NGX_HTTP_RANGE_NOT_SATISFIABLE;
+
+        if let Some(h) = &ho.content_range {
+            h.hash.set(0);
+        }
+
+        let value = format!("bytes */{}", ho.content_length_n);
+
+        let content_range = ho.add(b"Content-Range", value.as_bytes());
+        ho.content_range = Some(content_range);
+    }
 
     r.clear_content_length();
-    next(r).await
+
+    NGX_HTTP_RANGE_NOT_SATISFIABLE
 }
 
+/// ngx_http_range_body_filter
 async fn range_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
-    let ctx = match r.get_ctx::<RangeCtx>(ctx_index()) {
-        Some(c) => c,
-        None => {
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_body_filter: no context, passing through");
-            return next(r, input).await;
-        }
-    };
-
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_body_filter: input_empty={}, input_chain_len={}", input.is_empty(), input.len());
-
     if input.is_empty() {
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_body_filter: empty input, passing through");
         return next(r, input).await;
     }
 
-    let is_single = ctx.borrow().ranges.len() == 1;
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_body_filter: is_single={}", is_single);
+    let ctx = match r.get_ctx::<RangeFilterCtx>(ctx_index()) {
+        Some(ctx) => ctx,
+        None => return next(r, input).await,
+    };
 
-    if is_single {
-        range_singlepart_body(r, input, next, ctx).await
-    } else {
-        range_multipart_body(r, input, next, ctx).await
+    if ctx.borrow().ranges.len() == 1 {
+        return range_singlepart_body(r, &ctx, input, next).await;
     }
+
+    /*
+     * multipart ranges are supported only if whole body is in a single buffer
+     */
+
+    if input[0].special_buf() {
+        return next(r, input).await;
+    }
+
+    if range_test_overlapped(&r, &ctx, &input) != NGX_OK {
+        return NGX_ERROR;
+    }
+
+    range_multipart_body(r, &ctx, input, next).await
 }
 
-async fn range_singlepart_body(r: R, mut input: Chain, next: BodyFilter, ctx: Rc<RefCell<RangeCtx>>) -> i64 {
-    let (range, offset) = {
-        let c = ctx.borrow();
-        (c.ranges[0].clone(), c.offset)
-    };
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_singlepart_body: range={}-{}, offset={}", range.start, range.end, offset);
+/// ngx_http_range_test_overlapped
+fn range_test_overlapped(r: &R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: &Chain) -> i64 {
+    let mut ctx = ctx.borrow_mut();
 
-    let mut output = Chain::new();
-    let mut offset = offset;
+    'overlapped: {
+        if ctx.offset != 0 {
+            break 'overlapped;
+        }
 
-    while let Some(mut buf) = input.pop_front() {
-        let buf_size = buf.buf_size();
-        let buf_end = offset + buf_size;
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_singlepart_body: buf offset={}-{}, size={}, in_file={}, last_buf={}",
-            offset, buf_end, buf_size, buf.in_file, buf.last_buf);
+        let buf = &input[0];
 
-        if buf_size == 0 || (buf.sync && !buf.in_memory() && !buf.in_file) {
-            // Special buffer (flush, last, etc.)
-            if range.end <= offset {
-                // Skip special buffers before range
+        if !buf.last_buf {
+            let start = ctx.offset;
+            let last = ctx.offset + buf.buf_size();
+
+            for range in ctx.ranges.iter() {
+                if start > range.start || last < range.end {
+                    break 'overlapped;
+                }
+            }
+        }
+
+        ctx.offset = buf.buf_size();
+
+        return NGX_OK;
+    }
+
+    ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "range in overlapped buffers");
+
+    NGX_ERROR
+}
+
+/// ngx_http_range_singlepart_body
+async fn range_singlepart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: BodyFilter) -> i64 {
+    let mut out = Chain::new();
+
+    {
+        let mut ctx = ctx.borrow_mut();
+
+        let (range_start, range_end) = (ctx.ranges[0].start, ctx.ranges[0].end);
+
+        for mut buf in input {
+            let start = ctx.offset;
+            let last = ctx.offset + buf.buf_size();
+
+            ctx.offset = last;
+
+            http_debug!(r, "http range body buf: {}-{}", start, last);
+
+            if buf.special_buf() {
+                if range_end <= start {
+                    continue;
+                }
+
+                out.push_back(buf);
+
                 continue;
             }
-            output.push_back(buf);
-        } else if buf_end <= range.start || offset >= range.end {
-            // Buffer completely outside range - skip
-            if buf.in_file {
-                buf.file_pos = buf.file_last;
-            }
-            buf.pos = buf.last;
-            buf.sync = true;
-        } else {
-            // Buffer overlaps range - trim it
-            if offset < range.start {
-                let skip = range.start - offset;
-                if buf.in_memory() {
-                    buf.pos += skip as usize;
-                }
+
+            if range_end <= start || range_start >= last {
+                http_debug!(r, "http range body skip");
+
                 if buf.in_file {
-                    buf.file_pos += skip;
+                    buf.file_pos = buf.file_last;
+                }
+
+                buf.pos = buf.last;
+                buf.sync = true;
+
+                continue;
+            }
+
+            if range_start > start {
+                if buf.in_file {
+                    buf.file_pos += range_start - start;
+                }
+
+                if buf.in_memory() {
+                    buf.pos += (range_start - start) as usize;
                 }
             }
 
-            if buf_end > range.end {
-                let skip = buf_end - range.end;
-                if buf.in_memory() {
-                    buf.last -= skip as usize;
-                }
+            if range_end <= last {
                 if buf.in_file {
-                    buf.file_last -= skip;
+                    buf.file_last -= last - range_end;
                 }
-            }
 
-            // Mark last buffer in range
-            if buf_end >= range.end {
+                if buf.in_memory() {
+                    buf.last -= (last - range_end) as usize;
+                }
+
                 buf.last_buf = r.is_main();
                 buf.last_in_chain = true;
-            }
 
-            output.push_back(buf);
-        }
+                out.push_back(buf);
 
-        offset = buf_end;
-    }
-
-    // Update context offset for next call
-    ctx.borrow_mut().offset = offset;
-
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "range_singlepart_body: output {} buffers, total_offset={}", output.len(), offset);
-    next(r, output).await
-}
-
-async fn range_multipart_body(r: R, mut input: Chain, next: BodyFilter, ctx: Rc<RefCell<RangeCtx>>) -> i64 {
-    let mut output = Chain::new();
-    let mut all_data = Vec::new();
-    let mut has_file = false;
-
-    // Collect all data
-    while let Some(buf) = input.pop_front() {
-        if buf.in_file {
-            has_file = true;
-            // For file buffers, read the data
-            if let BufData::File(f) = &buf.data {
-                let mut file_data = vec![0u8; (buf.file_last - buf.file_pos) as usize];
-                let n = unsafe { libc::pread(f.fd, file_data.as_mut_ptr() as *mut libc::c_void, file_data.len(), buf.file_pos as libc::off_t) };
-                if n > 0 {
-                    all_data.extend_from_slice(&file_data[..n as usize]);
-                }
-            }
-        } else if buf.in_memory() {
-            if let BufData::Memory(m) = &buf.data {
-                all_data.extend_from_slice(&m[buf.pos..buf.last]);
-            }
-        }
-    }
-
-    if all_data.is_empty() && !has_file {
-        return next(r, output).await;
-    }
-
-    let boundary_header = {
-        let c = ctx.borrow();
-        c.boundary_header.clone()
-    };
-    let ranges = {
-        let c = ctx.borrow();
-        c.ranges.clone()
-    };
-
-    // Build multipart response (ngx_http_range_multipart_body)
-    for range in ranges.iter() {
-        // Boundary
-        output.push_back(Buf::from_vec(boundary_header.clone()));
-
-        // Content-Range
-        output.push_back(Buf::from_vec(range.content_range.clone()));
-
-        // Data slice
-        if !all_data.is_empty() {
-            let start = range.start as usize;
-            let end = (range.end as usize).min(all_data.len());
-            if start < end {
-                output.push_back(Buf::from_vec(all_data[start..end].to_vec()));
-            }
-        }
-    }
-
-    // the last boundary CRLF "--0123456789--" CRLF: the start of the
-    // boundary header
-    let mut final_boundary = boundary_header[..boundary_header.len().min("\r\n--".len() + 20)].to_vec();
-    final_boundary.extend_from_slice(b"--\r\n");
-    let mut final_buf = Buf::from_vec(final_boundary);
-    final_buf.last_buf = r.is_main();
-    final_buf.last_in_chain = true;
-    output.push_back(final_buf);
-
-    next(r, output).await
-}
-
-fn parse_ranges(range_str: &[u8], content_len: i64, max_ranges: i64, ranges: &mut Vec<Range>) -> Result<(), i64> {
-    let s = String::from_utf8_lossy(range_str);
-    let parts: Vec<&str> = s.split(',').collect();
-
-    let mut total_size = 0i64;
-    let mut remaining = max_ranges;
-
-    for part in parts {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        let range_parts: Vec<&str> = part.split('-').collect();
-        if range_parts.len() != 2 {
-            return Err(NGX_HTTP_RANGE_NOT_SATISFIABLE);
-        }
-
-        let start: i64;
-        let end: i64;
-
-        if range_parts[0].is_empty() {
-            // Suffix range: "-500"
-            let suffix_len: i64 = range_parts[1].parse().map_err(|_| NGX_HTTP_RANGE_NOT_SATISFIABLE)?;
-            start = (content_len - suffix_len).max(0);
-            end = content_len;
-        } else {
-            start = range_parts[0].parse().map_err(|_| NGX_HTTP_RANGE_NOT_SATISFIABLE)?;
-            if start < 0 || start >= content_len {
                 continue;
             }
 
-            end = if range_parts[1].is_empty() {
-                content_len
-            } else {
-                let e: i64 = range_parts[1].parse().map_err(|_| NGX_HTTP_RANGE_NOT_SATISFIABLE)?;
-                (e + 1).min(content_len)
+            out.push_back(buf);
+        }
+    }
+
+    next(r, out).await
+}
+
+/// ngx_http_range_multipart_body: the ranges of the single buffer in->buf
+async fn range_multipart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: BodyFilter) -> i64 {
+    let buf = &input[0];
+
+    let mut out = Chain::new();
+
+    let last_boundary = {
+        let ctx = ctx.borrow();
+
+        for range in ctx.ranges.iter() {
+            /*
+             * The boundary header of the range:
+             * CRLF
+             * "--0123456789" CRLF
+             * "Content-Type: image/jpeg" CRLF
+             * "Content-Range: bytes "
+             */
+
+            let mut b = Buf::from_vec(ctx.boundary_header.clone());
+            b.temporary = false;
+            b.memory = true;
+
+            out.push_back(b);
+
+            /* "SSSS-EEEE/TTTT" CRLF CRLF */
+
+            out.push_back(Buf::from_vec(range.content_range.clone()));
+
+            /* the range data */
+
+            let mut b = Buf {
+                in_file: buf.in_file,
+                temporary: buf.temporary,
+                memory: buf.memory,
+                mmap: buf.mmap,
+                ..Default::default()
             };
+
+            if buf.in_file {
+                b.data = buf.data.clone();
+                b.file_pos = buf.file_pos + range.start;
+                b.file_last = buf.file_pos + range.end;
+            }
+
+            if buf.in_memory() {
+                // the buffer memory is not shared here: the range of it
+                let (pos, last) = (buf.pos + range.start as usize, buf.pos + range.end as usize);
+
+                if let BufData::Memory(m) = &buf.data {
+                    b.data = BufData::Memory(m[pos..last].to_vec());
+                    b.pos = 0;
+                    b.last = last - pos;
+                }
+            }
+
+            out.push_back(b);
         }
 
-        if start >= end {
-            continue;
-        }
+        /* the last boundary CRLF "--0123456789--" CRLF  */
 
-        total_size += end - start;
-        if total_size > content_len {
-            return Err(NGX_DECLINED);
-        }
+        let mut last = ctx.boundary_header[.."\r\n--".len() + NGX_ATOMIC_T_LEN].to_vec();
+        last.extend_from_slice(b"--\r\n");
 
-        if remaining <= 0 {
-            // Exceeded max_ranges — matches C: return NGX_DECLINED (serve full body).
-            return Err(NGX_DECLINED);
-        }
-        remaining -= 1;
+        last
+    };
 
-        let content_range = format!("bytes {}-{}/{}\r\n\r\n", start, end - 1, content_len);
-        ranges.push(Range { start, end, content_range: content_range.into_bytes() });
-    }
+    let mut b = Buf::from_vec(last_boundary);
+    b.last_buf = true;
 
-    if ranges.is_empty() {
-        return Err(NGX_HTTP_RANGE_NOT_SATISFIABLE);
-    }
+    out.push_back(b);
 
+    next(r, out).await
+}
+
+/// ngx_http_range_header_filter_init
+fn range_header_filter_init(_cf: &mut Conf) -> ConfResult {
+    install_header_filter(|r, next| async move { range_header_filter(r, next).await });
+    Ok(())
+}
+
+/// ngx_http_range_body_filter_init
+fn range_body_filter_init(_cf: &mut Conf) -> ConfResult {
+    install_body_filter(|r, chain, next| async move { range_body_filter(r, chain, next).await });
     Ok(())
 }

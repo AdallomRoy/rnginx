@@ -20,10 +20,13 @@ pub type R = Rc<Request>;
 
 /// ngx_table_elt_t
 pub struct TableElt {
-    pub hash: Cell<u32>,
+    pub hash: Cell<usize>,
     pub key: Vec<u8>,
     pub value: RefCell<Vec<u8>>,
     pub lowcase_key: Vec<u8>,
+    /// value.data == NULL: the special empty "Server" and "Date" headers
+    /// of ngx_http_proxy_process_header
+    pub null: Cell<bool>,
 }
 
 pub type Header = Rc<TableElt>;
@@ -35,11 +38,12 @@ impl TableElt {
             key: key.to_vec(),
             value: RefCell::new(value.to_vec()),
             lowcase_key: ngx_core::string::to_lower_vec(key),
+            null: Cell::new(false),
         })
     }
 
-    pub fn with_hash(key: &[u8], value: &[u8], hash: u32, lowcase_key: Vec<u8>) -> Header {
-        Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key })
+    pub fn with_hash(key: &[u8], value: &[u8], hash: usize, lowcase_key: Vec<u8>) -> Header {
+        Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key, null: Cell::new(false) })
     }
 
     pub fn value(&self) -> Vec<u8> {
@@ -146,7 +150,7 @@ pub struct HeadersOut {
     pub content_type: Vec<u8>,
     pub charset: Vec<u8>,
     pub content_type_lowcase: Option<Vec<u8>>,
-    pub content_type_hash: u32,
+    pub content_type_hash: usize,
     pub content_length_n: i64,
     pub content_offset: i64,
     pub date_time: i64,
@@ -203,7 +207,7 @@ impl HeadersOut {
 
 /// ngx_http_request_body_t
 pub struct RequestBody {
-    pub temp_file: Option<ngx_core::buf::TempFile>,
+    pub temp_file: Option<ngx_core::file::TempFile>,
     pub bufs: Chain,
     pub buf: Option<ngx_core::buf::Buf>,
     pub rest: i64,
@@ -212,9 +216,9 @@ pub struct RequestBody {
     pub filter_need_buffering: bool,
     pub last_sent: bool,
     pub last_saved: bool,
-    /// rb->buf of an HTTP/1 body as its size and fill level (buf->last -
-    /// buf->start); the data read is passed on at once. 0 until the body
-    /// is read from the socket.
+    /// rb->buf as its size and fill level (buf->last - buf->start); for an
+    /// HTTP/2 stream, those of the stream's buffer. 0 until the body is
+    /// read from the socket.
     pub buf_size: usize,
     pub buf_last: usize,
 }
@@ -274,6 +278,8 @@ pub struct HttpConnection {
     /// Client header buffer shared by pipelined requests.
     pub buffer: RefCell<HeaderBuf>,
     pub nbusy: Cell<usize>,
+    /// the HTTP/3 session of a QUIC connection (c->data in C)
+    pub v3_session: RefCell<Option<Rc<crate::v3::H3Session>>>,
 }
 
 /// In-memory header buffer: data[pos..last] unread.
@@ -399,9 +405,15 @@ pub struct Request {
     pub loc_conf: RefCell<Rc<ConfSlots>>,
 
     pub upstream: RefCell<Option<Rc<dyn Any>>>,
+    /// The upstream has the read event handler: from
+    /// ngx_http_upstream_init_request (ngx_http_upstream_rd_check_broken_connection,
+    /// or ngx_http_block_reading it leaves) to ngx_http_upstream_finalize_request
+    pub upstream_handler: Cell<bool>,
     /// Upstream response headers, populated by proxy/fastcgi/etc. Read by $upstream_http_* variables.
     pub upstream_headers_in: RefCell<Vec<Header>>,
     pub upstream_states: RefCell<Vec<UpstreamState>>,
+    /// r->upstream_states is not NULL: an upstream was started
+    pub upstream_states_init: Cell<bool>,
     pub cache: RefCell<Option<Rc<dyn Any>>>,
 
     pub headers_in: RefCell<HeadersIn>,
@@ -447,6 +459,9 @@ pub struct Request {
     pub err_status: Cell<i64>,
 
     pub cleanup: RefCell<Vec<CleanupFn>>,
+    /// ngx_pool_cleanup_add(r->pool): run when the pool of the request is
+    /// destroyed, at the end of ngx_http_free_request
+    pub pool_cleanup: RefCell<Vec<CleanupFn>>,
     pub port: Cell<u16>,
 
     pub count: Cell<u32>,
@@ -531,8 +546,10 @@ pub struct Request {
 
     /// Parser state for request line / headers (offsets into the header buffer).
     pub parse: RefCell<ParseRequest>,
-    /// The HTTP/2 or /3 stream, if any.
+    /// The HTTP/2 stream, if any.
     pub stream: RefCell<Option<Rc<dyn Any>>>,
+    /// r->v3_parse of an HTTP/3 request
+    pub v3_parse: RefCell<Option<Rc<RefCell<crate::v3::request::V3Parse>>>>,
     /// Trailer state etc.
     pub log_ctx: Rc<HttpLogCtx>,
     /// Signalled when a subrequest waiting on this request completes (unused in sequential model).
@@ -541,6 +558,10 @@ pub struct Request {
     pub postponed: RefCell<std::collections::VecDeque<PostponedRequest>>,
     /// the post_subrequest handler of the subrequest when it sends output
     pub post_subrequest_async: RefCell<Option<PostSubrequestAsync>>,
+    /// What crate::postpone_filter keeps in the main request for the posted
+    /// subrequests (c->data, r->main->count of theirs): not a module
+    /// context, which an internal redirect clears.
+    pub posted_subrequests: RefCell<Option<Rc<dyn Any>>>,
 }
 
 impl Request {
@@ -613,6 +634,23 @@ impl Request {
         let v: Vec<CleanupFn> = std::mem::take(&mut *self.cleanup.borrow_mut());
         for f in v {
             f();
+        }
+    }
+
+    /// ngx_pool_cleanup_add(r->pool); subrequests share the pool of the
+    /// main request
+    pub fn add_pool_cleanup(self: &Rc<Self>, f: CleanupFn) {
+        self.main().pool_cleanup.borrow_mut().push(f);
+    }
+
+    /// The cleanups of ngx_destroy_pool(r->pool), the last added first.
+    pub fn run_pool_cleanups(&self) {
+        loop {
+            let f = self.pool_cleanup.borrow_mut().pop();
+            match f {
+                Some(f) => f(),
+                None => break,
+            }
         }
     }
 
@@ -707,8 +745,10 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         srv_conf: RefCell::new(ctx.srv.clone().unwrap()),
         loc_conf: RefCell::new(ctx.loc.clone().unwrap()),
         upstream: RefCell::new(None),
+        upstream_handler: Cell::new(false),
         upstream_headers_in: RefCell::new(Vec::new()),
         upstream_states: RefCell::new(Vec::new()),
+        upstream_states_init: Cell::new(false),
         cache: RefCell::new(None),
         headers_in: RefCell::new(HeadersIn::new()),
         headers_out: RefCell::new(HeadersOut::new()),
@@ -744,6 +784,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         request_length: Cell::new(0),
         err_status: Cell::new(0),
         cleanup: RefCell::new(Vec::new()),
+        pool_cleanup: RefCell::new(Vec::new()),
         port: Cell::new(0),
         count: Cell::new(1),
         subrequests: Cell::new(NGX_HTTP_MAX_SUBREQUESTS + 1),
@@ -764,7 +805,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         request_body_in_persistent_file: Cell::new(false),
         request_body_in_clean_file: Cell::new(false),
         request_body_file_group_access: Cell::new(false),
-        request_body_file_log_level: Cell::new(NGX_LOG_WARN),
+        request_body_file_log_level: Cell::new(0),
         request_body_no_buffering: Cell::new(false),
         subrequest_in_memory: Cell::new(false),
         waited: Cell::new(false),
@@ -820,10 +861,12 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         discard_body_done: Cell::new(false),
         parse: RefCell::new(ParseRequest::default()),
         stream: RefCell::new(None),
+        v3_parse: RefCell::new(None),
         log_ctx: log_ctx.clone(),
         weak_self: RefCell::new(Weak::new()),
         postponed: RefCell::new(std::collections::VecDeque::new()),
         post_subrequest_async: RefCell::new(None),
+        posted_subrequests: RefCell::new(None),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is

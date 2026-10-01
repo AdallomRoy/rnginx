@@ -366,6 +366,8 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         request_done: Cell::new(false),
         closed: Cell::new(false),
         authority: RefCell::new(None),
+        test_reading: RefCell::new(None),
+        upstream_watch: RefCell::new(None),
     });
 
     let any: Rc<dyn std::any::Any> = stream.clone();
@@ -1089,6 +1091,18 @@ fn terminate_request_now(stream: &Rc<H2Stream>, rc: i64) {
         return;
     }
 
+    // the read event handler of a request waiting with it:
+    // ngx_http_test_reading, which tests c->error on a stream
+    if rc == NGX_HTTP_CLIENT_CLOSED_REQUEST {
+        let waiting = stream.test_reading.borrow_mut().take().and_then(|w| w.upgrade());
+
+        if let Some(wr) = waiting {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, wr.connection.log, "http test reading");
+            wr.set_log_request();
+            crate::write_filter::test_reading_closed(&wr, 0);
+        }
+    }
+
     let task = stream.task.borrow_mut().take();
     if let Some(t) = task {
         t.abort();
@@ -1124,7 +1138,27 @@ pub fn stream_rst_received(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
         return;
     }
 
+    if upstream_read_event(stream) {
+        return;
+    }
+
     terminate_request_now(stream, NGX_HTTP_CLIENT_CLOSED_REQUEST);
+}
+
+/// The read event when the request's upstream has the handler: true if
+/// the request goes on (a cacheable response is read on, or the upstream
+/// does not check the client).
+fn upstream_read_event(stream: &Rc<H2Stream>) -> bool {
+    if stream.request_done.get() {
+        return false;
+    }
+
+    let watch = stream.upstream_watch.borrow().as_ref().and_then(|w| w.upgrade());
+
+    match watch {
+        Some(w) => w.read_event(),
+        None => false,
+    }
 }
 
 /// ngx_http_v2_terminate_stream
@@ -1170,7 +1204,9 @@ pub fn finalize_streams(h2c: &Rc<H2Connection>) {
         };
 
         if !stream.request_done.get() && stream.task.borrow().is_some() && stream.request.borrow().is_some() {
-            terminate_request_now(&stream, rc);
+            if !upstream_read_event(&stream) {
+                terminate_request_now(&stream, rc);
+            }
         } else {
             if let Some(t) = stream.task.borrow_mut().take() {
                 t.abort();
@@ -1218,6 +1254,27 @@ pub fn post_drain_waiting(h2c: &Rc<H2Connection>) {
     h2c.posted.borrow_mut().push_back(Posted::DrainWaiting);
 }
 
+/// Let the tasks spawned or woken so far run before this one goes on, as C
+/// runs a stream's request inline, the I/O driver not being polled in
+/// between: tokio::task::yield_now() waits for it to be, which lets the
+/// events of other connections (an upstream connected meanwhile) be handled
+/// before the rest of what was read (the client's close).
+async fn run_queued() {
+    let mut yielded = false;
+
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+
+        yielded = true;
+        cx.waker().wake_by_ref();
+
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Run the effects the last frame posted, in order, letting each woken
 /// stream task run (and queue its output) before the next.
 pub async fn run_posted(h2c: &Rc<H2Connection>) {
@@ -1227,7 +1284,7 @@ pub async fn run_posted(h2c: &Rc<H2Connection>) {
         match ev {
             None => return,
 
-            Some(Posted::Run) => tokio::task::yield_now().await,
+            Some(Posted::Run) => run_queued().await,
 
             Some(Posted::Write(stream)) => {
                 if !stream.closed.get() {
@@ -1257,3 +1314,27 @@ pub async fn run_posted(h2c: &Rc<H2Connection>) {
 
 #[allow(dead_code)]
 fn _core_srv(_: &CoreSrvConf) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_queued() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async {
+            let ran = Rc::new(std::cell::Cell::new(false));
+            let r = ran.clone();
+
+            // a stream task spawned by a state handler runs before the
+            // driver goes on
+            tokio::task::spawn_local(async move { r.set(true) });
+            assert!(!ran.get());
+
+            run_queued().await;
+            assert!(ran.get());
+        });
+    }
+}

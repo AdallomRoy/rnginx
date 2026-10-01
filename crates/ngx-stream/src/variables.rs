@@ -298,7 +298,7 @@ pub fn get_flushed_variable(s: &Session, index: usize) -> Option<VariableValue> 
 }
 
 /// ngx_stream_get_variable
-pub fn get_variable(s: &Session, name: &[u8], key: u32) -> Option<VariableValue> {
+pub fn get_variable(s: &Session, name: &[u8], key: usize) -> Option<VariableValue> {
     let cmcf = s.cmcf();
 
     let found = {

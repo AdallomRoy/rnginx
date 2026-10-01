@@ -19,7 +19,7 @@ fn new_body() -> RequestBody {
 
 /// ngx_http_test_expect: send "100 Continue" if requested.
 pub async fn test_expect(r: &R) -> i64 {
-    if r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() {
+    if r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() || r.connection.is_quic_stream() {
         return NGX_OK;
     }
     let expect = match &r.headers_in.borrow().expect {
@@ -127,12 +127,16 @@ async fn start_read_client_request_body(r: &R) -> i64 {
     if r.stream.borrow().is_some() {
         return crate::v2::request_body::read_request_body(r, &rb).await;
     }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
+        return crate::v3::request::read_request_body(r, &rb).await;
+    }
     let hc = r.http_connection.clone();
     // preread bytes already in the header buffer
     let preread: Vec<u8> = {
         let b = hc.buffer.borrow();
         b.unread().to_vec()
     };
+    let mut in_header = false;
     if !preread.is_empty() {
         http_debug!(r, "http client request body preread {}", preread.len());
         let mut chain = Chain::new();
@@ -146,27 +150,42 @@ async fn start_read_client_request_body(r: &R) -> i64 {
         if rc != NGX_OK {
             return rc;
         }
+        // the whole request body may be placed in r->header_in: rb->buf is
+        // what is left of it
+        let room = {
+            let b = hc.buffer.borrow();
+            b.data.len().saturating_sub(b.last)
+        };
+        let rest = rb.borrow().rest;
+        if !r.headers_in.borrow().chunked && rest > 0 && rest <= room as i64 {
+            let mut b = rb.borrow_mut();
+            b.buf_size = room;
+            b.buf_last = 0;
+            in_header = true;
+        }
     } else {
+        // set rb->rest
         let (rc, _) = request_body_filter(r, &rb, Chain::new()).await;
         if rc != NGX_OK {
             return rc;
         }
     }
-    {
-        let b = rb.borrow();
-        if b.rest == 0 && b.last_saved {
-            drop(b);
-            r.request_body_no_buffering.set(false);
-            return NGX_OK;
+    if !in_header {
+        {
+            let b = rb.borrow();
+            if b.rest == 0 && b.last_saved {
+                // the whole request body was pre-read
+                drop(b);
+                r.request_body_no_buffering.set(false);
+                return NGX_OK;
+            }
+            if b.rest < 0 {
+                ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "negative request body rest");
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
         }
-        if b.rest < 0 {
-            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "negative request body rest");
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-    }
-    // rb->buf: a body shorter than 1.25 client_body_buffer_size gets a
-    // buffer of its own size, so it stays in memory
-    {
+        // rb->buf: client_body_buffer_size, or the rest of the body if it
+        // is not more than a quarter bigger
         let clcf = r.clcf();
         let buffer_size = *clcf.borrow().client_body_buffer_size;
         let chunked = r.headers_in.borrow().chunked;
@@ -209,6 +228,10 @@ pub async fn read_unbuffered_request_body(r: &R) -> i64 {
         }
         return rc;
     }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
+        // ngx_http_v3_read_unbuffered_request_body() clears r->reading_body
+        return crate::v3::request::read_unbuffered_request_body(r).await;
+    }
     let rb = match r.request_body.borrow().clone() {
         Some(rb) => rb,
         None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
@@ -225,6 +248,10 @@ pub async fn read_unbuffered_request_body(r: &R) -> i64 {
 pub async fn wait_request_body(r: &R) {
     if let Some(stream) = crate::v2::stream::request_stream(r) {
         stream.notify.notified().await;
+        return;
+    }
+    if r.connection.is_quic_stream() {
+        crate::v3::request::wait_request_body(r).await;
         return;
     }
     // an error is reported by the next read
@@ -322,72 +349,102 @@ async fn do_read_unbuffered_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -
     NGX_OK
 }
 
+/// ngx_http_do_read_client_request_body: the body read into rb->buf (the
+/// counts buf_size and buf_last: each read is at most what fits and is left
+/// of the body, and passed to the request body filters), the buffer used
+/// again once full (the save filter wrote what was in it to the temporary
+/// file), until the body is complete. A read event wait is the recv with
+/// client_body_timeout.
 async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     let c = r.connection.clone();
     http_debug!(r, "http read client request body");
     let timeout = *r.clcf().borrow().client_body_timeout;
+    let mut flush = true;
     loop {
-        let (rest, buf_size, buf_last) = {
+        loop {
+            let (rest, buf_size, buf_last) = {
+                let b = rb.borrow();
+                (b.rest, b.buf_size, b.buf_last)
+            };
+            if rest == 0 {
+                break;
+            }
+            if buf_last == buf_size {
+                // update chains
+                let (rc, _) = request_body_filter(r, rb, Chain::new()).await;
+                if rc != NGX_OK {
+                    return rc;
+                }
+                // rb->busy: data of the buffer not written out
+                if rb.borrow().bufs.iter().any(|b| b.in_memory() && b.buf_size() > 0) {
+                    ngx_log_error!(NGX_LOG_ALERT, c.log, None, "busy buffers after request body flush");
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                flush = false;
+                rb.borrow_mut().buf_last = 0;
+            }
+            let (size, rest) = {
+                let b = rb.borrow();
+                (b.buf_size - b.buf_last, b.rest)
+            };
+            let size = if size as i64 > rest { rest as usize } else { size };
+            if size == 0 {
+                break;
+            }
+            let mut buf = vec![0u8; size];
+            let n = match tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)).await {
+                Err(_) => {
+                    c.timedout.set(true);
+                    return NGX_HTTP_REQUEST_TIME_OUT;
+                }
+                Ok(Ok(0)) => {
+                    ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
+                    c.error.set(true);
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                Ok(Err(_)) => {
+                    c.error.set(true);
+                    return NGX_HTTP_BAD_REQUEST;
+                }
+                Ok(Ok(n)) => n,
+            };
+            http_debug!(r, "http client request body recv {}", n);
+            buf.truncate(n);
+            rb.borrow_mut().buf_last += n;
+            r.request_length.set(r.request_length.get() + n as i64);
+            // pass buffer to request body filter chain
+            flush = false;
+            let mut chain = Chain::new();
+            chain.push_back(Buf::from_vec(buf));
+            let (rc, _) = request_body_filter(r, rb, chain).await;
+            if rc != NGX_OK {
+                return rc;
+            }
             let b = rb.borrow();
-            (b.rest, b.buf_size, b.buf_last)
-        };
-        if rest == 0 {
-            break;
+            if b.rest == 0 {
+                break;
+            }
+            if b.buf_last < b.buf_size {
+                break;
+            }
         }
-        if buf_last == buf_size {
-            // update chains: the save filter has written the full buffer
-            // to the temporary file
+        http_debug!(r, "http client request body rest {}", rb.borrow().rest);
+        if flush {
             let (rc, _) = request_body_filter(r, rb, Chain::new()).await;
             if rc != NGX_OK {
                 return rc;
             }
-            rb.borrow_mut().buf_last = 0;
         }
-        let size = {
+        {
             let b = rb.borrow();
-            ((b.buf_size - b.buf_last) as i64).min(b.rest) as usize
-        };
-        if size == 0 {
-            break;
+            if b.rest == 0 && b.last_saved {
+                break;
+            }
         }
-        let mut buf = vec![0u8; size];
-        let n = match tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)).await {
-            Err(_) => {
-                c.timedout.set(true);
-                return NGX_HTTP_REQUEST_TIME_OUT;
-            }
-            Ok(Ok(0)) => {
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client prematurely closed connection");
-                c.error.set(true);
-                return NGX_HTTP_BAD_REQUEST;
-            }
-            Ok(Err(_)) => {
-                c.error.set(true);
-                return NGX_HTTP_BAD_REQUEST;
-            }
-            Ok(Ok(n)) => n,
-        };
-        http_debug!(r, "http client request body recv {}", n);
-        buf.truncate(n);
-        rb.borrow_mut().buf_last += n;
-        r.request_length.set(r.request_length.get() + n as i64);
-        let mut chain = Chain::new();
-        chain.push_back(Buf::from_vec(buf));
-        let (rc, consumed) = request_body_filter(r, rb, chain).await;
-        if rc != NGX_OK {
-            return rc;
-        }
-        let _ = consumed;
-        http_debug!(r, "http client request body rest {}", rb.borrow().rest);
+        // the next read event
+        flush = true;
     }
-    let b = rb.borrow();
-    if b.rest == 0 && b.last_saved {
-        return NGX_OK;
-    }
-    drop(b);
-    // flush filter
-    let (rc, _) = request_body_filter(r, rb, Chain::new()).await;
-    rc
+    NGX_OK
 }
 
 /// ngx_http_request_body_filter: returns (rc, bytes consumed from input).
@@ -529,7 +586,8 @@ pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
         return NGX_OK;
     }
     if b.rest > 0 {
-        if !b.bufs.is_empty() && body_buf_full(&r, &b) {
+        // rb->buf full: what is in it goes to the temporary file
+        if !b.bufs.is_empty() && b.buf_size > 0 && b.buf_last == b.buf_size {
             if write_request_body(&r, &mut b) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
@@ -555,43 +613,51 @@ pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
     NGX_OK
 }
 
-/// rb->buf && rb->buf->last == rb->buf->end: the buffer the body is read
-/// into is full (an HTTP/2 stream keeps its rb->buf on the stream; before
-/// the buffer is set up there is none)
-fn body_buf_full(r: &R, b: &RequestBody) -> bool {
-    let (size, last) = match crate::v2::stream::request_stream(r) {
-        Some(stream) => (stream.body_cap.get(), stream.body_last.get()),
-        None => (b.buf_size, b.buf_last),
-    };
-    size > 0 && last == size
-}
-
+/// ngx_http_write_request_body: the buffers of the body written to the
+/// temporary file of client_body_temp_path, created on the first write
+/// ("a client request body is buffered to a temporary file" at
+/// r->request_body_file_log_level), or at once for an empty body with
+/// client_body_in_file_only.
 fn write_request_body(r: &R, b: &mut RequestBody) -> i64 {
     http_debug!(r, "http write client request body, bufs {}", b.bufs.len());
     if b.temp_file.is_none() {
         let clcf = r.clcf();
         let path = clcf.borrow().client_body_temp_path.get().clone();
-        let access = if r.request_body_file_group_access.get() { 0o660 } else { 0 };
-        match ngx_core::buf::create_temp_file(&path, r.request_body_in_persistent_file.get(), r.request_body_in_clean_file.get(), access, &r.connection.log) {
-            Ok(tf) => {
-                let level = r.request_body_file_log_level.get();
-                if level != 0 {
-                    ngx_log_error!(level, r.connection.log, None, "a client request body is buffered to a temporary file {}", ngx_core::string::B(&tf.name));
-                }
-                b.temp_file = Some(tf);
-            }
-            Err(_) => return NGX_ERROR,
+        let mut tf = ngx_core::file::TempFile::new(path, &r.connection.log);
+        tf.warn = "a client request body is buffered to a temporary file";
+        tf.log_level = r.request_body_file_log_level.get();
+        tf.persistent = r.request_body_in_persistent_file.get();
+        tf.clean = r.request_body_in_clean_file.get();
+        if r.request_body_file_group_access.get() {
+            tf.access = 0o660;
         }
+        let empty = match b.bufs.front() {
+            None => true,
+            Some(first) => !first.in_memory() && first.last_buf,
+        };
+        if empty {
+            // empty body with r->request_body_in_file_only
+            if tf.create().is_err() {
+                b.temp_file = Some(tf);
+                return NGX_ERROR;
+            }
+            b.temp_file = Some(tf);
+            return NGX_OK;
+        }
+        b.temp_file = Some(tf);
     }
-    let mem: Chain = b.bufs.drain(..).filter(|x| x.in_memory()).collect();
-    if mem.is_empty() {
+    if b.bufs.is_empty() {
         return NGX_OK;
     }
     let tf = b.temp_file.as_mut().unwrap();
-    match ngx_core::buf::write_chain_to_temp_file(tf, &mem, &r.connection.log) {
-        Ok(_) => NGX_OK,
-        Err(_) => NGX_ERROR,
-    }
+    let n = match tf.write_chain(&b.bufs) {
+        Ok(n) => n,
+        Err(()) => return NGX_ERROR,
+    };
+    tf.offset += n;
+    // mark all buffers as written
+    b.bufs.clear();
+    NGX_OK
 }
 
 /// ngx_http_discard_request_body: start discarding; may complete later.
@@ -601,6 +667,9 @@ pub async fn discard_request_body(r: &R) -> i64 {
     }
     if let Some(stream) = crate::v2::stream::request_stream(r) {
         stream.skip_data.set(true);
+        return NGX_OK;
+    }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
         return NGX_OK;
     }
     if test_expect(r).await != NGX_OK {

@@ -10,7 +10,7 @@ use ngx_core::string::B;
 use ngx_core::{ngx_log_error, ngx_log_stderr, os, process};
 
 const NGX_COMPILER: &str = "rustc 1.96.1";
-const NGX_CONFIGURE: &str = " --with-debug --with-http_ssl_module --with-http_v2_module --with-http_realip_module --with-http_addition_module --with-http_geoip_module --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-mail --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module --with-stream_ssl_preread_module --with-threads --with-file-aio";
+const NGX_CONFIGURE: &str = " --with-debug --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module --with-http_addition_module --with-http_geoip_module --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-http_json_module --with-control-api --with-mail --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module --with-stream_ssl_preread_module --with-threads --with-file-aio";
 
 struct Options {
     show_help: bool,
@@ -24,6 +24,8 @@ struct Options {
     conf_file: Option<Vec<u8>>,
     conf_params: Option<Vec<u8>>,
     signal: Option<String>,
+    /// ngx_control_addr
+    control_addr: Option<Vec<u8>>,
 }
 
 fn get_options(args: &[String]) -> Result<Options, ()> {
@@ -39,6 +41,7 @@ fn get_options(args: &[String]) -> Result<Options, ()> {
         conf_file: None,
         conf_params: None,
         signal: None,
+        control_addr: None,
     };
     let mut i = 1;
     while i < args.len() {
@@ -101,6 +104,21 @@ fn get_options(args: &[String]) -> Result<Options, ()> {
                     }
                     p = a.len();
                 }
+                b'l' => {
+                    ngx_core::control::CONTROL_API_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                    if p < a.len() {
+                        o.control_addr = Some(a[p..].to_vec());
+                    } else if i + 1 < args.len() {
+                        i += 1;
+                        o.control_addr = Some(args[i].as_bytes().to_vec());
+                    } else {
+                        ngx_log_stderr!(None, "option \"-l\" requires listen address");
+                        return Err(());
+                    }
+
+                    p = a.len();
+                }
                 _ => {
                     ngx_log_stderr!(None, "invalid option: \"{}\"", c as char);
                     return Err(());
@@ -116,7 +134,7 @@ fn show_version_info(o: &Options) {
     let mut s = format!("nginx version: {}\n", ngx_core::NGINX_VER_BUILD);
     if o.show_help {
         s.push_str(
-            "Usage: nginx [-?hvVtTq] [-s signal] [-p prefix]\n             [-e filename] [-c filename] [-g directives]\n\nOptions:\n  -?,-h         : this help\n  -v            : show version and exit\n  -V            : show version and configure options then exit\n  -t            : test configuration and exit\n  -T            : test configuration, dump it and exit\n  -q            : suppress non-error messages during configuration testing\n  -s signal     : send signal to a master process: stop, quit, reopen, reload\n  -p prefix     : set prefix path (default: /usr/local/nginx/)\n  -e filename   : set error log file (default: logs/error.log)\n  -c filename   : set configuration file (default: conf/nginx.conf)\n  -g directives : set global directives out of configuration file\n\n",
+            "Usage: nginx [-?hvVtTq] [-s signal] [-p prefix]\n             [-e filename] [-c filename] [-g directives]\n\nOptions:\n  -?,-h         : this help\n  -v            : show version and exit\n  -V            : show version and configure options then exit\n  -t            : test configuration and exit\n  -T            : test configuration, dump it and exit\n  -q            : suppress non-error messages during configuration testing\n  -s signal     : send signal to a master process: stop, quit, reopen, reload\n  -l addr       : open control socket on address\n  -p prefix     : set prefix path (default: /usr/local/nginx/)\n  -e filename   : set error log file (default: logs/error.log)\n  -c filename   : set configuration file (default: conf/nginx.conf)\n  -g directives : set global directives out of configuration file\n\n",
         );
     }
     if o.show_configure {
@@ -227,6 +245,7 @@ fn main() {
     if process::add_inherited_sockets(&mut init).is_err() {
         std::process::exit(1);
     }
+    ngx_core::control::preinit();
     let conf_file_name = init.conf_file.clone();
     let init = Rc::new(init);
     if let Some(sig) = &o.signal {
@@ -289,6 +308,11 @@ fn main() {
     if inherited {
         globals_mut(|g| g.daemonized = true);
         process::DAEMONIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if pt == ProcessType::Single {
+        ngx_log_error!(NGX_LOG_WARN, cycle.log, None, "control API unavailable in single process mode");
+    } else if ngx_core::control::init(o.control_addr.as_deref(), &cycle.log).is_err() {
+        std::process::exit(1);
     }
     let pid_path = ccf.borrow().pid.clone();
     if create_pidfile(&pid_path, &cycle.log).is_err() {

@@ -21,15 +21,66 @@ pub fn header_filter_module() -> ModuleDef {
 
 fn init(_cf: &mut Conf) -> ConfResult {
     set_top_header_filter(Rc::new(|r| Box::pin(header_filter(r))));
+    set_top_early_hints_filter(Rc::new(|r| Box::pin(early_hints_filter(r))));
     Ok(())
+}
+
+/// ngx_http_early_hints_filter: "103 Early Hints" with the headers of
+/// r->headers_out, flushed
+pub async fn early_hints_filter(r: R) -> i64 {
+    if !r.is_main() {
+        return NGX_OK;
+    }
+
+    if r.http_version.get() < NGX_HTTP_VERSION_11 {
+        return NGX_OK;
+    }
+
+    let mut headers: Vec<u8> = Vec::new();
+
+    for h in r.headers_out.borrow().headers.iter() {
+        if h.hash.get() == 0 {
+            continue;
+        }
+
+        headers.extend_from_slice(&h.key);
+        headers.extend_from_slice(b": ");
+        headers.extend_from_slice(&h.value.borrow());
+        headers.extend_from_slice(b"\r\n");
+    }
+
+    if headers.is_empty() {
+        return NGX_OK;
+    }
+
+    // ngx_http_early_hints_status_line
+    let mut out = b"HTTP/1.1 103 Early Hints\r\n".to_vec();
+
+    out.extend_from_slice(&headers);
+
+    http_debug!(r, "{}", B(&out));
+
+    // the end of HTTP early hints
+    out.extend_from_slice(b"\r\n");
+
+    r.header_size.set(out.len());
+
+    let mut b = Buf::from_vec(out);
+    b.flush = true;
+
+    let mut chain = Chain::new();
+    chain.push_back(b);
+
+    crate::write_filter::write_filter(r.clone(), chain).await
 }
 
 pub const SERVER_STRING: &[u8] = b"Server: nginx\r\n";
 pub const SERVER_FULL_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 pub const SERVER_BUILD_STRING: &[u8] = b"Server: nginx/1.31.7\r\n";
 
+/// ngx_http_status_lines: the statuses without a line there are written as
+/// their number
 static STATUS_LINES: &[(i64, &str)] = &[
-    (101, "101 Switching Protocols"),
     (200, "200 OK"),
     (201, "201 Created"),
     (202, "202 Accepted"),
@@ -48,6 +99,7 @@ static STATUS_LINES: &[(i64, &str)] = &[
     (404, "404 Not Found"),
     (405, "405 Not Allowed"),
     (406, "406 Not Acceptable"),
+    (407, "407 Proxy Authentication Required"),
     (408, "408 Request Time-out"),
     (409, "409 Conflict"),
     (410, "410 Gone"),
@@ -91,11 +143,10 @@ pub async fn header_filter(r: R) -> i64 {
     let mut out: Vec<u8> = Vec::with_capacity(512);
     {
         let mut ho = r.headers_out.borrow_mut();
+        // r->headers_out.last_modified = NULL: a header of the list stays
         if ho.last_modified_time != -1 && ho.status != NGX_HTTP_OK && ho.status != NGX_HTTP_PARTIAL_CONTENT && ho.status != NGX_HTTP_NOT_MODIFIED {
             ho.last_modified_time = -1;
-            if let Some(lm) = ho.last_modified.take() {
-                lm.hash.set(0);
-            }
+            ho.last_modified = None;
         }
         if ho.status == NGX_HTTP_NO_CONTENT {
             r.header_only.set(true);
@@ -105,9 +156,7 @@ pub async fn header_filter(r: R) -> i64 {
             if let Some(cl) = ho.content_length.take() {
                 cl.hash.set(0);
             }
-            if let Some(lm) = ho.last_modified.take() {
-                lm.hash.set(0);
-            }
+            ho.last_modified = None;
             ho.last_modified_time = -1;
         }
         if ho.status == NGX_HTTP_NOT_MODIFIED {
@@ -120,42 +169,26 @@ pub async fn header_filter(r: R) -> i64 {
         } else if let Some(l) = status_line(status) {
             out.extend_from_slice(l.as_bytes());
         } else {
-            out.extend_from_slice(format!("{} ", status).as_bytes());
+            out.extend_from_slice(format!("{:03} ", status).as_bytes());
         }
         out.extend_from_slice(b"\r\n");
     }
     let mut content_type: Option<Vec<u8>> = None;
-    // The headers kept in typed slots are written here; the ones that are
-    // also in the headers list are skipped there, and keep their hash as
-    // the list entries C writes in place do ($sent_http_etag etc.)
-    let mut written: Vec<Header> = Vec::new();
+    // ngx_http_header_filter: "Server", "Date", "Content-Length" and
+    // "Last-Modified" are written here only from the fields when there is
+    // no header for them; the headers of r->headers_out.headers (typed
+    // slots included) follow in their order after "Connection"
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
-        if let Some(sv) = &ho.server {
-            // a slot with hash 0 is not sent, nor the server's own
-            // (the empty "Server" of ngx_http_upstream_process_headers)
-            if sv.hash.get() != 0 {
-                out.extend_from_slice(b"Server: ");
-                out.extend_from_slice(&sv.value.borrow());
-                out.extend_from_slice(b"\r\n");
-                written.push(sv.clone());
-            }
-        } else {
+        if ho.server.is_none() {
             match *cl.server_tokens {
                 NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
                 NGX_HTTP_SERVER_TOKENS_BUILD => out.extend_from_slice(SERVER_BUILD_STRING),
                 _ => out.extend_from_slice(SERVER_STRING),
             }
         }
-        if let Some(dt) = &ho.date {
-            if dt.hash.get() != 0 {
-                out.extend_from_slice(b"Date: ");
-                out.extend_from_slice(&dt.value.borrow());
-                out.extend_from_slice(b"\r\n");
-                written.push(dt.clone());
-            }
-        } else {
+        if ho.date.is_none() {
             out.extend_from_slice(b"Date: ");
             out.extend_from_slice(ngx_core::times::cached_http_time().as_bytes());
             out.extend_from_slice(b"\r\n");
@@ -175,65 +208,29 @@ pub async fn header_filter(r: R) -> i64 {
         if ho.content_length.is_none() && ho.content_length_n >= 0 {
             out.extend_from_slice(format!("Content-Length: {}\r\n", ho.content_length_n).as_bytes());
         }
-        if let Some(cr) = &ho.content_range {
-            out.extend_from_slice(b"Content-Range: ");
-            out.extend_from_slice(&cr.value.borrow());
-            out.extend_from_slice(b"\r\n");
-            written.push(cr.clone());
-        }
-        if let Some(ce) = &ho.content_encoding {
-            if ce.hash.get() != 0 {
-                out.extend_from_slice(b"Content-Encoding: ");
-                out.extend_from_slice(&ce.value.borrow());
-                out.extend_from_slice(b"\r\n");
-                written.push(ce.clone());
-            }
-        }
-        if let Some(lm) = &ho.last_modified {
-            if lm.hash.get() != 0 {
-                out.extend_from_slice(b"Last-Modified: ");
-                out.extend_from_slice(&lm.value.borrow());
-                out.extend_from_slice(b"\r\n");
-                written.push(lm.clone());
-            }
-        } else if ho.last_modified_time != -1 {
+        if ho.last_modified.is_none() && ho.last_modified_time != -1 {
             out.extend_from_slice(b"Last-Modified: ");
             out.extend_from_slice(ngx_core::times::http_time(ho.last_modified_time).as_bytes());
             out.extend_from_slice(b"\r\n");
-        }
-        if let Some(et) = &ho.etag {
-            if et.hash.get() != 0 {
-                out.extend_from_slice(b"ETag: ");
-                out.extend_from_slice(&et.value.borrow());
-                out.extend_from_slice(b"\r\n");
-                written.push(et.clone());
-            }
         }
     }
     if let Some(ct) = content_type {
         r.headers_out.borrow_mut().content_type = ct;
     }
-    // Location: emit ho.location. If relative and absolute_redirect on,
-    // prepend scheme://host; otherwise pass through verbatim.
+    // Location: a relative one made absolute (absolute_redirect), its
+    // header not written again from the list; any other stays in the list
     {
         let ho = r.headers_out.borrow();
         let cl = clcf.borrow();
         if let Some(loc) = &ho.location {
             let v = loc.value.borrow().clone();
-            loc.hash.set(0);
-            if v.is_empty() {
-                // nothing to emit
-            } else if !(v[0] == b'/' && *cl.absolute_redirect) {
-                out.extend_from_slice(b"Location: ");
-                out.extend_from_slice(&v);
-                out.extend_from_slice(b"\r\n");
-            } else {
+            if !v.is_empty() && v[0] == b'/' && *cl.absolute_redirect {
+                loc.hash.set(0);
+                let p = out.len() + b"Location: ".len();
                 out.extend_from_slice(b"Location: ");
                 out.extend_from_slice(if r.connection.ssl.borrow().is_some() { b"https://" } else { b"http://" });
-                // Match C ngx_http_header_filter_module Location host selection:
-                //   server_name_in_redirect on  -> server_name
-                //   headers_in.server not empty -> the client Host header
-                //   else                        -> local sockaddr
+                // server_name_in_redirect on: the server name; else the
+                // client's Host; else the local address
                 let host: Vec<u8> = if *cl.server_name_in_redirect {
                     let cscf = r.cscf();
                     let n = cscf.borrow().server_name.clone();
@@ -265,6 +262,8 @@ pub async fn header_filter(r: R) -> i64 {
                     }
                 }
                 out.extend_from_slice(&v);
+                // update r->headers_out.location->value for possible logging
+                *loc.value.borrow_mut() = out[p..].to_vec();
                 out.extend_from_slice(b"\r\n");
             }
         }
@@ -293,8 +292,16 @@ pub async fn header_filter(r: R) -> i64 {
         } else {
             out.extend_from_slice(b"Connection: close\r\n");
         }
+        // NGX_HTTP_GZIP
+        if r.gzip_vary.get() {
+            if *cl.gzip_vary {
+                out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+            } else {
+                r.gzip_vary.set(false);
+            }
+        }
         for h in ho.headers.iter() {
-            if h.hash.get() == 0 || written.iter().any(|w| Rc::ptr_eq(w, h)) {
+            if h.hash.get() == 0 {
                 continue;
             }
             out.extend_from_slice(&h.key);

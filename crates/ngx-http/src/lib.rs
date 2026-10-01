@@ -26,6 +26,7 @@ pub mod write_filter;
 pub mod huff_decode;
 pub mod huff_encode;
 pub mod v2;
+pub mod v3;
 pub mod memcached;
 pub mod special_response;
 pub mod static_module;
@@ -70,6 +71,7 @@ pub mod upstream_round_robin;
 pub mod upstream_ssl;
 pub mod fastcgi;
 pub mod event_pipe;
+pub mod upstream_rt;
 pub mod ssl_module;
 pub mod gzip_filter;
 pub mod gzip_static;
@@ -86,10 +88,18 @@ pub mod dav;
 pub mod gunzip;
 pub mod degradation;
 pub mod sub_filter;
+pub mod http_types;
 pub mod charset_filter;
 pub mod secure_link;
 pub mod geoip;
 pub mod uwsgi;
+pub mod slice;
+pub mod scgi;
+pub mod grpc;
+pub mod upstream_h2;
+pub mod proxy_v2;
+pub mod tunnel;
+pub mod json;
 
 pub use request::{Request, R};
 
@@ -301,6 +311,7 @@ pub type RequestBodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> BoxFut<i64>>;
 
 thread_local! {
     static TOP_HEADER_FILTER: RefCell<Option<HeaderFilter>> = const { RefCell::new(None) };
+    static TOP_EARLY_HINTS_FILTER: RefCell<Option<HeaderFilter>> = const { RefCell::new(None) };
     static TOP_BODY_FILTER: RefCell<Option<BodyFilter>> = const { RefCell::new(None) };
     static TOP_REQUEST_BODY_FILTER: RefCell<Option<RequestBodyFilter>> = const { RefCell::new(None) };
 }
@@ -311,6 +322,30 @@ pub fn top_header_filter() -> HeaderFilter {
 
 pub fn set_top_header_filter(f: HeaderFilter) {
     TOP_HEADER_FILTER.with(|t| *t.borrow_mut() = Some(f));
+}
+
+/// ngx_http_top_early_hints_filter
+pub fn top_early_hints_filter() -> HeaderFilter {
+    TOP_EARLY_HINTS_FILTER.with(|t| t.borrow().clone().expect("early hints filter chain not initialized"))
+}
+
+pub fn set_top_early_hints_filter(f: HeaderFilter) {
+    TOP_EARLY_HINTS_FILTER.with(|t| *t.borrow_mut() = Some(f));
+}
+
+/// Install an early hints filter wrapping the current top.
+pub fn install_early_hints_filter<F, Fut>(f: F)
+where
+    F: Fn(R, HeaderFilter) -> Fut + 'static,
+    Fut: Future<Output = i64> + 'static,
+{
+    let next = top_early_hints_filter();
+    let f = Rc::new(f);
+    set_top_early_hints_filter(Rc::new(move |r| {
+        let f = f.clone();
+        let next = next.clone();
+        Box::pin(async move { f(r, next).await })
+    }));
 }
 
 pub fn top_body_filter() -> BodyFilter {
@@ -579,7 +614,7 @@ pub fn modules() -> Vec<ModuleDef> {
         log::log_module(),
         upstream::upstream_module(),
         v2::module::v2_module(),
-        stubs::v3_module(),
+        v3::module::v3_module(),
         static_module::static_module(),
         gzip_static::gzip_static_module(),
         dav::dav_module(),
@@ -594,7 +629,7 @@ pub fn modules() -> Vec<ModuleDef> {
         limit_conn::limit_conn_module(),
         limit_req::limit_req_module(),
         realip::realip_module(),
-        stubs::json_module(),
+        json::json_module(),
         geo::geo_module(),
         geoip::geoip_module(),
         map::map_module(),
@@ -605,10 +640,10 @@ pub fn modules() -> Vec<ModuleDef> {
         proxy::proxy_module(),
         fastcgi::fastcgi_module(),
         uwsgi::uwsgi_module(),
-        stubs::scgi_module(),
-        stubs::grpc_module(),
+        scgi::scgi_module(),
+        grpc::grpc_module(),
         stubs::proxy_v2_module(),
-        stubs::tunnel_module(),
+        tunnel::tunnel_module(),
         stubs::perl_module(),
         memcached::memcached_module(),
         empty_gif::empty_gif_module(),
@@ -630,7 +665,7 @@ pub fn modules() -> Vec<ModuleDef> {
         header_filter::header_filter_module(),
         chunked_filter::chunked_filter_module(),
         v2::filter::v2_filter_module(),
-        stubs::v3_filter_module(),
+        v3::filter::v3_filter_module(),
         range_filter::range_header_filter_module(),
         gzip_filter::gzip_filter_module(),
         postpone_filter::postpone_filter_module(),
@@ -646,7 +681,7 @@ pub fn modules() -> Vec<ModuleDef> {
         copy_filter::copy_filter_module(),
         range_filter::range_body_filter_module(),
         not_modified_filter::not_modified_filter_module(),
-        stubs::slice_filter_module(),
+        slice::slice_filter_module(),
     ]
 }
 

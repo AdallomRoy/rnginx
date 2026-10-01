@@ -22,11 +22,9 @@ use tokio::io::ReadBuf;
 use tokio::time::Instant;
 
 use ngx_core::conf::*;
-use ngx_core::connection::{Connection, IoStep, NGX_ERROR_ERR};
-use ngx_core::event_connect::{event_connect_peer, LocalAddr, PeerConnect, PeerSocket};
+use ngx_core::connection::{Connection, IoStep};
 use ngx_core::event_openssl::*;
 use ngx_core::event_openssl_cache::SslCache;
-use ngx_core::inet::SockAddr;
 use ngx_core::log::*;
 use ngx_core::rc::*;
 use ngx_core::ssl::SslConnection;
@@ -383,86 +381,6 @@ pub fn test_connect(c: &Connection) -> i64 {
     }
 
     NGX_OK
-}
-
-/// ngx_event_connect_peer to an https upstream, and on the connection
-/// (the write handler of the connect, ngx_http_upstream_send_request_handler)
-/// ngx_http_upstream_ssl_init_connection. `local` is proxy_bind.
-///
-/// Errors are those of ngx_http_upstream_next (FT_ERROR, FT_TIMEOUT, the
-/// connection is closed without "close notify") or 500
-/// (ngx_http_upstream_finalize_request).
-pub(crate) async fn connect(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, local: Option<&LocalAddr>, ssl: &SslSetup, connect_timeout: u64) -> Result<PeerConn, ConnectError> {
-    let log = r.connection.log.clone();
-    let action = log.action();
-
-    // ngx_http_upstream_connect
-    log.set_action(Some("connecting to upstream"));
-
-    let name = u.pc.name.clone();
-
-    let res = event_connect_peer(&PeerSocket {
-        sockaddr,
-        name: &name,
-        ty: libc::SOCK_STREAM,
-        rcvbuf: 0,
-        sndbuf: 0,
-        so_keepalive: false,
-        local,
-        transparent: false,
-        log: &log,
-        log_error: NGX_ERROR_ERR,
-    });
-
-    let (c, again) = match res {
-        PeerConnect::Ok(c) => (c, false),
-        PeerConnect::Again(c) => (c, true),
-        PeerConnect::Declined => {
-            log.set_action(action);
-            return Err(ConnectError::Error);
-        }
-        PeerConnect::Error => {
-            log.set_action(action);
-            return Err(ConnectError::Internal);
-        }
-    };
-
-    let pc = PeerConn { c: c.clone() };
-
-    // c->data = r
-    u.attach(&c);
-
-    let mut deadline = None;
-
-    if again {
-        // ngx_add_timer(c->write, u->conf->connect_timeout)
-        let d = Instant::now() + Duration::from_millis(connect_timeout);
-
-        if tokio::time::timeout_at(d, c.writable()).await.is_err() {
-            // ngx_http_upstream_send_request_handler: c->write->timedout,
-            // ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT)
-            ngx_log_error!(NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-            log.set_action(action);
-            pc.set_no_shutdown();
-            return Err(ConnectError::Timeout);
-        }
-
-        deadline = Some(d);
-    }
-
-    let rc = ssl_init_connection(r, u, &c, ssl, deadline, connect_timeout).await;
-
-    log.set_action(action);
-
-    match rc {
-        Ok(()) => Ok(pc),
-        Err(e) => {
-            if !matches!(e, ConnectError::Internal) {
-                pc.set_no_shutdown();
-            }
-            Err(e)
-        }
-    }
 }
 
 /// ngx_http_upstream_ssl_init_connection, and ngx_http_upstream_ssl_handshake

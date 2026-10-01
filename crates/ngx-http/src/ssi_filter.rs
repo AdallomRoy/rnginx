@@ -375,7 +375,7 @@ enum SsiState {
 /// ngx_http_ssi_var_t
 pub struct SsiVar {
     name: Vec<u8>,
-    key: u32,
+    key: usize,
     value: Vec<u8>,
 }
 
@@ -401,7 +401,7 @@ struct SsiParse {
     pos: usize,
     copy_start: Option<usize>,
     copy_end: Option<usize>,
-    key: u32,
+    key: usize,
     command: Vec<u8>,
     /// ctx->params: (key, value), ctx->param being the last one
     params: Vec<(Vec<u8>, Vec<u8>)>,
@@ -487,12 +487,12 @@ fn ssi_set_ctx(r: &R, ctx: Rc<SsiCtx>) {
 }
 
 /// ngx_hash_strlow(s, s, len)
-fn hash_strlow(s: &mut [u8]) -> u32 {
-    let mut key = 0u32;
+fn hash_strlow(s: &mut [u8]) -> usize {
+    let mut key = 0usize;
 
     for c in s.iter_mut() {
         *c = c.to_ascii_lowercase();
-        key = key.wrapping_mul(31).wrapping_add(*c as u32);
+        key = key.wrapping_mul(31).wrapping_add(*c as usize);
     }
 
     key
@@ -1157,7 +1157,7 @@ fn ssi_parse_buf(log: &Log, ctx: &mut SsiParse, buf: &Buf) -> i64 {
                     ctx.command.push(ch);
 
                     ctx.key = 0;
-                    ctx.key = ctx.key.wrapping_mul(31).wrapping_add(ch as u32);
+                    ctx.key = ctx.key.wrapping_mul(31).wrapping_add(ch as usize);
 
                     ctx.params.clear();
 
@@ -1179,7 +1179,7 @@ fn ssi_parse_buf(log: &Log, ctx: &mut SsiParse, buf: &Buf) -> i64 {
                         state = SsiState::Error;
                     } else {
                         ctx.command.push(ch);
-                        ctx.key = ctx.key.wrapping_mul(31).wrapping_add(ch as u32);
+                        ctx.key = ctx.key.wrapping_mul(31).wrapping_add(ch as usize);
                     }
                 }
             },
@@ -1408,11 +1408,11 @@ impl SsiVarRef {
 }
 
 /// ngx_http_ssi_get_variable
-fn ssi_get_variable(r: &R, name: &[u8], key: u32) -> Option<SsiVarRef> {
+fn ssi_get_variable(r: &R, name: &[u8], key: usize) -> Option<SsiVarRef> {
     let ctx = ssi_get_ctx(&r.main())?;
 
-    if key >= b'0' as u32 && key <= b'9' as u32 {
-        let i = (key - b'0' as u32) as usize;
+    if key >= b'0' as usize && key <= b'9' as usize {
+        let i = key - b'0' as usize;
 
         let caps = ctx.captures.borrow();
 
@@ -1441,7 +1441,7 @@ enum EvalPart {
 
 /// What looking a variable up gives ngx_http_ssi_evaluate_string(): None
 /// for an error, Some(None) for a variable not found.
-type EvalLookup<'a> = dyn FnMut(&[u8], u32) -> Option<Option<Vec<u8>>> + 'a;
+type EvalLookup<'a> = dyn FnMut(&[u8], usize) -> Option<Option<Vec<u8>>> + 'a;
 
 /// ngx_http_ssi_evaluate_string: the variables in `text` replaced with
 /// their values (an SSI variable, else a variable of the request); a
@@ -1450,7 +1450,7 @@ type EvalLookup<'a> = dyn FnMut(&[u8], u32) -> Option<Option<Vec<u8>>> + 'a;
 fn ssi_evaluate_string(r: &R, text: &mut Vec<u8>, flags: u32) -> i64 {
     let uri = r.uri.borrow().clone();
 
-    let mut lookup = |var: &[u8], key: u32| -> Option<Option<Vec<u8>>> {
+    let mut lookup = |var: &[u8], key: usize| -> Option<Option<Vec<u8>>> {
         match ssi_get_variable(r, var, key) {
             Some(val) => Some(Some(val.value())),
             None => {
@@ -2445,7 +2445,7 @@ mod tests {
 
     fn eval(uri: &[u8], text: &[u8], flags: u32) -> (i64, Vec<u8>) {
         let log = Log::stderr(NGX_LOG_EMERG);
-        let mut lookup = |var: &[u8], key: u32| -> Option<Option<Vec<u8>>> {
+        let mut lookup = |var: &[u8], key: usize| -> Option<Option<Vec<u8>>> {
             assert_eq!(key, hash_key(var));
             match var {
                 b"a" => Some(Some(b"A".to_vec())),
@@ -2493,7 +2493,7 @@ mod tests {
         assert_eq!(s, b"arg_v");
         // a one character name hashes to itself: the captures
         let mut s = b"1".to_vec();
-        assert_eq!(hash_strlow(&mut s), b'1' as u32);
+        assert_eq!(hash_strlow(&mut s), b'1' as usize);
     }
 
     #[test]

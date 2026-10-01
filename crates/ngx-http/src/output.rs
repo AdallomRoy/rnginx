@@ -3,14 +3,17 @@
 use std::io;
 
 use ngx_core::buf::{BufData, Chain};
-use ngx_core::connection::{Connection, TcpNopush};
+use ngx_core::connection::{Connection, TcpNodelay, TcpNopush};
 use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf, SslChainFile};
 use ngx_core::log::*;
-use ngx_core::ngx_log_error;
+use ngx_core::ngx_log_debug;
 
 /// Send as much of `chain` as possible up to `limit` bytes; returns bytes sent.
 /// Buffers are advanced in place (like ngx_chain_update_sent); fully sent buffers are removed.
 pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    if c.is_quic_stream() {
+        return quic_send_chain(c, chain, limit).await;
+    }
     if c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get()) {
         return ssl_send_chain(c, chain, limit).await;
     }
@@ -39,13 +42,6 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
                 BufData::File(f) => (f.fd, first.file_pos, (first.file_last - first.file_pos).min(budget)),
                 _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
             };
-            if c.tcp_nopush.get() == TcpNopush::Unset && c.ty == libc::SOCK_STREAM && !c.sockaddr.borrow().is_unix() {
-                if let Err(e) = c.tcp_push_on() {
-                    ngx_log_error!(NGX_LOG_CRIT, c.log, e.raw_os_error(), "setsockopt(TCP_CORK) failed");
-                } else {
-                    c.tcp_nopush.set(TcpNopush::Set);
-                }
-            }
             let n = c.sendfile(fd, off, size as usize).await?;
             if n == 0 {
                 return Err(io::Error::from_raw_os_error(libc::EPIPE));
@@ -57,8 +53,15 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
         // gather memory buffers
         let mut iov: Vec<&[u8]> = Vec::new();
         let mut gathered: i64 = 0;
+        // the buffer after the header is in a file
+        let mut file_next = false;
         for b in chain.iter() {
+            // ngx_output_chain_to_iovec: special buffers are skipped
+            if b.special_buf() {
+                continue;
+            }
             if !b.in_memory() {
+                file_next = b.in_file;
                 break;
             }
             if gathered >= budget {
@@ -78,6 +81,10 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
         if iov.is_empty() {
             return Ok(total);
         }
+        // TCP_CORK if there is a header before a file
+        if file_next && c.tcp_nopush.get() == TcpNopush::Unset {
+            tcp_nopush(c)?;
+        }
         let n = c.writev(&iov).await?;
         total += n as i64;
         drop(iov);
@@ -87,6 +94,41 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
             continue;
         }
     }
+}
+
+/// The TCP_CORK of ngx_linux_sendfile_chain for a header before a file:
+/// TCP_NODELAY off first, the two are mutually exclusive. EINTR leaves the
+/// connection as it is.
+fn tcp_nopush(c: &Connection) -> io::Result<()> {
+    if c.tcp_nodelay.get() == TcpNodelay::Set {
+        match c.setsockopt_int(libc::IPPROTO_TCP, libc::TCP_NODELAY, 0) {
+            Ok(()) => {
+                c.tcp_nodelay.set(TcpNodelay::Unset);
+                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "no tcp_nodelay");
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => {
+                c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(TCP_NODELAY) failed");
+                return Err(e);
+            }
+        }
+    }
+
+    if c.tcp_nodelay.get() == TcpNodelay::Unset {
+        match c.tcp_push_on() {
+            Ok(()) => {
+                c.tcp_nopush.set(TcpNopush::Set);
+                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "tcp_nopush");
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => {
+                c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(TCP_CORK) failed");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// c->send_chain of an SSL connection: ngx_ssl_send_chain(), which keeps
@@ -112,6 +154,62 @@ async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
     ngx_core::buf::chain_update_sent(chain, n);
 
     Ok(n)
+}
+
+/// c->send_chain of a QUIC stream: ngx_quic_stream_send_chain(), the data
+/// copied to the stream within its flow control window (the buffers not
+/// in memory are skipped, as ngx_quic_write_buffer does), waiting for the
+/// write event while the window is closed. `limit` 0 is none.
+async fn quic_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    let mut total: i64 = 0;
+
+    loop {
+        while let Some(b) = chain.front() {
+            if b.buf_size() == 0 {
+                chain.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let (n, left) = {
+            let mut iov: Vec<&[u8]> = chain
+                .iter()
+                .filter(|b| b.in_memory() && b.last > b.pos)
+                .filter_map(|b| match &b.data {
+                    BufData::Memory(v) => Some(&v[b.pos..b.last]),
+                    _ => None,
+                })
+                .collect();
+
+            if iov.is_empty() {
+                return Ok(total);
+            }
+
+            let before: usize = iov.iter().map(|s| s.len()).sum();
+
+            let budget = if limit > 0 { (limit - total) as u64 } else { 0 };
+
+            if ngx_core::quic::streams::ngx_quic_stream_send_chain(c, &mut iov, budget).is_err() {
+                return Err(io::Error::other("quic stream send failed"));
+            }
+
+            let after: usize = iov.iter().map(|s| s.len()).sum();
+
+            (before - after, after)
+        };
+
+        total += n as i64;
+
+        ngx_core::buf::chain_update_sent(chain, n as i64);
+
+        if left == 0 || (limit > 0 && total >= limit) {
+            return Ok(total);
+        }
+
+        // wev->ready = 0: the write event, once the peer acknowledges data
+        c.writable().await?;
+    }
 }
 
 /// Convenience: send a whole chain (awaiting writability) — used by simple paths.

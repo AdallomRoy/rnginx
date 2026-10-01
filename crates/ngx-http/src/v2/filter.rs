@@ -31,6 +31,9 @@ const NGINX_VER_BUILD: &[u8] = NGINX_VER;
 /// "nginx", Huffman-coded, with its length prefix.
 const NGINX: [u8; 5] = [0x84, 0xaa, 0x63, 0x55, 0xe7];
 
+/// "Accept-Encoding", Huffman-coded, with its length prefix.
+const ACCEPT_ENCODING: [u8; 12] = [0x8b, 0x84, 0x84, 0x2d, 0x69, 0x5b, 0x05, 0x44, 0x3c, 0x86, 0xaa, 0x6f];
+
 pub fn v2_filter_module() -> ModuleDef {
     let def = HttpModuleDef { postconfiguration: Some(filter_init), ..Default::default() };
     http_module_def("ngx_http_v2_filter_module", def, Vec::new())
@@ -44,7 +47,89 @@ fn filter_init(_cf: &mut ngx_core::conf::Conf) -> ngx_core::conf::ConfResult {
         }
         header_filter(&r).await
     });
+    install_early_hints_filter(|r: R, next: HeaderFilter| async move {
+        if request_stream(&r).is_none() {
+            return next(r).await;
+        }
+        early_hints_filter(&r).await
+    });
     Ok(())
+}
+
+/// ngx_http_v2_early_hints_filter: a HEADERS frame of ":status: 103" and
+/// the headers of r->headers_out
+async fn early_hints_filter(r: &R) -> i64 {
+    let stream = match request_stream(r) {
+        Some(s) => s,
+        None => return NGX_ERROR,
+    };
+
+    if !r.is_main() {
+        return NGX_OK;
+    }
+
+    let fc = stream.fc.clone();
+
+    if fc.error.get() {
+        return NGX_ERROR;
+    }
+
+    let headers: Vec<(Vec<u8>, Vec<u8>)> = r.headers_out.borrow().headers.iter().filter(|h| h.hash.get() != 0).map(|h| (h.key.clone(), h.value.borrow().clone())).collect();
+
+    for (key, value) in headers.iter() {
+        if key.len() > NGX_HTTP_V2_MAX_FIELD {
+            ngx_log_error!(NGX_LOG_CRIT, fc.log, None, "too long response header name: \"{}\"", B(key));
+            return NGX_ERROR;
+        }
+
+        if value.len() > NGX_HTTP_V2_MAX_FIELD {
+            ngx_log_error!(NGX_LOG_CRIT, fc.log, None, "too long response header value: \"{}: {}\"", B(key), B(value));
+            return NGX_ERROR;
+        }
+    }
+
+    if headers.is_empty() {
+        return NGX_OK;
+    }
+
+    let h2c = stream.connection.clone();
+
+    let mut pos: Vec<u8> = Vec::with_capacity(256);
+
+    if h2c.table_update.get() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 table size update: 0");
+        pos.push((1 << 5) | 0);
+        h2c.table_update.set(false);
+    }
+
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \":status: {:03}\"", NGX_HTTP_EARLY_HINTS);
+
+    pos.push(inc_indexed(NGX_HTTP_V2_STATUS_INDEX));
+    pos.push(NGX_HTTP_V2_ENCODE_RAW | 3);
+    pos.extend_from_slice(format!("{:03}", NGX_HTTP_EARLY_HINTS).as_bytes());
+
+    for (key, value) in headers.iter() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"{}: {}\"", B(&ngx_core::string::to_lower_vec(key)), B(value));
+
+        pos.push(0);
+
+        write_name(&mut pos, key);
+
+        write_value(&mut pos, value);
+    }
+
+    let frame = create_headers_frame(&stream, &pos, false);
+
+    h2c.queue_blocked_frame(frame);
+
+    stream.queued.set(stream.queued.get() + 1);
+
+    init_stream(r, &stream);
+
+    match filter_send(&stream).await {
+        Ok(()) => NGX_OK,
+        Err(()) => NGX_ERROR,
+    }
 }
 
 /// ngx_http_v2_header_filter
@@ -101,9 +186,7 @@ async fn header_filter(r: &R) -> i64 {
                 ho.content_length_n = -1;
 
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = indexed(NGX_HTTP_V2_STATUS_204_INDEX);
             }
@@ -117,9 +200,7 @@ async fn header_filter(r: &R) -> i64 {
 
             _ => {
                 ho.last_modified_time = -1;
-                if let Some(lm) = ho.last_modified.take() {
-                    lm.hash.set(0);
-                }
+                ho.last_modified = None;
 
                 status = match ho.status {
                     NGX_HTTP_BAD_REQUEST => indexed(NGX_HTTP_V2_STATUS_400_INDEX),
@@ -293,42 +374,24 @@ async fn header_filter(r: &R) -> i64 {
         }
     }
 
-    // Headers kept in typed headers_out slots only (C has them in the
-    // list): emitted like list entries.
-    let typed: Vec<(&[u8], Option<Header>)> = {
-        let ho = r.headers_out.borrow();
-        vec![
-            (&b"server"[..], ho.server.clone()),
-            (&b"date"[..], ho.date.clone()),
-            (&b"content-range"[..], ho.content_range.clone()),
-            (&b"content-encoding"[..], ho.content_encoding.clone()),
-            (&b"last-modified"[..], ho.last_modified.clone()),
-            (&b"etag"[..], ho.etag.clone()),
-        ]
-    };
+    // NGX_HTTP_GZIP
+    if r.gzip_vary.get() {
+        if *clcf.borrow().gzip_vary {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"vary: Accept-Encoding\"");
 
-    // those also in the list are skipped there and keep their hash, as
-    // the list entries C writes in place do ($sent_http_etag etc.)
-    let mut written: Vec<Header> = Vec::new();
-
-    for (name, h) in typed {
-        if let Some(h) = h {
-            if h.hash.get() == 0 {
-                continue;
-            }
-            let value = h.value.borrow().clone();
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"{}: {}\"", B(name), B(&value));
-            pos.push(0);
-            write_name(&mut pos, name);
-            write_value(&mut pos, &value);
-            written.push(h);
+            pos.push(inc_indexed(NGX_HTTP_V2_VARY_INDEX));
+            pos.extend_from_slice(&ACCEPT_ENCODING);
+        } else {
+            r.gzip_vary.set(false);
         }
     }
 
+    // the headers of the list, in their order: the typed slots (an
+    // upstream's Server and Date, ETag, Content-Encoding, ...) are in it
     let headers: Vec<Header> = r.headers_out.borrow().headers.clone();
 
     for h in headers.iter() {
-        if h.hash.get() == 0 || written.iter().any(|w| Rc::ptr_eq(w, h)) {
+        if h.hash.get() == 0 {
             continue;
         }
 
@@ -924,7 +987,7 @@ fn handle_frame(stream: &Rc<H2Stream>, frame: &OutFrame) {
 }
 
 /// ngx_http_v2_handle_stream: post the stream's write event.
-fn handle_stream(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
+fn handle_stream(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
     if stream.waiting.get() || stream.blocked.get() {
         return;
     }
@@ -934,6 +997,8 @@ fn handle_stream(_h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>) {
     }
 
     stream.notify.notify_one();
+
+    h2c.streams_posted.set(true);
 }
 
 /// ngx_http_v2_filter_cleanup: drop the stream's frames not yet started

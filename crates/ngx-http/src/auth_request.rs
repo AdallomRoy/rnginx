@@ -151,6 +151,7 @@ fn init(cf: &mut Conf) -> ConfResult {
     Ok(())
 }
 
+/// ngx_http_auth_request_handler
 async fn auth_request_handler(r: R) -> i64 {
     let conf = r.loc_conf::<AuthRequestLocConf>(ctx_index());
     let conf = conf.borrow();
@@ -164,105 +165,104 @@ async fn auth_request_handler(r: R) -> i64 {
         return NGX_DECLINED;
     }
 
-    // Check if context already exists
+    http_debug!(r, "auth request handler");
+
     if let Some(ctx) = r.get_ctx::<AuthRequestCtx>(ctx_index()) {
-        let ctx_ref = ctx.borrow();
-        if !ctx_ref.done {
-            return NGX_AGAIN;
-        }
-
-        // Set variables from subrequest
-        if set_variables(&r, &conf, &*ctx_ref).is_err() {
-            return NGX_ERROR;
-        }
-
-        return ctx_ref.status;
+        return auth_request_status(&r, &conf, &ctx);
     }
-
-    // Create new context
-    let uri_bytes = uri.clone();
 
     // ngx_http_subrequest(r, &arcf->uri, NULL, &sr, ps, NGX_HTTP_SUBREQUEST_WAITED),
     // then, before it runs, a fake request body (so that the subrequest does not
     // read the client's, nor its upstream close the body file) and
     // sr->header_only = 1
-    let sr = match subrequest_posted(&r, &uri_bytes, None, NGX_HTTP_SUBREQUEST_WAITED, None) {
-        Ok(sr) => {
-            *sr.request_body.borrow_mut() = Some(Rc::new(RefCell::new(RequestBody {
-                temp_file: None,
-                bufs: ngx_core::buf::Chain::new(),
-                buf: None,
-                rest: 0,
-                received: 0,
-                chunked: None,
-                filter_need_buffering: false,
-                last_sent: false,
-                last_saved: false,
-                buf_size: 0,
-                buf_last: 0,
-            })));
-            sr.header_only.set(true);
-            // the handler returns NGX_AGAIN in C, and the posted subrequest runs
-            crate::postpone_filter::run_posted_requests(&r).await;
-            Ok(sr)
-        }
-        Err(()) => Err(()),
+    let sr = match subrequest_posted(&r, &uri, None, NGX_HTTP_SUBREQUEST_WAITED, None) {
+        Ok(sr) => sr,
+        Err(()) => return NGX_ERROR,
     };
-    match sr {
-        Ok(sr) => {
-            // Use the HTTP status the subrequest produced, not the subrequest rc.
-            let http_status = sr.headers_out.borrow().status;
-            let status = if http_status >= NGX_HTTP_OK && http_status < NGX_HTTP_SPECIAL_RESPONSE {
-                NGX_OK
-            } else if http_status == NGX_HTTP_FORBIDDEN || http_status == NGX_HTTP_UNAUTHORIZED {
-                // Propagate WWW-Authenticate headers to the parent response, matching C.
-                if http_status == NGX_HTTP_UNAUTHORIZED {
-                    let sr_ho = sr.headers_out.borrow();
-                    let mut wwws: Vec<Header> = Vec::new();
-                    for h in &sr_ho.www_authenticate {
-                        wwws.push(h.clone());
-                    }
-                    for h in sr_ho.headers.iter() {
-                        if h.key.eq_ignore_ascii_case(b"WWW-Authenticate") {
-                            wwws.push(h.clone());
-                        }
-                    }
-                    drop(sr_ho);
-                    let mut ho = r.headers_out.borrow_mut();
-                    for h in wwws {
-                        ho.headers.push(h);
-                    }
-                }
-                http_status
-            } else {
-                NGX_HTTP_INTERNAL_SERVER_ERROR
-            };
-            let ctx_val = AuthRequestCtx {
-                done: true,
-                status,
-                subrequest_response: Some(Box::new(sr)),
-            };
 
-            let ctx = r.set_ctx(ctx_index(), ctx_val);
+    *sr.request_body.borrow_mut() = Some(Rc::new(RefCell::new(RequestBody {
+        temp_file: None,
+        bufs: ngx_core::buf::Chain::new(),
+        buf: None,
+        rest: 0,
+        received: 0,
+        chunked: None,
+        filter_need_buffering: false,
+        last_sent: false,
+        last_saved: false,
+        buf_size: 0,
+        buf_last: 0,
+    })));
 
-            let ctx_ref = ctx.borrow();
-            // Set variables from subrequest
-            if set_variables(&r, &conf, &*ctx_ref).is_err() {
-                return NGX_ERROR;
+    sr.header_only.set(true);
+
+    // the handler returns NGX_AGAIN in C, and the posted subrequest runs
+    crate::postpone_filter::run_posted_requests(&r).await;
+
+    // ngx_http_auth_request_done: the status of the subrequest
+    let status = sr.headers_out.borrow().status;
+
+    http_debug!(sr, "auth request done s:{}", status);
+
+    let ctx = r.set_ctx(ctx_index(), AuthRequestCtx { done: true, status, subrequest_response: Some(Box::new(sr)) });
+
+    // the phase handler again, with the subrequest done
+    auth_request_status(&r, &conf, &ctx)
+}
+
+/// The part of ngx_http_auth_request_handler once the subrequest is done:
+/// the variables of auth_request_set, then the status to return: 403 and
+/// 401 as they are (with the WWW-Authenticate headers of the subrequest, or
+/// those of its upstream), NGX_OK for 2xx, else 500.
+fn auth_request_status(r: &R, conf: &AuthRequestLocConf, ctx: &Rc<RefCell<AuthRequestCtx>>) -> i64 {
+    let ctx = ctx.borrow();
+
+    if !ctx.done {
+        return NGX_AGAIN;
+    }
+
+    // as soon as we are done - explicitly set variables to make sure they
+    // will be available after internal redirects
+
+    if set_variables(r, conf, &ctx).is_err() {
+        return NGX_ERROR;
+    }
+
+    // return appropriate status
+
+    if ctx.status == NGX_HTTP_FORBIDDEN {
+        return ctx.status;
+    }
+
+    if ctx.status == NGX_HTTP_UNAUTHORIZED {
+        if let Some(sr) = &ctx.subrequest_response {
+            let mut h: Vec<Header> = sr.headers_out.borrow().www_authenticate.clone();
+
+            if h.is_empty() {
+                // sr->upstream->headers_in.www_authenticate
+                h = sr.upstream_headers_in.borrow().iter().filter(|h| h.lowcase_key == b"www-authenticate").cloned().collect();
             }
 
-            ctx_ref.status
+            let mut ho = r.headers_out.borrow_mut();
+
+            for h in h.iter() {
+                let o = TableElt::with_hash(&h.key, &h.value.borrow(), h.hash.get(), h.lowcase_key.clone());
+
+                ho.headers.push(o.clone());
+                ho.www_authenticate.push(o);
+            }
         }
-        Err(_) => {
-            let ctx_val = AuthRequestCtx {
-                done: true,
-                status: NGX_HTTP_INTERNAL_SERVER_ERROR,
-                subrequest_response: None,
-            };
-            let _ = r.set_ctx(ctx_index(), ctx_val);
-            NGX_HTTP_INTERNAL_SERVER_ERROR
-        }
+
+        return ctx.status;
     }
+
+    if ctx.status >= NGX_HTTP_OK && ctx.status < NGX_HTTP_SPECIAL_RESPONSE {
+        return NGX_OK;
+    }
+
+    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "auth request unexpected status: {}", ctx.status);
+
+    NGX_HTTP_INTERNAL_SERVER_ERROR
 }
 
 fn set_variables(r: &R, conf: &AuthRequestLocConf, ctx: &AuthRequestCtx) -> Result<(), i64> {

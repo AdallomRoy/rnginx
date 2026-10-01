@@ -1,6 +1,7 @@
 //! ngx-core: core runtime of the Rust nginx port.
 
 pub mod buf;
+pub mod file;
 pub mod conf;
 pub mod cycle;
 pub mod hash;
@@ -9,6 +10,10 @@ pub mod module;
 pub mod os;
 pub mod parse;
 pub mod string;
+pub mod data;
+pub mod json;
+pub mod json_parse;
+pub mod json_unescape;
 pub mod times;
 
 pub const NGINX_VERSION: &str = "1.31.7";
@@ -40,11 +45,13 @@ pub mod inet;
 pub mod core_module;
 pub mod syslog;
 pub mod connection;
+pub mod control;
 pub mod event_connect;
 pub mod listen_event;
 pub mod process;
 pub mod event;
 pub mod event_udp;
+pub mod quic;
 pub mod ssl;
 pub mod radix_tree;
 pub mod stubs;

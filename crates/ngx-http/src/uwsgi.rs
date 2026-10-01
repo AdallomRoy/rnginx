@@ -18,21 +18,16 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::Instant;
-
-use ngx_core::buf::{Buf, BufData, Chain};
+use ngx_core::buf::{Buf, Chain};
 use ngx_core::conf::*;
-use ngx_core::connection::NGX_ERROR_ERR;
-use ngx_core::event_connect::{event_connect_peer, LocalAddr, PeerConnect, PeerSocket};
 use ngx_core::event_openssl::{
     ngx_ssl_certificate, ngx_ssl_ciphers, ngx_ssl_client_session_cache, ngx_ssl_conf_commands, ngx_ssl_create, ngx_ssl_crl, ngx_ssl_read_password_file,
     ngx_ssl_trusted_certificate, NgxSsl, NGX_SSL_DEFAULT_PROTOCOLS,
 };
-use ngx_core::hash::{hash_key, hash_key_lc, Hash, HashInit, HashKey};
-use ngx_core::inet::{SockAddr, Url};
+use ngx_core::event_connect::LocalAddr;
+use ngx_core::hash::{hash_key_lc, Hash, HashInit, HashKey};
+use ngx_core::inet::Url;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
@@ -40,13 +35,13 @@ use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_error};
 
 use crate::core::CoreLocConf;
-use crate::parse::{ParseRequest, Status, NGX_HTTP_PARSE_HEADER_DONE};
-use crate::proxy::{ClientWatch, ConnectError, UpstreamResponse};
+use crate::event_pipe::EventPipe;
 use crate::request::*;
 use crate::script::{ComplexValue, Part};
 use crate::upstream::*;
 use crate::upstream_cache::{UpstreamCacheConf, UpstreamCacheLocConf, UpstreamCacheMainConf, NGX_CONF_BITMASK_SET, NGX_HTTP_UPSTREAM_INVALID_HEADER};
-use crate::upstream_ssl::{PeerConn, SslSetup, UpstreamSslConf};
+use crate::upstream_rt::{Upstream, UpstreamConf, UpstreamModule};
+use crate::upstream_ssl::UpstreamSslConf;
 use crate::*;
 
 crate::http_module_index!("ngx_http_uwsgi_module");
@@ -93,43 +88,7 @@ const UWSGI_CACHE_HEADERS: &[(&[u8], &[u8])] = &[
     (b"HTTP_IF_RANGE", b""),
 ];
 
-/// ngx_http_upstream_param_t: a uwsgi_param
-#[derive(Clone, Debug)]
-pub struct ParamSource {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-    pub skip_empty: bool,
-}
-
-/// A param of params->lengths and params->values: the key, "if_not_empty"
-/// and the codes of the value.
-pub struct UwsgiParam {
-    pub key: Vec<u8>,
-    pub skip_empty: bool,
-    pub codes: Vec<Part>,
-}
-
-/// ngx_http_uwsgi_params_t
-pub struct UwsgiParams {
-    /// params->flushes: the variables of the values
-    pub flushes: Vec<usize>,
-    /// params->lengths and params->values
-    pub params: Vec<UwsgiParam>,
-    /// params->number: the HTTP_* params
-    pub number: usize,
-    /// params->hash: the names of the HTTP_* params after "HTTP_",
-    /// lowercase; the request headers of these names are not sent
-    pub hash: Hash<()>,
-}
-
-/// ngx_http_upstream_local_t: uwsgi_bind
-pub struct UpstreamLocal {
-    /// local->addr: the address without variables
-    pub addr: Option<LocalAddr>,
-    /// local->value: the address with variables
-    pub value: Option<ComplexValue>,
-    pub transparent: bool,
-}
+pub use crate::upstream_rt::{Param as UwsgiParam, ParamSource, Params as UwsgiParams, UpstreamLocal};
 
 /// ngx_http_uwsgi_loc_conf_t, with the fields of ngx_http_upstream_conf_t
 /// the module uses.
@@ -221,6 +180,9 @@ pub struct NgxHttpUwsgiLocConf {
     pub ssl_trusted_certificate: Val<Vec<u8>>,
     pub ssl_crl: Val<Vec<u8>>,
     pub ssl_conf_commands: Val<Option<Vec<(Vec<u8>, Vec<u8>)>>>,
+
+    /// uwcf->upstream as a request uses it, once merged
+    pub upstream_conf: Option<Rc<UpstreamConf>>,
 }
 
 impl UpstreamCacheLocConf for NgxHttpUwsgiLocConf {
@@ -297,6 +259,7 @@ fn new_loc_conf() -> NgxHttpUwsgiLocConf {
         ssl_trusted_certificate: Val::unset(),
         ssl_crl: Val::unset(),
         ssl_conf_commands: Val::unset(),
+        upstream_conf: None,
     }
 }
 
@@ -304,51 +267,53 @@ fn new_loc_conf() -> NgxHttpUwsgiLocConf {
 // the request
 // ---------------------------------------------------------------------------
 
-/// u->ssl and u->resolved of the request's upstream (the schema,
-/// "uwsgi://" or "suwsgi://", is only of use to the error log's upstream
-/// part, which the port does not have).
-#[derive(Default)]
-struct UwsgiUpstream {
-    ssl: bool,
-    resolved: Option<Url>,
+/// The context of the module for a request: the location's
+/// configuration, ngx_http_status_t and r->state of the header parser.
+struct UwsgiModule {
+    lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>,
+    st: crate::upstream_rt::CgiHeaderParse,
 }
 
 /// ngx_http_uwsgi_handler
 async fn uwsgi_handler(r: R) -> i64 {
     let lcf = r.loc_conf::<NgxHttpUwsgiLocConf>(ctx_index());
 
-    // ngx_http_upstream_create; u->conf (the cache fields), u->caches of
-    // the main configuration and u->create_key
+    // ngx_http_upstream_create, with u->conf and u->caches of the main
+    // configuration
 
-    {
-        let uwcf = lcf.borrow();
+    let (conf, uwsgi_values, ssl) = {
+        let c = lcf.borrow();
+        (c.upstream_conf.clone(), c.uwsgi_values.clone(), c.ssl)
+    };
+
+    let conf = match conf {
+        Some(c) => c,
+        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+    };
+
+    let caches = {
         let uwmcf = r.main_conf::<UpstreamCacheMainConf>(ctx_index());
-        let caches = Rc::new(uwmcf.borrow().caches.clone());
-        crate::upstream_cache::upstream_create(&r, uwcf.cache.clone(), caches, "uwsgi", uwcf.buffer_size.get_or(ngx_core::os::pagesize()));
-    }
+        let caches = uwmcf.borrow().caches.clone();
+        Rc::new(caches)
+    };
 
-    let mut u = UwsgiUpstream::default();
-
-    let uwsgi_values = lcf.borrow().uwsgi_values.clone();
+    let mut u = Upstream::create(&r, conf, caches, b"uwsgi://");
 
     match uwsgi_values {
         None => {
-            u.ssl = lcf.borrow().ssl;
+            u.ssl = ssl;
+
+            if ssl {
+                u.set_schema(b"suwsgi://");
+            }
         }
+
         Some(codes) => {
             if uwsgi_eval(&r, &codes, &mut u) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         }
     }
-
-    // u->create_request = ngx_http_uwsgi_create_request,
-    // u->reinit_request, u->process_header =
-    // ngx_http_uwsgi_process_status_line, u->abort_request,
-    // u->finalize_request, u->buffering, the pipe with
-    // ngx_event_pipe_copy_input_filter, u->input_filter_init =
-    // ngx_http_uwsgi_input_filter_init and u->input_filter =
-    // ngx_http_upstream_non_buffered_filter: upstream_init_request
 
     {
         let uwcf = lcf.borrow();
@@ -358,9 +323,7 @@ async fn uwsgi_handler(r: R) -> i64 {
         }
     }
 
-    // ngx_http_read_client_request_body(r, ngx_http_upstream_init):
-    // unbuffered, only what is there now, the rest is sent on as it
-    // arrives (send_request_body)
+    // ngx_http_read_client_request_body(r, ngx_http_upstream_init)
 
     let rc = crate::request_body::read_client_request_body(&r).await;
 
@@ -368,12 +331,14 @@ async fn uwsgi_handler(r: R) -> i64 {
         return rc;
     }
 
-    upstream_init_request(r, lcf, u).await
+    let mut m = UwsgiModule { lcf, st: crate::upstream_rt::CgiHeaderParse::new("uwsgi") };
+
+    crate::upstream_rt::init(r, u, &mut m).await
 }
 
 /// ngx_http_uwsgi_eval: the URL of uwsgi_pass with variables, its scheme,
 /// and the upstream it names (u->resolved).
-fn uwsgi_eval(r: &R, codes: &[Part], u: &mut UwsgiUpstream) -> i64 {
+fn uwsgi_eval(r: &R, codes: &[Part], u: &mut Upstream) -> i64 {
     let url = match crate::script::script_run(r, codes) {
         Some(v) => v,
         None => return NGX_ERROR,
@@ -387,6 +352,12 @@ fn uwsgi_eval(r: &R, codes: &[Part], u: &mut UwsgiUpstream) -> i64 {
     } else {
         0
     };
+
+    if add > 0 {
+        u.set_schema(&url[..add]);
+    } else {
+        u.set_schema(b"uwsgi://");
+    }
 
     let mut url = Url::new(&url[add..]);
     url.no_resolve = true;
@@ -403,6 +374,73 @@ fn uwsgi_eval(r: &R, codes: &[Part], u: &mut UwsgiUpstream) -> i64 {
     u.resolved = Some(url);
 
     NGX_OK
+}
+
+impl UpstreamModule for UwsgiModule {
+    fn create_key(&self, r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+        create_key(r, keys)
+    }
+
+    /// ngx_http_uwsgi_create_request: the packet, then, with
+    /// uwsgi_pass_request_body, the buffers of a buffered body (an
+    /// unbuffered one is sent after it by ngx_http_upstream_send_request_body)
+    fn create_request(&mut self, r: &R, u: &mut Upstream) -> i64 {
+        let uwcf = self.lcf.borrow();
+
+        let packet = match create_request(r, &uwcf, u.cacheable()) {
+            Ok(b) => b,
+            Err(()) => return NGX_ERROR,
+        };
+
+        let mut b = Buf::from_vec(packet);
+        b.flush = true;
+
+        let mut bufs = Chain::new();
+        bufs.push_back(b);
+
+        if !r.request_body_no_buffering.get() && *uwcf.pass_request_body {
+            bufs.extend(crate::upstream_rt::request_body_bufs(r));
+        }
+
+        u.request_bufs = bufs;
+
+        NGX_OK
+    }
+
+    /// ngx_http_uwsgi_reinit_request
+    fn reinit_request(&mut self, _r: &R, _u: &mut Upstream) -> i64 {
+        self.st = crate::upstream_rt::CgiHeaderParse::new("uwsgi");
+        NGX_OK
+    }
+
+    /// ngx_http_uwsgi_process_status_line, then ngx_http_uwsgi_process_header
+    fn process_header(&mut self, r: &R, u: &mut Upstream) -> i64 {
+        match crate::upstream_rt::cgi_process_status_line(r, u, &mut self.st) {
+            Ok(true) => NGX_OK,
+            Ok(false) => NGX_AGAIN,
+            Err(_) => NGX_HTTP_UPSTREAM_INVALID_HEADER,
+        }
+    }
+
+    /// ngx_http_uwsgi_input_filter_init: u->length and p->length
+    fn input_filter_init(&mut self, r: &R, u: &mut Upstream, p: Option<&mut EventPipe>) -> i64 {
+        http_debug!(r, "http uwsgi filter init s:{} l:{}", u.resp.status_n, u.resp.content_length_n);
+
+        let length = crate::upstream_rt::cgi_input_length(u.resp.status_n, r.method.get() == NGX_HTTP_HEAD, u.resp.content_length_n);
+
+        if let Some(p) = p {
+            p.length = length;
+        }
+
+        u.length = length;
+
+        NGX_OK
+    }
+
+    /// ngx_http_uwsgi_finalize_request
+    fn finalize_request(&mut self, r: &R, _u: &mut Upstream, _rc: i64) {
+        http_debug!(r, "finalize http uwsgi request");
+    }
 }
 
 /// ngx_http_uwsgi_create_key: uwsgi_cache_key
@@ -424,93 +462,10 @@ fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
     NGX_OK
 }
 
-/// The key of a request header as a param: "HTTP_" and the name in upper
-/// case, '-' as '_'.
-fn header_param_key(name: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity("HTTP_".len() + name.len());
-
-    key.extend_from_slice(b"HTTP_");
-
-    for &ch in name {
-        let ch = if ch.is_ascii_lowercase() {
-            ch & !0x20
-        } else if ch == b'-' {
-            b'_'
-        } else {
-            ch
-        };
-
-        key.push(ch);
-    }
-
-    key
-}
-
-/// The name of a request header as the params hash has it: lower case,
-/// '-' as '_'.
-fn header_hash_key(name: &[u8]) -> Vec<u8> {
-    name.iter()
-        .map(|&ch| {
-            if ch.is_ascii_uppercase() {
-                ch | 0x20
-            } else if ch == b'-' {
-                b'_'
-            } else {
-                ch
-            }
-        })
-        .collect()
-}
-
 /// The start of the packet: modifier1, the 16-bit little-endian size of
 /// the data, modifier2.
 fn packet_header(modifier1: i64, len: usize, modifier2: i64) -> [u8; 4] {
     [modifier1 as u8, (len & 0xff) as u8, ((len >> 8) & 0xff) as u8, modifier2 as u8]
-}
-
-/// The request headers as params: ngx_http_link_multi_headers() links the
-/// headers of a name (compared case-insensitively) to the first one, which
-/// is sent with the values of all, joined with "; " for "Cookie" and ", "
-/// otherwise; a header is not sent when `hidden` says so of its name in
-/// lower case with '-' as '_' (the params hash).
-fn header_params(headers: &[Header], hidden: &dyn Fn(&[u8]) -> bool) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut out = Vec::new();
-
-    // the headers of the params hash, and the linked ones
-    let mut ignored = vec![false; headers.len()];
-
-    for i in 0..headers.len() {
-        if ignored[i] {
-            continue;
-        }
-
-        let h = &headers[i];
-
-        if hidden(&header_hash_key(&h.key)) {
-            ignored[i] = true;
-            continue;
-        }
-
-        let mut value = h.value.borrow().clone();
-
-        let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
-
-        for j in i + 1..headers.len() {
-            let hn = &headers[j];
-
-            if hn.key.len() == h.key.len() && hn.key.eq_ignore_ascii_case(&h.key) {
-                ignored[j] = true;
-
-                value.push(sep);
-                value.push(b' ');
-                value.extend_from_slice(&hn.value.borrow());
-            }
-        }
-
-        out.push((header_param_key(&h.key), value));
-    }
-
-    out
 }
 
 /// A param as the packet has it: the 16-bit little-endian length and the
@@ -565,9 +520,9 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     let header_params = if *uwcf.pass_request_headers {
         let headers = r.headers_in.borrow().headers.clone();
 
-        let hidden = |lowcase_key: &[u8]| params.number != 0 && params.hash.find(hash_key(lowcase_key), lowcase_key).is_some();
+        let hidden = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        header_params(&headers, &hidden)
+        crate::upstream_rt::header_params(&headers, &hidden)
     } else {
         Vec::new()
     };
@@ -612,1889 +567,6 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     b.extend_from_slice(uwsgi_string);
 
     Ok(b)
-}
-
-/// The data of the memory buffers of a chain.
-fn chain_data(out: &mut Vec<u8>, bufs: &Chain) {
-    for b in bufs.iter() {
-        if let BufData::Memory(m) = &b.data {
-            let end = b.last.min(m.len());
-
-            if b.pos < end {
-                out.extend_from_slice(&m[b.pos..end]);
-            }
-        }
-    }
-}
-
-/// The body in u->request_bufs after the packet: the request body buffers
-/// (in memory or in the temporary file) with uwsgi_pass_request_body; for
-/// an unbuffered body, what was read of it so far, which
-/// ngx_http_upstream_send_request_body sends after the packet.
-fn request_body_bytes(r: &R, uwcf: &NgxHttpUwsgiLocConf) -> Vec<u8> {
-    let mut out = Vec::new();
-
-    if r.request_body_no_buffering.get() {
-        let bufs = crate::proxy::take_request_body_bufs(r);
-        chain_data(&mut out, &bufs);
-        return out;
-    }
-
-    if !*uwcf.pass_request_body {
-        return out;
-    }
-
-    let rb = r.request_body.borrow();
-
-    let body = match rb.as_ref() {
-        Some(b) => b.clone(),
-        None => return out,
-    };
-
-    let body = body.borrow();
-
-    for b in body.bufs.iter() {
-        if b.in_file {
-            if let BufData::File(f) = &b.data {
-                let size = (b.file_last - b.file_pos).max(0) as usize;
-                let mut buf = vec![0u8; size];
-                let mut off = 0usize;
-
-                while off < size {
-                    // SAFETY: buf has size bytes, off < size, and f.fd is
-                    // the open temporary file of the request body.
-                    let n = unsafe { libc::pread(f.fd, buf[off..].as_mut_ptr() as *mut libc::c_void, size - off, b.file_pos + off as i64) };
-
-                    if n <= 0 {
-                        break;
-                    }
-
-                    off += n as usize;
-                }
-
-                out.extend_from_slice(&buf[..off]);
-            }
-
-            continue;
-        }
-
-        if let BufData::Memory(m) = &b.data {
-            let end = b.last.min(m.len());
-
-            if b.pos < end {
-                out.extend_from_slice(&m[b.pos..end]);
-            }
-        }
-    }
-
-    out
-}
-
-/// ngx_http_uwsgi_reinit_request and the rest of
-/// ngx_http_upstream_reinit: the status and the header parser anew,
-/// u->process_header = ngx_http_uwsgi_process_status_line.
-struct HeaderParse {
-    /// u->process_header is ngx_http_uwsgi_process_header
-    status_done: bool,
-    /// r->state and the header parser
-    pr: ParseRequest,
-    /// u->buffer.pos
-    pos: usize,
-}
-
-impl HeaderParse {
-    fn new() -> HeaderParse {
-        HeaderParse { status_done: false, pr: ParseRequest { upstream: true, ..Default::default() }, pos: 0 }
-    }
-}
-
-/// What the header parser of the response found, beyond u->headers_in:
-/// X-Accel-Buffering (ngx_http_upstream_process_buffering changes
-/// u->buffering).
-#[derive(Default)]
-struct HeaderFlags {
-    buffering: Option<bool>,
-}
-
-/// ngx_http_uwsgi_process_status_line: an HTTP status line, or, if there is
-/// none, the CGI style header of ngx_http_uwsgi_process_header from the
-/// start. Ok(true) when the header is done, Ok(false) for more
-/// (NGX_AGAIN), Err with the failure type of
-/// NGX_HTTP_UPSTREAM_INVALID_HEADER.
-fn process_status_line(r: &R, u: &mut UpstreamResponse, st: &mut HeaderParse, flags: &mut HeaderFlags) -> Result<bool, u32> {
-    if st.status_done {
-        return process_header(r, u, st, flags);
-    }
-
-    let mut p = st.pos;
-    let mut status = Status::default();
-
-    let rc = crate::parse::parse_status_line(&u.buf, &mut p, &mut status);
-
-    if rc == NGX_AGAIN {
-        return Ok(false);
-    }
-
-    if rc == NGX_ERROR {
-        // u->process_header = ngx_http_uwsgi_process_header;
-        // u->buffer.pos = status->line_start; r->state = 0
-        st.status_done = true;
-        st.pr = ParseRequest { upstream: true, ..Default::default() };
-
-        return process_header(r, u, st, flags);
-    }
-
-    if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
-        if state.status == 0 {
-            state.status = status.code as i64;
-        }
-    }
-
-    u.status_n = status.code as i64;
-    u.status_line = u.buf[status.start..status.end].to_vec();
-
-    http_debug!(r, "http uwsgi status {} \"{}\"", u.status_n, B(&u.status_line));
-
-    st.pos = p;
-    st.status_done = true;
-
-    process_header(r, u, st, flags)
-}
-
-/// The first header of a name that counts (a duplicate of the headers only
-/// the first of which is processed has hash 0): u->headers_in.status,
-/// u->headers_in.location and the like.
-fn headers_in(u: &UpstreamResponse, lowcase_key: &[u8]) -> Option<Header> {
-    u.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == lowcase_key).cloned()
-}
-
-/// ngx_http_uwsgi_process_header: the header lines, each with the handler
-/// of ngx_http_upstream_headers_in[]; when the header is done, the status
-/// of the status line, of "Status", 302 with "Location", or 200.
-fn process_header(r: &R, u: &mut UpstreamResponse, st: &mut HeaderParse, flags: &mut HeaderFlags) -> Result<bool, u32> {
-    let invalid = NGX_HTTP_UPSTREAM_FT_INVALID_HEADER;
-
-    loop {
-        let rc = crate::parse::parse_header_line(&mut st.pr, &u.buf, &mut st.pos, true);
-
-        if rc == NGX_OK {
-            // a header line has been parsed successfully
-
-            let pr = &st.pr;
-
-            let key = u.buf[pr.header_name_start..pr.header_name_end].to_vec();
-            let value = u.buf[pr.header_start..pr.header_end].to_vec();
-
-            let lowcase_key = if key.len() == pr.lowcase_index { pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
-
-            let h = TableElt::with_hash(&key, &value, pr.header_hash, lowcase_key);
-
-            u.headers.push(h.clone());
-
-            // hh->handler(r, h, hh->offset)
-            crate::proxy::upstream_process_header_line(r, u, &h)?;
-
-            upstream_process_accel(r, &h, flags);
-
-            http_debug!(r, "http uwsgi header: \"{}: {}\"", B(&h.key), B(&h.value.borrow()));
-
-            continue;
-        }
-
-        if rc == NGX_HTTP_PARSE_HEADER_DONE {
-            // a whole header has been parsed successfully
-
-            http_debug!(r, "http uwsgi header done");
-
-            if u.status_n == 0 {
-                if let Some(status) = headers_in(u, b"status") {
-                    let status_line = status.value.borrow().clone();
-
-                    // ngx_atoi(status_line->data, 3): the value is
-                    // null-terminated
-                    let status = match cgi_status(&status_line) {
-                        Some(s) => s,
-                        None => {
-                            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid status \"{}\"", B(&status_line));
-                            return Err(invalid);
-                        }
-                    };
-
-                    u.status_n = status;
-
-                    if status_line.len() > 3 {
-                        u.status_line = status_line;
-                    }
-                } else if headers_in(u, b"location").is_some() {
-                    u.status_n = 302;
-                    u.status_line = b"302 Moved Temporarily".to_vec();
-                } else {
-                    u.status_n = 200;
-                    u.status_line = b"200 OK".to_vec();
-                }
-
-                if let Some(state) = r.upstream_states.borrow_mut().last_mut() {
-                    if state.status == 0 {
-                        state.status = u.status_n;
-                    }
-                }
-            }
-
-            // done:
-
-            if u.status_n == NGX_HTTP_SWITCHING_PROTOCOLS && !r.headers_in.borrow().upgrade.is_empty() {
-                u.upgrade = true;
-            }
-
-            u.pos = st.pos;
-
-            return Ok(true);
-        }
-
-        if rc == NGX_AGAIN {
-            return Ok(false);
-        }
-
-        // rc == NGX_HTTP_PARSE_INVALID_HEADER
-
-        let pr = &st.pr;
-
-        let end = pr.header_end.min(u.buf.len());
-        let start = pr.header_name_start.min(end);
-        let ch = u.buf.get(end).copied().unwrap_or(0);
-
-        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent invalid header: \"{}\\x{:02x}...\"", B(&u.buf[start..end]), ch);
-
-        return Err(invalid);
-    }
-}
-
-/// The handlers of ngx_http_upstream_headers_in[] which proxy.rs applies in
-/// its process_headers: ngx_http_upstream_process_limit_rate (after the
-/// duplicate check, which left the hash of a duplicate 0),
-/// ngx_http_upstream_process_buffering and ngx_http_upstream_process_charset.
-fn upstream_process_accel(r: &R, h: &Header, flags: &mut HeaderFlags) {
-    let ignores = |mask: u32| crate::upstream_cache::upstream_of(r).map(|u| u.conf.ignores(mask)).unwrap_or(false);
-
-    match h.lowcase_key.as_slice() {
-        b"x-accel-limit-rate" => {
-            if h.hash.get() == 0 || ignores(NGX_HTTP_UPSTREAM_IGN_XA_LIMIT_RATE) {
-                return;
-            }
-
-            if let Some(n) = ngx_core::string::atoi(&h.value.borrow()) {
-                r.limit_rate.set(n as usize);
-                r.limit_rate_set.set(true);
-            }
-        }
-
-        b"x-accel-buffering" => {
-            if ignores(NGX_HTTP_UPSTREAM_IGN_XA_BUFFERING) {
-                return;
-            }
-
-            // u->conf->change_buffering is set
-            let v = h.value.borrow();
-
-            if v.len() == 2 && v.eq_ignore_ascii_case(b"no") {
-                flags.buffering = Some(false);
-            } else if v.len() == 3 && v.eq_ignore_ascii_case(b"yes") {
-                flags.buffering = Some(true);
-            }
-        }
-
-        b"x-accel-charset" => {
-            if ignores(NGX_HTTP_UPSTREAM_IGN_XA_CHARSET) {
-                return;
-            }
-
-            r.headers_out.borrow_mut().override_charset = Some(h.value.borrow().clone());
-        }
-
-        _ => {}
-    }
-}
-
-/// ngx_http_uwsgi_input_filter_init: u->length and p->length.
-fn input_filter_init(r: &R, u: &UpstreamResponse) -> i64 {
-    http_debug!(r, "http uwsgi filter init s:{} l:{}", u.status_n, u.content_length_n);
-
-    input_length(u.status_n, r.method.get() == NGX_HTTP_HEAD, u.content_length_n)
-}
-
-/// The length of ngx_http_uwsgi_input_filter_init: none for 204 and 304,
-/// up to the end of the connection for HEAD, else the "Content-Length"
-/// (-1 if none).
-fn input_length(status_n: i64, head: bool, content_length_n: i64) -> i64 {
-    if status_n == NGX_HTTP_NO_CONTENT || status_n == NGX_HTTP_NOT_MODIFIED {
-        0
-    } else if head {
-        -1
-    } else {
-        content_length_n
-    }
-}
-
-/// The status of a "Status" header: ngx_atoi() of its first 3 characters
-/// (the value is null-terminated: a shorter one is invalid).
-fn cgi_status(value: &[u8]) -> Option<i64> {
-    if value.len() < 3 {
-        return None;
-    }
-
-    ngx_core::string::atoi(&value[..3])
-}
-
-// ngx_http_uwsgi_abort_request is not ported: ngx_http_upstream.c never
-// calls u->abort_request.
-
-/// ngx_http_uwsgi_finalize_request
-fn finalize_request(r: &R, _rc: i64) {
-    http_debug!(r, "finalize http uwsgi request");
-}
-
-// ---------------------------------------------------------------------------
-// the upstream: ngx_http_upstream_init_request and what follows
-// ---------------------------------------------------------------------------
-
-/// How reading the response header failed.
-enum HeaderError {
-    /// ngx_http_upstream_next() with this failure type
-    Next(u32),
-    /// the client closed the connection (ngx_http_upstream_check_broken_connection)
-    ClientClosed(i32),
-}
-
-/// The socket options of u->conf and u->peer.local for
-/// ngx_event_connect_peer, and u->conf->connect_timeout.
-struct PeerOpts {
-    rcvbuf: i32,
-    sndbuf: i32,
-    so_keepalive: bool,
-    local: Option<LocalAddr>,
-    transparent: bool,
-    connect_timeout: u64,
-}
-
-/// Whether a socket is a plain connection: its errors are not logged by
-/// the SSL layer.
-fn plain(sock: &UpstreamSock) -> bool {
-    match sock {
-        UpstreamSock::Conn(pc) => pc.c.ssl.borrow().is_none(),
-        _ => true,
-    }
-}
-
-/// ngx_http_upstream_finalize_request before the header is sent (or with
-/// an rc ngx_http_finalize_request takes as it is): u->finalize_request,
-/// the cache of a 502 or 504 for its uwsgi_cache_valid time; the peer and
-/// the connection are freed when the handler returns.
-fn finalize(r: &R, rc: i64) -> i64 {
-    http_debug!(r, "finalize http upstream request: {}", rc);
-
-    finalize_request(r, rc);
-
-    crate::upstream_cache::finalize(r, rc, None);
-
-    if rc != NGX_DECLINED {
-        r.connection.log.set_action(Some("sending to client"));
-    }
-
-    rc
-}
-
-/// ngx_http_upstream_connect after the peer is chosen:
-/// ngx_event_connect_peer, the connect timer, and on the connection
-/// ngx_http_upstream_ssl_init_connection for suwsgi, or the test of the
-/// connect of ngx_http_upstream_send_request. The errors are those of
-/// ngx_http_upstream_next (FT_ERROR, FT_TIMEOUT: the connection is closed
-/// without "close notify") or 500.
-async fn connect_peer(r: &R, u: &mut UpstreamPeer, sockaddr: &SockAddr, opts: &PeerOpts, ssl: Option<&SslSetup>) -> Result<UpstreamSock, ConnectError> {
-    // the action is "connecting to upstream" (ngx_http_upstream_connect)
-    let log = r.connection.log.clone();
-
-    let name = u.pc.name.clone();
-
-    let res = event_connect_peer(&PeerSocket {
-        sockaddr,
-        name: &name,
-        ty: libc::SOCK_STREAM,
-        rcvbuf: opts.rcvbuf,
-        sndbuf: opts.sndbuf,
-        so_keepalive: opts.so_keepalive,
-        local: opts.local.as_ref(),
-        transparent: opts.transparent,
-        log: &log,
-        log_error: NGX_ERROR_ERR,
-    });
-
-    let (c, again) = match res {
-        PeerConnect::Ok(c) => (c, false),
-        PeerConnect::Again(c) => (c, true),
-        PeerConnect::Declined => return Err(ConnectError::Error),
-        PeerConnect::Error => return Err(ConnectError::Internal),
-    };
-
-    let pc = PeerConn { c: c.clone() };
-
-    // c->data = r
-    u.attach(&c);
-
-    let mut deadline = None;
-
-    if again {
-        // ngx_add_timer(c->write, u->conf->connect_timeout)
-        let d = Instant::now() + Duration::from_millis(opts.connect_timeout);
-
-        if tokio::time::timeout_at(d, c.writable()).await.is_err() {
-            // ngx_http_upstream_send_request_handler: c->write->timedout,
-            // ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_TIMEOUT)
-            ngx_log_error!(NGX_LOG_ERR, log, Some(libc::ETIMEDOUT), "upstream timed out");
-            pc.set_no_shutdown();
-            return Err(ConnectError::Timeout);
-        }
-
-        deadline = Some(d);
-    }
-
-    let rc = match ssl {
-        Some(ssl) => crate::upstream_ssl::ssl_init_connection(r, u, &c, ssl, deadline, opts.connect_timeout).await,
-
-        None => {
-            // ngx_http_upstream_send_request: ngx_http_upstream_test_connect
-            if crate::upstream_ssl::test_connect(&c) != NGX_OK {
-                Err(ConnectError::Error)
-            } else {
-                Ok(())
-            }
-        }
-    };
-
-    match rc {
-        Ok(()) => Ok(UpstreamSock::Conn(pc)),
-        Err(e) => {
-            if !matches!(e, ConnectError::Internal) {
-                pc.set_no_shutdown();
-            }
-            Err(e)
-        }
-    }
-}
-
-/// ngx_http_upstream_set_local: the address of uwsgi_bind, evaluated if it
-/// has variables (an empty or invalid value: none). Err for NGX_ERROR.
-fn set_local(r: &R, local: Option<&Rc<UpstreamLocal>>) -> Result<(Option<LocalAddr>, bool), ()> {
-    let local = match local {
-        Some(l) => l,
-        None => return Ok((None, false)),
-    };
-
-    let value = match &local.value {
-        None => return Ok((local.addr.clone(), local.transparent)),
-        Some(cv) => cv,
-    };
-
-    let val = crate::script::complex_value(r, value).map_err(|_| ())?;
-
-    if val.is_empty() {
-        return Ok((None, local.transparent));
-    }
-
-    match ngx_core::inet::parse_addr_port(&val) {
-        Some(sa) => Ok((Some(LocalAddr { sockaddr: sa, name: val }), local.transparent)),
-        None => {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "invalid local address \"{}\"", B(&val));
-            Ok((None, local.transparent))
-        }
-    }
-}
-
-/// ngx_http_upstream_init_request with the uwsgi module's callbacks, and
-/// what follows up to the end of the response.
-async fn upstream_init_request(r: R, lcf: Rc<RefCell<NgxHttpUwsgiLocConf>>, u: UwsgiUpstream) -> i64 {
-    let ucache = match crate::upstream_cache::upstream_of(&r) {
-        Some(uc) => uc,
-        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
-    };
-
-    // ngx_http_upstream_cache, then ngx_http_upstream_cache_send for a
-    // response from the cache
-
-    if ucache.conf.enabled() {
-        let mut rc = crate::upstream_cache::upstream_cache_wait(&r, &ucache, &create_key).await;
-
-        if rc == NGX_ERROR {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-
-        if rc == NGX_OK {
-            rc = cache_send(&r, &lcf).await;
-
-            if rc == NGX_DONE {
-                return NGX_DONE;
-            }
-
-            if rc == NGX_HTTP_UPSTREAM_INVALID_HEADER {
-                rc = NGX_DECLINED;
-                r.cached.set(false);
-                ucache.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_MISS);
-            }
-        }
-
-        if rc != NGX_DECLINED {
-            return rc;
-        }
-    }
-
-    // the cache is freed when the upstream is done (finalize)
-    let _cache_guard = crate::upstream_cache::CacheGuard::new(&r);
-
-    // u->store = u->conf->store
-    let (store, ignore_client_abort) = {
-        let c = lcf.borrow();
-        (*c.store, *c.ignore_client_abort)
-    };
-
-    let cacheable = ucache.cacheable.get();
-
-    // ngx_http_upstream_rd_check_broken_connection: a request that is not
-    // cached is finalized with 499 when the client closes the connection
-    let watch = if !store && !r.post_action.get() && !ignore_client_abort && !cacheable { Some(ClientWatch::new(&r)) } else { None };
-    let watch = watch.as_ref();
-
-    // u->request_bufs = r->request_body->bufs; u->create_request(r)
-
-    let (request, body) = {
-        let c = lcf.borrow();
-
-        let request = match create_request(&r, &c, cacheable) {
-            Ok(b) => b,
-            Err(()) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
-        };
-
-        (request, request_body_bytes(&r, &c))
-    };
-
-    // ngx_http_upstream_set_local, the socket options
-
-    let local = lcf.borrow().local.as_option().cloned().flatten();
-
-    let (local, transparent) = match set_local(&r, local.as_ref()) {
-        Ok(l) => l,
-        Err(()) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
-    };
-
-    let (opts, ssl_setup, next_upstream, next_upstream_tries, next_upstream_timeout, static_upstream) = {
-        let c = lcf.borrow();
-
-        let opts = PeerOpts {
-            rcvbuf: *c.socket_rcvbuf as i32,
-            sndbuf: *c.socket_sndbuf as i32,
-            so_keepalive: *c.socket_keepalive,
-            local,
-            transparent,
-            connect_timeout: *c.connect_timeout,
-        };
-
-        // u->ssl: ngx_http_upstream_ssl_init_connection after connecting,
-        // with u->conf's SSL fields
-        let ssl_setup = if u.ssl { Some(SslSetup { conf: c.upstream_ssl.clone(), alpn: Vec::new() }) } else { None };
-
-        (opts, ssl_setup, c.next_upstream, *c.next_upstream_tries as u32, *c.next_upstream_timeout, c.upstream.clone())
-    };
-
-    // the upstream of u->resolved (by host and port), its address, or the
-    // addresses the resolver finds; or u->conf->upstream
-
-    let tag = Rc::as_ptr(&lcf) as *const () as usize;
-
-    let peer = match (&u.resolved, static_upstream.as_ref()) {
-        (Some(url), _) => UpstreamPeer::resolve(&r, url, next_upstream, next_upstream_tries, next_upstream_timeout, tag).await,
-        (None, Some(uscf)) => UpstreamPeer::init(&r, uscf, next_upstream, next_upstream_tries, next_upstream_timeout, tag),
-        (None, None) => {
-            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
-            Err(NGX_HTTP_INTERNAL_SERVER_ERROR)
-        }
-    };
-
-    let peer = match peer {
-        Ok(p) => p,
-        Err(rc) => return finalize(&r, rc),
-    };
-
-    // the peer is freed when the request is done
-    let mut g = PeerGuard::new(&r, peer);
-
-    let (conf_buffering, read_timeout, send_timeout, buffer_size, tcp_nodelay) = {
-        let c = lcf.borrow();
-        (*c.buffering, *c.read_timeout, *c.send_timeout, *c.buffer_size, *r.clcf().borrow().tcp_nodelay)
-    };
-
-    // u->buffer.pos += r->cache->header_start: the header of the cache file
-    // goes before the response header in u->buffer
-    let header_buffer_size = match crate::file_cache::cache_of(&r) {
-        Some(c) => buffer_size.saturating_sub(c.borrow().header_start),
-        None => buffer_size,
-    };
-
-    let mut sock: UpstreamSock;
-    let mut resp: UpstreamResponse;
-    let mut flags: HeaderFlags;
-
-    'retry: loop {
-        // ngx_http_upstream_connect
-
-        r.connection.log.set_action(Some("connecting to upstream"));
-
-        let rc = g.u.connect(&r);
-
-        if rc == NGX_ERROR {
-            return finalize(&r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        }
-
-        if rc == NGX_BUSY {
-            match g.u.next(&r, NGX_HTTP_UPSTREAM_FT_NOLIVE) {
-                Ok(()) => continue 'retry,
-                Err(st) => return next_failed(&r, &lcf, NGX_HTTP_UPSTREAM_FT_NOLIVE, st).await,
-            }
-        }
-
-        let try_started = g.u.start_time;
-
-        sock = if rc == NGX_DONE {
-            // a cached keepalive connection; c->data = r
-            let c = g.u.pc.connection.take().unwrap();
-            g.u.attach_sock(&c.sock);
-            c.sock
-        } else {
-            let sockaddr = match g.u.pc.sockaddr.clone() {
-                Some(sa) => sa,
-                None => return finalize(&r, NGX_HTTP_INTERNAL_SERVER_ERROR),
-            };
-
-            let connected = {
-                let connect = connect_peer(&r, &mut g.u, &sockaddr, &opts, ssl_setup.as_ref());
-
-                tokio::select! {
-                    res = connect => res,
-                    err = crate::proxy::client_closed(watch) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
-                }
-            };
-
-            match connected {
-                Ok(s) => s,
-                Err(e) => {
-                    let ft = match e {
-                        ConnectError::Error => NGX_HTTP_UPSTREAM_FT_ERROR,
-                        ConnectError::Timeout => NGX_HTTP_UPSTREAM_FT_TIMEOUT,
-                        ConnectError::Internal => return finalize(&r, NGX_HTTP_INTERNAL_SERVER_ERROR),
-                    };
-
-                    match g.u.next(&r, ft) {
-                        Ok(()) => continue 'retry,
-                        Err(st) => return next_failed(&r, &lcf, ft, st).await,
-                    }
-                }
-            }
-        };
-
-        // ngx_http_upstream_send_request
-
-        http_debug!(r, "http upstream send request");
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            if st.connect_time == u64::MAX {
-                st.connect_time = ngx_core::times::current_msec().saturating_sub(try_started);
-            }
-        }
-
-        // the packet (u->request_bufs) and the body that goes with it, in
-        // one write
-
-        let mut wire: Vec<u8> = Vec::with_capacity(request.len() + body.len());
-        wire.extend_from_slice(&request);
-        wire.extend_from_slice(&body);
-
-        g.u.request_sent = true;
-
-        if r.request_body_no_buffering.get() && tcp_nodelay {
-            // ngx_http_upstream_send_request_body: ngx_tcp_nodelay(c)
-            if let UpstreamSock::Conn(pc) = &sock {
-                if !pc.c.set_tcp_nodelay() {
-                    match g.u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
-                        Ok(()) => continue 'retry,
-                        Err(st) => return next_failed(&r, &lcf, NGX_HTTP_UPSTREAM_FT_ERROR, st).await,
-                    }
-                }
-            }
-        }
-
-        r.connection.log.set_action(Some("sending request to upstream"));
-
-        let written = {
-            let write = write_request(&mut sock, &wire, send_timeout);
-
-            tokio::select! {
-                res = write => res,
-                err = crate::proxy::client_closed(watch) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
-            }
-        };
-
-        let failure: Option<u32> = match written {
-            Ok(()) => None,
-            Err(Some(e)) => {
-                if plain(&sock) {
-                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "writev() failed");
-                }
-                Some(NGX_HTTP_UPSTREAM_FT_ERROR)
-            }
-            Err(None) => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
-                Some(NGX_HTTP_UPSTREAM_FT_TIMEOUT)
-            }
-        };
-
-        if let Some(ft) = failure {
-            match g.u.next(&r, ft) {
-                Ok(()) => continue 'retry,
-                Err(st) => return next_failed(&r, &lcf, ft, st).await,
-            }
-        }
-
-        let mut bytes_sent = wire.len() as i64;
-
-        if r.reading_body.get() {
-            // the rest of an unbuffered body as it arrives
-            match crate::proxy::send_request_body(&r, &mut sock, &chain_data).await {
-                Ok(n) => bytes_sent += n,
-                Err(rc) => {
-                    if rc == NGX_HTTP_BAD_GATEWAY {
-                        // the upstream write failed
-                        match g.u.next(&r, NGX_HTTP_UPSTREAM_FT_ERROR) {
-                            Ok(()) => continue 'retry,
-                            Err(st) => return next_failed(&r, &lcf, NGX_HTTP_UPSTREAM_FT_ERROR, st).await,
-                        }
-                    }
-
-                    return finalize(&r, rc);
-                }
-            }
-        }
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.bytes_sent = bytes_sent;
-        }
-
-        // ngx_http_upstream_process_header
-
-        flags = HeaderFlags::default();
-
-        resp = match read_header(&r, &mut sock, header_buffer_size, read_timeout, watch, &mut flags).await {
-            Ok(h) => h,
-            Err(HeaderError::Next(ft)) => match g.u.next(&r, ft) {
-                Ok(()) => continue 'retry,
-                Err(st) => return next_failed(&r, &lcf, ft, st).await,
-            },
-            Err(HeaderError::ClientClosed(err)) => return finalize(&r, crate::proxy::client_closed_request(&r, err)),
-        };
-
-        // u->state->header_time
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.header_time = ngx_core::times::current_msec().saturating_sub(try_started);
-        }
-
-        // u->headers_in, for $upstream_http_* and the balancer's notify
-        *r.upstream_headers_in.borrow_mut() = resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
-
-        // ngx_http_upstream_test_next: a status uwsgi_next_upstream names,
-        // with tries left
-
-        if resp.status_n >= NGX_HTTP_SPECIAL_RESPONSE {
-            let ft = status_failure(resp.status_n);
-
-            if ft != 0 {
-                let mut mask = ft;
-
-                if g.u.request_sent && matches!(r.method.get(), NGX_HTTP_POST | NGX_HTTP_LOCK | NGX_HTTP_PATCH) {
-                    mask |= NGX_HTTP_UPSTREAM_FT_NON_IDEMPOTENT;
-                }
-
-                if g.u.pc.tries > 1
-                    && next_upstream & mask == mask
-                    && !(g.u.request_sent && r.request_body_no_buffering.get())
-                    && !(next_upstream_timeout != 0 && ngx_core::times::current_msec().saturating_sub(g.u.pc.start_time) >= next_upstream_timeout)
-                {
-                    match g.u.next(&r, ft) {
-                        Ok(()) => continue 'retry,
-                        Err(st) => return next_failed(&r, &lcf, ft, st).await,
-                    }
-                }
-            }
-        }
-
-        break 'retry;
-    }
-
-    let status = resp.status_n;
-
-    if status >= NGX_HTTP_SPECIAL_RESPONSE {
-        // ngx_http_upstream_test_next: the stale response instead of the
-        // status uwsgi_cache_use_stale names
-
-        let ft = status_failure(status);
-
-        if ft != 0 && crate::upstream_cache::test_next_stale(&r, ft) {
-            // u->reinit_request(r)
-
-            drop(sock);
-            g.finalize();
-
-            ucache.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_STALE);
-
-            let mut rc = cache_send(&r, &lcf).await;
-
-            if rc == NGX_DONE {
-                return NGX_DONE;
-            }
-
-            if rc == NGX_HTTP_UPSTREAM_INVALID_HEADER {
-                rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-
-            return finalize(&r, rc);
-        }
-
-        // the expired response was revalidated
-
-        if crate::upstream_cache::test_next_not_modified(&r, status) {
-            let saved = crate::upstream_cache::not_modified_start(&r);
-
-            // u->reinit_request(r)
-
-            drop(sock);
-            g.finalize();
-
-            let mut rc = cache_send(&r, &lcf).await;
-
-            if rc == NGX_DONE {
-                return NGX_DONE;
-            }
-
-            if rc == NGX_HTTP_UPSTREAM_INVALID_HEADER {
-                rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-
-            // u->headers_in.status_n: that of the cached response now
-            let cached_status = r.headers_out.borrow().status;
-
-            crate::upstream_cache::not_modified_finish(&r, saved, cached_status);
-
-            return finalize(&r, rc);
-        }
-
-        // ngx_http_upstream_intercept_errors: the error_page of the status
-        // instead of the response
-
-        let intercept = *lcf.borrow().intercept_errors;
-
-        let has_page = intercept && r.clcf().borrow().error_pages.as_ref().map(|pages| pages.iter().any(|p| p.status == status)).unwrap_or(false);
-
-        if has_page {
-            if status == NGX_HTTP_UNAUTHORIZED {
-                // the WWW-Authenticate of the upstream goes with the error page
-                let mut ho = r.headers_out.borrow_mut();
-
-                for h in resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"www-authenticate") {
-                    let ho_h = TableElt::new(&h.key, &h.value.borrow());
-                    ho.headers.push(ho_h.clone());
-                    ho.www_authenticate.push(ho_h);
-                }
-            }
-
-            // the status is cached as an error of the keys zone
-            crate::upstream_cache::intercept_errors(&r, status, &resp.cache);
-
-            drop(sock);
-            g.finalize();
-
-            return finalize(&r, status);
-        }
-    }
-
-    // peer.notify(NGX_HTTP_UPSTREAM_NOTIFY_HEADER)
-    g.u.notify(&r, NGX_HTTP_UPSTREAM_NOTIFY_HEADER);
-
-    // ngx_http_upstream_process_headers
-
-    if let Processed::Redirect(xar) = process_headers(&r, &lcf, &resp) {
-        // ngx_http_upstream_finalize_request(r, u, NGX_DECLINED), then the
-        // redirect
-        drop(sock);
-        g.finalize();
-        finalize(&r, NGX_DECLINED);
-
-        return accel_redirect(&r, &xar).await;
-    }
-
-    // u->buffering, as X-Accel-Buffering left it
-    let buffering = flags.buffering.unwrap_or(conf_buffering);
-
-    // ngx_http_upstream_send_response
-
-    let rc = crate::core_rt::send_header(&r).await;
-
-    if rc == NGX_ERROR || rc > NGX_OK || r.post_action.get() {
-        return finalize(&r, rc);
-    }
-
-    if resp.upgrade {
-        crate::upstream_cache::free(&r, None);
-
-        return upgrade(&r, sock, &resp, read_timeout).await;
-    }
-
-    let header_only = r.header_only.get();
-
-    // p->downstream_error of a header only response read for the cache
-    // or uwsgi_store
-    let mut downstream = true;
-
-    if header_only {
-        if !buffering {
-            return finalize(&r, rc);
-        }
-
-        if !ucache.cacheable.get() && !store {
-            return finalize(&r, rc);
-        }
-
-        downstream = false;
-    }
-
-    let mut writer: Option<crate::upstream_cache::CacheWriter> = None;
-
-    let (limit_rate, capture) = if !buffering {
-        crate::upstream_cache::free(&r, None);
-
-        // ngx_tcp_nodelay(c) of the client connection
-        if tcp_nodelay && r.stream.borrow().is_none() && !r.connection.set_tcp_nodelay() {
-            return finalize(&r, NGX_ERROR);
-        }
-
-        (0, false)
-    } else {
-        // the cache: uwsgi_no_cache, the valid time, the header of the cache
-        // file; p->temp_file with it (p->buf_to_file)
-
-        match crate::upstream_cache::send_response(&r, status, &resp.cache, resp.pos) {
-            Err(()) => return finalize(&r, NGX_ERROR),
-
-            Ok(Some(header)) => {
-                let temp_path = lcf.borrow().temp_path.as_option().cloned();
-
-                writer = crate::upstream_cache::CacheWriter::new(&r, temp_path.as_deref(), &header, &resp.buf[..resp.pos]);
-
-                if writer.is_none() {
-                    return finalize(&r, NGX_ERROR);
-                }
-            }
-
-            Ok(None) => {}
-        }
-
-        if header_only && !ucache.cacheable.get() && !store {
-            return finalize(&r, 0);
-        }
-
-        // p->limit_rate = ngx_http_complex_value_size(r, u->conf->limit_rate, 0)
-        let lr = lcf.borrow().limit_rate.as_option().cloned().flatten();
-
-        (crate::script::complex_value_size(&r, &lr, 0), ucache.cacheable.get() || store)
-    };
-
-    // u->input_filter_init(): p->length, u->length
-    let length = input_filter_init(&r, &resp);
-
-    // uwsgi_store is of the pipe of a buffered response
-    let store = store && buffering;
-
-    let body = send_response_body(
-        &r,
-        &mut sock,
-        &resp,
-        length,
-        BodyParams { buffering, limit_rate, downstream, capture, store, read_timeout, buffer_size },
-        watch,
-        &mut writer,
-    )
-    .await;
-
-    // ngx_http_upstream_process_request: ngx_http_upstream_store() and the
-    // cache file
-
-    if store && (body.upstream_done || body.eof) && status == NGX_HTTP_OK && (body.upstream_done || length == -1) && (resp.content_length_n == -1 || resp.content_length_n == body.data.len() as i64) {
-        upstream_store(&r, &lcf, &resp, &body.data);
-    }
-
-    if let Some(w) = writer {
-        w.finish(&r, body.upstream_done, body.eof && length == -1, resp.content_length_n);
-    }
-
-    // ngx_http_upstream_finalize_request
-    let rc = finalize_body(&r, &body).await;
-
-    finalize(&r, rc)
-}
-
-/// The end of ngx_http_upstream_finalize_request after the header was sent,
-/// while "sending to client": the last buffer of a complete response; for
-/// an error of the upstream (rc >= NGX_HTTP_SPECIAL_RESPONSE) NGX_ERROR,
-/// with a flush and no keepalive; nothing more when the client connection
-/// failed (p->downstream_error) or for a header only response.
-async fn finalize_body(r: &R, body: &BodyResult) -> i64 {
-    r.connection.log.set_action(Some("sending to client"));
-
-    match body.end {
-        BodyEnd::Done => {
-            if r.header_only.get() || !body.downstream {
-                return NGX_OK;
-            }
-
-            // ngx_http_upstream_process_trailers: uwsgi passes none
-            crate::special_response::send_special(r, true).await
-        }
-
-        BodyEnd::UpstreamError => {
-            if r.header_only.get() || !body.downstream {
-                return NGX_ERROR;
-            }
-
-            r.keepalive.set(false);
-
-            crate::special_response::send_special(r, false).await
-        }
-
-        BodyEnd::Error => NGX_ERROR,
-
-        BodyEnd::Status(rc) => rc,
-    }
-}
-
-/// The request written as ngx_http_upstream_send_request writes it: the
-/// uwsgi_send_timeout timer is armed while a write waits, and again after
-/// each write that made progress. Err(None) when it expires.
-async fn write_request(sock: &mut UpstreamSock, data: &[u8], send_timeout: u64) -> Result<(), Option<std::io::Error>> {
-    let mut off = 0;
-
-    while off < data.len() {
-        match tokio::time::timeout(Duration::from_millis(send_timeout), sock.write(&data[off..])).await {
-            Err(_) => return Err(None),
-            Ok(Err(e)) => return Err(Some(e)),
-            Ok(Ok(0)) => return Err(Some(std::io::Error::from(std::io::ErrorKind::WriteZero))),
-            Ok(Ok(n)) => off += n,
-        }
-    }
-
-    Ok(())
-}
-
-/// The failure type of ngx_http_upstream_next_errors[] for a status.
-fn status_failure(status: i64) -> u32 {
-    match status {
-        500 => NGX_HTTP_UPSTREAM_FT_HTTP_500,
-        502 => NGX_HTTP_UPSTREAM_FT_HTTP_502,
-        503 => NGX_HTTP_UPSTREAM_FT_HTTP_503,
-        504 => NGX_HTTP_UPSTREAM_FT_HTTP_504,
-        403 => NGX_HTTP_UPSTREAM_FT_HTTP_403,
-        404 => NGX_HTTP_UPSTREAM_FT_HTTP_404,
-        429 => NGX_HTTP_UPSTREAM_FT_HTTP_429,
-        _ => 0,
-    }
-}
-
-/// ngx_http_upstream_process_header: the response header read into
-/// u->buffer and parsed by u->process_header. The action stays "reading
-/// response header from upstream" while the response is processed. The
-/// uwsgi_read_timeout timer is that ngx_http_upstream_send_request armed
-/// once the request was sent: the reads of the header do not arm it again.
-async fn read_header(r: &R, sock: &mut UpstreamSock, buffer_size: usize, read_timeout: u64, watch: Option<&ClientWatch>, flags: &mut HeaderFlags) -> Result<UpstreamResponse, HeaderError> {
-    http_debug!(r, "http upstream process header");
-
-    r.connection.log.set_action(Some("reading response header from upstream"));
-
-    let deadline = Instant::now() + Duration::from_millis(read_timeout);
-
-    let mut u = UpstreamResponse::new();
-
-    // u->process_header = ngx_http_uwsgi_process_status_line, r->state = 0
-    let mut st = HeaderParse::new();
-
-    let mut chunk = vec![0u8; buffer_size.max(1)];
-
-    loop {
-        // c->recv() into what is left of u->buffer
-        let room = buffer_size.saturating_sub(u.buf.len()).clamp(1, chunk.len());
-
-        let res = {
-            let read = tokio::time::timeout_at(deadline, sock.read(&mut chunk[..room]));
-
-            tokio::select! {
-                res = read => res,
-                err = crate::proxy::client_closed(watch) => return Err(HeaderError::ClientClosed(err)),
-            }
-        };
-
-        let n = match res {
-            Err(_) => {
-                // c->read->timedout: ngx_http_upstream_next(FT_TIMEOUT)
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
-                return Err(HeaderError::Next(NGX_HTTP_UPSTREAM_FT_TIMEOUT));
-            }
-            Ok(Err(e)) => {
-                if plain(sock) {
-                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
-                }
-                return Err(HeaderError::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
-            }
-            Ok(Ok(0)) => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
-                return Err(HeaderError::Next(NGX_HTTP_UPSTREAM_FT_ERROR));
-            }
-            Ok(Ok(n)) => n,
-        };
-
-        if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-            st.bytes_received += n as i64;
-        }
-
-        u.buf.extend_from_slice(&chunk[..n]);
-
-        // rc = u->process_header(r)
-
-        match process_status_line(r, &mut u, &mut st, flags) {
-            Ok(true) => return Ok(u),
-
-            Ok(false) => {
-                // NGX_AGAIN
-                if u.buf.len() >= buffer_size {
-                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream sent too big header");
-                    return Err(HeaderError::Next(NGX_HTTP_UPSTREAM_FT_INVALID_HEADER));
-                }
-            }
-
-            Err(ft) => return Err(HeaderError::Next(ft)),
-        }
-    }
-}
-
-/// What ngx_http_upstream_process_headers ends with.
-enum Processed {
-    /// the headers are in headers_out
-    Ok,
-    /// X-Accel-Redirect: the upstream is finalized (NGX_DECLINED), then the
-    /// request redirected
-    Redirect(Vec<u8>),
-}
-
-/// The headers of ngx_http_upstream_headers_in[] with "redirect": copied
-/// before an X-Accel-Redirect.
-const REDIRECT_HEADERS: &[&[u8]] = &[b"content-type", b"set-cookie", b"content-disposition", b"cache-control", b"expires", b"accept-ranges"];
-
-/// The charset of ngx_http_upstream_copy_content_type: the length of the
-/// type before the ";" of a "charset=" parameter, and the charset without
-/// quotes. As the C loop does, the character after the spaces that follow
-/// a ";" is not looked at as a ";" again.
-fn content_type_charset(value: &[u8]) -> Option<(usize, Vec<u8>)> {
-    let mut p = 0;
-
-    while p < value.len() {
-        if value[p] != b';' {
-            p += 1;
-            continue;
-        }
-
-        let last = p;
-
-        p += 1;
-
-        while p < value.len() && value[p] == b' ' {
-            p += 1;
-        }
-
-        if p == value.len() {
-            return None;
-        }
-
-        if value.len() - p < 8 || !value[p..p + 8].eq_ignore_ascii_case(b"charset=") {
-            // the p++ of the for loop
-            p += 1;
-            continue;
-        }
-
-        p += 8;
-
-        if p < value.len() && value[p] == b'"' {
-            p += 1;
-        }
-
-        let mut end = value.len();
-
-        if end > p && value[end - 1] == b'"' {
-            end -= 1;
-        }
-
-        let charset = if end > p { value[p..end].to_vec() } else { Vec::new() };
-
-        return Some((last, charset));
-    }
-
-    None
-}
-
-/// The copy handlers of ngx_http_upstream_headers_in[] (of a module
-/// without u->rewrite_redirect and u->rewrite_cookie), and
-/// ngx_http_upstream_copy_header_line for the other headers: the header
-/// goes to r->headers_out.
-fn copy_header(r: &R, u: &UpstreamResponse, h: &Header, force_ranges: bool) {
-    let value = h.value.borrow();
-
-    let mut ho = r.headers_out.borrow_mut();
-
-    match h.lowcase_key.as_slice() {
-        b"content-type" => {
-            // ngx_http_upstream_copy_content_type
-            ho.content_type_len = value.len();
-            ho.content_type = value.clone();
-            ho.content_type_lowcase = None;
-
-            if let Some((len, charset)) = content_type_charset(&value) {
-                ho.content_type_len = len;
-                ho.charset = charset;
-            }
-        }
-
-        // ngx_http_upstream_ignore_header_line
-        b"content-length" | b"connection" | b"keep-alive" | b"transfer-encoding" => {}
-
-        b"date" => {
-            let o = ho.add(&h.key, &value);
-            ho.date = Some(o);
-        }
-
-        b"last-modified" => {
-            // ngx_http_upstream_copy_last_modified
-            let o = ho.add(&h.key, &value);
-            ho.last_modified = Some(o);
-            ho.last_modified_time = u.cache.last_modified_time;
-        }
-
-        b"etag" => {
-            let o = ho.add(&h.key, &value);
-            ho.etag = Some(o);
-        }
-
-        b"server" => {
-            let o = ho.add(&h.key, &value);
-            ho.server = Some(o);
-        }
-
-        b"location" => {
-            // ngx_http_upstream_rewrite_location: a relative location is
-            // not r->headers_out.location, not to be made absolute by the
-            // header filter
-            let o = ho.add(&h.key, &value);
-
-            if value.first() != Some(&b'/') {
-                ho.location = Some(o);
-            }
-        }
-
-        b"refresh" => {
-            // ngx_http_upstream_rewrite_refresh
-            let o = ho.add(&h.key, &value);
-            ho.refresh = Some(o);
-        }
-
-        b"cache-control" => {
-            // ngx_http_upstream_copy_multi_header_lines
-            let o = ho.add(&h.key, &value);
-            ho.cache_control.push(o);
-        }
-
-        b"link" => {
-            let o = ho.add(&h.key, &value);
-            ho.link.push(o);
-        }
-
-        b"expires" => {
-            let o = ho.add(&h.key, &value);
-            ho.expires = Some(o);
-        }
-
-        b"accept-ranges" => {
-            // ngx_http_upstream_copy_allow_ranges
-            if force_ranges {
-                return;
-            }
-
-            if r.cached.get() {
-                r.allow_ranges.set(true);
-                return;
-            }
-
-            if crate::upstream_cache::cacheable(r) {
-                r.allow_ranges.set(true);
-                r.single_range.set(true);
-                return;
-            }
-
-            let o = ho.add(&h.key, &value);
-            ho.accept_ranges = Some(o);
-        }
-
-        b"upgrade" => {
-            // ngx_http_upstream_copy_upgrade
-            if r.http_version.get() >= NGX_HTTP_VERSION_20 {
-                return;
-            }
-
-            ho.add(&h.key, &value);
-        }
-
-        b"content-range" => {
-            let o = ho.add(&h.key, &value);
-            ho.content_range = Some(o);
-        }
-
-        b"content-encoding" => {
-            let o = ho.add(&h.key, &value);
-            ho.content_encoding = Some(o);
-        }
-
-        // "Status", "WWW-Authenticate", "Set-Cookie", "Content-Disposition",
-        // "Vary", "X-Accel-*" and the headers without a handler:
-        // ngx_http_upstream_copy_header_line
-        _ => {
-            ho.add(&h.key, &value);
-        }
-    }
-}
-
-/// ngx_http_upstream_process_headers: the headers not hidden go to
-/// r->headers_out; for X-Accel-Redirect, only those with "redirect".
-fn process_headers(r: &R, lcf: &Rc<RefCell<NgxHttpUwsgiLocConf>>, u: &UpstreamResponse) -> Processed {
-    // u->headers_in.no_cache || u->headers_in.expired
-    crate::upstream_cache::process_headers_cacheable(r, &u.cache);
-
-    let (hide, ignore_xa_redirect, force_ranges) = {
-        let c = lcf.borrow();
-        (c.hide_headers_hash.clone(), c.cache.ignores(NGX_HTTP_UPSTREAM_IGN_XA_REDIRECT), *c.force_ranges)
-    };
-
-    if let Some(xar) = headers_in(u, b"x-accel-redirect") {
-        if !ignore_xa_redirect {
-            for h in u.headers.iter() {
-                if h.hash.get() == 0 {
-                    continue;
-                }
-
-                if REDIRECT_HEADERS.iter().any(|k| h.lowcase_key == *k) {
-                    copy_header(r, u, h, force_ranges);
-                }
-            }
-
-            let uri = xar.value.borrow().clone();
-
-            return Processed::Redirect(uri);
-        }
-    }
-
-    for h in u.headers.iter() {
-        if h.hash.get() == 0 {
-            continue;
-        }
-
-        if let Some(hide) = &hide {
-            if hide.find(hash_key(&h.lowcase_key), &h.lowcase_key).is_some() {
-                continue;
-            }
-        }
-
-        copy_header(r, u, h, force_ranges);
-    }
-
-    {
-        let mut ho = r.headers_out.borrow_mut();
-
-        ho.status = u.status_n;
-        ho.status_line = u.status_line.clone();
-
-        ho.content_length_n = u.content_length_n;
-    }
-
-    r.disable_not_modified.set(!crate::upstream_cache::cacheable(r));
-
-    if force_ranges {
-        r.allow_ranges.set(true);
-        r.single_range.set(true);
-
-        if r.cached.get() {
-            r.single_range.set(false);
-        }
-    }
-
-    // u->length = -1
-
-    Processed::Ok
-}
-
-/// The X-Accel-Redirect of ngx_http_upstream_process_headers: a named
-/// location, or the URI (with its arguments) for an internal redirect,
-/// with the method GET unless HEAD.
-async fn accel_redirect(r: &R, xar: &[u8]) -> i64 {
-    if xar.first() == Some(&b'@') {
-        crate::core_rt::named_location(r, xar).await;
-
-        // ngx_http_finalize_request(r, NGX_DONE)
-        return NGX_DONE;
-    }
-
-    let mut uri = xar.to_vec();
-    let mut args = Vec::new();
-
-    if crate::parse::parse_unsafe_uri_args(&r.connection.log, &mut uri, &mut args, crate::parse::NGX_HTTP_LOG_UNSAFE) != NGX_OK {
-        return NGX_HTTP_NOT_FOUND;
-    }
-
-    if r.method.get() != NGX_HTTP_HEAD {
-        r.method.set(NGX_HTTP_GET);
-        *r.method_name.borrow_mut() = b"GET".to_vec();
-    }
-
-    crate::core_rt::internal_redirect(r, &uri, Some(&args)).await;
-
-    NGX_DONE
-}
-
-/// ngx_http_upstream_upgrade: the header is out, what the upstream sent
-/// after it goes to the client, then the data of each side is passed to
-/// the other (ngx_http_upstream_process_upgraded).
-async fn upgrade(r: &R, sock: UpstreamSock, u: &UpstreamResponse, read_timeout: u64) -> i64 {
-    if !r.is_main() {
-        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "connection upgrade in subrequest");
-        return finalize(r, NGX_ERROR);
-    }
-
-    r.keepalive.set(false);
-
-    // the header goes out now, not with the "last" buffer that never comes
-    let mut b = Buf::from_vec(Vec::new());
-    b.flush = true;
-    b.sync = true;
-    let mut chain = Chain::new();
-    chain.push_back(b);
-    let _ = crate::core_rt::output_filter(r, chain).await;
-
-    if u.pos < u.buf.len() {
-        let _ = r.connection.send_all(&u.buf[u.pos..]).await;
-    }
-
-    let _ = crate::proxy::upgrade_tunnel(r.clone(), sock, read_timeout).await;
-
-    // ngx_http_upstream_finalize_request(r, u, 0) when the tunnel is done
-    finalize(r, 0);
-
-    NGX_DONE
-}
-
-/// What reading the response body needs of the upstream configuration.
-struct BodyParams {
-    /// u->buffering
-    buffering: bool,
-    /// p->limit_rate (uwsgi_limit_rate), buffered only
-    limit_rate: usize,
-    /// the body goes to the client (not p->downstream_error)
-    downstream: bool,
-    /// the response is read in full for the cache or uwsgi_store
-    /// (p->cacheable)
-    capture: bool,
-    /// the body is kept for uwsgi_store
-    store: bool,
-    read_timeout: u64,
-    /// uwsgi_buffer_size: the reads of an unbuffered response
-    buffer_size: usize,
-}
-
-/// How the body of a response ended.
-enum BodyEnd {
-    /// p->upstream_done, or the end of a response without a length
-    /// (ngx_http_upstream_finalize_request(r, u, 0))
-    Done,
-    /// the upstream closed the connection early, timed out or failed: 502
-    /// or 504 after the header
-    UpstreamError,
-    /// the client connection failed and the response is not read for the
-    /// cache or uwsgi_store (NGX_ERROR)
-    Error,
-    /// the request is finalized with this status (499: the client closed
-    /// the connection)
-    Status(i64),
-}
-
-/// The end of a response body.
-struct BodyResult {
-    end: BodyEnd,
-    /// p->upstream_done (u->length reached 0)
-    upstream_done: bool,
-    /// p->upstream_eof: the upstream closed the connection
-    eof: bool,
-    /// the body goes to the client (no p->downstream_error)
-    downstream: bool,
-    /// the body, kept for uwsgi_store
-    data: Vec<u8>,
-}
-
-/// ngx_http_upstream_send_response after the header is sent: the body read
-/// with ngx_event_pipe_copy_input_filter (buffered, with uwsgi_limit_rate)
-/// or ngx_http_upstream_non_buffered_filter and passed to the client, up
-/// to what ngx_http_upstream_process_request finds at its end.
-///
-/// The actions are those of C: "reading upstream" for the pipe
-/// (ngx_http_upstream_process_upstream) and the reads of an unbuffered
-/// response; the preread part of an unbuffered response is filtered while
-/// "reading response header from upstream" and sent while "sending to
-/// client" (ngx_http_upstream_process_non_buffered_downstream).
-async fn send_response_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length: i64, p: BodyParams, watch: Option<&ClientWatch>, cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
-    if p.buffering {
-        r.connection.log.set_action(Some("reading upstream"));
-    }
-
-    read_body(r, sock, u, length, &p, watch, cache).await
-}
-
-async fn read_body(r: &R, sock: &mut UpstreamSock, u: &UpstreamResponse, length: i64, p: &BodyParams, watch: Option<&ClientWatch>, cache: &mut Option<crate::upstream_cache::CacheWriter>) -> BodyResult {
-    let log = r.connection.log.clone();
-
-    let mut length = length;
-
-    if !p.buffering {
-        r.limit_rate.set(0);
-        r.limit_rate_set.set(true);
-    }
-
-    let mut downstream = p.downstream;
-    let mut upstream_done = false;
-    let mut eof = false;
-    let mut timedout = false;
-
-    let mut captured: Vec<u8> = Vec::new();
-
-    macro_rules! end {
-        ($end:expr) => {
-            return BodyResult { end: $end, upstream_done, eof, downstream, data: captured }
-        };
-    }
-
-    // the preread part of the body in u->buffer, then what is read
-    let mut data: Vec<u8> = u.buf[u.pos..].to_vec();
-    let preread = !data.is_empty();
-
-    if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-        st.response_length += data.len() as i64;
-    }
-
-    if !p.buffering && !preread && downstream {
-        // ngx_http_send_special(r, NGX_HTTP_FLUSH): the header goes now
-        if crate::special_response::send_special(r, false).await == NGX_ERROR {
-            end!(BodyEnd::Error);
-        }
-    }
-
-    // p->read_length and p->start_sec of uwsgi_limit_rate
-    let start_sec = ngx_core::times::cached().sec;
-    let mut read_length: i64 = 0;
-    let mut delay: u64 = 0;
-
-    if p.limit_rate > 0 && preread {
-        read_length += data.len() as i64;
-        delay = data.len() as u64 * 1000 / p.limit_rate as u64;
-    }
-
-    let read_size = if p.buffering { 16384 } else { p.buffer_size.max(1) };
-    let mut chunk = vec![0u8; read_size];
-
-    // the preread part of an unbuffered response is sent by
-    // ngx_http_upstream_process_non_buffered_downstream
-    let mut sending_preread = !p.buffering && preread;
-
-    loop {
-        // u->input_filter / p->input_filter
-
-        let mut out: Vec<u8> = Vec::new();
-
-        if !data.is_empty() && !upstream_done {
-            if length == 0 {
-                // the copy filters: the data after the length is dropped
-                ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
-                upstream_done = true;
-            } else if length == -1 {
-                out.extend_from_slice(&data);
-            } else if data.len() as i64 > length {
-                ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "upstream sent more data than specified in \"Content-Length\" header");
-                out.extend_from_slice(&data[..length as usize]);
-                length = 0;
-                upstream_done = true;
-            } else {
-                out.extend_from_slice(&data);
-                length -= data.len() as i64;
-            }
-        }
-
-        data.clear();
-
-        if sending_preread {
-            log.set_action(Some("sending to client"));
-            sending_preread = false;
-        }
-
-        if !out.is_empty() {
-            if p.store {
-                captured.extend_from_slice(&out);
-            }
-
-            // ngx_event_pipe_write_chain_to_temp_file()
-            if let Some(w) = cache.as_mut() {
-                w.write(r, &out);
-            }
-
-            if downstream {
-                let mut b = Buf::from_vec(out);
-                b.memory = true;
-                b.flush = !p.buffering;
-                let mut chain = Chain::new();
-                chain.push_back(b);
-
-                if crate::core_rt::output_filter(r, chain).await == NGX_ERROR {
-                    // p->downstream_error: the upstream is read to the end
-                    // only for the cache or uwsgi_store
-                    downstream = false;
-
-                    if !p.capture {
-                        end!(BodyEnd::Error);
-                    }
-                }
-            }
-        }
-
-        if length == 0 {
-            upstream_done = true;
-        }
-
-        if upstream_done || (eof && length == -1) {
-            end!(BodyEnd::Done);
-        }
-
-        if eof || timedout {
-            if eof {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "upstream prematurely closed connection");
-            }
-
-            end!(BodyEnd::UpstreamError);
-        }
-
-        // p->limit_rate: the read is delayed by the time the last one
-        // took at the rate, and limited to what the rate allows so far
-        if delay > 0 {
-            if !crate::proxy::sleep_or_client_closed(delay, watch).await {
-                end!(BodyEnd::Status(crate::proxy::client_closed_request(r, 0)));
-            }
-
-            delay = 0;
-        }
-
-        let mut limit = chunk.len();
-
-        if p.limit_rate > 0 {
-            let now = ngx_core::times::cached().sec;
-            let allowed = p.limit_rate as i64 * (now - start_sec + 1) - read_length;
-
-            if allowed <= 0 {
-                delay = (-allowed * 1000 / p.limit_rate as i64 + 1) as u64;
-                continue;
-            }
-
-            limit = limit.min(allowed as usize);
-        }
-
-        // ngx_http_upstream_process_non_buffered_upstream, and the pipe
-        log.set_action(Some("reading upstream"));
-
-        let res = {
-            let read = tokio::time::timeout(Duration::from_millis(p.read_timeout), sock.read(&mut chunk[..limit]));
-
-            tokio::select! {
-                res = read => res,
-                err = crate::proxy::client_closed(watch) => end!(BodyEnd::Status(crate::proxy::client_closed_request(r, err))),
-            }
-        };
-
-        match res {
-            Err(_) => {
-                ngx_log_error!(NGX_LOG_ERR, r.connection.log, Some(libc::ETIMEDOUT), "upstream timed out");
-                timedout = true;
-            }
-            Ok(Err(e)) => {
-                if plain(sock) {
-                    ngx_log_error!(NGX_LOG_ERR, r.connection.log, e.raw_os_error(), "recv() failed");
-                }
-
-                // upstream->read->error, p->upstream_error
-                end!(BodyEnd::UpstreamError);
-            }
-            Ok(Ok(0)) => eof = true,
-            Ok(Ok(n)) => {
-                if let Some(st) = r.upstream_states.borrow_mut().last_mut() {
-                    st.bytes_received += n as i64;
-                    st.response_length += n as i64;
-                }
-
-                if p.limit_rate > 0 {
-                    read_length += n as i64;
-                    delay = n as u64 * 1000 / p.limit_rate as u64;
-                }
-
-                data.extend_from_slice(&chunk[..n]);
-            }
-        }
-    }
-}
-
-/// ngx_http_upstream_store: the body in a temporary file of uwsgi_temp_path
-/// renamed to the path of uwsgi_store (the location's file with "on"),
-/// with uwsgi_store_access and the time of "Last-Modified".
-fn upstream_store(r: &R, lcf: &Rc<RefCell<NgxHttpUwsgiLocConf>>, u: &UpstreamResponse, body: &[u8]) {
-    let (temp_path, store_access, store_values) = {
-        let c = lcf.borrow();
-        (c.temp_path.get().clone(), *c.store_access, c.store_values.clone())
-    };
-
-    let log = r.connection.log.clone();
-
-    let mut tf = match crate::file_cache::CacheTempFile::create(r, &temp_path, None) {
-        Ok(tf) => tf,
-        Err(()) => return,
-    };
-
-    if tf.write(body, &log).is_err() {
-        let _ = ngx_core::os::unlink(&tf.name);
-        return;
-    }
-
-    // ext.time: the time of "Last-Modified"
-    let mut time = -1;
-
-    if let Some(lm) = headers_in(u, b"last-modified") {
-        if let Some(t) = ngx_core::parse::parse_http_time(&lm.value.borrow()) {
-            time = t;
-        }
-    }
-
-    let path = match &store_values {
-        None => match crate::core_rt::map_uri_to_path(r, 0) {
-            Some((p, _)) => p,
-            None => {
-                let _ = ngx_core::os::unlink(&tf.name);
-                return;
-            }
-        },
-        Some(codes) => match crate::script::script_run(r, codes) {
-            Some(p) => p,
-            None => {
-                let _ = ngx_core::os::unlink(&tf.name);
-                return;
-            }
-        },
-    };
-
-    http_debug!(r, "upstream stores \"{}\" to \"{}\"", B(&tf.name), B(&path));
-
-    if path.is_empty() {
-        let _ = ngx_core::os::unlink(&tf.name);
-        return;
-    }
-
-    if time != -1 {
-        // ngx_set_file_time(): the times of the temporary file
-        let tv = [libc::timeval { tv_sec: time as libc::time_t, tv_usec: 0 }, libc::timeval { tv_sec: time as libc::time_t, tv_usec: 0 }];
-
-        // SAFETY: tf.fd is the open temporary file, tv two timevals.
-        if unsafe { libc::futimes(tf.fd, tv.as_ptr()) } == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "futimes() \"{}\" failed", B(&tf.name));
-            let _ = ngx_core::os::unlink(&tf.name);
-            return;
-        }
-    }
-
-    let _ = crate::file_cache::ext_rename_file(&tf.name, &path, store_access, store_access, true, true, &log);
-}
-
-/// ngx_http_upstream_cache_send with ngx_http_uwsgi_process_status_line,
-/// ngx_http_uwsgi_process_header and ngx_http_upstream_process_headers:
-/// the response from the cache.
-async fn cache_send(r: &R, lcf: &Rc<RefCell<NgxHttpUwsgiLocConf>>) -> i64 {
-    crate::upstream_cache::upstream_cache_send(r, |buf| async move {
-        let mut resp = UpstreamResponse::new();
-
-        resp.buf = buf;
-
-        let mut st = HeaderParse::new();
-        let mut flags = HeaderFlags::default();
-
-        match process_status_line(r, &mut resp, &mut st, &mut flags) {
-            Ok(true) => {}
-            Ok(false) => return NGX_AGAIN,
-            Err(_) => return NGX_HTTP_UPSTREAM_INVALID_HEADER,
-        }
-
-        // u->headers_in, for $upstream_http_*
-        *r.upstream_headers_in.borrow_mut() = resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
-
-        match process_headers(r, lcf, &resp) {
-            Processed::Ok => NGX_OK,
-            Processed::Redirect(xar) => {
-                // ngx_http_upstream_finalize_request(r, u, NGX_DECLINED)
-                finalize(r, NGX_DECLINED);
-                accel_redirect(r, &xar).await
-            }
-        }
-    })
-    .await
-}
-
-/// The stale response of ngx_http_upstream_next, when there is no next
-/// upstream to try, or the status the request is finalized with.
-async fn next_failed(r: &R, lcf: &Rc<RefCell<NgxHttpUwsgiLocConf>>, ft_type: u32, status: i64) -> i64 {
-    if crate::upstream_cache::next_stale(r, ft_type) {
-        // u->reinit_request(r)
-
-        if let Some(u) = crate::upstream_cache::upstream_of(r) {
-            u.cache_status.set(crate::file_cache::NGX_HTTP_CACHE_STALE);
-        }
-
-        let mut rc = cache_send(r, lcf).await;
-
-        if rc == NGX_DONE {
-            return NGX_DONE;
-        }
-
-        if rc == NGX_HTTP_UPSTREAM_INVALID_HEADER {
-            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-
-        return finalize(r, rc);
-    }
-
-    finalize(r, status)
 }
 
 // ---------------------------------------------------------------------------
@@ -2713,12 +785,12 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
     }
 
     if c.params.is_none() {
-        let params = init_params(cf, c.params_source.as_ref(), UWSGI_HEADERS)?;
+        let params = crate::upstream_rt::init_params(cf, c.params_source.as_ref(), UWSGI_HEADERS, "uwsgi_params_hash")?;
         c.params = Some(params);
     }
 
     if c.cache.enabled() && c.params_cache.is_none() {
-        let params = init_params(cf, c.params_source.as_ref(), UWSGI_CACHE_HEADERS)?;
+        let params = crate::upstream_rt::init_params(cf, c.params_source.as_ref(), UWSGI_CACHE_HEADERS, "uwsgi_params_hash")?;
         c.params_cache = Some(params);
     }
 
@@ -2736,69 +808,55 @@ fn merge_loc_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
         p.params_cache = c.params_cache.clone();
     }
 
+    c.upstream_conf = Some(Rc::new(upstream_conf(&c)));
+
     Ok(())
 }
 
-/// ngx_http_uwsgi_init_params: the params of uwsgi_param, then those of
-/// `default_params` it does not set (sent only if not empty); the names of
-/// the HTTP_* ones go to the hash (the request headers of these names are
-/// not sent), and the params with a value are compiled.
-fn init_params(cf: &mut Conf, params_source: Option<&Rc<Vec<ParamSource>>>, default_params: &[(&[u8], &[u8])]) -> Result<Rc<UwsgiParams>, ConfError> {
-    let src = merge_params(params_source.map(|s| s.as_slice()).unwrap_or(&[]), default_params);
-
-    let mut headers_names: Vec<HashKey<()>> = Vec::new();
-    let mut params: Vec<UwsgiParam> = Vec::new();
-    let mut flushes: Vec<usize> = Vec::new();
-
-    for s in src {
-        if s.key.len() > "HTTP_".len() && s.key.starts_with(b"HTTP_") {
-            let name = &s.key[5..];
-
-            // the hash keys are lowercased by ngx_hash_init()
-            headers_names.push(HashKey { key: name.to_ascii_lowercase(), key_hash: hash_key_lc(name), value: () });
-
-            if s.value.is_empty() {
-                continue;
-            }
-        }
-
-        let codes = crate::script::script_compile(cf, &s.value)?;
-
-        flushes.extend(crate::proxy::script_flushes(&codes));
-
-        params.push(UwsgiParam { key: s.key, skip_empty: s.skip_empty, codes });
+/// uwcf->upstream, the ngx_http_upstream_conf_t of the location, as merged
+fn upstream_conf(c: &NgxHttpUwsgiLocConf) -> UpstreamConf {
+    UpstreamConf {
+        upstream: c.upstream.clone(),
+        connect_timeout: *c.connect_timeout,
+        send_timeout: *c.send_timeout,
+        read_timeout: *c.read_timeout,
+        next_upstream_timeout: *c.next_upstream_timeout,
+        send_lowat: *c.send_lowat,
+        buffer_size: *c.buffer_size,
+        limit_rate: c.limit_rate.as_option().cloned().flatten(),
+        busy_buffers_size: c.busy_buffers_size,
+        max_temp_file_size: c.max_temp_file_size,
+        temp_file_write_size: c.temp_file_write_size,
+        bufs: c.bufs,
+        next_upstream: c.next_upstream,
+        store_access: *c.store_access,
+        next_upstream_tries: *c.next_upstream_tries as u32,
+        buffering: *c.buffering,
+        request_buffering: *c.request_buffering,
+        pass_request_headers: *c.pass_request_headers,
+        pass_request_body: *c.pass_request_body,
+        pass_trailers: false,
+        pass_early_hints: false,
+        ignore_client_abort: *c.ignore_client_abort,
+        intercept_errors: *c.intercept_errors,
+        cyclic_temp_file: false,
+        force_ranges: *c.force_ranges,
+        temp_path: c.temp_path.as_option().cloned(),
+        hide_headers_hash: c.hide_headers_hash.clone(),
+        local: c.local.as_option().cloned().flatten(),
+        socket_keepalive: *c.socket_keepalive,
+        socket_rcvbuf: *c.socket_rcvbuf,
+        socket_sndbuf: *c.socket_sndbuf,
+        cache: c.cache.clone(),
+        store: c.store.get_or(false),
+        store_values: c.store_values.clone(),
+        intercept_404: false,
+        change_buffering: true,
+        preserve_output: false,
+        ignore_input: false,
+        ssl: c.upstream_ssl.clone(),
+        module: "uwsgi",
     }
-
-    let number = headers_names.len();
-
-    let hinit = HashInit { name: "uwsgi_params_hash", max_size: 512, bucket_size: 64, log: &cf.log };
-
-    let hash = match Hash::init(&hinit, headers_names) {
-        Ok(h) => h,
-        Err(e) => {
-            ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "{}", e);
-            return Err(ConfError::Logged);
-        }
-    };
-
-    Ok(Rc::new(UwsgiParams { flushes, params, number, hash }))
-}
-
-/// params_merged of ngx_http_uwsgi_init_params: the params of uwsgi_param,
-/// then the default params of names they do not have (compared
-/// case-insensitively), sent only if not empty.
-fn merge_params(source: &[ParamSource], default_params: &[(&[u8], &[u8])]) -> Vec<ParamSource> {
-    let mut src: Vec<ParamSource> = source.to_vec();
-
-    for (key, value) in default_params {
-        if src.iter().any(|s| s.key.eq_ignore_ascii_case(key)) {
-            continue;
-        }
-
-        src.push(ParamSource { key: key.to_vec(), value: value.to_vec(), skip_empty: true });
-    }
-
-    src
 }
 
 /// Two lists of upstream.hide_headers or pass_headers are the same one
@@ -3271,31 +1329,10 @@ fn uwsgi_str_array(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> C
 /// uwsgi_param: ngx_http_upstream_param_set_slot
 fn uwsgi_param(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let cell = uwcf_of(&conf);
-
-    let value = cf.args.clone();
-
-    let mut param = ParamSource { key: value[1].clone(), value: value[2].clone(), skip_empty: false };
-
-    if value.len() == 4 {
-        if value[3] != b"if_not_empty" {
-            return Err(cf.emerg(format_args!("invalid parameter \"{}\"", B(&value[3]))));
-        }
-
-        param.skip_empty = true;
-    }
-
-    let mut c = cell.borrow_mut();
-
-    let mut list: Vec<ParamSource> = match c.params_source.take() {
-        Some(l) => Rc::try_unwrap(l).unwrap_or_else(|l| l.as_ref().clone()),
-        None => Vec::new(),
-    };
-
-    list.push(param);
-
-    c.params_source = Some(Rc::new(list));
-
-    Ok(())
+    let mut list = cell.borrow_mut().params_source.take();
+    let rc = crate::upstream_rt::param_set_slot(cf, &mut list);
+    cell.borrow_mut().params_source = list;
+    rc
 }
 
 /// uwsgi_bind: ngx_http_upstream_bind_set_slot
@@ -3507,6 +1544,7 @@ pub fn uwsgi_module() -> ModuleDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream_rt::{cgi_input_length as input_length, cgi_status, content_type_charset, header_hash_key, header_param_key, header_params, merge_params, status_failure};
 
     #[test]
     fn test_packet_header() {

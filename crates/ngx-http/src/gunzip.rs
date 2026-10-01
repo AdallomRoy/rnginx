@@ -1,185 +1,701 @@
-//! ngx_http_gunzip_filter_module: decompress gzipped upstream responses when
-//! the client doesn't accept gzip encoding. Matches
-//! ngx_http_gunzip_filter_module.c: header filter clears Content-Encoding /
-//! Content-Length when engaging; body filter feeds each chunk through
-//! flate2's gzip Decompress and emits plain bytes.
+//! ngx_http_gunzip_filter_module
+//!
+//! zlib (libz-sys, the system zlib as in the C build) decodes the gzip
+//! framing itself (inflateInit2() with MAX_WBITS + 16). The buffers own
+//! their data here: the output buffers a buffer of ctx->free stands for
+//! are allocated again when it is taken, and those passed on are free once
+//! the next filter returns, as the write filter has sent them by then (C
+//! keeps the ones not sent yet in ctx->busy).
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use flate2::{Decompress, FlushDecompress, Status};
+use libz_sys as z;
 
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::*;
+use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
+use ngx_core::{cmd, ngx_log_debug, ngx_log_error};
 
-use crate::request::TableElt;
+use crate::request::*;
 use crate::*;
 
 crate::http_module_index!("ngx_http_gunzip_filter_module");
 
+/// MAX_WBITS of zconf.h
+const MAX_WBITS: i32 = 15;
+
+/// ngx_http_gunzip_conf_t
 pub struct GunzipConf {
     pub enable: Val<bool>,
+    pub bufs: Bufs,
 }
 
-fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(GunzipConf { enable: Val::unset() })
+/// The memory ngx_http_gunzip_filter_alloc() gives zlib from the request
+/// pool, reached through zstream.opaque during the zlib calls.
+struct GunzipAlloc {
+    pool: Vec<Vec<u64>>,
+    log: Log,
 }
 
-fn merge_conf(_cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> ConfResult {
-    let p = conf_cell::<GunzipConf>(prev).borrow();
-    let mut c = conf_cell::<GunzipConf>(conf).borrow_mut();
-    c.enable.merge(&p.enable, false);
+/// ngx_http_gunzip_ctx_t
+pub struct GunzipCtx {
+    in_: Chain,
+    /// ctx->free: the output buffers sent, their data to be allocated
+    /// again when one is taken
+    free: Vec<Buf>,
+    out: Chain,
+
+    in_buf: Option<Buf>,
+    out_buf: Option<Buf>,
+    bufs: usize,
+
+    started: bool,
+    flush: i32,
+    redo: bool,
+    done: bool,
+    nomem: bool,
+
+    alloc: *mut GunzipAlloc,
+    zstream: Box<z::z_stream>,
+}
+
+impl Drop for GunzipCtx {
+    fn drop(&mut self) {
+        // SAFETY: alloc comes from Box::into_raw() in GunzipCtx::new() and
+        // is freed only here; zlib does not use the memory any more (its
+        // zfree is a no-op, as the pool frees the memory in C).
+        unsafe { drop(Box::from_raw(self.alloc)) };
+    }
+}
+
+impl GunzipCtx {
+    fn new(log: Log) -> GunzipCtx {
+        let alloc = Box::into_raw(Box::new(GunzipAlloc { pool: Vec::new(), log }));
+
+        GunzipCtx {
+            in_: Chain::new(),
+            free: Vec::new(),
+            out: Chain::new(),
+            in_buf: None,
+            out_buf: None,
+            bufs: 0,
+            started: false,
+            flush: z::Z_NO_FLUSH,
+            redo: false,
+            done: false,
+            nomem: false,
+            alloc,
+            zstream: Box::new(z::z_stream {
+                next_in: std::ptr::null_mut(),
+                avail_in: 0,
+                total_in: 0,
+                next_out: std::ptr::null_mut(),
+                avail_out: 0,
+                total_out: 0,
+                msg: std::ptr::null_mut(),
+                state: std::ptr::null_mut(),
+                zalloc: gunzip_filter_alloc,
+                zfree: gunzip_filter_free,
+                opaque: alloc as *mut libc::c_void,
+                data_type: 0,
+                adler: 0,
+                reserved: 0,
+            }),
+        }
+    }
+
+    /// The first buffer of ctx->in for "%p"
+    fn in_ptr(&self) -> usize {
+        self.in_.front().map_or(0, |b| b as *const Buf as usize)
+    }
+
+    fn in_buf_ptr(&self) -> usize {
+        self.in_buf.as_ref().map_or(0, |b| b as *const Buf as usize)
+    }
+
+    fn in_buf_pos(&self) -> usize {
+        self.in_buf.as_ref().map_or(0, |b| buf_data_ptr(b) as usize + b.pos)
+    }
+}
+
+/// The tag of the buffers of the module, (ngx_buf_tag_t)
+/// &ngx_http_gunzip_filter_module
+fn gunzip_tag() -> usize {
+    static TAG: u8 = 0;
+    &TAG as *const u8 as usize
+}
+
+/// The start of the data of a buffer in memory (buf->start), NULL for
+/// the others (pos and last of these are NULL in C)
+fn buf_data_ptr(b: &Buf) -> *const u8 {
+    match &b.data {
+        BufData::Memory(v) => v.as_ptr(),
+        _ => std::ptr::null(),
+    }
+}
+
+fn buf_data_mut_ptr(b: &mut Buf) -> *mut u8 {
+    match &mut b.data {
+        BufData::Memory(v) => v.as_mut_ptr(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// buf->last - buf->pos
+fn buf_mem_size(b: &Buf) -> usize {
+    if buf_data_ptr(b).is_null() {
+        return 0;
+    }
+
+    b.last - b.pos
+}
+
+/// A buffer sent, as ngx_chain_update_chains() moves it to ctx->free:
+/// pos and last at its start, its data to be allocated again
+fn buf_shell(b: &Buf) -> Buf {
+    Buf {
+        pos: 0,
+        last: 0,
+        file_pos: 0,
+        file_last: 0,
+        tag: b.tag,
+        num: b.num,
+        data: BufData::None,
+        temporary: b.temporary,
+        memory: b.memory,
+        mmap: b.mmap,
+        recycled: b.recycled,
+        in_file: b.in_file,
+        flush: b.flush,
+        sync: b.sync,
+        last_buf: b.last_buf,
+        last_in_chain: b.last_in_chain,
+        temp_file: b.temp_file,
+    }
+}
+
+/// ngx_http_gunzip_header_filter
+async fn gunzip_header_filter(r: R, next: HeaderFilter) -> i64 {
+    let conf = r.loc_conf::<GunzipConf>(ctx_index());
+
+    // TODO support multiple content-codings
+    // TODO always gunzip - due to configuration or module request
+    // TODO ignore content encoding?
+
+    let gzip = {
+        let ho = r.headers_out.borrow();
+        ho.content_encoding.as_ref().is_some_and(|h| {
+            let v = h.value.borrow();
+            v.len() == 4 && v.eq_ignore_ascii_case(b"gzip")
+        })
+    };
+
+    if !*conf.borrow().enable || !gzip {
+        return next(r).await;
+    }
+
+    r.gzip_vary.set(true);
+
+    if !r.gzip_tested.get() {
+        if crate::core_rt::gzip_ok(&r) == NGX_OK {
+            return next(r).await;
+        }
+    } else if r.gzip_ok.get() {
+        return next(r).await;
+    }
+
+    r.set_ctx(ctx_index(), GunzipCtx::new(r.connection.log.clone()));
+
+    r.filter_need_in_memory.set(true);
+
+    r.clear_content_encoding();
+
+    r.clear_content_length();
+    r.clear_accept_ranges();
+    crate::core_rt::weak_etag(&r);
+
+    next(r).await
+}
+
+/// ngx_http_gunzip_body_filter
+async fn gunzip_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
+    let ctx = match r.get_ctx::<GunzipCtx>(ctx_index()) {
+        Some(ctx) => ctx,
+        None => return next(r, input).await,
+    };
+
+    if ctx.borrow().done {
+        return next(r, input).await;
+    }
+
+    http_debug!(r, "http gunzip filter");
+
+    if !ctx.borrow().started && gunzip_filter_inflate_start(&r, &mut ctx.borrow_mut()) != NGX_OK {
+        return gunzip_filter_failed(&ctx);
+    }
+
+    if !input.is_empty() {
+        ctx.borrow_mut().in_.extend(input);
+    }
+
+    let mut flush;
+
+    if ctx.borrow().nomem {
+        // flush busy buffers
+
+        if next(r.clone(), Chain::new()).await == NGX_ERROR {
+            return gunzip_filter_failed(&ctx);
+        }
+
+        ctx.borrow_mut().nomem = false;
+        flush = false;
+    } else {
+        // ctx->busy: none, the buffers passed on are sent
+        flush = false;
+    }
+
+    loop {
+        // cycle while we can write to a client
+
+        loop {
+            // cycle while there is data to feed zlib and ...
+
+            let rc = gunzip_filter_add_data(&r, &mut ctx.borrow_mut());
+
+            if rc == NGX_DECLINED {
+                break;
+            }
+
+            if rc == NGX_AGAIN {
+                continue;
+            }
+
+            // ... there are buffers to write zlib output
+
+            let rc = gunzip_filter_get_buf(&r, &mut ctx.borrow_mut());
+
+            if rc == NGX_DECLINED {
+                break;
+            }
+
+            if rc == NGX_ERROR {
+                return gunzip_filter_failed(&ctx);
+            }
+
+            let rc = gunzip_filter_inflate(&r, &mut ctx.borrow_mut());
+
+            if rc == NGX_OK {
+                break;
+            }
+
+            if rc == NGX_ERROR {
+                return gunzip_filter_failed(&ctx);
+            }
+
+            // rc == NGX_AGAIN
+        }
+
+        if ctx.borrow().out.is_empty() && !flush {
+            return NGX_OK;
+        }
+
+        let out = std::mem::take(&mut ctx.borrow_mut().out);
+
+        // ngx_chain_update_chains(): the buffers of the module passed on
+        // are free once sent
+        let sent: Vec<Buf> = out.iter().filter(|b| b.tag == gunzip_tag()).map(buf_shell).collect();
+
+        let rc = next(r.clone(), out).await;
+
+        if rc == NGX_ERROR {
+            return gunzip_filter_failed(&ctx);
+        }
+
+        let mut c = ctx.borrow_mut();
+
+        for b in sent {
+            c.free.insert(0, b);
+        }
+
+        http_debug!(r, "gunzip out: {:016X}", 0);
+
+        c.nomem = false;
+        flush = false;
+
+        if c.done {
+            return rc;
+        }
+    }
+}
+
+/// The failed: part of ngx_http_gunzip_body_filter()
+fn gunzip_filter_failed(ctx: &Rc<RefCell<GunzipCtx>>) -> i64 {
+    ctx.borrow_mut().done = true;
+
+    NGX_ERROR
+}
+
+/// ngx_http_gunzip_filter_inflate_start
+fn gunzip_filter_inflate_start(r: &R, ctx: &mut GunzipCtx) -> i64 {
+    ctx.zstream.next_in = std::ptr::null_mut();
+    ctx.zstream.avail_in = 0;
+
+    ctx.zstream.zalloc = gunzip_filter_alloc;
+    ctx.zstream.zfree = gunzip_filter_free;
+    ctx.zstream.opaque = ctx.alloc as *mut libc::c_void;
+
+    // windowBits +16 to decode gzip, zlib 1.2.0.4+
+    // SAFETY: the stream is boxed (zlib keeps a pointer to it in its state)
+    // and its allocator is the one of the ctx, which outlives it.
+    let rc = unsafe { z::inflateInit2_(&mut *ctx.zstream, MAX_WBITS + 16, z::zlibVersion(), std::mem::size_of::<z::z_stream>() as i32) };
+
+    if rc != z::Z_OK {
+        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "inflateInit2() failed: {}", rc);
+        return NGX_ERROR;
+    }
+
+    ctx.started = true;
+
+    ctx.flush = z::Z_NO_FLUSH;
+
+    NGX_OK
+}
+
+/// ngx_http_gunzip_filter_add_data
+fn gunzip_filter_add_data(r: &R, ctx: &mut GunzipCtx) -> i64 {
+    if ctx.zstream.avail_in != 0 || ctx.flush != z::Z_NO_FLUSH || ctx.redo {
+        return NGX_OK;
+    }
+
+    http_debug!(r, "gunzip in: {:016X}", ctx.in_ptr());
+
+    let buf = match ctx.in_.pop_front() {
+        Some(buf) => buf,
+        None => return NGX_DECLINED,
+    };
+
+    ctx.in_buf = Some(buf);
+
+    let in_buf = ctx.in_buf.as_ref().expect("in_buf");
+
+    let start = buf_data_ptr(in_buf);
+
+    ctx.zstream.next_in = if start.is_null() { std::ptr::null_mut() } else { start.wrapping_add(in_buf.pos) as *mut u8 };
+    ctx.zstream.avail_in = buf_mem_size(in_buf) as z::uInt;
+
+    http_debug!(r, "gunzip in_buf:{:016X} ni:{:016X} ai:{}", ctx.in_buf_ptr(), ctx.zstream.next_in as usize, ctx.zstream.avail_in);
+
+    let in_buf = ctx.in_buf.as_ref().expect("in_buf");
+
+    if in_buf.last_buf || in_buf.last_in_chain {
+        ctx.flush = z::Z_FINISH;
+    } else if in_buf.flush {
+        ctx.flush = z::Z_SYNC_FLUSH;
+    } else if ctx.zstream.avail_in == 0 {
+        // ctx->flush == Z_NO_FLUSH
+        return NGX_AGAIN;
+    }
+
+    NGX_OK
+}
+
+/// ngx_http_gunzip_filter_get_buf
+fn gunzip_filter_get_buf(r: &R, ctx: &mut GunzipCtx) -> i64 {
+    if ctx.zstream.avail_out != 0 {
+        return NGX_OK;
+    }
+
+    let conf = r.loc_conf::<GunzipConf>(ctx_index());
+    let bufs = conf.borrow().bufs;
+
+    if !ctx.free.is_empty() {
+        let mut b = ctx.free.remove(0);
+
+        b.data = BufData::Memory(vec![0u8; bufs.size]);
+        b.flush = false;
+
+        ctx.out_buf = Some(b);
+    } else if ctx.bufs < bufs.num {
+        // ngx_create_temp_buf()
+        let mut b = Buf { data: BufData::Memory(vec![0u8; bufs.size]), pos: 0, last: 0, temporary: true, ..Default::default() };
+
+        b.tag = gunzip_tag();
+        b.recycled = true;
+        ctx.bufs += 1;
+
+        ctx.out_buf = Some(b);
+    } else {
+        ctx.nomem = true;
+        return NGX_DECLINED;
+    }
+
+    let out_buf = ctx.out_buf.as_mut().expect("out_buf");
+    let pos = out_buf.pos;
+
+    ctx.zstream.next_out = buf_data_mut_ptr(out_buf).wrapping_add(pos);
+    ctx.zstream.avail_out = bufs.size as z::uInt;
+
+    NGX_OK
+}
+
+/// ngx_http_gunzip_filter_inflate
+fn gunzip_filter_inflate(r: &R, ctx: &mut GunzipCtx) -> i64 {
+    http_debug!(
+        r,
+        "inflate in: ni:{:016X} no:{:016X} ai:{} ao:{} fl:{} redo:{}",
+        ctx.zstream.next_in as usize,
+        ctx.zstream.next_out as usize,
+        ctx.zstream.avail_in,
+        ctx.zstream.avail_out,
+        ctx.flush,
+        ctx.redo as i32
+    );
+
+    // SAFETY: next_in points into ctx->in_buf and next_out into
+    // ctx->out_buf, both owned by the ctx with the lengths avail_in and
+    // avail_out; the stream was initialized by inflateInit2_().
+    let rc = unsafe { z::inflate(&mut *ctx.zstream, ctx.flush) };
+
+    if rc != z::Z_OK && rc != z::Z_STREAM_END && rc != z::Z_BUF_ERROR {
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "inflate() failed: {}, {}", ctx.flush, rc);
+        return NGX_ERROR;
+    }
+
+    http_debug!(
+        r,
+        "inflate out: ni:{:016X} no:{:016X} ai:{} ao:{} rc:{}",
+        ctx.zstream.next_in as usize,
+        ctx.zstream.next_out as usize,
+        ctx.zstream.avail_in,
+        ctx.zstream.avail_out,
+        rc
+    );
+
+    http_debug!(r, "gunzip in_buf:{:016X} pos:{:016X}", ctx.in_buf_ptr(), ctx.in_buf_pos());
+
+    if !ctx.zstream.next_in.is_null() {
+        if let Some(in_buf) = ctx.in_buf.as_mut() {
+            in_buf.pos = ctx.zstream.next_in as usize - buf_data_ptr(in_buf) as usize;
+        }
+
+        if ctx.zstream.avail_in == 0 {
+            ctx.zstream.next_in = std::ptr::null_mut();
+        }
+    }
+
+    {
+        let out_buf = ctx.out_buf.as_mut().expect("out_buf");
+        out_buf.last = ctx.zstream.next_out as usize - buf_data_mut_ptr(out_buf) as usize;
+    }
+
+    if ctx.zstream.avail_out == 0 {
+        // zlib wants to output some more data
+
+        let b = ctx.out_buf.take().expect("out_buf");
+        ctx.out.push_back(b);
+
+        ctx.redo = true;
+
+        return NGX_AGAIN;
+    }
+
+    ctx.redo = false;
+
+    if ctx.flush == z::Z_SYNC_FLUSH {
+        ctx.flush = z::Z_NO_FLUSH;
+
+        let mut b = if ctx.out_buf.as_ref().expect("out_buf").buf_size() == 0 {
+            // ngx_calloc_buf()
+            Buf::default()
+        } else {
+            ctx.zstream.avail_out = 0;
+            ctx.out_buf.take().expect("out_buf")
+        };
+
+        b.flush = true;
+
+        ctx.out.push_back(b);
+
+        return NGX_OK;
+    }
+
+    if ctx.flush == z::Z_FINISH && ctx.zstream.avail_in == 0 {
+        if rc != z::Z_STREAM_END {
+            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "inflate() returned {} on response end", rc);
+            return NGX_ERROR;
+        }
+
+        if gunzip_filter_inflate_end(r, ctx) != NGX_OK {
+            return NGX_ERROR;
+        }
+
+        return NGX_OK;
+    }
+
+    if rc == z::Z_STREAM_END && ctx.zstream.avail_in > 0 {
+        // SAFETY: the stream was initialized by inflateInit2_().
+        let rc = unsafe { z::inflateReset(&mut *ctx.zstream) };
+
+        if rc != z::Z_OK {
+            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "inflateReset() failed: {}", rc);
+            return NGX_ERROR;
+        }
+
+        ctx.redo = true;
+
+        return NGX_AGAIN;
+    }
+
+    if ctx.in_.is_empty() {
+        if ctx.out_buf.as_ref().expect("out_buf").buf_size() == 0 {
+            return NGX_OK;
+        }
+
+        ctx.zstream.avail_out = 0;
+
+        let b = ctx.out_buf.take().expect("out_buf");
+        ctx.out.push_back(b);
+
+        return NGX_OK;
+    }
+
+    NGX_AGAIN
+}
+
+/// ngx_http_gunzip_filter_inflate_end
+fn gunzip_filter_inflate_end(r: &R, ctx: &mut GunzipCtx) -> i64 {
+    http_debug!(r, "gunzip inflate end");
+
+    // SAFETY: the stream was initialized by inflateInit2_().
+    let rc = unsafe { z::inflateEnd(&mut *ctx.zstream) };
+
+    if rc != z::Z_OK {
+        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "inflateEnd() failed: {}", rc);
+        return NGX_ERROR;
+    }
+
+    let mut b = if ctx.out_buf.as_ref().expect("out_buf").buf_size() == 0 {
+        // ngx_calloc_buf()
+        Buf::default()
+    } else {
+        ctx.out_buf.take().expect("out_buf")
+    };
+
+    b.last_buf = r.is_main();
+    b.last_in_chain = true;
+    b.sync = true;
+
+    ctx.out.push_back(b);
+
+    ctx.done = true;
+
+    NGX_OK
+}
+
+/// ngx_http_gunzip_filter_alloc
+unsafe extern "C" fn gunzip_filter_alloc(opaque: *mut libc::c_void, items: z::uInt, size: z::uInt) -> *mut libc::c_void {
+    // SAFETY: opaque is the GunzipAlloc of the ctx, alive during the zlib
+    // calls, and nothing else refers to it meanwhile.
+    let ctx = &mut *(opaque as *mut GunzipAlloc);
+
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, ctx.log, "gunzip alloc: n:{} s:{}", items, size);
+
+    // ngx_palloc(ctx->request->pool, items * size)
+    let mut v = vec![0u64; (items as usize * size as usize).div_ceil(8)];
+    let p = v.as_mut_ptr() as *mut libc::c_void;
+
+    ctx.pool.push(v);
+
+    p
+}
+
+/// ngx_http_gunzip_filter_free
+unsafe extern "C" fn gunzip_filter_free(_opaque: *mut libc::c_void, _address: *mut libc::c_void) {}
+
+/// ngx_http_gunzip_create_conf
+fn gunzip_create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
+    make_slot(GunzipConf { enable: Val::unset(), bufs: Bufs::default() })
+}
+
+/// ngx_http_gunzip_merge_conf
+fn gunzip_merge_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) -> ConfResult {
+    let prev = conf_cell::<GunzipConf>(parent).borrow();
+    let mut conf = conf_cell::<GunzipConf>(child).borrow_mut();
+
+    conf.enable.merge(&prev.enable, false);
+
+    let pagesize = ngx_core::os::pagesize();
+    conf.bufs.merge(&prev.bufs, (128 * 1024) / pagesize, pagesize);
+
+    Ok(())
+}
+
+/// ngx_http_gunzip_filter_init
+fn gunzip_filter_init(_cf: &mut Conf) -> ConfResult {
+    install_header_filter(|r, next| async move { gunzip_header_filter(r, next).await });
+    install_body_filter(|r, input, next| async move { gunzip_body_filter(r, input, next).await });
     Ok(())
 }
 
 pub fn gunzip_filter_module() -> ModuleDef {
     let def = HttpModuleDef {
-        postconfiguration: Some(init),
-        create_loc_conf: Some(create_conf),
-        merge_loc_conf: Some(merge_conf),
+        postconfiguration: Some(gunzip_filter_init),
+        create_loc_conf: Some(gunzip_create_conf),
+        merge_loc_conf: Some(gunzip_merge_conf),
         ..Default::default()
     };
+
+    const MSL: u32 = NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF;
+
     let commands = vec![
-        ngx_core::cmd!("gunzip", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG, ConfLevel::Loc, GunzipConf, enable, set_flag),
-        ngx_core::cmd_fn!("gunzip_buffers", NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ConfLevel::Loc, |_cf, _cmd, _conf| Ok(())),
+        cmd!("gunzip", MSL | NGX_CONF_FLAG, ConfLevel::Loc, GunzipConf, enable, set_flag),
+        cmd!("gunzip_buffers", MSL | NGX_CONF_TAKE2, ConfLevel::Loc, GunzipConf, bufs, set_bufs),
     ];
+
     http_module_def("ngx_http_gunzip_filter_module", def, commands)
 }
 
-struct GunzipCtx {
-    decoder: Decompress,
-    done: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn init(cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter(|r, next| async move { gunzip_header_filter(r, next).await });
-    crate::install_body_filter(|r, input, next| async move { gunzip_body_filter(r, input, next).await });
-    Ok(())
-}
+    /// inflateInit2() with MAX_WBITS + 16 decodes a gzip member, and
+    /// inflateReset() the next one
+    #[test]
+    fn gzip_members() {
+        let mut ctx = GunzipCtx::new(Log::new(ngx_core::log::LogChain::new()));
 
-async fn gunzip_header_filter(r: R, next: crate::HeaderFilter) -> i64 {
-    // C's ngx_http_gunzip_header_filter runs on subrequests too — it only
-    // uses r == r->main to decide the buffer's last_buf flag in the body
-    // filter. Skipping subrequests here means SSI includes that fetch
-    // gzipped content never get decoded.
-    let conf = r.loc_conf::<GunzipConf>(ctx_index());
-    if !*conf.borrow().enable {
-        return next(r).await;
-    }
-    // Only engage if the response is gzipped.
-    let is_gzip = {
-        let ho = r.headers_out.borrow();
-        ho.content_encoding.as_ref()
-            .map(|h| h.value.borrow().eq_ignore_ascii_case(b"gzip"))
-            .unwrap_or(false)
-    };
-    if !is_gzip {
-        return next(r).await;
-    }
-    // Client accepts gzip → don't decompress (pass through).
-    if crate::core_rt::gzip_ok(&r) == NGX_OK {
-        return next(r).await;
-    }
-    // gzip-only decoder: window_bits=15 with new_gzip selects gzip framing.
-    let decoder = Decompress::new_gzip(15);
-    r.set_ctx(ctx_index(), GunzipCtx { decoder, done: false });
-    {
-        let mut ho = r.headers_out.borrow_mut();
-        ho.content_encoding = None;
-        for h in ho.headers.iter() {
-            if h.lowcase_key.eq_ignore_ascii_case(b"content-encoding") {
-                h.hash.set(0);
-            }
-        }
-        ho.content_length = None;
-        ho.content_length_n = -1;
-        // Vary: Accept-Encoding — the response body varies based on whether
-        // the upstream sent gzip that we then decoded.
-        let have_vary = ho.headers.iter().any(|h|
-            h.hash.get() != 0 && h.lowcase_key.eq_ignore_ascii_case(b"vary")
-                && h.value.borrow().eq_ignore_ascii_case(b"Accept-Encoding"));
-        if !have_vary {
-            let h = TableElt::new(b"Vary", b"Accept-Encoding");
-            ho.headers.push(h);
-        }
-    }
-    r.filter_need_in_memory.set(true);
-    next(r).await
-}
+        let rc = unsafe { z::inflateInit2_(&mut *ctx.zstream, MAX_WBITS + 16, z::zlibVersion(), std::mem::size_of::<z::z_stream>() as i32) };
+        assert_eq!(rc, z::Z_OK);
 
-async fn gunzip_body_filter(r: R, input: Chain, next: crate::BodyFilter) -> i64 {
-    let ctx_opt = r.get_ctx::<GunzipCtx>(ctx_index());
-    let ctx = match ctx_opt { Some(c) => c, None => return next(r, input).await };
+        // "TEST" gzipped by the C gzip filter at level 1
+        let member: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x04\x03\x0bq\x0d\x0e\x01\x00\xb8\x93\xea\xee\x04\x00\x00\x00";
+        let mut input = member.to_vec();
+        input.extend_from_slice(member);
 
-    let mut output = Chain::new();
-    let mut last_buf = false;
-    let mut last_in_chain = false;
-    for buf in input.iter() {
-        if buf.last_buf { last_buf = true; }
-        if buf.last_in_chain { last_in_chain = true; }
-        let data = match &buf.data {
-            BufData::Memory(v) => v[buf.pos..buf.last].to_vec(),
-            _ => { output.push_back(buf.clone()); continue; }
-        };
-        // Feed input to the decoder; may need multiple output buffers.
-        let mut in_pos = 0usize;
-        loop {
-            let mut out = vec![0u8; 8192];
-            let before_in = ctx.borrow().decoder.total_in();
-            let before_out = ctx.borrow().decoder.total_out();
-            let status = {
-                let mut c = ctx.borrow_mut();
-                c.decoder.decompress(&data[in_pos..], &mut out, FlushDecompress::None)
-            };
-            let consumed = (ctx.borrow().decoder.total_in() - before_in) as usize;
-            let produced = (ctx.borrow().decoder.total_out() - before_out) as usize;
-            in_pos += consumed;
-            if produced > 0 {
-                out.truncate(produced);
-                let mut b = Buf::from_vec(out);
-                b.last_buf = false;
-                b.last_in_chain = false;
-                output.push_back(b);
-            }
-            match status {
-                Ok(Status::StreamEnd) => {
-                    // A single gzip stream ended. If there's more input we
-                    // may be inside a multi-member gzip file (RFC1952
-                    // allows concatenating members). Reset the decoder and
-                    // keep going; only report done once all input is
-                    // consumed.
-                    if in_pos >= data.len() {
-                        ctx.borrow_mut().done = true;
-                        break;
-                    }
-                    ctx.borrow_mut().decoder = Decompress::new_gzip(15);
-                    continue;
-                }
-                Ok(Status::BufError) | Ok(Status::Ok) => {
-                    if consumed == 0 && produced == 0 { break; }
-                    if in_pos >= data.len() { break; }
-                }
-                Err(_) => { break; }
-            }
-        }
+        let mut out = vec![0u8; 64];
+
+        ctx.zstream.next_in = input.as_mut_ptr();
+        ctx.zstream.avail_in = input.len() as z::uInt;
+        ctx.zstream.next_out = out.as_mut_ptr();
+        ctx.zstream.avail_out = out.len() as z::uInt;
+
+        let rc = unsafe { z::inflate(&mut *ctx.zstream, z::Z_FINISH) };
+        assert_eq!(rc, z::Z_STREAM_END);
+        assert_eq!(ctx.zstream.avail_in as usize, member.len());
+
+        assert_eq!(unsafe { z::inflateReset(&mut *ctx.zstream) }, z::Z_OK);
+
+        let rc = unsafe { z::inflate(&mut *ctx.zstream, z::Z_FINISH) };
+        assert_eq!(rc, z::Z_STREAM_END);
+
+        let n = out.len() - ctx.zstream.avail_out as usize;
+        assert_eq!(&out[..n], b"TESTTEST");
+
+        assert_eq!(unsafe { z::inflateEnd(&mut *ctx.zstream) }, z::Z_OK);
     }
-    // Only the main request can produce a last_buf — subrequests bubble
-    // through the postpone filter and their last_buf flag is set upstream.
-    // Matches C: `b->last_buf = (r == r->main) ? 1 : 0;`.
-    let effective_last_buf = last_buf && r.is_main();
-    if effective_last_buf || last_in_chain {
-        if let Some(back) = output.back_mut() {
-            back.last_buf = effective_last_buf;
-            back.last_in_chain = last_in_chain;
-        } else {
-            let mut b = Buf::from_vec(Vec::new());
-            b.sync = true;
-            b.last_buf = effective_last_buf;
-            b.last_in_chain = last_in_chain;
-            output.push_back(b);
-        }
-    }
-    next(r, output).await
 }

@@ -298,6 +298,14 @@ fn event_module_init(cycle: &mut Cycle) -> Result<(), ()> {
 
 fn event_process_init(cycle: &Rc<Cycle>) -> Result<(), ()> {
     set_connection_n(cycle.connection_n.max(1));
+
+    // a connection for each listening socket, but those of the other
+    // workers with reuseport
+    let worker = worker_index();
+    let n = cycle.listening.iter().filter(|ls| ls.fd.get() != -1 && !(ls.reuseport.get() && ls.worker.get() as i64 != worker)).count();
+
+    crate::connection::reserve_connections(n);
+
     if let Some(e) = get_event_conf(cycle) {
         EVENT_CONF.with(|c| *c.borrow_mut() = Some(e));
     }
@@ -338,6 +346,8 @@ fn flags_notify() -> Rc<tokio::sync::Notify> {
 
 /// Called after fork in a worker (ngx_worker_process_init).
 fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
+    crate::control::close_sockets();
+
     set_environment(cycle);
     let ccf = core_conf(cycle);
     let (priority, rlimit_nofile, rlimit_core, user, group, username, workdir, cpu_affinity, cpu_auto) = {
@@ -423,6 +433,8 @@ fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
             }
         }
     }
+    // the connection of the channel (ngx_add_channel_event)
+    crate::connection::reserve_connections(1);
     // close other workers' channel[1] and our channel[0]
     let slot = PROCESS_SLOT.with(|p| p.get());
     PROCESSES.with(|p| {
@@ -495,7 +507,7 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
     worker_process_init(&cycle, -1);
     let name: &[u8] = if data == 0 { b"cache manager process" } else { b"cache loader process" };
     setproctitle(name);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
     local.block_on(&rt, async move {
@@ -564,7 +576,7 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
     let wake = wake_fd();
     let chan = CHANNEL.with(|c| c.get());
     let wake_afd = if wake >= 0 { AsyncFd::with_interest(Fd(wake), tokio::io::Interest::READABLE).ok() } else { None };
-    let chan_afd = if chan >= 0 && process_type() != ProcessType::Single { AsyncFd::with_interest(Fd(chan), tokio::io::Interest::READABLE).ok() } else { None };
+    let mut chan_afd = if chan >= 0 && process_type() != ProcessType::Single { AsyncFd::with_interest(Fd(chan), tokio::io::Interest::READABLE).ok() } else { None };
     let notify = flags_notify();
     loop {
         tokio::select! {
@@ -579,7 +591,15 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
                 if r.is_err() { break; }
                 loop {
                     match read_channel(chan, &cycle.log) {
-                        Err(()) => { return; }
+                        Err(()) => {
+                            // ngx_close_connection() of the channel: signals
+                            // are still handled
+                            chan_afd = None;
+                            if unsafe { libc::close(chan) } == -1 {
+                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() socket {} failed", chan);
+                            }
+                            break;
+                        }
                         Ok(None) => break,
                         Ok(Some(ch)) => {
                             ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "channel command: {}", ch.command);
@@ -714,7 +734,14 @@ async fn accept_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                     }
                 }
             }
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "*{} accept: {} fd:{}", c.number, B(&c.addr_text.borrow()), s);
+            if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+                // c->log is a copy of ls->log until the handler sets the
+                // connection number in it
+                let addr = c.sockaddr.borrow().to_text(true);
+                c.log.set_connection(0);
+                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "*{} accept: {} fd:{}", c.number, B(&addr), s);
+                c.log.set_connection(c.number);
+            }
             handler(c);
 
             if !multi_accept {
@@ -1084,8 +1111,72 @@ fn start_accepting(cycle: &Rc<Cycle>) {
     }
 }
 
+/// The runtime of a process running ngx_process_events_and_timers(): its
+/// park is the epoll_wait() of ngx_epoll_process_events()
+fn event_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(|| EVENTS_PARKED.store(true, Ordering::SeqCst))
+        .on_thread_unpark(events_unparked)
+        .build()
+        .expect("tokio runtime")
+}
+
+/// epoll_wait() returned: a signal which interrupted it is logged as
+/// ngx_signal_handler() and ngx_epoll_process_events() do, and the process
+/// ends on ngx_terminate (ngx_quit for a single or helper process) before
+/// any event is handled, as the cycles check it after
+/// ngx_process_events_and_timers()
+fn events_unparked() {
+    EVENTS_PARKED.store(false, Ordering::SeqCst);
+
+    crate::times::update_event_msec();
+
+    let pt = process_type();
+    let exit = SIG_TERMINATE.load(Ordering::SeqCst) || (pt != ProcessType::Worker && SIG_QUIT.load(Ordering::SeqCst));
+
+    if !EVENTS_EINTR.load(Ordering::SeqCst) && !exit {
+        return;
+    }
+
+    let cycle = match try_cycle() {
+        Some(c) => c,
+        None => return,
+    };
+
+    drain_signal_log(&cycle.log);
+
+    if EVENTS_EINTR.swap(false, Ordering::SeqCst) {
+        ngx_log_error!(NGX_LOG_INFO, cycle.log, Some(libc::EINTR), "epoll_wait() failed");
+    }
+
+    if !exit {
+        return;
+    }
+
+    match pt {
+        ProcessType::Single => {
+            for m in cycle.modules.iter() {
+                if let Some(f) = m.def.exit_process {
+                    f(&cycle);
+                }
+            }
+            master_exit_single(&cycle);
+        }
+        ProcessType::Worker => {
+            ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "exiting");
+            worker_process_exit(&cycle);
+        }
+        _ => {
+            // ngx_cache_manager_process_cycle
+            ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
 fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
     local.block_on(&rt, async move {
