@@ -306,6 +306,10 @@ pub struct SslConnState {
     pub session_ctx: Cell<*mut SSL_CTX>,
     /// c->ssl->last: the result of the last ngx_ssl_handle_recv()
     pub last: Cell<i64>,
+    /// the last ngx_ssl_recv() ended with SSL_ERROR_WANT_READ, which left
+    /// c->read->ready = 0: OpenSSL holds no records, so the next read waits
+    /// for a read event first
+    pub recv_drained: Cell<bool>,
     /// NGX_SSL_BUFFER
     pub buffer: Cell<bool>,
     /// the session being saved (ngx_ssl_new_client_session())
@@ -339,6 +343,7 @@ impl Default for SslConnState {
             ngx: Cell::new(false),
             session_ctx: Cell::new(std::ptr::null_mut()),
             last: Cell::new(NGX_OK),
+            recv_drained: Cell::new(false),
             buffer: Cell::new(false),
             session: Cell::new(std::ptr::null_mut()),
             save_session: RefCell::new(None),
@@ -1936,6 +1941,8 @@ pub fn ngx_ssl_recv_step(c: &Connection, sc: &SslConnection, buf: &mut [u8]) -> 
     let mut bytes = 0usize;
     let mut size = buf.len();
 
+    sc.state.recv_drained.set(false);
+
     ngx_ssl_clear_error(&c.log);
 
     /*
@@ -2103,6 +2110,7 @@ fn ngx_ssl_handle_recv(c: &Connection, sc: &SslConnection, n: c_int) -> (i64, bo
         // c->read->ready = 0: OpenSSL's read found the socket drained, also
         // when ngx_ssl_recv returns the data read before
         c.read_drained();
+        sc.state.recv_drained.set(true);
         return (NGX_AGAIN, false);
     }
 

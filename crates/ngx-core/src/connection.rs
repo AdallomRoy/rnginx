@@ -861,7 +861,8 @@ impl Connection {
     /// ngx_http_upstream_send_request processes the response at once only
     /// then): after a read that found the socket drained, the next one
     /// waits for an event instead of trying a recv() that fails with EAGAIN.
-    /// Not for TLS, whose buffered records the socket does not show.
+    /// For TLS only after a read that ended with SSL_ERROR_WANT_READ: else
+    /// OpenSSL may hold records the socket no longer shows.
     pub fn poll_read_io<T>(&self, cx: &mut std::task::Context<'_>, op: impl FnMut() -> IoStep<T>) -> std::task::Poll<io::Result<T>> {
         use std::task::Poll;
 
@@ -901,9 +902,13 @@ impl Connection {
         }
         let afd = self.afd()?;
         if let Some(ssl) = self.ssl.borrow().clone() {
-            match ssl.try_recv(self, buf) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                r => return r,
+            // OpenSSL may hold records the socket no longer shows, unless
+            // its last read found the socket drained (c->read->ready = 0)
+            if !(ssl.state.recv_drained.get() && ssl.state.ngx.get() && !ssl.state.in_early.get()) {
+                match ssl.try_recv(self, buf) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    r => return r,
+                }
             }
             // retried while the socket is read-ready: nothing again clears
             // the readiness

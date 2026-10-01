@@ -187,6 +187,9 @@ impl PeerConn {
         let dst = buf.initialize_unfilled();
 
         let rc = match sc {
+            // OpenSSL may hold records the socket no longer shows, unless its
+            // last read found the socket drained (c->read->ready = 0)
+            Some(sc) if sc.state.recv_drained.get() && !sc.state.in_early.get() => c.poll_read_io(cx, || ngx_ssl_recv_step(c, &sc, &mut *dst)),
             Some(sc) => c.poll_io(cx, || ngx_ssl_recv_step(c, &sc, &mut *dst)),
             None => c.poll_read_io(cx, || recv_step(c, &mut *dst)),
         };

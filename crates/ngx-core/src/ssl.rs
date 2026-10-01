@@ -89,6 +89,11 @@ impl SslConnection {
 
     pub async fn recv(&self, c: &Connection, buf: &mut [u8]) -> io::Result<usize> {
         if self.state.ngx.get() {
+            if self.state.recv_drained.get() && !self.state.in_early.get() {
+                // c->read->ready = 0 since the last SSL_read(): nothing is
+                // buffered, the read runs on the read event, as in C
+                c.readable().await?;
+            }
             return c.drive_io(|| crate::event_openssl::ngx_ssl_recv_step(c, self, buf)).await?;
         }
         c.drive_io(|| self.read_step(c, buf)).await?
