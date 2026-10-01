@@ -188,7 +188,7 @@ impl PeerConn {
 
         let rc = match sc {
             Some(sc) => c.poll_io(cx, || ngx_ssl_recv_step(c, &sc, &mut *dst)),
-            None => c.poll_io(cx, || recv_step(c, &mut *dst)),
+            None => c.poll_read_io(cx, || recv_step(c, &mut *dst)),
         };
 
         match rc {
@@ -309,6 +309,13 @@ fn recv_step(c: &Connection, buf: &mut [u8]) -> IoStep<io::Result<usize>> {
         Ok(0) => {
             c.read_eof.set(true);
             IoStep::Done(Ok(0))
+        }
+        Ok(n) => {
+            // ngx_unix_recv: a short read emptied the socket
+            if n < buf.len() {
+                c.read_drained();
+            }
+            IoStep::Done(Ok(n))
         }
         r => IoStep::Done(r),
     }

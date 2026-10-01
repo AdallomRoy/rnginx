@@ -856,6 +856,29 @@ impl Connection {
         }
     }
 
+    /// poll_io() of a read that is attempted only while the socket is
+    /// read-ready, as C reads only when c->read->ready (and
+    /// ngx_http_upstream_send_request processes the response at once only
+    /// then): after a read that found the socket drained, the next one
+    /// waits for an event instead of trying a recv() that fails with EAGAIN.
+    /// Not for TLS, whose buffered records the socket does not show.
+    pub fn poll_read_io<T>(&self, cx: &mut std::task::Context<'_>, op: impl FnMut() -> IoStep<T>) -> std::task::Poll<io::Result<T>> {
+        use std::task::Poll;
+
+        let afd = match self.afd() {
+            Ok(a) => a,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+
+        match afd.poll_read_ready(cx) {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        self.poll_io(cx, op)
+    }
+
     /// One non-blocking recv attempt (plain or TLS), without waiting:
     /// WouldBlock when no data can be read now. OpenSSL may hold decrypted
     /// data the socket no longer shows, so TLS is always tried first. A
