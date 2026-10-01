@@ -106,7 +106,9 @@ async fn connection_task(c: Rc<Connection>) {
                 return;
             }
             crate::ssl_module::SslHandshakeNext::Http2 => {
-                crate::v2::connection::init(c.clone(), hc.clone(), Vec::new()).await;
+                // boxed: the HTTP/2 driver's state is not part of every
+                // HTTP/1 connection's task
+                Box::pin(crate::v2::connection::init(c.clone(), hc.clone(), Vec::new())).await;
                 return;
             }
             crate::ssl_module::SslHandshakeNext::WaitRequest => {}
@@ -130,7 +132,7 @@ async fn connection_task(c: Rc<Connection>) {
                         b.pos = b.last;
                         v
                     };
-                    crate::v2::connection::init(c.clone(), hc.clone(), preread).await;
+                    Box::pin(crate::v2::connection::init(c.clone(), hc.clone(), preread)).await;
                     return;
                 }
                 Ok(Waited::Http1) => {}
