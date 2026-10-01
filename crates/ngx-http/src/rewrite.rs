@@ -114,6 +114,10 @@ pub enum IfCondition {
 
 pub struct RewriteConf {
     pub codes: Vec<Code>,
+    /// the codes as the handler runs them, shared by all requests (the
+    /// handler cannot hold the conf borrowed across its awaits): made once,
+    /// from the codes of the read configuration
+    shared: std::cell::OnceCell<Rc<[Code]>>,
     pub stack_size: Val<i64>,
     pub log: Val<bool>,
     pub uninitialized_variable_warn: Val<bool>,
@@ -400,6 +404,7 @@ fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> Result<bool, 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(RewriteConf {
         codes: Vec::new(),
+        shared: std::cell::OnceCell::new(),
         stack_size: Val::unset(),
         log: Val::unset(),
         uninitialized_variable_warn: Val::unset(),
@@ -918,7 +923,7 @@ async fn rewrite_handler(r: R) -> i64 {
             return NGX_DECLINED;
         }
 
-        (c.codes.clone(), c.log.get_or(false))
+        (c.shared.get_or_init(|| c.codes.clone().into()).clone(), c.log.get_or(false))
     };
 
     match run_codes(&r, &codes, log).await {

@@ -255,7 +255,7 @@ fn set_expires(r: &R, conf: &HeadersConf) -> i64 {
     }
 
     if expires_time == 0 && expires != Expires::Daily {
-        *e.value.borrow_mut() = ngx_core::times::cached_http_time().into_bytes();
+        *e.value.borrow_mut() = ngx_core::times::cached_http_time().as_bytes().to_vec();
         *cc.value.borrow_mut() = b"max-age=0".to_vec();
         return NGX_OK;
     }

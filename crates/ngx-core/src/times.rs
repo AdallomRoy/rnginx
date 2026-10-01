@@ -1,6 +1,7 @@
 //! Cached time and time formatting, ported from ngx_times.c.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const WEEK: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -88,16 +89,19 @@ pub fn gmtoff(t: i64) -> i64 {
     }
 }
 
+/// The cached time and its strings (ngx_cached_time and the
+/// ngx_cached_*_time strings), rebuilt once a second. The strings are
+/// shared, so a copy of it, or of one of them, allocates nothing.
 #[derive(Clone, Debug)]
 pub struct CachedTime {
     pub sec: i64,
     pub msec: u64,
     pub gmtoff: i64,
-    pub err_log_time: String,     // "1970/09/28 12:00:00"
-    pub http_time: String,        // "Mon, 28 Sep 1970 06:00:00 GMT"
-    pub http_log_time: String,    // "28/Sep/1970:12:00:00 +0600"
-    pub http_log_iso8601: String, // "1970-09-28T12:00:00+06:00"
-    pub syslog_time: String,      // "Sep 28 12:00:00"
+    pub err_log_time: Rc<str>,     // "1970/09/28 12:00:00"
+    pub http_time: Rc<str>,        // "Mon, 28 Sep 1970 06:00:00 GMT"
+    pub http_log_time: Rc<str>,    // "28/Sep/1970:12:00:00 +0600"
+    pub http_log_iso8601: Rc<str>, // "1970-09-28T12:00:00+06:00"
+    pub syslog_time: Rc<str>,      // "Sep 28 12:00:00"
 }
 
 thread_local! {
@@ -118,17 +122,20 @@ fn build(sec: i64, msec: u64) -> CachedTime {
         http_time: format!(
             "{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT",
             WEEK[gmt.wday as usize], gmt.mday, MONTHS[(gmt.mon - 1) as usize], gmt.year, gmt.hour, gmt.min, gmt.sec
-        ),
-        err_log_time: format!("{:4}/{:02}/{:02} {:02}:{:02}:{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec),
+        )
+        .into(),
+        err_log_time: format!("{:4}/{:02}/{:02} {:02}:{:02}:{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec).into(),
         http_log_time: format!(
             "{:02}/{}/{}:{:02}:{:02}:{:02} {}{:02}{:02}",
             tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec, sign, aoff / 60, aoff % 60
-        ),
+        )
+        .into(),
         http_log_iso8601: format!(
             "{:4}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
             tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec, sign, aoff / 60, aoff % 60
-        ),
-        syslog_time: format!("{} {:2} {:02}:{:02}:{:02}", MONTHS[(tm.mon - 1) as usize], tm.mday, tm.hour, tm.min, tm.sec),
+        )
+        .into(),
+        syslog_time: format!("{} {:2} {:02}:{:02}:{:02}", MONTHS[(tm.mon - 1) as usize], tm.mday, tm.hour, tm.min, tm.sec).into(),
     }
 }
 
@@ -257,23 +264,23 @@ pub fn with_cached<R>(f: impl FnOnce(&CachedTime) -> R) -> R {
     CACHED.with(|c| f(&c.borrow()))
 }
 
-pub fn cached_http_time() -> String {
+pub fn cached_http_time() -> Rc<str> {
     with_cached(|c| c.http_time.clone())
 }
 
-pub fn cached_err_log_time() -> String {
+pub fn cached_err_log_time() -> Rc<str> {
     with_cached(|c| c.err_log_time.clone())
 }
 
-pub fn cached_http_log_time() -> String {
+pub fn cached_http_log_time() -> Rc<str> {
     with_cached(|c| c.http_log_time.clone())
 }
 
-pub fn cached_http_log_iso8601() -> String {
+pub fn cached_http_log_iso8601() -> Rc<str> {
     with_cached(|c| c.http_log_iso8601.clone())
 }
 
-pub fn cached_syslog_time() -> String {
+pub fn cached_syslog_time() -> Rc<str> {
     with_cached(|c| c.syslog_time.clone())
 }
 

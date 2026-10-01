@@ -1291,8 +1291,10 @@ pub fn log_request(r: &R) {
     // reconciliation is needed. Failed / never-reached states keep the u64::MAX
     // sentinel and format as "-".
     let cmcf = r.cmcf();
-    let handlers = cmcf.borrow().log_handlers.clone();
-    for h in handlers.iter() {
+    let n = cmcf.borrow().log_handlers.len();
+    for i in 0..n {
+        // the conf is not kept borrowed while a handler runs
+        let h = cmcf.borrow().log_handlers[i].clone();
         h(r);
     }
 }
