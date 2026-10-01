@@ -212,8 +212,9 @@ pub struct RequestBody {
     pub filter_need_buffering: bool,
     pub last_sent: bool,
     pub last_saved: bool,
-    /// rb->buf of an unbuffered HTTP/1 body as its size and fill level
-    /// (buf->last - buf->start); the data read is passed on at once.
+    /// rb->buf of an HTTP/1 body as its size and fill level (buf->last -
+    /// buf->start); the data read is passed on at once. 0 until the body
+    /// is read from the socket.
     pub buf_size: usize,
     pub buf_last: usize,
 }

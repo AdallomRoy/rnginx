@@ -164,7 +164,9 @@ async fn start_read_client_request_body(r: &R) -> i64 {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
-    if r.request_body_no_buffering.get() {
+    // rb->buf: a body shorter than 1.25 client_body_buffer_size gets a
+    // buffer of its own size, so it stays in memory
+    {
         let clcf = r.clcf();
         let buffer_size = *clcf.borrow().client_body_buffer_size;
         let chunked = r.headers_in.borrow().chunked;
@@ -183,7 +185,8 @@ async fn start_read_client_request_body(r: &R) -> i64 {
         }
         b.buf_size = size as usize;
         b.buf_last = 0;
-        drop(b);
+    }
+    if r.request_body_no_buffering.get() {
         return do_read_unbuffered_request_body(r, &rb).await;
     }
     let rc = do_read_client_request_body(r, &rb).await;
@@ -322,23 +325,30 @@ async fn do_read_unbuffered_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -
 async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i64 {
     let c = r.connection.clone();
     http_debug!(r, "http read client request body");
-    let clcf = r.clcf();
-    let (buf_size, timeout) = {
-        let cl = clcf.borrow();
-        (*cl.client_body_buffer_size, *cl.client_body_timeout)
-    };
+    let timeout = *r.clcf().borrow().client_body_timeout;
     loop {
-        let rest = rb.borrow().rest;
+        let (rest, buf_size, buf_last) = {
+            let b = rb.borrow();
+            (b.rest, b.buf_size, b.buf_last)
+        };
         if rest == 0 {
             break;
         }
-        let chunked = r.headers_in.borrow().chunked;
-        let mut size = buf_size;
-        if !chunked && rest < size as i64 {
-            size = rest as usize;
+        if buf_last == buf_size {
+            // update chains: the save filter has written the full buffer
+            // to the temporary file
+            let (rc, _) = request_body_filter(r, rb, Chain::new()).await;
+            if rc != NGX_OK {
+                return rc;
+            }
+            rb.borrow_mut().buf_last = 0;
         }
+        let size = {
+            let b = rb.borrow();
+            ((b.buf_size - b.buf_last) as i64).min(b.rest) as usize
+        };
         if size == 0 {
-            size = 1;
+            break;
         }
         let mut buf = vec![0u8; size];
         let n = match tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)).await {
@@ -359,6 +369,7 @@ async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i6
         };
         http_debug!(r, "http client request body recv {}", n);
         buf.truncate(n);
+        rb.borrow_mut().buf_last += n;
         r.request_length.set(r.request_length.get() + n as i64);
         let mut chain = Chain::new();
         chain.push_back(Buf::from_vec(buf));
@@ -517,11 +528,8 @@ pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
     if r.request_body_no_buffering.get() {
         return NGX_OK;
     }
-    let clcf = r.clcf();
-    let buffer_size = *clcf.borrow().client_body_buffer_size;
-    let in_mem: usize = b.bufs.iter().map(|x| x.buf_size() as usize).sum();
     if b.rest > 0 {
-        if (in_mem >= buffer_size && !b.bufs.is_empty()) || r.request_body_in_file_only.get() {
+        if !b.bufs.is_empty() && body_buf_full(&r, &b) {
             if write_request_body(&r, &mut b) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
@@ -545,6 +553,17 @@ pub async fn request_body_save_filter(r: R, input: Chain) -> i64 {
         }
     }
     NGX_OK
+}
+
+/// rb->buf && rb->buf->last == rb->buf->end: the buffer the body is read
+/// into is full (an HTTP/2 stream keeps its rb->buf on the stream; before
+/// the buffer is set up there is none)
+fn body_buf_full(r: &R, b: &RequestBody) -> bool {
+    let (size, last) = match crate::v2::stream::request_stream(r) {
+        Some(stream) => (stream.body_cap.get(), stream.body_last.get()),
+        None => (b.buf_size, b.buf_last),
+    };
+    size > 0 && last == size
 }
 
 fn write_request_body(r: &R, b: &mut RequestBody) -> i64 {
