@@ -125,6 +125,10 @@ async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
     let ctx = SubCtx { applied: 0, once, pending: Vec::new() };
     r.set_ctx(ctx_index(), ctx);
 
+    // the body is matched in memory: file buffers (sendfile on) are read
+    // in by the copy filter instead of passing through untouched
+    r.filter_need_in_memory.set(true);
+
     r.clear_content_length();
 
     let last_modified = r.loc_conf::<SubLocConf>(ctx_index()).borrow().last_modified.get_or(false);
@@ -155,8 +159,8 @@ fn replace_matches(content: &[u8], compiled: &[(Vec<u8>, Vec<u8>)], once: bool, 
         for (i, (m, _repl)) in compiled.iter().enumerate() {
             if once && used[i] { continue; }
             if pos + m.len() > content.len() { continue; }
-            let slice = &content[pos..pos + m.len()];
-            if slice.to_ascii_lowercase() == *m {
+            // m is lowercased already
+            if content[pos..pos + m.len()].eq_ignore_ascii_case(m) {
                 if best.map_or(true, |(len, _)| m.len() > len) {
                     best = Some((m.len(), i));
                 }
