@@ -235,6 +235,11 @@ fn create_temp_buf(size: usize) -> Buf {
 }
 
 /// ngx_http_gzip_header_filter
+/// gzip_header_filter passes the response on as it is: gzip off
+fn gzip_header_idle(r: &R) -> bool {
+    !*r.loc_conf::<GzipConf>(ctx_index()).borrow().enable
+}
+
 async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     let conf = r.loc_conf::<GzipConf>(ctx_index());
 
@@ -298,6 +303,11 @@ async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
 }
 
 /// ngx_http_gzip_body_filter
+/// gzip_body_filter passes the chain on as it is
+fn gzip_body_idle(r: &R, _input: &Chain) -> bool {
+    r.header_only.get() || r.get_ctx::<GzipCtx>(ctx_index()).is_none_or(|c| c.borrow().done)
+}
+
 async fn gzip_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let ctx = match r.get_ctx::<GzipCtx>(ctx_index()) {
         Some(ctx) => ctx,
@@ -967,8 +977,8 @@ fn gzip_merge_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) -> 
 
 /// ngx_http_gzip_filter_init
 fn gzip_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { gzip_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { gzip_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(gzip_header_idle, gzip_header_filter);
+    crate::install_body_filter_idle(gzip_body_idle, gzip_body_filter);
     Ok(())
 }
 

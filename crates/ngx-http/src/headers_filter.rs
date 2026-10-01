@@ -109,6 +109,18 @@ fn safe_status(status: i64) -> bool {
 }
 
 /// ngx_http_headers_filter
+/// headers_filter passes the response on as it is: a subrequest, or no
+/// expires, add_header, add_trailer
+fn headers_idle(r: &R) -> bool {
+    if !r.is_main() {
+        return true;
+    }
+
+    let conf = r.loc_conf::<HeadersConf>(ctx_index());
+    let c = conf.borrow();
+    c.expires == Expires::Off && c.headers.is_none() && c.trailers.is_none()
+}
+
 async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
     if !r.is_main() {
         return next(r).await;
@@ -158,6 +170,14 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
 }
 
 /// ngx_http_trailers_filter
+/// trailers_filter passes the chain on as it is
+fn trailers_idle(r: &R, input: &Chain) -> bool {
+    input.is_empty()
+        || !r.expect_trailers.get()
+        || r.header_only.get()
+        || r.loc_conf::<HeadersConf>(ctx_index()).borrow().trailers.is_none()
+}
+
 async fn trailers_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let conf = r.loc_conf::<HeadersConf>(ctx_index());
 
@@ -457,8 +477,8 @@ fn inherit(headers: &mut Option<Vec<HeaderVal>>, prev: Option<&Vec<HeaderVal>>, 
 
 /// ngx_http_headers_filter_init
 fn filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { headers_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { trailers_filter(r, chain, next).await });
+    crate::install_header_filter_idle(headers_idle, headers_filter);
+    crate::install_body_filter_idle(trailers_idle, trailers_filter);
     Ok(())
 }
 

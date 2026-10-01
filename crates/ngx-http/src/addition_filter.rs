@@ -73,9 +73,21 @@ fn set_types(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { addition_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { addition_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(addition_header_idle, addition_header_filter);
+    crate::install_body_filter_idle(addition_body_idle, addition_body_filter);
     Ok(())
+}
+
+/// addition_header_filter passes the response on as it is: not a 200 of
+/// the main request, or no add_before_body/add_after_body
+fn addition_header_idle(r: &R) -> bool {
+    if r.headers_out.borrow().status != NGX_HTTP_OK || !r.is_main() {
+        return true;
+    }
+
+    let conf = r.loc_conf::<AdditionLocConf>(ctx_index());
+    let c = conf.borrow();
+    c.before_body.get().is_empty() && c.after_body.get().is_empty()
 }
 
 async fn addition_header_filter(r: R, next: HeaderFilter) -> i64 {
@@ -132,6 +144,11 @@ async fn addition_header_filter(r: R, next: HeaderFilter) -> i64 {
 /// ngx_http_addition_body_filter: the subrequests are posted ones
 /// (ngx_http_subrequest), which the request waits for once its handler is
 /// done (request_rt::finalize_request).
+/// addition_body_filter passes the chain on as it is
+fn addition_body_idle(r: &R, chain: &Chain) -> bool {
+    chain.is_empty() || r.header_only.get() || !r.has_ctx(ctx_index())
+}
+
 async fn addition_body_filter(r: R, mut chain: Chain, next: BodyFilter) -> i64 {
     if chain.is_empty() || r.header_only.get() {
         return next(r, chain).await;

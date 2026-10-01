@@ -82,6 +82,18 @@ pub fn range_body_filter_module() -> ModuleDef {
 }
 
 /// ngx_http_range_header_filter
+/// range_header_filter passes the response on as it is: ranges do not
+/// apply to it
+fn range_header_idle(r: &R) -> bool {
+    let ho = r.headers_out.borrow();
+
+    r.http_version.get() < NGX_HTTP_VERSION_10
+        || ho.status != NGX_HTTP_OK
+        || (!r.is_main() && !r.subrequest_ranges.get())
+        || ho.content_length_n == -1
+        || !r.allow_ranges.get()
+}
+
 async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
     let (status, content_length_n, content_offset) = {
         let ho = r.headers_out.borrow();
@@ -488,6 +500,11 @@ fn range_not_satisfiable(r: &R) -> i64 {
 }
 
 /// ngx_http_range_body_filter
+/// range_body_filter passes the chain on as it is
+fn range_body_idle(r: &R, input: &Chain) -> bool {
+    input.is_empty() || !r.has_ctx(ctx_index())
+}
+
 async fn range_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     if input.is_empty() {
         return next(r, input).await;
@@ -699,12 +716,12 @@ async fn range_multipart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Ch
 
 /// ngx_http_range_header_filter_init
 fn range_header_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { range_header_filter(r, next).await });
+    crate::install_header_filter_idle(range_header_idle, range_header_filter);
     Ok(())
 }
 
 /// ngx_http_range_body_filter_init
 fn range_body_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_body_filter(|r, chain, next| async move { range_body_filter(r, chain, next).await });
+    crate::install_body_filter_idle(range_body_idle, range_body_filter);
     Ok(())
 }

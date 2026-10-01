@@ -41,12 +41,16 @@ pub fn v2_filter_module() -> ModuleDef {
 
 /// ngx_http_v2_filter_init
 fn filter_init(_cf: &mut ngx_core::conf::Conf) -> ngx_core::conf::ConfResult {
-    install_header_filter(|r: R, next: HeaderFilter| async move {
-        if request_stream(&r).is_none() {
-            return next(r).await;
-        }
-        header_filter(&r).await
-    });
+    // not an HTTP/2 stream: passed on as it is
+    crate::install_header_filter_idle(
+        |r| r.stream.borrow().is_none(),
+        |r: R, next: HeaderFilter| async move {
+            if request_stream(&r).is_none() {
+                return next(r).await;
+            }
+            header_filter(&r).await
+        },
+    );
     install_early_hints_filter(|r: R, next: HeaderFilter| async move {
         if request_stream(&r).is_none() {
             return next(r).await;

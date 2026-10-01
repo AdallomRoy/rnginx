@@ -371,11 +371,28 @@ where
     Fut: Future<Output = i64> + 'static,
 {
     let next = top_header_filter();
-    let f = Rc::new(f);
+    set_top_header_filter(Rc::new(move |r| Box::pin(f(r, next.clone()))));
+}
+
+/// Install a header filter wrapping the current top that passes the
+/// request to the next filter without running, while `idle` says it has
+/// nothing to do for it: the call is the next filter's, without the boxed
+/// future of this one. `idle` repeats only tests the filter makes before it
+/// calls the next filter with the request as it is, before it logs or
+/// changes anything; in C such a filter is a function call that returns
+/// ngx_http_next_header_filter(r).
+pub fn install_header_filter_idle<F, Fut>(idle: fn(&R) -> bool, f: F)
+where
+    F: Fn(R, HeaderFilter) -> Fut + 'static,
+    Fut: Future<Output = i64> + 'static,
+{
+    let next = top_header_filter();
     set_top_header_filter(Rc::new(move |r| {
-        let f = f.clone();
-        let next = next.clone();
-        Box::pin(async move { f(r, next).await })
+        if idle(&r) {
+            return next(r);
+        }
+
+        Box::pin(f(r, next.clone()))
     }));
 }
 
@@ -386,11 +403,23 @@ where
     Fut: Future<Output = i64> + 'static,
 {
     let next = top_body_filter();
-    let f = Rc::new(f);
+    set_top_body_filter(Rc::new(move |r, chain| Box::pin(f(r, chain, next.clone()))));
+}
+
+/// install_header_filter_idle() for a body filter: `idle` sees the chain
+/// too, which goes to the next filter as it is
+pub fn install_body_filter_idle<F, Fut>(idle: fn(&R, &ngx_core::buf::Chain) -> bool, f: F)
+where
+    F: Fn(R, ngx_core::buf::Chain, BodyFilter) -> Fut + 'static,
+    Fut: Future<Output = i64> + 'static,
+{
+    let next = top_body_filter();
     set_top_body_filter(Rc::new(move |r, chain| {
-        let f = f.clone();
-        let next = next.clone();
-        Box::pin(async move { f(r, chain, next).await })
+        if idle(&r, &chain) {
+            return next(r, chain);
+        }
+
+        Box::pin(f(r, chain, next.clone()))
     }));
 }
 
