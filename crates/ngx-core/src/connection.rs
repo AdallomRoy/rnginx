@@ -997,6 +997,44 @@ impl Connection {
         }
     }
 
+    /// The close handler of an idle connection (as
+    /// ngx_http_upstream_keepalive_close_handler) on the read event of the
+    /// connection's own registration: Ready when a peek at the socket finds
+    /// data, the end of the stream or an error, Pending until the next read
+    /// event. A peek that finds nothing clears the readiness (ev->ready = 0).
+    pub fn poll_peek_close(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+
+        let afd = match self.afd() {
+            Ok(a) => a,
+            Err(_) => return Poll::Ready(()),
+        };
+
+        loop {
+            let mut guard = match afd.poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(()),
+                Poll::Ready(Ok(g)) => g,
+            };
+
+            let peek = guard.try_io(|inner| {
+                let mut b = [0u8; 1];
+                let n = unsafe { libc::recv(inner.get_ref().0, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n)
+                }
+            });
+
+            match peek {
+                // EAGAIN: the readiness was cleared, wait for the next event
+                Err(_) => continue,
+                Ok(_) => return Poll::Ready(()),
+            }
+        }
+    }
+
     /// Peek without consuming.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;

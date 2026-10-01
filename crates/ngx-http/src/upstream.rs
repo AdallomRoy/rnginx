@@ -182,6 +182,39 @@ impl UpstreamSock {
     }
 }
 
+impl UpstreamSock {
+    /// ngx_http_upstream_keepalive_close_handler on the read event of a
+    /// cached connection, which keeps its own registration while cached as
+    /// in C: Ready when the connection is to be closed (the upstream sent
+    /// data or closed it, or an error), Pending until the next read event.
+    /// A peek that finds nothing clears the readiness (ev->ready = 0).
+    pub(crate) fn poll_idle_close(&self, cx: &mut Context<'_>) -> Poll<()> {
+        use std::os::unix::io::AsRawFd;
+
+        loop {
+            let peek = match self {
+                UpstreamSock::Tcp(s) => match s.poll_read_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Ready(Ok(())) => s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd())),
+                },
+                UpstreamSock::Unix(s) => match s.poll_read_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Ready(Ok(())) => s.try_io(tokio::io::Interest::READABLE, || peek_fd(s.as_raw_fd())),
+                },
+                UpstreamSock::Conn(c) => return c.c.poll_peek_close(cx),
+            };
+
+            match peek {
+                // EAGAIN: try_io cleared the readiness, poll for the next event
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                _ => return Poll::Ready(()),
+            }
+        }
+    }
+}
+
 fn peek_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<usize> {
     let mut b = [0u8; 1];
     let n = unsafe { libc::recv(fd, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
