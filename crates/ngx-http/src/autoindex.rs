@@ -99,7 +99,7 @@ fn autoindex_format_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn An
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(autoindex_handler(r))));
+    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(autoindex_idle, autoindex_handler));
     Ok(())
 }
 
@@ -107,6 +107,14 @@ fn close_dir(r: &R, dir: Dir, path: &[u8]) {
     if let Err(err) = dir.close() {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(err), "closedir() \"{}\" failed", B(path));
     }
+}
+
+/// autoindex_handler declines at once: not a directory URI, a method it
+/// does not handle, or autoindex off
+fn autoindex_idle(r: &R) -> bool {
+    r.uri.borrow().last() != Some(&b'/')
+        || r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD) == 0
+        || !*r.loc_conf::<AutoIndexConf>(ctx_index()).borrow().enable
 }
 
 async fn autoindex_handler(r: R) -> i64 {

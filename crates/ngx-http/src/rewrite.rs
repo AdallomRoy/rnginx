@@ -880,16 +880,8 @@ pub fn rewrite_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(
-        cf,
-        NGX_HTTP_SERVER_REWRITE_PHASE,
-        Rc::new(|r| Box::pin(rewrite_handler(r))),
-    );
-    add_phase_handler(
-        cf,
-        NGX_HTTP_REWRITE_PHASE,
-        Rc::new(|r| Box::pin(rewrite_handler(r))),
-    );
+    add_phase_handler(cf, NGX_HTTP_SERVER_REWRITE_PHASE, crate::core::phase_handler(rewrite_idle, rewrite_handler));
+    add_phase_handler(cf, NGX_HTTP_REWRITE_PHASE, crate::core::phase_handler(rewrite_idle, rewrite_handler));
     Ok(())
 }
 
@@ -897,6 +889,11 @@ fn init(cf: &mut Conf) -> ConfResult {
 enum Flow {
     Next,
     Exit(i64),
+}
+
+/// rewrite_handler declines at once: no codes for the location
+fn rewrite_idle(r: &R) -> bool {
+    r.loc_conf::<RewriteConf>(ctx_index()).borrow().codes.is_empty()
 }
 
 /// ngx_http_rewrite_handler

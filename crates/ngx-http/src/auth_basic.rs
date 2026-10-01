@@ -94,7 +94,7 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_ACCESS_PHASE,
-        Rc::new(|r| Box::pin(auth_basic_handler(r))),
+        crate::core::phase_handler(auth_basic_idle, auth_basic_handler),
     );
     Ok(())
 }
@@ -271,6 +271,13 @@ fn lookup_user(user: &[u8], mut read: impl FnMut(&mut [u8], i64) -> Result<usize
     std::hint::black_box(&buf);
 
     result
+}
+
+/// auth_basic_handler declines at once: no auth_basic realm or user file
+fn auth_basic_idle(r: &R) -> bool {
+    let alcf = r.loc_conf::<AuthBasicLocConf>(ctx_index());
+    let c = alcf.borrow();
+    c.realm.is_none() || c.user_file.is_none()
 }
 
 async fn auth_basic_handler(r: R) -> i64 {

@@ -245,9 +245,14 @@ fn add_variables(cf: &mut Conf) -> ConfResult {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_POST_READ_PHASE, Rc::new(|r| Box::pin(realip_handler(r))));
-    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, Rc::new(|r| Box::pin(realip_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_POST_READ_PHASE, crate::core::phase_handler(realip_idle, realip_handler));
+    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler(realip_idle, realip_handler));
     Ok(())
+}
+
+/// realip_handler declines at once: no set_real_ip_from
+fn realip_idle(r: &R) -> bool {
+    r.loc_conf::<RealipLocConf>(ctx_index()).borrow().from.is_empty()
 }
 
 async fn realip_handler(r: R) -> i64 {

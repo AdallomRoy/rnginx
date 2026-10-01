@@ -2156,6 +2156,38 @@ pub fn init_phases(_cf: &mut Conf, cmcf: &Rc<RefCell<CoreMainConf>>) -> ConfResu
     Ok(())
 }
 
+/// A phase handler that declines at once, without running, while `idle`
+/// says its module has nothing to do for the request (the location has no
+/// configuration of it, or the method or URI is not one it handles): the
+/// same result as the handler's own first test, without the boxed future of
+/// its async fn. `idle` repeats only tests the handler makes before it logs
+/// or changes anything.
+pub fn phase_handler<F, Fut>(idle: fn(&R) -> bool, h: F) -> HandlerFn
+where
+    F: Fn(R) -> Fut + 'static,
+    Fut: std::future::Future<Output = i64> + 'static,
+{
+    Rc::new(move |r| {
+        if idle(&r) {
+            return Box::pin(Declined);
+        }
+
+        Box::pin(h(r))
+    })
+}
+
+/// The future of a phase handler that declined at once: zero-sized, so the
+/// box allocates nothing
+struct Declined;
+
+impl std::future::Future for Declined {
+    type Output = i64;
+
+    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        std::task::Poll::Ready(NGX_DECLINED)
+    }
+}
+
 /// Add a phase handler (called by modules in postconfiguration).
 pub fn add_phase_handler(cf: &Conf, phase: usize, h: HandlerFn) {
     let cmcf = core_main_conf(cf);

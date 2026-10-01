@@ -86,8 +86,14 @@ pub fn index_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(index_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(index_idle, index_handler));
     Ok(())
+}
+
+/// index_handler declines at once: not a directory URI, or a method it
+/// does not handle
+fn index_idle(r: &R) -> bool {
+    r.uri.borrow().last() != Some(&b'/') || r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_POST) == 0
 }
 
 async fn index_handler(r: R) -> i64 {
