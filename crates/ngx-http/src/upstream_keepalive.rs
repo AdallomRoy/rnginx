@@ -187,10 +187,9 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
             break 'invalid;
         }
 
-        let fd = match raw_fd(&conn.sock) {
-            Some(fd) => fd,
-            None => break 'invalid,
-        };
+        if raw_fd(&conn.sock).is_none() {
+            break 'invalid;
+        }
 
         let sockaddr = match pc.sockaddr.clone() {
             Some(s) => s,
@@ -210,7 +209,7 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
             _ => None,
         };
 
-        let watch = spawn_close_handler(Rc::downgrade(&kp.conf), id, fd, kp.conf.timeout.get().unwrap_or(60000), c);
+        let watch = spawn_close_handler(Rc::downgrade(&kp.conf), id, kp.conf.timeout.get().unwrap_or(60000), c);
 
         // c->idle = 1
         if let UpstreamSock::Conn(c) = &conn.sock {
@@ -255,10 +254,25 @@ fn keepalive_close(item: CacheItem) {
 /// ngx_http_upstream_keepalive_close_handler, as a task on a duplicate of
 /// the socket: the connection is closed when data or the end of it arrives
 /// (a peek that does not return EAGAIN), or on keepalive_timeout.
-fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u64, c: Option<Rc<ngx_core::connection::Connection>>) -> tokio::task::JoinHandle<()> {
-    let dup = unsafe { libc::dup(fd) };
-
+///
+/// The duplicate is made when the task first runs, from the item still in
+/// the cache (taking the item out of the cache aborts the task), and is
+/// owned at once: a connection reused before then aborts the task unpolled,
+/// and a descriptor duplicated up front would leak with the dropped future.
+fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Option<Rc<ngx_core::connection::Connection>>) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
+        let dup = match conf.upgrade() {
+            Some(conf) => {
+                let cache = conf.cache.borrow();
+
+                match cache.iter().find(|it| it.id == id) {
+                    Some(it) => raw_fd(&it.conn.sock).map(|fd| unsafe { libc::dup(fd) }).filter(|&d| d >= 0).map(|d| unsafe { OwnedFd::from_raw_fd(d) }),
+                    None => return,
+                }
+            }
+            None => return,
+        };
+
         // c->close: ngx_close_idle_connections() at the worker's shutdown
         let close = async {
             match &c {
@@ -277,9 +291,7 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, fd: RawFd, timeout: u
 
         tokio::pin!(close);
 
-        if dup >= 0 {
-            let owned = unsafe { OwnedFd::from_raw_fd(dup) };
-
+        if let Some(owned) = dup {
             if let Ok(afd) = tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE) {
                 let watch = async {
                     loop {
