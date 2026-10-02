@@ -21,7 +21,7 @@ use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
 use crate::request::*;
-use crate::upstream_round_robin::RrPeers;
+use crate::upstream_round_robin::UpstreamPeers;
 use crate::variables::{VarDef, NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_NOCACHEABLE, prefix_var_name};
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_UPS_CONF, HttpModuleDef, http_module_def};
 
@@ -240,10 +240,9 @@ pub struct UpstreamSrvConf {
 
     pub init_upstream: Cell<Option<InitUpstream>>,
     pub init: RefCell<Option<InitPeer>>,
-    /// us->peer.data of the round-robin based balancers
-    pub peers: Cell<*mut RrPeers>,
-    /// the memory of the peers (cf->pool)
-    pub arena: crate::upstream_round_robin::Arena,
+    /// us->peer.data of the round-robin based balancers: the peers, in
+    /// their memory
+    pub peers: UpstreamPeers,
 
     pub shm_zone: RefCell<Option<Rc<ngx_core::shm::ShmZone>>>,
     pub resolver: RefCell<Option<Rc<Resolver>>>,
@@ -267,8 +266,7 @@ impl UpstreamSrvConf {
             block: Cell::new(false),
             init_upstream: Cell::new(None),
             init: RefCell::new(None),
-            peers: Cell::new(std::ptr::null_mut()),
-            arena: Default::default(),
+            peers: UpstreamPeers::default(),
             shm_zone: RefCell::new(None),
             resolver: RefCell::new(None),
             resolver_timeout: Cell::new(None),

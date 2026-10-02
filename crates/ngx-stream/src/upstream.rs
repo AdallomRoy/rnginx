@@ -19,7 +19,7 @@ use ngx_core::shm::ShmZone;
 use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_error};
 
-use crate::upstream_round_robin::{Arena, RrPeers};
+use crate::upstream_round_robin::UpstreamPeers;
 use crate::variables::*;
 use crate::*;
 
@@ -84,10 +84,9 @@ pub struct UpstreamSrvConf {
 
     pub init_upstream: Cell<Option<InitUpstream>>,
     pub init: RefCell<Option<InitPeer>>,
-    /// us->peer.data of the round-robin based balancers
-    pub peers: Cell<*mut RrPeers>,
-    /// the memory of the peers (cf->pool)
-    pub arena: Arena,
+    /// us->peer.data of the round-robin based balancers: the peers, in
+    /// their memory
+    pub peers: UpstreamPeers,
 
     pub shm_zone: RefCell<Option<Rc<ShmZone>>>,
     pub resolver: RefCell<Option<Rc<Resolver>>>,
@@ -108,8 +107,7 @@ impl UpstreamSrvConf {
             srv_conf: RefCell::new(None),
             init_upstream: Cell::new(None),
             init: RefCell::new(None),
-            peers: Cell::new(std::ptr::null_mut()),
-            arena: Default::default(),
+            peers: UpstreamPeers::default(),
             shm_zone: RefCell::new(None),
             resolver: RefCell::new(None),
             resolver_timeout: Cell::new(None),
