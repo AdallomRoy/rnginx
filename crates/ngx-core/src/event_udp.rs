@@ -44,7 +44,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
@@ -237,6 +237,10 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
 
     let mut buffer = vec![0u8; if quic { crate::quic::NGX_QUIC_MAX_UDP_PAYLOAD_SIZE } else { NGX_UDP_BUFFER_SIZE }];
 
+    // the control buffer of recvmsg(), CMSG_SPACE(sizeof(ngx_addrinfo_t)),
+    // made once (nix fills a Vec of that room)
+    let mut control = nix::cmsg_space!(libc::in6_pktinfo);
+
     loop {
         // the datagrams of the connections which left the lookup unread
 
@@ -296,7 +300,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                 break;
             }
 
-            let r = recvmsg(sock.get_ref().as_raw_fd(), &ls, &mut buffer, &log);
+            let r = recvmsg(sock.get_ref().as_raw_fd(), &ls, &mut buffer, &mut control, &log);
 
             let (n, sockaddr, local_sockaddr) = match r {
                 Recvmsg::Again => {
@@ -364,7 +368,7 @@ enum Peer {
 /// address length, 0 from an unbound socket, is kept in the UnixAddr),
 /// sizeof(sockaddr_storage) otherwise (the kernel always writes an inet
 /// address); the control buffer is CMSG_SPACE(sizeof(ngx_addrinfo_t)).
-fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], log: &Log) -> Recvmsg {
+fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], control: &mut Vec<u8>, log: &Log) -> Recvmsg {
     let wildcard = ls.wildcard.get();
 
     let mut local_sockaddr = ls.sockaddr.clone();
@@ -381,9 +385,7 @@ fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], log: &Log) -> Recvmsg {
             (msg.bytes, msg.flags, peer)
         })
     } else {
-        let mut control = nix::cmsg_space!(libc::in6_pktinfo);
-
-        nix::sys::socket::recvmsg::<SockaddrStorage>(fd, &mut iov, wildcard.then_some(&mut control), MsgFlags::empty()).map(|msg| {
+        nix::sys::socket::recvmsg::<SockaddrStorage>(fd, &mut iov, wildcard.then_some(control), MsgFlags::empty()).map(|msg| {
             let peer = match &msg.address {
                 Some(ss) => match SockAddr::from_nix(ss) {
                     Some(sa) => Peer::Addr(sa),
@@ -787,27 +789,66 @@ impl UdpConnection {
             None => return Err(io::Error::from_raw_os_error(libc::EBADF)),
         };
 
-        let mut iovs: Vec<IoSlice<'_>> = iov.iter().filter(|s| !s.is_empty()).map(|s| IoSlice::new(s)).collect();
+        // the iovecs on the stack (NGX_IOVS_PREALLOCATE), the empty buffers
+        // left out
+        let mut stack = [IoSlice::new(&[]); NGX_IOVS_PREALLOCATE];
+        let mut heap = Vec::new();
+        let mut nio = 0;
+
+        for s in iov.iter().filter(|s| !s.is_empty()) {
+            if nio < NGX_IOVS_PREALLOCATE {
+                stack[nio] = IoSlice::new(s);
+            } else {
+                if heap.is_empty() {
+                    heap.extend_from_slice(&stack);
+                }
+
+                heap.push(IoSlice::new(s));
+            }
+
+            nio += 1;
+        }
 
         // zero-sized datagram; pretend to have at least 1 iov
 
-        if iovs.is_empty() {
-            iovs.push(IoSlice::new(&[]));
-        }
+        let iovs: &[IoSlice<'_>] = if nio > NGX_IOVS_PREALLOCATE { &heap } else { &stack[..nio.max(1)] };
 
-        let addr = c.sockaddr.borrow().to_nix();
+        let addr = c.sockaddr.borrow().clone();
 
         // the source address on a wildcard listening (none for a unix one)
-        let srcaddr = if self.listening.wildcard { c.local_sockaddr.borrow().as_ref().and_then(set_srcaddr_cmsg) } else { None };
+        let local = if self.listening.wildcard { c.local_sockaddr.borrow().clone() } else { None };
 
-        let cmsgs: Vec<ControlMessage<'_>> = srcaddr.iter().map(SrcAddrCmsg::cmsg).collect();
-
-        let n = sendmsg(c, sock.get_ref().as_raw_fd(), &iovs, &cmsgs, &addr)?;
+        let n = sendmsg(c, sock.get_ref().0.as_fd(), iovs, &addr, None, local.as_ref())?;
 
         c.sent.set(c.sent.get() + n as u64);
 
         Ok(n)
     }
+}
+
+/// NGX_IOVS_PREALLOCATE
+const NGX_IOVS_PREALLOCATE: usize = 64;
+
+/// sendmsg() of the buffers as one datagram to the address (or, with
+/// `segment`, as datagrams of that size), from the source address `src`
+/// (a wildcard listening's local address): the control messages of
+/// ngx_set_srcaddr_cmsg() and UDP_SEGMENT built on the stack
+/// (ngx_sys::os::sendmsg_udp) for an inet address; a unix one has none,
+/// and goes with nix.
+pub(crate) fn sendmsg_udp(fd: BorrowedFd<'_>, iov: &[IoSlice<'_>], addr: &SockAddr, segment: Option<u16>, src: Option<&SockAddr>) -> nix::Result<usize> {
+    let dest = match addr {
+        SockAddr::V4(a) => std::net::SocketAddr::V4(*a),
+        SockAddr::V6(a) => std::net::SocketAddr::V6(*a),
+        SockAddr::Unix(_) => return sendmsg_to(fd.as_raw_fd(), iov, &[], &addr.to_nix()),
+    };
+
+    let src = match src {
+        Some(SockAddr::V4(a)) => Some(ngx_sys::os::UdpSrcAddr::V4(*a.ip())),
+        Some(SockAddr::V6(a)) => Some(ngx_sys::os::UdpSrcAddr::V6(*a.ip())),
+        _ => None,
+    };
+
+    ngx_sys::os::sendmsg_udp(fd, iov, &dest, segment, src).map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EINVAL)))
 }
 
 /// sendmsg() of the buffers as one datagram to the address, with the
@@ -824,9 +865,9 @@ pub(crate) fn sendmsg_to(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage
 
 /// ngx_sendmsg: EAGAIN is WouldBlock; other errors are returned to the
 /// caller, which logs "sendmsg() failed" (ngx_connection_error).
-fn sendmsg(c: &Connection, fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage<'_>], addr: &NixSockAddr) -> io::Result<usize> {
+fn sendmsg(c: &Connection, fd: BorrowedFd<'_>, iov: &[IoSlice<'_>], addr: &SockAddr, segment: Option<u16>, src: Option<&SockAddr>) -> io::Result<usize> {
     loop {
-        let n = match sendmsg_to(fd, iov, cmsgs, addr) {
+        let n = match sendmsg_udp(fd, iov, addr, segment, src) {
             Ok(n) => n,
 
             Err(Errno::EAGAIN) => {
@@ -1812,5 +1853,48 @@ mod tests {
 
         // no source address for a unix socket
         assert!(set_srcaddr_cmsg(&SockAddr::Unix(b"/tmp/x".to_vec())).is_none());
+    }
+
+    #[test]
+    fn datagrams_with_control_data() {
+        use std::os::fd::AsFd;
+
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let tx = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+
+        let dest = match rx.local_addr().unwrap() {
+            SocketAddr::V4(a) => SockAddr::V4(a),
+            SocketAddr::V6(a) => SockAddr::V6(a),
+        };
+
+        // the source address of a wildcard listening, from two buffers
+        let src = SockAddr::v4(Ipv4Addr::LOCALHOST, 8999);
+        let n = sendmsg_udp(tx.as_fd(), &[IoSlice::new(b"one "), IoSlice::new(b"datagram")], &dest, None, Some(&src)).unwrap();
+        assert_eq!(n, 12);
+
+        let mut buf = [0u8; 64];
+        let (n, from) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"one datagram");
+        assert_eq!(from.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // a unix datagram socket: no control data, through nix
+        let dir = std::env::temp_dir().join(format!("ngx-udp-test-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let path = dir.join("rx.sock");
+        let _ = std::fs::remove_file(&path);
+
+        let urx = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        urx.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let utx = std::os::unix::net::UnixDatagram::unbound().unwrap();
+
+        let dest = SockAddr::Unix(path.as_os_str().as_encoded_bytes().to_vec());
+        let n = sendmsg_udp(utx.as_fd(), &[IoSlice::new(b"unix")], &dest, None, Some(&src)).unwrap();
+        assert_eq!(n, 4);
+        let n = urx.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"unix");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

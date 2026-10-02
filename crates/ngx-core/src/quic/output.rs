@@ -6,14 +6,14 @@
 use std::cell::RefCell;
 use std::io;
 use std::io::IoSlice;
+use std::os::fd::AsFd;
 use std::rc::Rc;
 
 use nix::errno::Errno;
-use nix::sys::socket::ControlMessage;
 
 use crate::connection::Connection;
-use crate::event_udp::{sendmsg_to, set_srcaddr_cmsg, SrcAddrCmsg};
-use crate::inet::{NixSockAddr, SockAddr};
+use crate::event_udp::sendmsg_udp;
+use crate::inet::SockAddr;
 use crate::log::*;
 use openssl::rand::rand_bytes;
 use crate::rc::*;
@@ -352,11 +352,12 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
     NGX_OK
 }
 
-/// The source address control message of a datagram of the connection: on
-/// a wildcard listening, its local address (ngx_set_srcaddr_cmsg).
-fn ngx_quic_srcaddr(c: &Connection) -> Option<SrcAddrCmsg> {
+/// The source address of a datagram of the connection: on a wildcard
+/// listening, its local address (the control message of
+/// ngx_set_srcaddr_cmsg()).
+fn ngx_quic_srcaddr(c: &Connection) -> Option<SockAddr> {
     if c.listening().is_some_and(|ls| ls.wildcard.get()) {
-        return c.local_sockaddr.borrow().as_ref().and_then(set_srcaddr_cmsg);
+        return c.local_sockaddr.borrow().clone();
     }
 
     None
@@ -367,17 +368,9 @@ fn ngx_quic_srcaddr(c: &Connection) -> Option<SrcAddrCmsg> {
 fn ngx_quic_send_segments(c: &Connection, buf: &[u8], sockaddr: &SockAddr, segment: usize) -> isize {
     let iov = [IoSlice::new(buf)];
 
-    let segment = segment as u16;
-
     let srcaddr = ngx_quic_srcaddr(c);
 
-    let mut cmsgs = vec![ControlMessage::UdpGsoSegments(&segment)];
-
-    if let Some(src) = &srcaddr {
-        cmsgs.push(src.cmsg());
-    }
-
-    let n = ngx_sendmsg(c, &iov, &cmsgs, &sockaddr.to_nix());
+    let n = ngx_sendmsg(c, &iov, sockaddr, Some(segment as u16), srcaddr.as_ref());
     if n < 0 {
         return n;
     }
@@ -570,15 +563,22 @@ fn ngx_quic_init_packet<'a>(c: &Connection, qc: &QuicConnection, ctx: &QuicSendC
     ngx_quic_set_packet_number(pkt, ctx);
 }
 
-/// ngx_sendmsg: the bytes sent, NGX_AGAIN or NGX_ERROR (logged)
-fn ngx_sendmsg(c: &Connection, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage<'_>], addr: &NixSockAddr) -> isize {
+/// ngx_sendmsg: the bytes sent, NGX_AGAIN or NGX_ERROR (logged); the
+/// control messages (UDP_SEGMENT with `segment`, the source address `src`)
+/// on the stack
+fn ngx_sendmsg(c: &Connection, iov: &[IoSlice<'_>], addr: &SockAddr, segment: Option<u16>, src: Option<&SockAddr>) -> isize {
     let fd = match c.listening() {
         Some(ls) => ls.fd.get(),
         None => c.fd.get(),
     };
 
     loop {
-        let n = match sendmsg_to(fd, iov, cmsgs, addr) {
+        let r = match crate::fd::get(fd) {
+            Ok(f) => sendmsg_udp(f.as_fd(), iov, addr, segment, src),
+            Err(_) => Err(Errno::EBADF),
+        };
+
+        let n = match r {
             Ok(n) => n,
 
             Err(Errno::EAGAIN) => {
@@ -622,9 +622,7 @@ fn ngx_quic_send(c: &Connection, buf: &[u8], sockaddr: &SockAddr) -> isize {
 
     let srcaddr = ngx_quic_srcaddr(c);
 
-    let cmsgs: Vec<ControlMessage<'_>> = srcaddr.iter().map(SrcAddrCmsg::cmsg).collect();
-
-    let n = ngx_sendmsg(c, &iov, &cmsgs, &sockaddr.to_nix());
+    let n = ngx_sendmsg(c, &iov, sockaddr, None, srcaddr.as_ref());
     if n < 0 {
         return n;
     }
