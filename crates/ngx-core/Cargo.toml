@@ -25,3 +25,4 @@ zerocopy.workspace = true
 signal-hook.workspace = true
 chrono.workspace = true
 pwhash.workspace = true
+blowfish.workspace = true

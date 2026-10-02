@@ -480,6 +480,7 @@ dependencies = [
 name = "ngx-core"
 version = "1.31.7"
 dependencies = [
+ "blowfish",
  "bytes",
  "chrono",
  "crc32fast",
