@@ -218,3 +218,66 @@ fn string_encoding() {
     string_encode(&mut v, b"X-{Z}", true);
     assert_eq!(v, b"\x05x-{z}");
 }
+
+#[test]
+fn string_encoding_reuses_scratch() {
+    // strings of growing and shrinking lengths through the worker's
+    // scratch buffer: the same bytes as Huffman coding into a buffer of
+    // their own
+    for (i, len) in [40usize, 3, 200, 0, 17, 1000, 5].into_iter().enumerate() {
+        let src = pattern(len, i as u8);
+        let mut v = Vec::new();
+        string_encode(&mut v, &src, false);
+
+        let mut want = Vec::new();
+        match encode(&src, false) {
+            Some(h) => {
+                write_int(&mut want, NGX_HTTP_V2_ENCODE_HUFF, prefix(7), h.len());
+                want.extend_from_slice(&h);
+            }
+            None => {
+                write_int(&mut want, 0, prefix(7), src.len());
+                want.extend_from_slice(&src);
+            }
+        }
+        assert_eq!(v, want, "len {}", len);
+    }
+}
+
+#[test]
+fn hpack_indexed_into_buffers() {
+    let log = Log::stderr(NGX_LOG_ERR);
+    let mut t = Hpack::new();
+    t.add_header(&pattern(2000, 0), &pattern(2000, 1), &log);
+    // evicts the first, stored at the end of the ring
+    t.add_header(b"x", b"y", &log);
+    // name wraps the ring
+    t.add_header(&pattern(1000, 1), &pattern(1000, 2), &log);
+
+    let mut name = Vec::with_capacity(4096);
+    let mut value = Vec::with_capacity(4096);
+    let (np, vp) = (name.as_ptr(), value.as_ptr());
+
+    // static: name and value replaced
+    t.get_indexed_header_into(2, false, &log, &mut name, &mut value).unwrap();
+    assert_eq!((&name[..], &value[..]), (&b":method"[..], &b"GET"[..]));
+
+    // a name only leaves the value as it is
+    t.get_indexed_header_into(63, true, &log, &mut name, &mut value).unwrap();
+    assert_eq!((&name[..], &value[..]), (&b"x"[..], &b"GET"[..]));
+
+    // the wrapped entry
+    t.get_indexed_header_into(62, false, &log, &mut name, &mut value).unwrap();
+    assert_eq!((name.clone(), value.clone()), (pattern(1000, 1), pattern(1000, 2)));
+
+    t.get_indexed_header_into(63, false, &log, &mut name, &mut value).unwrap();
+    assert_eq!((&name[..], &value[..]), (&b"x"[..], &b"y"[..]));
+
+    // errors change nothing
+    assert!(t.get_indexed_header_into(0, false, &log, &mut name, &mut value).is_err());
+    assert!(t.get_indexed_header_into(64, false, &log, &mut name, &mut value).is_err());
+    assert_eq!((&name[..], &value[..]), (&b"x"[..], &b"y"[..]));
+
+    // the buffers were filled in place
+    assert_eq!((name.as_ptr(), value.as_ptr()), (np, vp));
+}

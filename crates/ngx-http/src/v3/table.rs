@@ -220,7 +220,7 @@ pub fn ref_insert(c: &Rc<Connection>, dynamic: bool, index: u64, value: &[u8]) -
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 ref insert static[{}] \"{}\"", index, B(value));
 
         match lookup_static(c, index) {
-            Some(f) => name = f.name,
+            Some((n, _)) => name = n.to_vec(),
             None => return NGX_HTTP_V3_ERR_ENCODER_STREAM_ERROR as i64,
         }
     }
@@ -399,8 +399,9 @@ pub fn inc_insert_count(c: &Connection, inc: u64) -> i64 {
     NGX_HTTP_V3_ERR_DECODER_STREAM_ERROR as i64
 }
 
-/// ngx_http_v3_lookup_static
-pub fn lookup_static(c: &Connection, index: u64) -> Option<Field> {
+/// ngx_http_v3_lookup_static: the name and value of the entry, the
+/// table's own bytes (C points to them)
+pub fn lookup_static(c: &Connection, index: u64) -> Option<(&'static [u8], &'static [u8])> {
     let nelts = STATIC_TABLE.len() as u64;
 
     if index >= nelts {
@@ -412,24 +413,49 @@ pub fn lookup_static(c: &Connection, index: u64) -> Option<Field> {
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 static[{}] lookup \"{}\":\"{}\"", index, B(name), B(value));
 
-    Some(Field { name: name.to_vec(), value: value.to_vec() })
+    Some((name, value))
 }
 
 /// ngx_http_v3_lookup
 pub fn lookup(c: &Rc<Connection>, index: u64) -> Option<Field> {
-    let h3c = get_session(c)?;
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+
+    if !lookup_into(c, index, &mut name, Some(&mut value)) {
+        return None;
+    }
+
+    Some(Field { name, value })
+}
+
+/// ngx_http_v3_lookup into the caller's buffers, which keep their
+/// capacity: the name, and the value if asked; false when out of bounds
+/// (the buffers unchanged).
+pub fn lookup_into(c: &Rc<Connection>, index: u64, name: &mut Vec<u8>, value: Option<&mut Vec<u8>>) -> bool {
+    let h3c = match get_session(c) {
+        Some(h3c) => h3c,
+        None => return false,
+    };
+
     let dt = h3c.table.borrow();
 
     if index < dt.base || index - dt.base >= dt.elts.len() as u64 {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 dynamic[{}] lookup out of bounds: [{},{}]", index, dt.base, dt.base + dt.elts.len() as u64);
-        return None;
+        return false;
     }
 
-    let field = dt.elts[(index - dt.base) as usize].clone();
+    let field = &dt.elts[(index - dt.base) as usize];
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 dynamic[{}] lookup \"{}\":\"{}\"", index, B(&field.name), B(&field.value));
 
-    Some(field)
+    name.clear();
+    name.extend_from_slice(&field.name);
+
+    if let Some(value) = value {
+        value.clear();
+        value.extend_from_slice(&field.value);
+    }
+
+    true
 }
 
 /// ngx_http_v3_decode_insert_count

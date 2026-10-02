@@ -576,12 +576,15 @@ fn state_header_block(h2c: &Rc<H2Connection>, buf: &mut [u8], mut pos: usize) ->
 
 /// ngx_http_v2_get_indexed_header into state.header.
 fn get_indexed_header(h2c: &Rc<H2Connection>, index: usize, name_only: bool) -> Result<(), ()> {
-    let (name, value) = h2c.hpack.borrow().get_indexed_header(index, name_only, &h2c.connection.log)?;
-    *h2c.state.header_name.borrow_mut() = name;
-    if !name_only {
-        *h2c.state.header_value.borrow_mut() = value;
-    }
-    Ok(())
+    let st = &h2c.state;
+
+    st.keep_field(name_only);
+
+    let hpack = h2c.hpack.borrow();
+    let mut name = st.header_name.borrow_mut();
+    let mut value = st.header_value.borrow_mut();
+
+    hpack.get_indexed_header_into(index, name_only, &h2c.connection.log, &mut name, &mut value)
 }
 
 fn state_field_len(h2c: &Rc<H2Connection>, buf: &mut [u8], mut pos: usize) -> Option<usize> {
@@ -636,11 +639,7 @@ fn state_field_len(h2c: &Rc<H2Connection>, buf: &mut [u8], mut pos: usize) -> Op
         return state_field_skip(h2c, buf, pos);
     }
 
-    {
-        let mut field = st.field.borrow_mut();
-        field.clear();
-        field.reserve(if huff { len * 8 / 5 } else { len } + 1);
-    }
+    st.new_field(if huff { len * 8 / 5 } else { len } + 1);
 
     if huff {
         return state_field_huff(h2c, buf, pos);
@@ -752,14 +751,12 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
     if st.parse_name.get() {
         st.parse_name.set(false);
 
-        let name = st.field.borrow().clone();
+        st.take_field(false);
 
-        if name.is_empty() {
+        if st.header_name.borrow().is_empty() {
             ngx_log_error!(NGX_LOG_INFO, log, None, "client sent zero header name length");
             return connection_error(h2c, NGX_HTTP_V2_PROTOCOL_ERROR);
         }
-
-        *st.header_name.borrow_mut() = name;
 
         return state_field_len(h2c, buf, pos);
     }
@@ -767,7 +764,7 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
     if st.parse_value.get() {
         st.parse_value.set(false);
 
-        *st.header_value.borrow_mut() = st.field.borrow().clone();
+        st.take_field(true);
     }
 
     let len = st.header_name.borrow().len() + st.header_value.borrow().len();
@@ -790,10 +787,16 @@ fn state_process_header(h2c: &Rc<H2Connection>, buf: &mut [u8], pos: usize) -> O
         Some(s) => s,
     };
 
-    let name = st.header_name.borrow().clone();
-    let value = st.header_value.borrow().clone();
+    // lent to the request side, then put back with their capacity
+    let name = std::mem::take(&mut *st.header_name.borrow_mut());
+    let value = std::mem::take(&mut *st.header_value.borrow_mut());
 
-    match header_request(h2c, &stream, &name, &value) {
+    let rc = header_request(h2c, &stream, &name, &value);
+
+    *st.header_name.borrow_mut() = name;
+    *st.header_value.borrow_mut() = value;
+
+    match rc {
         Ok(()) => {}
         // the request was finalized (or failed): stop feeding it headers
         Err(Some(())) => {

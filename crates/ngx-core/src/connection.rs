@@ -656,6 +656,145 @@ impl Connection {
         })
     }
 
+    /// A fake connection of a stream that ended made again for a new stream
+    /// of `c`, as ngx_http_v2_create_stream reuses
+    /// h2c->free_fake_connections: every field as new_fake(c) makes it,
+    /// nothing kept from the previous stream (a notify_one() permit is
+    /// taken). The number, listening and type, which cannot change, are
+    /// those of `c` already: the caller reuses only fake connections of `c`
+    /// that nothing else refers to (and whose log nothing else holds).
+    pub fn reset_fake(&self, c: &Rc<Connection>) {
+        // every field, so that one added later is not forgotten here
+        let Connection {
+            fd,
+            afd,
+            number,
+            log,
+            listening,
+            ty,
+            sockaddr,
+            addr_text,
+            original_sockaddr,
+            original_addr_text,
+            local_sockaddr,
+            proxy_protocol,
+            ssl,
+            buffer,
+            sent,
+            requests,
+            start_time,
+            start_msec,
+            timedout,
+            error,
+            destroyed,
+            idle,
+            close,
+            shared,
+            tcp_nodelay,
+            tcp_nopush,
+            need_last_buf,
+            need_flush_buf,
+            sendfile,
+            udp,
+            close_notify,
+            data,
+            reusable,
+            queue,
+            this,
+            slot_key,
+            slot,
+            close_handler,
+            pipeline,
+            read_delayed,
+            write_delayed,
+            write_delay_until,
+            unexpected_eof,
+            write_ready,
+            read_eof,
+            read_pending_eof,
+            log_error,
+            cleanups,
+            passed_listening,
+            fake,
+            udp_conn,
+            quic_conn,
+            quic_sock,
+            quic_stream,
+        } = self;
+
+        debug_assert!(*fake && *number == c.number && *ty == c.ty);
+        debug_assert!(listening.as_ref().map(Rc::as_ptr) == c.listening.as_ref().map(Rc::as_ptr));
+        debug_assert!(this.upgrade().is_none() && !slot.get());
+
+        fd.set(-1);
+        *afd.borrow_mut() = None;
+
+        // log: a fork of c's (c.log.fork() and the connection number)
+        log.inner.level.set(c.log.inner.level.get());
+        *log.inner.chain.borrow_mut() = c.log.inner.chain.borrow().clone();
+        log.set_connection(c.number);
+        log.set_action(None);
+        log.set_context(None);
+
+        *sockaddr.borrow_mut() = c.sockaddr.borrow().clone();
+
+        {
+            let mut text = addr_text.borrow_mut();
+            text.clear();
+            text.extend_from_slice(&c.addr_text.borrow());
+        }
+
+        *original_sockaddr.borrow_mut() = c.original_sockaddr.borrow().clone();
+        *original_addr_text.borrow_mut() = c.original_addr_text.borrow().clone();
+        *local_sockaddr.borrow_mut() = c.local_sockaddr();
+        *proxy_protocol.borrow_mut() = c.proxy_protocol.borrow().clone();
+        *ssl.borrow_mut() = c.ssl.borrow().clone();
+        buffer.borrow_mut().clear();
+        sent.set(0);
+        requests.set(c.requests.get());
+        start_time.set(c.start_time.get());
+        start_msec.set(c.start_msec.get());
+        timedout.set(false);
+        error.set(false);
+        destroyed.set(false);
+        idle.set(false);
+        close.set(false);
+        shared.set(true);
+        tcp_nodelay.set(TcpNodelay::Disabled);
+        tcp_nopush.set(c.tcp_nopush.get());
+        need_last_buf.set(false);
+        need_flush_buf.set(false);
+        sendfile.set(c.sendfile.get());
+        udp.set(false);
+
+        // a permit a notify_one() left (nothing waits: nothing refers to
+        // the connection) is taken
+        let notified = close_notify.notified();
+        let _ = std::pin::pin!(notified).enable();
+
+        *data.borrow_mut() = c.data.borrow().clone();
+        reusable.set(false);
+        queue.set(0);
+        slot_key.set(0);
+        slot.set(false);
+        *close_handler.borrow_mut() = None;
+        pipeline.set(false);
+        read_delayed.set(false);
+        write_delayed.set(false);
+        write_delay_until.set(None);
+        unexpected_eof.set(false);
+        write_ready.set(false);
+        read_eof.set(false);
+        read_pending_eof.set(false);
+        log_error.set(c.log_error.get());
+        cleanups.borrow_mut().clear();
+        *passed_listening.borrow_mut() = None;
+        *udp_conn.borrow_mut() = None;
+        *quic_conn.borrow_mut() = None;
+        *quic_sock.borrow_mut() = None;
+        *quic_stream.borrow_mut() = None;
+    }
+
     /// ngx_get_connection for a QUIC stream (ngx_quic_create_stream): the
     /// stream's connection has the addresses, the listening and the SSL
     /// object of the QUIC connection, a copy of its log, and a number of

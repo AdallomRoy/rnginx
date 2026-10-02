@@ -45,7 +45,18 @@ pub struct Driver {
     /// OpenSSL requires after SSL_ERROR_WANT_WRITE).
     wbuf: RefCell<Vec<u8>>,
     wpos: Cell<usize>,
+    /// The frames fill_wbuf() copied out, whose handlers it runs (kept for
+    /// its capacity).
+    done: RefCell<Vec<OutFrame>>,
+    /// When the fake connections kept for the next streams go, if the
+    /// connection is still idle then (C frees them with h2c->pool as soon
+    /// as it is idle; kept a little here, as the next streams of a client
+    /// often come right after)
+    fake_release: Cell<Option<Instant>>,
 }
+
+/// How long an idle connection keeps the fake connections of its streams.
+const FAKE_RELEASE_DELAY: Duration = Duration::from_millis(100);
 
 const WBUF_SIZE: usize = 64 * 1024;
 
@@ -119,6 +130,8 @@ impl Driver {
             write_timer: Cell::new(None),
             wbuf: RefCell::new(Vec::new()),
             wpos: Cell::new(0),
+            done: RefCell::new(Vec::new()),
+            fake_release: Cell::new(None),
         }
     }
 
@@ -190,7 +203,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         hpack: RefCell::new(table::Hpack::new()),
         streams_index: RefCell::new(vec![Vec::new(); streams_index_mask + 1]),
         streams_index_mask,
-        last_out: RefCell::new(Vec::new()),
+        last_out: RefCell::new(VecDeque::new()),
         dependencies: RefCell::new(Vec::new()),
         closed: RefCell::new(VecDeque::new()),
         closed_nodes: Cell::new(0),
@@ -206,6 +219,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         posted_reads: RefCell::new(Vec::new()),
         finalized: Cell::new(false),
         read_timer: Cell::new(None),
+        free_fake_connections: RefCell::new(Vec::new()),
     });
 
     let driver = Driver::new();
@@ -258,6 +272,7 @@ enum Ev {
     Queued,
     ReadTimeout,
     WriteTimeout,
+    ReleaseFake,
 }
 
 /// The event loop standing in for the read and write handlers.
@@ -300,6 +315,14 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
         let write_timer = d.write_timer.get();
         let reading = !h2c.finalized.get();
 
+        // fake connections of streams that went once the connection was
+        // idle go a little later too
+        if d.mode.get() == Mode::Idle && d.fake_release.get().is_none() && !h2c.free_fake_connections.borrow().is_empty() {
+            d.fake_release.set(Some(Instant::now() + FAKE_RELEASE_DELAY));
+        }
+
+        let fake_release = if d.mode.get() == Mode::Idle { d.fake_release.get() } else { None };
+
         // the read event is waited for without a buffer: one is taken from
         // the worker's pool when there is something to read
         let ev = tokio::select! {
@@ -311,6 +334,7 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
             _ = h2c.out_notify.notified(), if !has_output => Ev::Queued,
             _ = sleep_opt(read_timer), if read_timer.is_some() => Ev::ReadTimeout,
             _ = sleep_opt(write_timer), if write_timer.is_some() => Ev::WriteTimeout,
+            _ = sleep_opt(fake_release), if fake_release.is_some() => Ev::ReleaseFake,
         };
 
         match ev {
@@ -346,6 +370,11 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
                     finalize_connection(h2c, NGX_HTTP_V2_PROTOCOL_ERROR);
                 }
                 decide_after_finalize(h2c, d);
+            }
+
+            Ev::ReleaseFake => {
+                d.fake_release.set(None);
+                release_fake_connections(h2c);
             }
 
             Ev::WriteTimeout => {
@@ -430,9 +459,20 @@ fn idle_handler(h2c: &Rc<H2Connection>, d: &Driver) -> bool {
     c.destroyed.set(false);
     reusable(c, false);
 
+    // the fake connections kept serve the new streams
+    d.fake_release.set(None);
+
     d.mode.set(Mode::Read);
 
     true
+}
+
+/// The fake connections kept for the next streams go (h2c->pool
+/// destroyed).
+fn release_fake_connections(h2c: &H2Connection) {
+    let fake = std::mem::take(&mut *h2c.free_fake_connections.borrow_mut());
+
+    drop(fake);
 }
 
 /// ngx_http_v2_read_handler on a read event: what the socket has is read
@@ -606,7 +646,8 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         return;
     }
 
-    let mut done: Vec<OutFrame> = Vec::new();
+    // the list of the frames copied out, lent by the driver
+    let mut done = std::mem::take(&mut *d.done.borrow_mut());
     {
         let mut wbuf = d.wbuf.borrow_mut();
         wbuf.clear();
@@ -620,7 +661,7 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
             wbuf.reserve_exact(queued.min(WBUF_SIZE));
         }
 
-        while let Some(f) = out.last_mut() {
+        while let Some(f) = out.back_mut() {
             let room = WBUF_SIZE.saturating_sub(wbuf.len());
             if room == 0 {
                 break;
@@ -632,11 +673,12 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
                 f.blocked = true;
                 break;
             }
-            done.push(out.pop().unwrap());
+            done.extend(out.pop_back());
         }
     }
 
     if done.is_empty() {
+        *d.done.borrow_mut() = done;
         return;
     }
 
@@ -646,7 +688,7 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         c.error.set(true);
     }
 
-    for frame in done {
+    for frame in done.drain(..) {
         ngx_log_debug!(
             NGX_LOG_DEBUG_HTTP,
             c.log,
@@ -656,6 +698,8 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         );
         frame_sent(h2c, frame);
     }
+
+    *d.done.borrow_mut() = done;
 }
 
 /// Write the write buffer out, waiting for writability. Cancel safe: the
@@ -850,6 +894,13 @@ fn handle_connection(h2c: &Rc<H2Connection>, d: &Driver) {
     // connection keeps no output buffers
     *d.wbuf.borrow_mut() = Vec::new();
     d.wpos.set(0);
+    *d.done.borrow_mut() = Vec::new();
+
+    // h2c->free_fake_connections = NULL, a little later
+    if !h2c.free_fake_connections.borrow().is_empty() {
+        d.fake_release.set(Some(Instant::now() + FAKE_RELEASE_DELAY));
+    }
+
     ngx_core::event_openssl::ngx_ssl_free_buffer(c);
 
     c.destroyed.set(true);
@@ -1052,7 +1103,7 @@ fn send_settings(h2c: &Rc<H2Connection>) -> Result<(), ()> {
         (s.concurrent_streams, s.preread_size)
     };
 
-    let mut data = Vec::with_capacity(NGX_HTTP_V2_FRAME_HEADER_SIZE + len);
+    let mut data = frame_buf(NGX_HTTP_V2_FRAME_HEADER_SIZE + len);
     write_frame_head(&mut data, len, NGX_HTTP_V2_SETTINGS_FRAME, NGX_HTTP_V2_NO_FLAG, 0);
 
     write_uint16(&mut data, NGX_HTTP_V2_MAX_STREAMS_SETTING);
@@ -1134,7 +1185,7 @@ pub fn get_frame(h2c: &Rc<H2Connection>, length: usize, ty: u8, flags: u8, sid: 
         return None;
     }
 
-    let mut data = Vec::with_capacity(NGX_HTTP_V2_FRAME_BUFFER_SIZE);
+    let mut data = frame_buf(NGX_HTTP_V2_FRAME_BUFFER_SIZE);
     write_frame_head(&mut data, length, ty, flags, sid);
 
     Some(OutFrame { data, sent: 0, handler: FrameHandler::Control, stream: None, length, blocked: false, fin: false })

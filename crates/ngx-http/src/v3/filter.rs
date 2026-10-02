@@ -2,6 +2,8 @@
 //! the response header as a HEADERS frame, the body in DATA frames, the
 //! trailers.
 
+use std::io::Write;
+
 use ngx_core::buf::{Buf, Chain};
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
@@ -184,12 +186,21 @@ async fn header_filter(r: &R) -> i64 {
 
     let (server, date) = {
         let ho = r.headers_out.borrow();
-        (ho.server.clone(), ho.date.clone())
+        (ho.server.is_none(), ho.date.is_none())
     };
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 header len:{}", header_len(r, &location, server.is_none(), date.is_none()));
+    let len = header_len(r, &location, server, date);
 
-    let mut b: Vec<u8> = Vec::new();
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 header len:{}", len);
+
+    // one buffer: the HEADERS frame header goes in front of the field
+    // section (room for it reserved), the DATA frame header of the body
+    // behind it; C has three, with the same bytes
+    const HEAD: usize = 2 * NGX_HTTP_V3_VARLEN_INT_LEN;
+
+    let mut b: Vec<u8> = Vec::with_capacity(HEAD + len + HEAD);
+
+    b.resize(HEAD, 0);
 
     encode_field_section_prefix(&mut b, 0, false, 0);
 
@@ -201,10 +212,10 @@ async fn header_filter(r: &R) -> i64 {
         encode_field_ri(&mut b, false, NGX_HTTP_V3_HEADER_STATUS_200);
     } else {
         encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_STATUS_200, None, 3);
-        b.extend_from_slice(format!("{:03}", status).as_bytes());
+        let _ = write!(b, "{:03}", status);
     }
 
-    if server.is_none() {
+    if server {
         let p: &[u8] = if server_tokens == NGX_HTTP_SERVER_TOKENS_ON {
             NGINX_VER
         } else if server_tokens == NGX_HTTP_SERVER_TOKENS_BUILD {
@@ -218,7 +229,7 @@ async fn header_filter(r: &R) -> i64 {
         encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_SERVER, Some(p), p.len());
     }
 
-    if date.is_none() {
+    if date {
         let t = ngx_core::times::cached_http_time();
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"date: {}\"", t);
@@ -233,43 +244,44 @@ async fn header_filter(r: &R) -> i64 {
             if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
                 /* updated r->headers_out.content_type is also needed for logging */
 
-                let charset = ho.charset.clone();
+                let charset = std::mem::take(&mut ho.charset);
                 ho.content_type.extend_from_slice(b"; charset=");
                 ho.content_type.extend_from_slice(&charset);
+                ho.charset = charset;
             }
 
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"content-type: {}\"", B(&ho.content_type));
 
-            let ct = ho.content_type.clone();
-
-            encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_CONTENT_TYPE_TEXT_PLAIN, Some(&ct), ct.len());
+            encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_CONTENT_TYPE_TEXT_PLAIN, Some(&ho.content_type), ho.content_type.len());
         }
 
         if ho.content_length.is_none() && ho.content_length_n >= 0 {
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"content-length: {}\"", ho.content_length_n);
 
             if ho.content_length_n > 0 {
-                let v = ho.content_length_n.to_string();
+                let mut v = [0u8; 20];
+                let v = dec(&mut v, ho.content_length_n);
 
                 encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_CONTENT_LENGTH_ZERO, None, v.len());
 
-                b.extend_from_slice(v.as_bytes());
+                b.extend_from_slice(v);
             } else {
                 encode_field_ri(&mut b, false, NGX_HTTP_V3_HEADER_CONTENT_LENGTH_ZERO);
             }
         }
 
         if ho.last_modified.is_none() && ho.last_modified_time != -1 {
-            let t = ngx_core::times::http_time(ho.last_modified_time);
+            let tb = ngx_core::times::http_time_bytes(ho.last_modified_time);
+            let t = &tb[..];
 
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"last-modified: {}\"", t);
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"last-modified: {}\"", B(t));
 
-            encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_LAST_MODIFIED, Some(t.as_bytes()), t.len());
+            encode_field_lri(&mut b, false, NGX_HTTP_V3_HEADER_LAST_MODIFIED, Some(t), t.len());
         }
     }
 
     if let Some(loc) = &location {
-        let v = loc.value.borrow().clone();
+        let v = loc.value.borrow();
 
         if !v.is_empty() {
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"location: {}\"", B(&v));
@@ -285,9 +297,7 @@ async fn header_filter(r: &R) -> i64 {
         encode_field_ri(&mut b, false, NGX_HTTP_V3_HEADER_VARY_ACCEPT_ENCODING);
     }
 
-    let headers: Vec<Header> = r.headers_out.borrow().headers.clone();
-
-    for h in headers.iter() {
+    for h in r.headers_out.borrow().headers.iter() {
         if h.hash.get() == 0 {
             continue;
         }
@@ -299,42 +309,39 @@ async fn header_filter(r: &R) -> i64 {
         encode_field_l(&mut b, &h.key, &value);
     }
 
-    let n = b.len();
+    let n = b.len() - HEAD;
 
     h3c.payload_bytes.set(h3c.payload_bytes.get() + n as i64);
 
-    let mut hl = Vec::with_capacity(varlen_int_len(NGX_HTTP_V3_FRAME_HEADERS) + varlen_int_len(n as u64));
+    // the HEADERS frame header, right before the field section
+    let (hl, hn) = varlen_ints_bytes(NGX_HTTP_V3_FRAME_HEADERS, n as u64);
+    let start = HEAD - hn;
+    b[start..HEAD].copy_from_slice(&hl[..hn]);
 
-    encode_varlen_int(&mut hl, NGX_HTTP_V3_FRAME_HEADERS);
-    encode_varlen_int(&mut hl, n as u64);
+    let content_length_n = r.headers_out.borrow().content_length_n;
 
-    let mut out = Chain::new();
+    let data = content_length_n >= 0 && !r.header_only.get() && !r.expect_trailers.get();
 
-    out.push_back(Buf::from_vec(hl));
+    if data {
+        encode_varlen_int(&mut b, NGX_HTTP_V3_FRAME_DATA);
+        encode_varlen_int(&mut b, content_length_n as u64);
+
+        h3c.payload_bytes.set(h3c.payload_bytes.get() + content_length_n);
+        h3c.total_bytes.set(h3c.total_bytes.get() + content_length_n);
+    } else {
+        r.set_ctx(ctx_index(), FilterCtx);
+    }
 
     let mut hb = Buf::from_vec(b);
+    hb.pos = start;
 
     if r.header_only.get() {
         hb.last_buf = true;
     }
 
+    let mut out = Chain::new();
+
     out.push_back(hb);
-
-    let content_length_n = r.headers_out.borrow().content_length_n;
-
-    if content_length_n >= 0 && !r.header_only.get() && !r.expect_trailers.get() {
-        let mut d = Vec::with_capacity(varlen_int_len(NGX_HTTP_V3_FRAME_DATA) + varlen_int_len(content_length_n as u64));
-
-        encode_varlen_int(&mut d, NGX_HTTP_V3_FRAME_DATA);
-        encode_varlen_int(&mut d, content_length_n as u64);
-
-        h3c.payload_bytes.set(h3c.payload_bytes.get() + content_length_n);
-        h3c.total_bytes.set(h3c.total_bytes.get() + content_length_n);
-
-        out.push_back(Buf::from_vec(d));
-    } else {
-        r.set_ctx(ctx_index(), FilterCtx);
-    }
 
     for cl in out.iter() {
         let len = cl.last - cl.pos;

@@ -232,7 +232,7 @@ pub fn ngx_quic_validate_token(c: &Connection, key: &[u8; 32], pkt: &mut QuicHea
     }
 
     if odcid_len != 0 {
-        pkt.odcid = tdec[p..p + odcid_len].to_vec();
+        pkt.odcid = QuicCid::new(&tdec[p..p + odcid_len]);
     } else {
         pkt.odcid = pkt.dcid.clone();
     }
@@ -262,7 +262,7 @@ mod tests {
     }
 
     fn validate(c: &Connection, key: &[u8; 32], token: &[u8], dcid: &[u8]) -> (i64, QuicHeader<'static>) {
-        let mut pkt = QuicHeader { token: token.to_vec(), dcid: dcid.to_vec(), ..Default::default() };
+        let mut pkt = QuicHeader { token: token.to_vec(), dcid: QuicCid::new(dcid), ..Default::default() };
         let rc = ngx_quic_validate_token(c, key, &mut pkt);
 
         (rc, pkt)
@@ -290,7 +290,7 @@ mod tests {
         let (rc, pkt) = validate(&c, &KEY, &token, b"dcid");
         assert_eq!(rc, NGX_OK);
         assert!(pkt.retried && pkt.validated);
-        assert_eq!(pkt.odcid, odcid);
+        assert_eq!(pkt.odcid.as_slice(), &odcid);
 
         // a Retry token is for the address and the port
         let (rc, pkt) = validate(&conn(addr(4434)), &KEY, &token, b"dcid");
@@ -318,7 +318,7 @@ mod tests {
         let (rc, pkt) = validate(&conn(addr(5000)), &KEY, &token, b"the dcid");
         assert_eq!(rc, NGX_OK);
         assert!(!pkt.retried && pkt.validated);
-        assert_eq!(pkt.odcid, b"the dcid");
+        assert_eq!(pkt.odcid.as_slice(), b"the dcid");
 
         let (rc, _) = validate(&conn(SockAddr::v4(std::net::Ipv4Addr::new(127, 0, 0, 2), 4433)), &KEY, &token, b"dcid");
         assert_eq!(rc, NGX_DECLINED);
