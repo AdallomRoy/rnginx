@@ -124,11 +124,12 @@ impl SockAddr {
     pub fn to_text(&self, with_port: bool) -> Vec<u8> {
         match self {
             SockAddr::V4(a) => {
-                if with_port {
-                    format!("{}:{}", a.ip(), a.port()).into_bytes()
-                } else {
-                    format!("{}", a.ip()).into_bytes()
-                }
+                use std::io::Write;
+
+                // "255.255.255.255:65535" in one allocation
+                let mut v = Vec::with_capacity(21);
+                let _ = if with_port { write!(v, "{}:{}", a.ip(), a.port()) } else { write!(v, "{}", a.ip()) };
+                v
             }
             SockAddr::V6(a) => {
                 let text = inet6_ntop(&a.ip().octets());
@@ -1099,6 +1100,23 @@ mod tests {
         assert_eq!(a("::1%eth0"), None);
         assert_eq!(a("g::1"), None);
         assert_eq!(a("1:2:3:4:5:6:7:1.2.3.4"), None);
+    }
+
+    #[test]
+    fn sockaddr_text() {
+        let a = SockAddr::v4(Ipv4Addr::new(127, 0, 0, 1), 8080);
+        assert_eq!(a.to_text(true), b"127.0.0.1:8080");
+        assert_eq!(a.addr_text(), b"127.0.0.1");
+
+        let a = SockAddr::v4(Ipv4Addr::new(255, 255, 255, 255), 65535);
+        assert_eq!(a.to_text(true), b"255.255.255.255:65535");
+        assert_eq!(a.to_text(true).capacity(), 21, "one allocation");
+        assert_eq!(SockAddr::v4(Ipv4Addr::UNSPECIFIED, 0).to_text(true), b"0.0.0.0:0");
+
+        let a = SockAddr::V6(SocketAddrV6::new("::1".parse().unwrap(), 443, 0, 0));
+        assert_eq!(a.to_text(true), b"[::1]:443");
+        assert_eq!(a.addr_text(), b"::1");
+        assert_eq!(SockAddr::Unix(b"/tmp/s".to_vec()).to_text(true), b"unix:/tmp/s");
     }
 
     #[test]

@@ -13,8 +13,11 @@ fn ncpu() -> usize {
     *NCPU.get_or_init(crate::os::ncpu)
 }
 
+/// ngx_pid: the process's pid as cached by crate::log (refreshed in the
+/// child after fork(), as ngx_spawn_process() and ngx_daemon() set
+/// ngx_pid), not a getpid() system call on every lock and unlock
 fn pid() -> usize {
-    crate::os::getpid() as usize
+    crate::log::pid() as usize
 }
 
 #[inline]

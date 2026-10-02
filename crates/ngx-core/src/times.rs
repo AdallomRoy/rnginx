@@ -52,29 +52,62 @@ pub fn gmtime(t: i64) -> Tm {
     Tm { sec: sec as u32, min, hour, mday: mday as u32, mon: mon as u32, year: year as u32, wday }
 }
 
+/// The length of an HTTP time, "Sun, 06 Nov 1994 08:49:37 GMT".
+pub const HTTP_TIME_LEN: usize = 29;
+
+/// Two digits of `v` (0..=99), as "%02d" prints them.
+fn put2(d: &mut [u8], v: u32) {
+    d[0] = b'0' + (v / 10 % 10) as u8;
+    d[1] = b'0' + (v % 10) as u8;
+}
+
+/// ngx_http_time() into an array, without allocating: "Sun, 06 Nov 1994
+/// 08:49:37 GMT" ("%s, %02d %s %4d %02d:%02d:%02d GMT"; ngx_gmtime() keeps
+/// the year within four digits).
+pub fn http_time_bytes(t: i64) -> [u8; HTTP_TIME_LEN] {
+    let tm = gmtime(t);
+    let mut b = *b"Sun, 00 Jan 0000 00:00:00 GMT";
+
+    b[..3].copy_from_slice(WEEK[tm.wday as usize].as_bytes());
+    put2(&mut b[5..7], tm.mday);
+    b[8..11].copy_from_slice(MONTHS[(tm.mon - 1) as usize].as_bytes());
+    put2(&mut b[12..14], tm.year / 100);
+    put2(&mut b[14..16], tm.year % 100);
+    put2(&mut b[17..19], tm.hour);
+    put2(&mut b[20..22], tm.min);
+    put2(&mut b[23..25], tm.sec);
+
+    b
+}
+
 /// "Sun, 06 Nov 1994 08:49:37 GMT"
 pub fn http_time(t: i64) -> String {
-    let tm = gmtime(t);
-    format!(
-        "{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT",
-        WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec
-    )
+    let mut s = String::with_capacity(HTTP_TIME_LEN);
+    s.extend(http_time_bytes(t).iter().map(|&c| c as char));
+    s
 }
 
 /// "Sun, 06-Nov-94 08:49:37 GMT" (two digit year unless > 2037)
 pub fn http_cookie_time(t: i64) -> String {
+    use std::fmt::Write;
+
     let tm = gmtime(t);
+    // written into its size at once
+    let mut s = String::with_capacity(HTTP_TIME_LEN);
     if tm.year > 2037 {
-        format!(
+        let _ = write!(
+            s,
             "{}, {:02}-{}-{} {:02}:{:02}:{:02} GMT",
             WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec
-        )
+        );
     } else {
-        format!(
+        let _ = write!(
+            s,
             "{}, {:02}-{}-{:02} {:02}:{:02}:{:02} GMT",
             WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year % 100, tm.hour, tm.min, tm.sec
-        )
+        );
     }
+    s
 }
 
 /// Local timezone offset in minutes for time `t` (tm_gmtoff of
@@ -140,7 +173,12 @@ fn now_raw() -> (i64, u64) {
     (d.as_secs() as i64, (d.subsec_millis()) as u64)
 }
 
-/// Refresh the cached time (call at least once per event-loop iteration; cheap).
+/// ngx_time_update(): the cached time (and its strings, once a second)
+/// read again from the clock. The event loop does it once per iteration
+/// (event.rs: when the driver returns and before the tasks it woke run),
+/// the master once a signal woke it, and the code that calls it in C (the
+/// cache manager and loader, ngx_init_cycle(), ...) as C does; the readers
+/// below read the cache only.
 pub fn update() {
     let (sec, msec) = now_raw();
     CACHED.with(|c| {
@@ -153,10 +191,27 @@ pub fn update() {
     });
 }
 
-/// Current cached time in seconds (updates the cache first).
+/// The cached time, as of the last update(); the clock is read only if
+/// it never was (a process or thread that runs no event loop yet).
+fn read<R>(f: impl FnOnce(&CachedTime) -> R) -> R {
+    CACHED.with(|c| {
+        {
+            let c = c.borrow();
+
+            if c.sec != 0 {
+                return f(&c);
+            }
+        }
+
+        update();
+
+        f(&c.borrow())
+    })
+}
+
+/// ngx_time(): the cached time in seconds.
 pub fn time() -> i64 {
-    update();
-    CACHED.with(|c| c.borrow().sec)
+    read(|c| c.sec)
 }
 
 /// ngx_timezone_update(): the zone read again, as localtime() of glibc
@@ -207,13 +262,9 @@ pub fn next_time(when: i64) -> i64 {
     -1
 }
 
-/// Current time in milliseconds since epoch (wall clock).
+/// The cached time in milliseconds since the epoch (wall clock).
 pub fn msec() -> u64 {
-    update();
-    CACHED.with(|c| {
-        let c = c.borrow();
-        c.sec as u64 * 1000 + c.msec
-    })
+    read(|c| c.sec as u64 * 1000 + c.msec)
 }
 
 /// Monotonic milliseconds, like ngx_current_msec.
@@ -246,14 +297,14 @@ pub fn update_event_msec() -> u64 {
     t
 }
 
+/// A copy of the cached time (its strings are shared).
 pub fn cached() -> CachedTime {
-    update();
-    CACHED.with(|c| c.borrow().clone())
+    read(|c| c.clone())
 }
 
+/// The cached time, borrowed.
 pub fn with_cached<R>(f: impl FnOnce(&CachedTime) -> R) -> R {
-    update();
-    CACHED.with(|c| f(&c.borrow()))
+    read(f)
 }
 
 pub fn cached_http_time() -> Rc<str> {
@@ -300,6 +351,56 @@ mod tests {
             let local = next + gmtoff(next) * 60;
             assert_eq!(local.rem_euclid(86400), when % 86400, "{when}");
         }
+    }
+
+    #[test]
+    fn cached_until_updated() {
+        // a thread with no update yet reads the clock once
+        let sys = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let first = time();
+        assert!((first - sys).abs() <= 1, "{first} {sys}");
+
+        // the readers read the cache only: ngx_time_update() moves it
+        update();
+        let (s, m) = (time(), msec());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!((time(), msec()), (s, m));
+        assert_eq!(cached().msec, m % 1000);
+        assert_eq!(with_cached(|c| c.sec), s);
+
+        update();
+        assert!(msec() >= m + 20, "{} {}", msec(), m);
+        assert!(time() >= s);
+
+        // the strings are those of the cached second
+        let t = time();
+        assert_eq!(&*cached_http_time(), http_time(t));
+        assert!(with_cached(|c| c.http_time.clone()) == cached().http_time);
+    }
+
+    #[test]
+    fn http_time_as_sprintf() {
+        let old = |t: i64| {
+            let tm = gmtime(t);
+            format!("{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT", WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec)
+        };
+
+        let mut t: i64 = 1;
+        let mut cases = vec![-1, 0, 59, 951782400, 951868799, 2147483647, 2147483648, 253402300799, 253402300800, i64::MAX / 2];
+        for _ in 0..2000 {
+            t = t.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            cases.push((t as u64 % 253402300800) as i64);
+        }
+
+        for t in cases {
+            let b = http_time_bytes(t);
+            assert_eq!(std::str::from_utf8(&b).unwrap(), old(t), "{t}");
+            assert_eq!(http_time(t), old(t), "{t}");
+            assert_eq!(http_time(t).capacity(), HTTP_TIME_LEN);
+        }
+
+        assert_eq!(http_cookie_time(2147483647 + 86400 * 365), "Wed, 19-Jan-2039 03:14:07 GMT");
+        assert_eq!(http_cookie_time(0), "Thu, 01-Jan-70 00:00:00 GMT");
     }
 
     #[test]

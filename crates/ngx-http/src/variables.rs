@@ -135,12 +135,43 @@ pub fn get_variable_index(cf: &mut Conf, name: &[u8]) -> Result<usize, ConfError
 
 /// ngx_http_get_indexed_variable
 pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
+    with_indexed_variable(r, index, |v| v.cloned())
+}
+
+/// ngx_http_get_indexed_variable without a copy of the value: it is
+/// evaluated if not cached yet, cached in r->variables, and lent to `f`
+/// (None when it cannot be evaluated, where C returns NULL).
+///
+/// r->variables stays borrowed while `f` runs: `f` must not evaluate
+/// variables (nor set them).
+pub fn with_indexed_variable<T>(r: &R, index: usize, f: impl FnOnce(Option<&VariableValue>) -> T) -> T {
+    if !index_variable(r, index) {
+        return f(None);
+    }
+    let vars = r.variables.borrow();
+    f(vars.get(index))
+}
+
+/// The evaluation of ngx_http_get_indexed_variable: true when
+/// r->variables[index] holds the value (valid or not found), false when
+/// the variable cannot be evaluated.
+fn index_variable(r: &R, index: usize) -> bool {
+    {
+        // r->variables has an element for each indexed variable (no more
+        // than cmcf->variables.nelts), so a cached value is a known index
+        let vars = r.variables.borrow();
+        if let Some(v) = vars.get(index) {
+            if v.not_found || v.valid {
+                return true;
+            }
+        }
+    }
     let cmcf = r.cmcf();
     let (var, nvars) = {
         let m = cmcf.borrow();
         if index >= m.variables.len() {
             ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "unknown variable index: {}", index);
-            return None;
+            return false;
         }
         (m.variables[index].clone(), m.variables.len())
     };
@@ -149,14 +180,10 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         if vars.len() < nvars {
             vars.resize(nvars, VariableValue::default());
         }
-        let v = &vars[index];
-        if v.not_found || v.valid {
-            return Some(v.clone());
-        }
     }
     if VARIABLE_DEPTH.with(|d| d.get()) == 0 {
         ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "cycle while evaluating variable \"{}\"", B(&var.name));
-        return None;
+        return false;
     }
     VARIABLE_DEPTH.with(|d| d.set(d.get() - 1));
     let mut vv = VariableValue::default();
@@ -166,6 +193,7 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         None => NGX_ERROR,
     };
     VARIABLE_DEPTH.with(|d| d.set(d.get() + 1));
+    let mut vars = r.variables.borrow_mut();
     if rc == NGX_OK {
         if !vv.not_found {
             vv.valid = true;
@@ -176,39 +204,40 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         if var.flags.get() & NGX_HTTP_VAR_NOCACHEABLE != 0 {
             vv.no_cacheable = true;
         }
-        let mut vars = r.variables.borrow_mut();
-        vars[index] = vv.clone();
-        return Some(vv);
+        vars[index] = vv;
+        return true;
     }
     // the get handler fills r->variables[index] itself in C: what it has
     // set before failing (e.g. no_cacheable) stays
-    let mut vars = r.variables.borrow_mut();
     vars[index] = vv;
     vars[index].valid = false;
     vars[index].not_found = true;
-    None
+    false
 }
 
 /// ngx_http_get_flushed_variable
 pub fn get_flushed_variable(r: &R, index: usize) -> Option<VariableValue> {
-    {
-        let vars = r.variables.borrow();
-        if let Some(v) = vars.get(index) {
-            if v.valid || v.not_found {
-                if !v.no_cacheable {
-                    return Some(v.clone());
-                }
-            }
-        }
-    }
-    {
-        let mut vars = r.variables.borrow_mut();
-        if let Some(v) = vars.get_mut(index) {
+    with_flushed_variable(r, index, |v| v.cloned())
+}
+
+/// ngx_http_get_flushed_variable without a copy of the value, as
+/// with_indexed_variable(): a non-cacheable value is evaluated again.
+pub fn with_flushed_variable<T>(r: &R, index: usize, f: impl FnOnce(Option<&VariableValue>) -> T) -> T {
+    flush_variable(r, index);
+    with_indexed_variable(r, index, f)
+}
+
+/// The cached value of a non-cacheable variable dropped, as
+/// ngx_http_get_flushed_variable() does before ngx_http_get_indexed_variable()
+/// (and ngx_http_script_flush_complex_value() for the variables of a value).
+pub fn flush_variable(r: &R, index: usize) {
+    let mut vars = r.variables.borrow_mut();
+    if let Some(v) = vars.get_mut(index) {
+        if (v.valid || v.not_found) && v.no_cacheable {
             v.valid = false;
             v.not_found = false;
         }
     }
-    get_indexed_variable(r, index)
 }
 
 /// ngx_http_get_variable (by name at runtime).
@@ -242,16 +271,20 @@ pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
         }
         return None;
     }
-    // prefix variables
-    let prefixes = cmcf.borrow().prefix_variables.clone();
-    let mut best: Option<Rc<Variable>> = None;
-    let mut len = 0;
-    for pv in prefixes.iter() {
-        if name.len() >= pv.name.len() && name.len() > len && name[..pv.name.len()] == pv.name[..] {
-            len = pv.name.len();
-            best = Some(pv.clone());
+    // prefix variables: the longest one the name starts with, looked up in
+    // the configuration's list where it is
+    let best: Option<Rc<Variable>> = {
+        let m = cmcf.borrow();
+        let mut best: Option<&Rc<Variable>> = None;
+        let mut len = 0;
+        for pv in m.prefix_variables.iter() {
+            if name.len() >= pv.name.len() && name.len() > len && name[..pv.name.len()] == pv.name[..] {
+                len = pv.name.len();
+                best = Some(pv);
+            }
         }
-    }
+        best.cloned()
+    };
     if let Some(pv) = best {
         let mut vv = VariableValue::default();
         if let Some(g) = pv.get_handler.get() {
@@ -278,12 +311,20 @@ thread_local! {
 
 /// The full variable name for prefix-variable handlers (data == usize::MAX means "current prefix lookup").
 pub fn prefix_var_name(r: &R, data: usize) -> Vec<u8> {
+    with_prefix_var_name(r, data, |name| name.to_vec())
+}
+
+/// prefix_var_name() lent to `f`, without a copy
+pub fn with_prefix_var_name<T>(r: &R, data: usize, f: impl FnOnce(&[u8]) -> T) -> T {
     if data == usize::MAX {
-        return PREFIX_NAME.with(|n| n.borrow().clone());
+        return PREFIX_NAME.with(|n| f(&n.borrow()));
     }
     let cmcf = r.cmcf();
     let m = cmcf.borrow();
-    m.variables.get(data).map(|v| v.name.clone()).unwrap_or_default()
+    match m.variables.get(data) {
+        Some(v) => f(&v.name),
+        None => f(b""),
+    }
 }
 
 /// ngx_http_variables_init_vars
@@ -398,42 +439,52 @@ pub fn regex_compile(cf: &mut Conf, pattern: &[u8], options: u32) -> Result<Rc<H
 }
 
 /// ngx_http_regex_exec: NGX_OK on match (captures stored), NGX_DECLINED on no match, NGX_ERROR.
+///
+/// The captures and their subject go to the request's own arrays, reused
+/// from match to match (C allocates r->captures once per request); the
+/// subject may be borrowed from anything but them and r->variables.
 pub fn regex_exec(r: &R, re: &Rc<HttpRegex>, s: &[u8]) -> i64 {
     let cmcf = r.cmcf();
     let ncaptures = cmcf.borrow().ncaptures;
     if re.ncaptures > 0 || !re.variables.is_empty() || ncaptures > 0 {
         // full exec with captures
-        match re.regex.exec(s) {
+        let n = match re.regex.exec_into(s, &mut r.captures.borrow_mut()) {
             None => return NGX_DECLINED,
-            Some(caps) => {
-                let mut flat = Vec::with_capacity(caps.len() * 2);
-                for (a, b) in caps.iter() {
-                    flat.push(*a);
-                    flat.push(*b);
+            Some(n) => n,
+        };
+        r.ncaptures.set(n * 2);
+        {
+            let mut data = r.captures_data.borrow_mut();
+            data.clear();
+            data.extend_from_slice(s);
+        }
+        if !re.variables.is_empty() {
+            let nvars = cmcf.borrow().variables.len();
+            let caps = r.captures.borrow();
+            let mut vars = r.variables.borrow_mut();
+            if vars.len() < nvars {
+                vars.resize(nvars, VariableValue::default());
+            }
+            for (cap, vi) in re.variables.iter() {
+                if *vi >= vars.len() {
+                    continue;
                 }
-                r.ncaptures.set(caps.len() * 2);
-                *r.captures.borrow_mut() = flat;
-                *r.captures_data.borrow_mut() = s.to_vec();
-                let nvars = cmcf.borrow().variables.len();
-                for (cap, vi) in re.variables.iter() {
-                    let mut vv = VariableValue::default();
-                    if let Some((a, b)) = caps.get(*cap) {
-                        if *a >= 0 {
-                            vv.data = s[*a as usize..*b as usize].to_vec();
-                        }
-                    }
-                    vv.valid = true;
-                    let mut vars = r.variables.borrow_mut();
-                    if vars.len() < nvars {
-                        vars.resize(nvars, VariableValue::default());
-                    }
-                    if *vi < vars.len() {
-                        vars[*vi] = vv;
+                // the value of the named capture, its buffer reused
+                let vv = &mut vars[*vi];
+                vv.data.clear();
+                if *cap < n {
+                    let (a, b) = (caps[2 * cap], caps[2 * cap + 1]);
+                    if a >= 0 {
+                        vv.data.extend_from_slice(&s[a as usize..b as usize]);
                     }
                 }
-                return NGX_OK;
+                vv.valid = true;
+                vv.no_cacheable = false;
+                vv.not_found = false;
+                vv.escape = false;
             }
         }
+        return NGX_OK;
     }
     if re.regex.is_match(s) {
         NGX_OK
@@ -454,15 +505,85 @@ fn set_str(v: &mut VariableValue, s: &[u8]) {
     v.valid = true;
 }
 
+/// A value made already: set without a copy
+fn set_owned(v: &mut VariableValue, s: Vec<u8>) {
+    v.data = s;
+    v.valid = true;
+}
+
+/// A number as the value (ngx_sprintf() "%ui", "%O", "%uA", ...)
+fn set_uint(v: &mut VariableValue, n: u64) {
+    v.data.clear();
+    push_u64(&mut v.data, n);
+    v.valid = true;
+}
+
+/// A signed number as the value (ngx_sprintf() "%i", "%O")
+fn set_int(v: &mut VariableValue, n: i64) {
+    v.data.clear();
+    push_i64(&mut v.data, n);
+    v.valid = true;
+}
+
+/// Milliseconds as seconds with three decimals ("%T.%03M")
+fn set_msec(v: &mut VariableValue, sec: i64, msec: u64) {
+    v.data.clear();
+    push_i64(&mut v.data, sec);
+    v.data.push(b'.');
+    push_u64_pad(&mut v.data, msec, 3);
+    v.valid = true;
+}
+
+/// The decimal digits of `n` appended to `buf`, as ngx_sprintf() writes an
+/// unsigned number, without format!() and its String
+pub fn push_u64(buf: &mut Vec<u8>, n: u64) {
+    push_u64_pad(buf, n, 1);
+}
+
+/// The decimal digits of `n`, zero-padded to `width` ("%03ui"); a number
+/// is never cut to the width
+pub fn push_u64_pad(buf: &mut Vec<u8>, mut n: u64, width: usize) {
+    let mut tmp = [b'0'; 20];
+    let mut i = tmp.len();
+
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+
+        if n == 0 {
+            break;
+        }
+    }
+
+    let width = width.min(tmp.len());
+
+    if tmp.len() - i < width {
+        i = tmp.len() - width;
+    }
+
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// The decimal digits of a signed `n`, "-" first if negative
+pub fn push_i64(buf: &mut Vec<u8>, n: i64) {
+    if n < 0 {
+        buf.push(b'-');
+    }
+
+    push_u64(buf, n.unsigned_abs());
+}
+
 fn var_host(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let server = r.headers_in.borrow().server.clone();
-    if !server.is_empty() {
-        set_str(v, &server);
-        return NGX_OK;
+    {
+        let hin = r.headers_in.borrow();
+        if !hin.server.is_empty() {
+            set_str(v, &hin.server);
+            return NGX_OK;
+        }
     }
     let cscf = r.cscf();
-    let name = cscf.borrow().server_name.clone();
-    set_str(v, &name);
+    set_str(v, &cscf.borrow().server_name);
     NGX_OK
 }
 
@@ -472,14 +593,19 @@ fn var_remote_addr(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_binary_remote_addr(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, &r.connection.sockaddr.borrow().ip_bytes());
+    // the bytes of SockAddr::ip_bytes(), from the address itself
+    match &*r.connection.sockaddr.borrow() {
+        ngx_core::inet::SockAddr::V4(a) => set_str(v, &a.ip().octets()),
+        ngx_core::inet::SockAddr::V6(a) => set_str(v, &a.ip().octets()),
+        ngx_core::inet::SockAddr::Unix(_) => set_str(v, b""),
+    }
     NGX_OK
 }
 
 fn var_remote_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let p = r.connection.sockaddr.borrow().port();
     if p > 0 {
-        set_str(v, p.to_string().as_bytes());
+        set_uint(v, p as u64);
     } else {
         set_str(v, b"");
     }
@@ -488,7 +614,7 @@ fn var_remote_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_server_addr(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     match r.connection.local_sockaddr() {
-        Some(a) => set_str(v, &a.addr_text()),
+        Some(a) => set_owned(v, a.addr_text()),
         None => return NGX_ERROR,
     }
     NGX_OK
@@ -496,7 +622,7 @@ fn var_server_addr(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_server_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     match r.connection.local_sockaddr() {
-        Some(a) => set_str(v, a.port().to_string().as_bytes()),
+        Some(a) => set_uint(v, a.port() as u64),
         None => return NGX_ERROR,
     }
     NGX_OK
@@ -560,10 +686,11 @@ fn var_is_args(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_request(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let rl = r.main().request_line.borrow().clone();
+    let m = r.main();
+    let rl = m.request_line.borrow();
     if rl.is_empty() {
-        if let Some(l) = r.main().partial_request_line() {
-            set_str(v, &l);
+        if let Some(l) = m.partial_request_line() {
+            set_owned(v, l);
             return NGX_OK;
         }
     }
@@ -573,7 +700,7 @@ fn var_request(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_request_method(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let m = r.main();
-    let mn = m.method_name.borrow().clone();
+    let mn = m.method_name.borrow();
     if mn.is_empty() {
         v.not_found = true;
         return NGX_OK;
@@ -589,8 +716,7 @@ fn var_server_protocol(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 
 fn var_server_name(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let cscf = r.cscf();
-    let name = cscf.borrow().server_name.clone();
-    set_str(v, &name);
+    set_str(v, &cscf.borrow().server_name);
     NGX_OK
 }
 
@@ -671,14 +797,14 @@ fn var_remote_user(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_bytes_sent(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, r.connection.sent.get().to_string().as_bytes());
+    set_uint(v, r.connection.sent.get());
     NGX_OK
 }
 
 fn var_body_bytes_sent(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let sent = r.connection.sent.get() as i64 - r.header_size.get() as i64;
     let sent = if sent < 0 { 0 } else { sent };
-    set_str(v, sent.to_string().as_bytes());
+    set_int(v, sent);
     NGX_OK
 }
 
@@ -726,15 +852,15 @@ fn var_request_body_file(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_request_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, r.request_length.get().to_string().as_bytes());
+    set_int(v, r.request_length.get());
     NGX_OK
 }
 
 fn var_request_time(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let now = ngx_core::times::cached();
-    let ms = (now.sec - r.start_sec.get()) * 1000 + (now.msec as i64 - r.start_msec.get() as i64);
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
+    let ms = (sec - r.start_sec.get()) * 1000 + (msec as i64 - r.start_msec.get() as i64);
     let ms = ms.max(0);
-    set_str(v, format!("{}.{:03}", ms / 1000, ms % 1000).as_bytes());
+    set_msec(v, ms / 1000, (ms % 1000) as u64);
     NGX_OK
 }
 
@@ -744,7 +870,7 @@ fn var_request_id(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         return NGX_ERROR;
     }
     let _ = r;
-    set_str(v, &ngx_core::string::hex_string(&bytes));
+    set_owned(v, ngx_core::string::hex_string(&bytes));
     NGX_OK
 }
 
@@ -758,7 +884,7 @@ fn var_request_port(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         v.valid = true;
         return NGX_OK;
     }
-    set_str(v, p.to_string().as_bytes());
+    set_uint(v, p as u64);
     NGX_OK
 }
 
@@ -787,17 +913,24 @@ fn var_status(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
             0
         }
     };
-    set_str(v, format!("{:03}", status).as_bytes());
+    if status >= 0 {
+        // "%03ui"
+        v.data.clear();
+        push_u64_pad(&mut v.data, status as u64, 3);
+        v.valid = true;
+    } else {
+        set_str(v, format!("{:03}", status).as_bytes());
+    }
     NGX_OK
 }
 
 fn var_connection(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, r.connection.number.to_string().as_bytes());
+    set_uint(v, r.connection.number);
     NGX_OK
 }
 
 fn var_connection_requests(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, r.connection.requests.get().to_string().as_bytes());
+    set_uint(v, r.connection.requests.get());
     NGX_OK
 }
 
@@ -805,10 +938,9 @@ fn var_connection_time(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     // Both timestamps are wall-clock ms since epoch (connection.start_msec
     // is set from cached sec*1000 + msec). current_msec() is MONOTONIC and
     // cannot be subtracted from that. Use the cached wall time.
-    let now = ngx_core::times::cached();
-    let now_ms = now.sec as u64 * 1000 + now.msec;
+    let now_ms = ngx_core::times::with_cached(|t| t.sec as u64 * 1000 + t.msec);
     let ms = now_ms.saturating_sub(r.connection.start_msec.get());
-    set_str(v, format!("{}.{:03}", ms / 1000, ms % 1000).as_bytes());
+    set_msec(v, (ms / 1000) as i64, ms % 1000);
     NGX_OK
 }
 
@@ -823,13 +955,13 @@ fn var_hostname(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_pid(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, ngx_core::os::getpid().to_string().as_bytes());
+    set_int(v, ngx_core::log::pid() as i64);
     NGX_OK
 }
 
 fn var_msec(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    let t = ngx_core::times::cached();
-    set_str(v, format!("{}.{:03}", t.sec, t.msec).as_bytes());
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
+    set_msec(v, sec, msec);
     NGX_OK
 }
 
@@ -846,7 +978,7 @@ fn var_time_local(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 fn var_limit_rate(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
     let clcf = r.clcf();
     let rate = if r.limit_rate_set.get() { r.limit_rate.get() } else { crate::script::complex_value_size(r, &clcf.borrow().limit_rate, 0) };
-    set_str(v, rate.to_string().as_bytes());
+    set_uint(v, rate as u64);
     NGX_OK
 }
 
@@ -870,7 +1002,7 @@ fn var_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         v.not_found = true;
         v.no_cacheable = true;
     } else if hin.content_length_n >= 0 {
-        set_str(v, hin.content_length_n.to_string().as_bytes());
+        set_int(v, hin.content_length_n);
     } else if hin.chunked {
         // ngx_http_variable_content_length: known once the body is read
         v.not_found = true;
@@ -893,19 +1025,20 @@ const HEADERS_IN_CONTENT_TYPE: usize = 6;
 const HEADERS_OUT_CACHE_CONTROL: usize = 7;
 const HEADERS_OUT_LINK: usize = 8;
 
-/// `*(ngx_table_elt_t **) ((char *) r + data)` and its h->next chain.
-fn variable_header_lines(r: &R, data: usize) -> Vec<Header> {
+/// `*(ngx_table_elt_t **) ((char *) r + data)` and its h->next chain,
+/// lent to `f`.
+fn with_variable_header_lines<T>(r: &R, data: usize, f: impl FnOnce(&[Header]) -> T) -> T {
     match data {
-        HEADERS_IN_HOST => r.headers_in.borrow().host.iter().cloned().collect(),
-        HEADERS_IN_USER_AGENT => r.headers_in.borrow().user_agent.clone(),
-        HEADERS_IN_REFERER => r.headers_in.borrow().referer.clone(),
-        HEADERS_IN_VIA => r.headers_in.borrow().via.clone(),
-        HEADERS_IN_X_FORWARDED_FOR => r.headers_in.borrow().x_forwarded_for.clone(),
-        HEADERS_IN_COOKIE => r.headers_in.borrow().cookie.clone(),
-        HEADERS_IN_CONTENT_TYPE => r.headers_in.borrow().content_type.clone(),
-        HEADERS_OUT_CACHE_CONTROL => r.headers_out.borrow().cache_control.clone(),
-        HEADERS_OUT_LINK => r.headers_out.borrow().link.clone(),
-        _ => Vec::new(),
+        HEADERS_IN_HOST => f(r.headers_in.borrow().host.as_slice()),
+        HEADERS_IN_USER_AGENT => f(&r.headers_in.borrow().user_agent),
+        HEADERS_IN_REFERER => f(&r.headers_in.borrow().referer),
+        HEADERS_IN_VIA => f(&r.headers_in.borrow().via),
+        HEADERS_IN_X_FORWARDED_FOR => f(&r.headers_in.borrow().x_forwarded_for),
+        HEADERS_IN_COOKIE => f(&r.headers_in.borrow().cookie),
+        HEADERS_IN_CONTENT_TYPE => f(&r.headers_in.borrow().content_type),
+        HEADERS_OUT_CACHE_CONTROL => f(&r.headers_out.borrow().cache_control),
+        HEADERS_OUT_LINK => f(&r.headers_out.borrow().link),
+        _ => f(&[]),
     }
 }
 
@@ -921,8 +1054,7 @@ fn variable_cookies(r: &R, v: &mut VariableValue, data: usize) -> i64 {
 
 /// ngx_http_variable_headers_internal
 fn variable_headers_internal(r: &R, v: &mut VariableValue, data: usize, sep: u8) -> i64 {
-    let h = variable_header_lines(r, data);
-    match join_header_lines(&h, sep) {
+    match with_variable_header_lines(r, data, |h| join_header_lines(h, sep)) {
         Some(value) => {
             v.data = value;
             v.valid = true;
@@ -970,32 +1102,28 @@ fn join_header_lines(h: &[Header], sep: u8) -> Option<Vec<u8>> {
 /// `prefix` bytes (letters lowercased, '-' read as '_'), joined with ", ".
 pub fn variable_unknown_header(v: &mut VariableValue, var: &[u8], headers: &[Header], prefix: usize) -> i64 {
     let want = &var[prefix..];
-    let mut found: Vec<&Header> = Vec::new();
+    let matches = |h: &Header| {
+        h.hash.get() != 0
+            && h.key.len() == want.len()
+            && h.key.iter().zip(want.iter()).all(|(&c, &w)| {
+                let ch = if c.is_ascii_uppercase() {
+                    c | 0x20
+                } else if c == b'-' {
+                    b'_'
+                } else {
+                    c
+                };
+                ch == w
+            })
+    };
+    // the length of the value first, then the value in a buffer of it
+    let mut found = 0;
     let mut len = 0;
-    for h in headers.iter() {
-        if h.hash.get() == 0 {
-            continue;
-        }
-        if h.key.len() != want.len() {
-            continue;
-        }
-        let same = h.key.iter().zip(want.iter()).all(|(&c, &w)| {
-            let ch = if c.is_ascii_uppercase() {
-                c | 0x20
-            } else if c == b'-' {
-                b'_'
-            } else {
-                c
-            };
-            ch == w
-        });
-        if !same {
-            continue;
-        }
+    for h in headers.iter().filter(|h| matches(h)) {
         len += h.value.borrow().len() + 2;
-        found.push(h);
+        found += 1;
     }
-    if found.is_empty() {
+    if found == 0 {
         v.not_found = true;
         return NGX_OK;
     }
@@ -1003,12 +1131,8 @@ pub fn variable_unknown_header(v: &mut VariableValue, var: &[u8], headers: &[Hea
     v.valid = true;
     v.no_cacheable = false;
     v.not_found = false;
-    if found.len() == 1 {
-        v.data = found[0].value.borrow().clone();
-        return NGX_OK;
-    }
     let mut p = Vec::with_capacity(len);
-    for (i, h) in found.iter().enumerate() {
+    for (i, h) in headers.iter().filter(|h| matches(h)).enumerate() {
         if i > 0 {
             p.extend_from_slice(b", ");
         }
@@ -1019,48 +1143,44 @@ pub fn variable_unknown_header(v: &mut VariableValue, var: &[u8], headers: &[Hea
 }
 
 fn var_cookie_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let name = &name["cookie_".len()..];
-    let hin = r.headers_in.borrow();
-    let vals: Vec<Vec<u8>> = hin.cookie.iter().map(|h| h.value.borrow().clone()).collect();
-    let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
-    match crate::parse::parse_multi_header_lines(&refs, name, b';') {
-        Some(val) => set_str(v, &val),
-        None => v.not_found = true,
-    }
+    with_prefix_var_name(r, d, |name| {
+        let name = &name["cookie_".len()..];
+        let hin = r.headers_in.borrow();
+        let vals: Vec<std::cell::Ref<'_, Vec<u8>>> = hin.cookie.iter().map(|h| h.value.borrow()).collect();
+        let refs: Vec<&[u8]> = vals.iter().map(|v| v.as_slice()).collect();
+        match crate::parse::parse_multi_header_lines(&refs, name, b';') {
+            Some(val) => set_str(v, &val),
+            None => v.not_found = true,
+        }
+    });
     NGX_OK
 }
 
 fn var_arg_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let name = &name["arg_".len()..];
-    let args = r.args.borrow();
-    match crate::parse::arg(&args, name) {
-        Some(val) => set_str(v, val),
-        None => v.not_found = true,
-    }
+    with_prefix_var_name(r, d, |name| {
+        let name = &name["arg_".len()..];
+        let args = r.args.borrow();
+        match crate::parse::arg(&args, name) {
+            Some(val) => set_str(v, val),
+            None => v.not_found = true,
+        }
+    });
     NGX_OK
 }
 
 /// ngx_http_variable_unknown_header_in
 fn var_http_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let headers = r.headers_in.borrow().headers.clone();
-    variable_unknown_header(v, &name, &headers, "http_".len())
+    with_prefix_var_name(r, d, |name| variable_unknown_header(v, name, &r.headers_in.borrow().headers, "http_".len()))
 }
 
 /// ngx_http_variable_unknown_header_out
 fn var_sent_http_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let headers = r.headers_out.borrow().headers.clone();
-    variable_unknown_header(v, &name, &headers, "sent_http_".len())
+    with_prefix_var_name(r, d, |name| variable_unknown_header(v, name, &r.headers_out.borrow().headers, "sent_http_".len()))
 }
 
 /// ngx_http_variable_unknown_trailer_out
 fn var_sent_trailer_prefix(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let name = prefix_var_name(r, d);
-    let trailers = r.headers_out.borrow().trailers.clone();
-    variable_unknown_header(v, &name, &trailers, "sent_trailer_".len())
+    with_prefix_var_name(r, d, |name| variable_unknown_header(v, name, &r.headers_out.borrow().trailers, "sent_trailer_".len()))
 }
 
 /// ngx_http_variable_sent_content_type
@@ -1082,7 +1202,7 @@ fn var_sent_content_length(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         return NGX_OK;
     }
     if ho.content_length_n >= 0 {
-        set_str(v, ho.content_length_n.to_string().as_bytes());
+        set_int(v, ho.content_length_n);
         return NGX_OK;
     }
     v.not_found = true;
@@ -1133,7 +1253,10 @@ fn var_sent_keep_alive(r: &R, v: &mut VariableValue, _d: usize) -> i64 {
         let clcf = r.clcf();
         let kh = *clcf.borrow().keepalive_header;
         if kh != 0 {
-            set_str(v, format!("timeout={}", kh).as_bytes());
+            v.data.clear();
+            v.data.extend_from_slice(b"timeout=");
+            push_i64(&mut v.data, kh as i64);
+            v.valid = true;
             return NGX_OK;
         }
     }
@@ -1157,8 +1280,8 @@ fn var_proxy_protocol_addr(r: &R, v: &mut VariableValue, d: usize) -> i64 {
         Some(p) => match d {
             0 => set_str(v, &p.src_addr),
             1 => set_str(v, &p.dst_addr),
-            2 => set_str(v, p.src_port.to_string().as_bytes()),
-            _ => set_str(v, p.dst_port.to_string().as_bytes()),
+            2 => set_uint(v, p.src_port as u64),
+            _ => set_uint(v, p.dst_port as u64),
         },
         None => v.not_found = true,
     }
@@ -1171,7 +1294,7 @@ fn var_proxy_protocol_tlv(r: &R, v: &mut VariableValue, d: usize) -> i64 {
     let pp = r.connection.proxy_protocol.borrow().clone();
     match pp.and_then(|p| p.downcast::<ngx_core::proxy_protocol::ProxyProtocol>().ok()) {
         Some(p) => match ngx_core::proxy_protocol::get_tlv(&p, &r.connection.log, tlv) {
-            Ok(Some(val)) => set_str(v, &val),
+            Ok(Some(val)) => set_owned(v, val),
             Ok(None) => v.not_found = true,
             Err(()) => return NGX_ERROR,
         },
@@ -1200,7 +1323,7 @@ fn var_tcpinfo(r: &R, v: &mut VariableValue, d: usize) -> i64 {
         2 => ti.snd_cwnd,
         _ => ti.rcv_space,
     };
-    set_str(v, val.to_string().as_bytes());
+    set_uint(v, val as u64);
     NGX_OK
 }
 
@@ -1285,7 +1408,7 @@ pub static CORE_VARIABLES: &[VarDef] = &[
 /// ngx_http_variable_set_args: the arguments, and the request line's URI no
 /// longer valid for them
 fn set_args(r: &R, v: &mut VariableValue, _d: usize) {
-    *r.args.borrow_mut() = v.data.clone();
+    *r.args.borrow_mut() = std::mem::take(&mut v.data);
     r.valid_unparsed_uri.set(false);
 }
 
@@ -1352,5 +1475,32 @@ mod tests {
         let mut v = VariableValue::default();
         variable_unknown_header(&mut v, b"http_x_bar", &headers, "http_".len());
         assert!(v.not_found && !v.valid);
+    }
+
+    #[test]
+    fn decimal_writers() {
+        let mut b = Vec::new();
+        push_u64(&mut b, 0);
+        b.push(b' ');
+        push_u64(&mut b, 1234567890123);
+        b.push(b' ');
+        push_u64(&mut b, u64::MAX);
+        b.push(b' ');
+        push_i64(&mut b, -42);
+        b.push(b' ');
+        push_i64(&mut b, i64::MIN);
+        assert_eq!(b, format!("0 1234567890123 {} -42 {}", u64::MAX, i64::MIN).into_bytes());
+
+        // "%03ui": padded, never cut
+        for (n, s) in [(0u64, "000"), (7, "007"), (200, "200"), (1234, "1234")] {
+            let mut b = Vec::new();
+            push_u64_pad(&mut b, n, 3);
+            assert_eq!(b, s.as_bytes());
+        }
+
+        let mut v = VariableValue::default();
+        set_msec(&mut v, 1696000000, 5);
+        assert_eq!(v.data, b"1696000000.005".to_vec());
+        assert!(v.valid);
     }
 }
