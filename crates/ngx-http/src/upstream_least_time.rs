@@ -252,7 +252,7 @@ fn get_least_time_peer(pc: &mut PeerConnection, ltp: &mut LeastTimePeerData) -> 
             b.set(RrPeer::checked, now);
         }
 
-        connect_peer(pc, mem, best);
+        connect_rr_peer(pc, &ltp.rrp, best);
 
         b.set(RrPeer::conns, b.get(RrPeer::conns) + 1);
 

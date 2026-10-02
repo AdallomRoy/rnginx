@@ -434,7 +434,7 @@ pub struct UpstreamCache {
     /// unix socket: the upstream part of the error log
     pub schema: RefCell<Rc<[u8]>>,
     pub uri: RefCell<Vec<u8>>,
-    pub peer_name: RefCell<Option<Vec<u8>>>,
+    pub peer_name: RefCell<Option<Rc<[u8]>>>,
     pub peer_unix: Cell<bool>,
 }
 

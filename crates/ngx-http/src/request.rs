@@ -246,7 +246,7 @@ pub struct UpstreamState {
     pub response_length: i64,
     pub bytes_received: i64,
     pub bytes_sent: i64,
-    pub peer: Vec<u8>,
+    pub peer: Option<Rc<[u8]>>,
 }
 
 pub type ContentHandler = Rc<dyn Fn(R) -> BoxFut<i64>>;

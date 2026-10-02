@@ -767,7 +767,7 @@ pub struct RrPeerData {
     pub peers: usize,
     /// the peer chosen, 0 before
     pub current: usize,
-    pub tried: Vec<usize>,
+    pub tried: Tried,
     /// the peers of addresses resolved for the session: they have no
     /// sessions (ngx_stream_upstream_empty_set_session)
     pub resolved: bool,
@@ -775,9 +775,86 @@ pub struct RrPeerData {
 
 const UINTPTR_BITS: usize = usize::BITS as usize;
 
+/// rrp->tried: a bitmap of the peers tried, in rrp->data for up to 64 of
+/// them, allocated for more.
+#[derive(Clone, Debug)]
+pub struct Tried {
+    data: [usize; 1],
+    words: Vec<usize>,
+}
+
+impl Tried {
+    /// The bitmap of `n` peers.
+    pub fn new(n: usize) -> Tried {
+        if n <= UINTPTR_BITS {
+            Tried { data: [0], words: Vec::new() }
+        } else {
+            Tried { data: [0], words: vec![0; n.div_ceil(UINTPTR_BITS)] }
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        if self.words.is_empty() {
+            &self.data
+        } else {
+            &self.words
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        if self.words.is_empty() {
+            &mut self.data
+        } else {
+            &mut self.words
+        }
+    }
+
+    /// The words of the bitmap.
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn get(&self, i: usize) -> Option<&usize> {
+        self.as_slice().get(i)
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, usize> {
+        self.as_mut_slice().iter_mut()
+    }
+
+    /// The bitmap with room for `n` words.
+    fn grow(&mut self, n: usize) {
+        if n > self.len() {
+            if self.words.is_empty() {
+                self.words.push(self.data[0]);
+            }
+
+            self.words.resize(n, 0);
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Tried {
+    type Output = usize;
+
+    fn index(&self, i: usize) -> &usize {
+        &self.as_slice()[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Tried {
+    fn index_mut(&mut self, i: usize) -> &mut usize {
+        &mut self.as_mut_slice()[i]
+    }
+}
+
 impl RrPeerData {
-    fn tried_bitmap(n: usize) -> Vec<usize> {
-        vec![0; n.div_ceil(UINTPTR_BITS).max(1)]
+    fn tried_bitmap(n: usize) -> Tried {
+        Tried::new(n)
     }
 
     pub fn is_tried(&self, i: usize) -> bool {
@@ -787,7 +864,7 @@ impl RrPeerData {
     pub fn set_tried(&mut self, i: usize) {
         let n = i / UINTPTR_BITS;
         if n >= self.tried.len() {
-            self.tried.resize(n + 1, 0);
+            self.tried.grow(n + 1);
         }
         self.tried[n] |= 1 << (i % UINTPTR_BITS);
     }

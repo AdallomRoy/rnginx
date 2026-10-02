@@ -163,7 +163,7 @@ fn get_ip_hash_peer(pc: &mut PeerConnection, iphp: &mut IpHashPeerData) -> i64 {
     iphp.rrp.current = peer;
     peer_ref(mem, peer);
 
-    connect_peer(pc, mem, peer);
+    connect_rr_peer(pc, &iphp.rrp, peer);
 
     let pp = RrPeer::at(mem, peer);
 

@@ -1178,8 +1178,11 @@ async fn connect_peer(r: &R, u: &mut Upstream, sockaddr: &SockAddr, opts: &PeerO
 
     let pc = PeerConn { c: c.clone() };
 
-    // c->data = r
-    g.u.attach(&c);
+    // c->data = r: what the SSL sessions of the connection go to (nothing
+    // else uses it)
+    if ssl.is_some() {
+        g.u.attach(&c);
+    }
 
     let mut deadline = None;
 
@@ -1921,7 +1924,7 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
 
     let peer = match u.resolved.clone() {
         Some(url) => {
-            let resolve = UpstreamPeer::resolve(r, &url, conf.next_upstream, conf.next_upstream_tries, conf.next_upstream_timeout, tag);
+            let resolve = UpstreamPeer::resolve(r, &url, conf.next_upstream, conf.next_upstream_tries, conf.next_upstream_timeout, tag, ssl.is_some());
 
             tokio::select! {
                 res = resolve => res,
@@ -1933,7 +1936,7 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
         }
 
         None => match &conf.upstream {
-            Some(uscf) => UpstreamPeer::init(r, uscf, conf.next_upstream, conf.next_upstream_tries, conf.next_upstream_timeout, tag),
+            Some(uscf) => UpstreamPeer::init(r, uscf, conf.next_upstream, conf.next_upstream_tries, conf.next_upstream_timeout, tag, ssl.is_some()),
             None => {
                 ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "no upstream configuration");
                 Err(NGX_HTTP_INTERNAL_SERVER_ERROR)

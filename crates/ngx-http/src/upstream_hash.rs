@@ -195,7 +195,7 @@ fn get_hash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     hp.rrp.current = peer;
     peer_ref(mem, peer);
 
-    connect_peer(pc, mem, peer);
+    connect_rr_peer(pc, &hp.rrp, peer);
 
     let pp = RrPeer::at(mem, peer);
 
@@ -466,7 +466,7 @@ fn get_chash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     hp.rrp.current = best;
     peer_ref(mem, best);
 
-    connect_peer(pc, mem, best);
+    connect_rr_peer(pc, &hp.rrp, best);
 
     let b = RrPeer::at(mem, best);
 

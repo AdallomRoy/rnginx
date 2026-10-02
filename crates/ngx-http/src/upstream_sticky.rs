@@ -436,7 +436,7 @@ impl StickyPeerData {
         if !self.id.is_empty() {
             // check that the selected peer matches SID from request
 
-            if sid != &self.id {
+            if **sid != *self.id {
                 ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: server with requested SID is unavailable");
             }
         }
