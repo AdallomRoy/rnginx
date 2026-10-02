@@ -340,6 +340,124 @@ fn spawn_posted_tasks() {
     }
 }
 
+/// NGX_TIMER_LAZY_DELAY: ngx_add_timer() leaves a set timer as it is when
+/// the new expiry is less than this many milliseconds from the old one.
+pub const NGX_TIMER_LAZY_DELAY: u64 = 300;
+
+/// The timer of an event (ev->timer.key, ev->timer_set, ev->timedout) for
+/// the task that handles the event: ngx_add_timer() and ngx_del_timer()
+/// over one tokio Sleep, pinned once and reset, instead of a timeout future
+/// made, registered with the timer wheel and cancelled for each wait.
+///
+/// - add(msec) / add_at(deadline): ngx_add_timer(); a set timer is moved
+///   only by NGX_TIMER_LAZY_DELAY or more (C saves rbtree operations that
+///   way; here the wheel's). Moving a timer later is lock-free in tokio
+///   (the entry's expiry is extended in place; the wheel re-files it when
+///   the old expiry comes); moving it earlier re-registers it.
+/// - del(): ngx_del_timer(): no longer set. The Sleep is left as it is, so
+///   the next add() is usually a move later; a deleted timer whose old
+///   expiry passes may wake its waiter once, which finds it not set.
+/// - expired().await / poll_expired(): the event handler's wait for
+///   ev->timedout. Never ready while the timer is not set; once expired,
+///   the timer is not set any more and timedout() is true, as
+///   ngx_event_expire_timers() leaves it before calling the handler.
+///
+/// The methods take &self, so the timer can be shared (Rc) between the
+/// code that sets it and the task waiting for it; one task waits at a time
+/// (the Sleep keeps the waker of the last poll), as an event has one
+/// handler. Made in a runtime (a Sleep is bound to the timer driver); the
+/// Sleep is boxed once per timer, and registered only once polled.
+pub struct EventTimer {
+    sleep: RefCell<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    key: Cell<Option<tokio::time::Instant>>,
+    timedout: Cell<bool>,
+}
+
+impl EventTimer {
+    pub fn new() -> EventTimer {
+        // a Sleep that is never polled is never registered: the deadline
+        // is only that of a Sleep not set yet
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365 * 30);
+
+        EventTimer { sleep: RefCell::new(Box::pin(tokio::time::sleep_until(far))), key: Cell::new(None), timedout: Cell::new(false) }
+    }
+
+    /// ev->timer_set
+    pub fn is_set(&self) -> bool {
+        self.key.get().is_some()
+    }
+
+    /// ev->timer.key: when the timer expires, if set
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.key.get()
+    }
+
+    /// ev->timedout: set when the timer expired, until the handler clears it
+    pub fn timedout(&self) -> bool {
+        self.timedout.get()
+    }
+
+    pub fn set_timedout(&self, timedout: bool) {
+        self.timedout.set(timedout);
+    }
+
+    /// ngx_add_timer(ev, msec)
+    pub fn add(&self, msec: u64) {
+        self.add_at(tokio::time::Instant::now() + std::time::Duration::from_millis(msec));
+    }
+
+    /// ngx_add_timer() with the expiry given: a set timer is moved only if
+    /// by NGX_TIMER_LAZY_DELAY or more
+    pub fn add_at(&self, key: tokio::time::Instant) {
+        if let Some(old) = self.key.get() {
+            let diff = if key > old { key - old } else { old - key };
+
+            if diff < std::time::Duration::from_millis(NGX_TIMER_LAZY_DELAY) {
+                return;
+            }
+        }
+
+        self.key.set(Some(key));
+        self.sleep.borrow_mut().as_mut().reset(key);
+    }
+
+    /// ngx_del_timer(ev)
+    pub fn del(&self) {
+        self.key.set(None);
+    }
+
+    /// Ready once the timer, while set, expires: it is not set any more,
+    /// and timedout() is true.
+    pub fn poll_expired(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::future::Future;
+
+        if self.key.get().is_none() {
+            return std::task::Poll::Pending;
+        }
+
+        match self.sleep.borrow_mut().as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => {
+                self.key.set(None);
+                self.timedout.set(true);
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    /// Wait until the timer expires (see poll_expired()); never, while it
+    /// is not set.
+    pub async fn expired(&self) {
+        std::future::poll_fn(|cx| self.poll_expired(cx)).await
+    }
+}
+
+impl Default for EventTimer {
+    fn default() -> EventTimer {
+        EventTimer::new()
+    }
+}
+
 fn flags_notify() -> Rc<tokio::sync::Notify> {
     FLAGS_NOTIFY.with(|n| n.clone())
 }
@@ -506,7 +624,8 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
         let notify = flags_notify();
         // ngx_add_timer(&ev, ctx->delay): the manager at once, the loader
         // after a minute
-        let mut timer = tokio::time::Instant::now() + std::time::Duration::from_millis(if data == 0 { 0 } else { 60000 });
+        let timer = EventTimer::new();
+        timer.add(if data == 0 { 0 } else { 60000 });
         loop {
             if SIG_TERMINATE.load(Ordering::SeqCst) || SIG_QUIT.load(Ordering::SeqCst) {
                 ngx_log_error!(NGX_LOG_NOTICE, c2.log, None, "exiting");
@@ -519,7 +638,7 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
             // ngx_process_events_and_timers
             tokio::select! {
                 _ = notify.notified() => continue,
-                _ = tokio::time::sleep_until(timer) => {}
+                _ = timer.expired() => {}
             }
             if data == 0 {
                 // ngx_cache_manager_process_handler: every path manager
@@ -540,7 +659,7 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
                 if next == 0 {
                     next = 1;
                 }
-                timer = tokio::time::Instant::now() + std::time::Duration::from_millis(next);
+                timer.add(next);
             } else {
                 // ngx_cache_loader_process_handler: every path loader, once
                 for p in c2.paths.iter() {
@@ -1034,6 +1153,14 @@ async fn accept_mutex_loop(cycle: Rc<Cycle>) {
 
     let accepted = ACCEPTED.with(|a| a.clone());
 
+    // the timer of an iteration (epoll_wait() for accept_mutex_delay)
+    let timer = EventTimer::new();
+
+    let iteration = |timer: &EventTimer| {
+        timer.del();
+        timer.add_at(tokio::time::Instant::now() + delay);
+    };
+
     loop {
         if is_exiting() || !USE_ACCEPT_MUTEX.with(|m| m.get()) {
             return;
@@ -1050,19 +1177,25 @@ async fn accept_mutex_loop(cycle: Rc<Cycle>) {
         }
 
         if trylock_accept_mutex(&cycle).is_err() {
-            tokio::time::sleep(delay).await;
+            iteration(&timer);
+            timer.expired().await;
             continue;
         }
 
         if !ACCEPT_MUTEX_HELD.with(|h| h.get()) {
             // the timer of the iteration
-            tokio::time::sleep(delay).await;
+            iteration(&timer);
+            timer.expired().await;
             continue;
         }
 
         // the iteration: until an accept event is handled, then the mutex
         // is released
-        let _ = tokio::time::timeout(delay, accepted.notified()).await;
+        iteration(&timer);
+        tokio::select! {
+            _ = accepted.notified() => {}
+            _ = timer.expired() => {}
+        }
 
         if ACCEPT_MUTEX_HELD.with(|h| h.get()) {
             accept_mutex_unlock();
@@ -1219,7 +1352,10 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
         start_accepting(&cycle);
         let notify = flags_notify();
         let close_notify = close_notify();
-        let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+        // ngx_shutdown_event's timer (worker_shutdown_timeout)
+        let shutdown = EventTimer::new();
+        // the cycle checks the flags at least once a second
+        let tick = EventTimer::new();
         loop {
             crate::times::update();
             if SIG_TERMINATE.load(Ordering::SeqCst) {
@@ -1250,7 +1386,7 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
                     let ccf = core_conf(&cycle);
                     let to = *ccf.borrow().shutdown_timeout;
                     if to > 0 {
-                        shutdown_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(to));
+                        shutdown.add(to);
                     }
                     close_listening_sockets(&cycle);
                     close_idle_connections();
@@ -1275,15 +1411,13 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
                 ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "exiting");
                 worker_process_exit(&cycle);
             }
-            let deadline = shutdown_deadline;
+            tick.add(1000);
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = close_notify.notified() => {}
-                _ = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => {
-                    shutdown_deadline = None;
-                    close_all_connections();
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(1000)) => {}
+                // ngx_shutdown_timer_handler
+                _ = shutdown.expired() => close_all_connections(),
+                _ = tick.expired() => {}
             }
         }
     });
@@ -1318,4 +1452,106 @@ fn master_exit_single(cycle: &Rc<Cycle>) -> ! {
     }
     close_listening_sockets(cycle);
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn run<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(f);
+    }
+
+    /// The timer expired within `within`.
+    async fn expires(t: &EventTimer, within: u64) -> bool {
+        tokio::time::timeout(Duration::from_millis(within), t.expired()).await.is_ok()
+    }
+
+    #[test]
+    fn timer_add_expire() {
+        run(async {
+            let t = EventTimer::new();
+            assert!(!t.is_set() && !t.timedout());
+            assert!(!expires(&t, 30).await, "not set: never");
+
+            let start = Instant::now();
+            t.add(40);
+            assert!(t.is_set());
+            assert!(t.deadline().unwrap() >= start + Duration::from_millis(40));
+            assert!(expires(&t, 2000).await);
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            assert!(!t.is_set() && t.timedout(), "expired: timer_set = 0, timedout = 1");
+            assert!(!expires(&t, 30).await, "expired once");
+
+            // the handler clears timedout; the timer is set again
+            t.set_timedout(false);
+            t.add(10);
+            assert!(expires(&t, 2000).await);
+            assert!(t.timedout());
+        });
+    }
+
+    #[test]
+    fn timer_lazy_delay() {
+        run(async {
+            let t = EventTimer::new();
+
+            t.add(1000);
+            let key = t.deadline().unwrap();
+
+            // less than NGX_TIMER_LAZY_DELAY away: the timer stays
+            t.add(1000 + NGX_TIMER_LAZY_DELAY - 50);
+            assert_eq!(t.deadline(), Some(key));
+            t.add_at(key - Duration::from_millis(NGX_TIMER_LAZY_DELAY - 1));
+            assert_eq!(t.deadline(), Some(key));
+
+            // as much or more: moved, later or earlier
+            t.add_at(key + Duration::from_millis(NGX_TIMER_LAZY_DELAY));
+            assert_eq!(t.deadline(), Some(key + Duration::from_millis(NGX_TIMER_LAZY_DELAY)));
+            t.add(20);
+            assert!(t.deadline().unwrap() < key);
+            assert!(expires(&t, 2000).await, "moved earlier, it expires then");
+
+            // not set: any expiry is taken
+            t.add(1000);
+            t.del();
+            t.add(1100);
+            assert!(t.deadline().unwrap() > key);
+        });
+    }
+
+    #[test]
+    fn timer_moved_later_and_deleted() {
+        run(async {
+            let t = EventTimer::new();
+
+            // a wait polled the timer at the first expiry, then it is
+            // moved later: it does not expire at the first one
+            t.add(30);
+            assert!(!expires(&t, 5).await);
+            let start = Instant::now();
+            t.add(30 + NGX_TIMER_LAZY_DELAY + 100);
+            assert!(!expires(&t, 200).await);
+            assert!(expires(&t, 2000).await);
+            assert!(start.elapsed() >= Duration::from_millis(NGX_TIMER_LAZY_DELAY + 100));
+
+            // deleted while waited for, it never expires
+            t.add(20);
+            let wait = tokio::time::timeout(Duration::from_millis(100), t.expired());
+            let del = async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                t.del();
+            };
+            let (r, ()) = tokio::join!(wait, del);
+            assert!(r.is_err());
+            assert!(!t.is_set());
+
+            // set again after a delete and an old expiry passed
+            t.add(10);
+            assert!(expires(&t, 2000).await);
+        });
+    }
 }
