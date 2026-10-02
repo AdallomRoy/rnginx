@@ -1,8 +1,8 @@
 # Phase 1 of the performance plan: rules for the workstream agents
 
 Read this fully, then:
-- /home/ubuntu/nginx-bench/PLAN.md: the plan, especially §1–§4. Your workstream's items are in §4.
-- /home/ubuntu/nginx-bench/REPORT.md: the benchmark analysis.
+- bench/PLAN.md: the plan, especially §1–§4. Your workstream's items are in §4.
+- bench/REPORT.md: the benchmark analysis.
 - CONVENTIONS.md and docs/SAFETY.md.
 
 You are one of six agents. Each works in its own git worktree (your cwd), on a branch made from master. The orchestrator merges the branches.
@@ -25,7 +25,7 @@ Cut what each request costs in user space: heap allocations, copies, boxed futur
 
 **Allocations per request.** The main indicator: deterministic, and cheap to measure.
 - Build release: `cargo build --release`.
-- Then run, from /home/ubuntu/nginx-bench:
+- Then run, from /home/ubuntu/rnginx/bench (the main checkout: a worktree's bench/ has no binaries or data):
   `NGX_BENCH_BIN=$PWD_OF_YOUR_WORKTREE/target/release/nginx flock /tmp/nginx-bench.lock python3 analyze.py allocs <scenarios> custom`
   - Scenarios are names from `python3 bench.py --list`, comma-separated.
   - `flock` is required: the harness uses fixed ports and pinned CPUs, and all agents share them.

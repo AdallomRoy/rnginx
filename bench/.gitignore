@@ -1,0 +1,12 @@
+# Not in git: what setup.sh and build-c.sh make, what the runs write, and
+# machine-local leftovers (local/).
+/bin/
+/src/
+/certs/
+/www/
+/www-extra/
+/run/
+/logs/
+/results/
+/local/
+__pycache__/

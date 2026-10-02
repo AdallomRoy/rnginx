@@ -1,0 +1,35 @@
+diff --git a/crates/ngx-core/src/connection.rs b/crates/ngx-core/src/connection.rs
+index 385a953..10920bf 100644
+--- a/crates/ngx-core/src/connection.rs
++++ b/crates/ngx-core/src/connection.rs
+@@ -976,6 +976,11 @@ impl Connection {
+                     if r == 0 && self.ty != libc::SOCK_DGRAM {
+                         self.read_eof.set(true);
+                     }
++                    // EXPERIMENT: a short read drained the socket (epoll is
++                    // edge-triggered; tokio keeps the closed bits)
++                    if r > 0 && r < buf.len() {
++                        guard.clear_ready();
++                    }
+                     return Ok(r);
+                 }
+                 Err(_) => continue,
+diff --git a/crates/ngx-http/src/request_body.rs b/crates/ngx-http/src/request_body.rs
+index 55745ef..0e1ac45 100644
+--- a/crates/ngx-http/src/request_body.rs
++++ b/crates/ngx-http/src/request_body.rs
+@@ -451,7 +451,13 @@ async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i6
+ /// Leftover bytes (pipelined requests) are appended back to the connection buffer.
+ async fn request_body_filter(r: &R, rb: &Rc<RefCell<RequestBody>>, input: Chain) -> (i64, usize) {
+     let chunked = r.headers_in.borrow().chunked;
+-    let data: Vec<u8> = input.iter().filter_map(|b| if let BufData::Memory(v) = &b.data { Some(&v[b.pos..b.last]) } else { None }).flatten().copied().collect();
++    // EXPERIMENT: slice copies instead of a per-byte iterator
++    let mut data: Vec<u8> = Vec::new();
++    for b in input.iter() {
++        if let BufData::Memory(v) = &b.data {
++            data.extend_from_slice(&v[b.pos..b.last]);
++        }
++    }
+     let total = data.len();
+     let mut out = Chain::new();
+     let mut consumed = 0usize;
