@@ -4204,13 +4204,16 @@ fn ngx_ssl_ticket_key_callback(ssl_conn: &mut SslRef, tk: &mut sys::TicketKeyCtx
 
         let (cipher, size) = if keys[0].size == 48 { (openssl::cipher::Cipher::aes_128_cbc(), 16) } else { (openssl::cipher::Cipher::aes_256_cbc(), 32) };
 
+        let mut iv = [0u8; 16];
         let iv_len = cipher.iv_length().min(16);
 
-        if let Err(e) = openssl::rand::rand_bytes(&mut tk.iv_mut()[..iv_len]) {
+        if let Err(e) = openssl::rand::rand_bytes(&mut iv[..iv_len]) {
             put(e);
             ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("RAND_bytes() failed"));
             return -1;
         }
+
+        tk.set_iv(&iv[..iv_len]);
 
         if !tk.cipher_init(cipher, &keys[0].aes_key, true) {
             ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("EVP_EncryptInit_ex() failed"));
@@ -4222,13 +4225,13 @@ fn ngx_ssl_ticket_key_callback(ssl_conn: &mut SslRef, tk: &mut sys::TicketKeyCtx
             return -1;
         }
 
-        tk.name_mut().copy_from_slice(&keys[0].name);
+        tk.set_name(&keys[0].name);
 
         1
     } else {
         /* decrypt session ticket */
 
-        let tname = *tk.name();
+        let tname = tk.name();
 
         let i = match keys.iter().position(|k| k.name == tname) {
             Some(i) => i,

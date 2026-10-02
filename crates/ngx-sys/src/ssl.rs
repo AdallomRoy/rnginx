@@ -1712,45 +1712,62 @@ unsafe extern "C" fn raw_get_session<H: GetSessionCallback>(ssl: *mut ffi::SSL, 
 }
 
 /// The ciphers of a session ticket, as the ticket key callback is given
-/// them: the key name, the IV, the cipher and HMAC contexts to initialize.
+/// them: the key name and the IV buffers of OpenSSL (16 bytes each: in a
+/// decryption they are the ticket's, only read), the cipher and HMAC
+/// contexts to initialize. Valid for the callback only (the lifetime).
 pub struct TicketKeyCtx<'a> {
-    name: &'a mut [u8; 16],
-    iv: &'a mut [u8; 16],
+    name: *mut u8,
+    iv: *mut u8,
     ectx: *mut ffi::EVP_CIPHER_CTX,
     hctx: *mut HMAC_CTX,
+    _call: PhantomData<&'a mut ()>,
 }
 
 impl TicketKeyCtx<'_> {
-    /// key_name: the name of the key of the ticket (decryption), or the
-    /// one to set (encryption)
-    pub fn name(&self) -> &[u8; 16] {
-        self.name
+    /// key_name: the name of the key of the ticket (decryption)
+    pub fn name(&self) -> [u8; 16] {
+        let mut name = [0u8; 16];
+
+        // SAFETY: OpenSSL's key name buffer has 16 bytes, valid for the call
+        unsafe { std::ptr::copy_nonoverlapping(self.name, name.as_mut_ptr(), 16) };
+
+        name
     }
 
-    pub fn name_mut(&mut self) -> &mut [u8; 16] {
-        self.name
+    /// key_name = name (encryption)
+    pub fn set_name(&mut self, name: &[u8; 16]) {
+        // SAFETY: as name(); in an encryption the buffer is OpenSSL's output
+        unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), self.name, 16) };
     }
 
-    /// iv: to fill for an encryption
-    pub fn iv_mut(&mut self) -> &mut [u8; 16] {
-        self.iv
+    /// The IV of an encryption (at most 16 bytes).
+    pub fn set_iv(&mut self, iv: &[u8]) -> bool {
+        if iv.len() > 16 {
+            return false;
+        }
+
+        // SAFETY: OpenSSL's IV buffer has EVP_MAX_IV_LENGTH (16) bytes, valid
+        // for the call; in an encryption it is OpenSSL's output
+        unsafe { std::ptr::copy_nonoverlapping(iv.as_ptr(), self.iv, iv.len()) };
+
+        true
     }
 
     /// EVP_EncryptInit_ex(ectx, cipher, NULL, key, iv) or
     /// EVP_DecryptInit_ex()
     pub fn cipher_init(&mut self, cipher: &CipherRef, key: &[u8], encrypt: bool) -> bool {
-        if key.len() < cipher.key_length() || cipher.iv_length() > self.iv.len() {
+        if key.len() < cipher.key_length() || cipher.iv_length() > 16 {
             return false;
         }
 
         // SAFETY: the cipher context OpenSSL gave the callback; the cipher
-        // reads key_length() bytes of key and iv_length() bytes of the IV,
-        // both checked above
+        // reads key_length() bytes of key and iv_length() bytes of the IV
+        // buffer (16 bytes), both checked above
         unsafe {
             if encrypt {
-                EVP_EncryptInit_ex(self.ectx, cipher.as_ptr(), std::ptr::null_mut(), key.as_ptr(), self.iv.as_ptr()) == 1
+                EVP_EncryptInit_ex(self.ectx, cipher.as_ptr(), std::ptr::null_mut(), key.as_ptr(), self.iv) == 1
             } else {
-                EVP_DecryptInit_ex(self.ectx, cipher.as_ptr(), std::ptr::null_mut(), key.as_ptr(), self.iv.as_ptr()) == 1
+                EVP_DecryptInit_ex(self.ectx, cipher.as_ptr(), std::ptr::null_mut(), key.as_ptr(), self.iv) == 1
             }
         }
     }
@@ -1768,17 +1785,18 @@ impl TicketKeyCtx<'_> {
 }
 
 unsafe extern "C" fn raw_ticket_key<H: TicketKeyCallback>(ssl: *mut ffi::SSL, name: *mut u8, iv: *mut u8, ectx: *mut ffi::EVP_CIPHER_CTX, hctx: *mut HMAC_CTX, enc: c_int) -> c_int {
-    // SAFETY: OpenSSL calls the callback with the SSL being processed, the
-    // key name (TLSEXT_KEYNAME_LENGTH, 16 bytes), the IV buffer
-    // (EVP_MAX_IV_LENGTH, 16 bytes) and the contexts to initialize, all
-    // valid for the call
-    unsafe {
-        let ssl = SslRef::from_ptr_mut(ssl);
-
-        let mut keys = TicketKeyCtx { name: &mut *(name as *mut [u8; 16]), iv: &mut *(iv as *mut [u8; 16]), ectx, hctx };
-
-        H::ticket_key(ssl, &mut keys, enc == 1)
+    if name.is_null() || iv.is_null() {
+        return -1;
     }
+
+    // SAFETY: OpenSSL calls the callback with the SSL being processed; the
+    // buffers and contexts it gives are valid for the call, which the
+    // TicketKeyCtx does not outlive (it is borrowed by the handler only)
+    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+
+    let mut keys = TicketKeyCtx { name, iv, ectx, hctx, _call: PhantomData };
+
+    H::ticket_key(ssl, &mut keys, enc == 1)
 }
 
 unsafe extern "C" fn raw_msg<H: MsgCallback>(write_p: c_int, version: c_int, content_type: c_int, buf: *const c_void, len: usize, ssl: *mut ffi::SSL, _arg: *mut c_void) {
