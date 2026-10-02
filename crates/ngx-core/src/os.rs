@@ -344,11 +344,10 @@ pub fn close(fd: i32) {
 
 /// close(), with its error.
 pub fn close_fd(fd: i32) -> Result<(), i32> {
-    if fd::contains(fd) {
-        return fd::close(fd).map_err(io_errno);
+    match fd::close_registered(fd) {
+        Some(r) => r.map_err(io_errno),
+        None => nix::unistd::close(fd).map_err(|e| e as i32),
     }
-
-    nix::unistd::close(fd).map_err(|e| e as i32)
 }
 
 /// dup(), close-on-exec: the registered duplicate or errno.

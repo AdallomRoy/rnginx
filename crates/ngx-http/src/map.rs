@@ -1,8 +1,10 @@
-//! ngx_http_map_module - variable mapping
+//! ngx_http_map_module: the "map" block, a variable whose value depends on
+//! the value of another (complex) value: exact and wildcard keys in a
+//! combined hash (ngx_hash_find_combined), then the regexes.
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::os::unix::ffi::OsStrExt;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
@@ -10,502 +12,504 @@ use ngx_core::hash::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
-use ngx_core::regex::Regex;
-use ngx_core::string::{B, eq_ignore_case};
-use ngx_core::ngx_log_debug;
+use ngx_core::regex::NGX_REGEX_CASELESS;
+use ngx_core::string::{dns_strcmp, to_lower_vec, B};
+use ngx_core::{cmd, cmd_fn, ngx_log_error};
 
-use crate::script::ComplexValue;
-use crate::variables::{add_variable, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE};
+use crate::script::*;
+use crate::variables::*;
 use crate::{request::*, *};
 
 crate::http_module_index!("ngx_http_map_module");
 
+/// ngx_http_map_conf_t
 pub struct MapMainConf {
-    pub hash_max_size: Val<u32>,
-    pub hash_bucket_size: Val<u32>,
+    pub hash_max_size: Val<i64>,
+    pub hash_bucket_size: Val<i64>,
     /// The maps of the "map" blocks (the configuration pool in C): the
     /// variables' data is the index of their map.
     pub maps: Vec<Rc<MapCtx>>,
 }
 
-fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
-    make_slot(MapMainConf {
-        hash_max_size: Val::unset(),
-        hash_bucket_size: Val::unset(),
-        maps: Vec::new(),
-    })
-}
-
-#[derive(Clone)]
-enum MapEntry {
-    Static(Vec<u8>),
+/// A value of a map: ngx_http_variable_value_t, where "valid = 0" means
+/// the data is a complex value.
+pub enum MapValue {
+    Value(VariableValue),
     Complex(ComplexValue),
 }
 
-struct MapRegex {
-    regex: Rc<crate::variables::HttpRegex>,
-    value: MapEntry,
+pub type MapVal = Rc<MapValue>;
+
+/// ngx_http_map_regex_t
+pub struct MapRegex {
+    pub regex: Rc<HttpRegex>,
+    pub value: MapVal,
 }
 
+/// ngx_http_map_t
+pub struct HttpMap {
+    pub hash: HashCombined<MapVal>,
+    pub regex: Vec<MapRegex>,
+}
+
+/// ngx_http_map_ctx_t
 pub struct MapCtx {
-    cv: ComplexValue,
-    default: RefCell<Option<MapEntry>>,
-    entries: RefCell<Vec<(Vec<u8>, MapEntry)>>,
-    regexes: RefCell<Vec<MapRegex>>,
-    volatile: std::cell::Cell<bool>,
-    hostnames: std::cell::Cell<bool>,
+    pub map: HttpMap,
+    pub value: ComplexValue,
+    pub default_value: MapVal,
+    pub hostnames: bool,
 }
 
-fn is_wildcard_pattern(key: &[u8]) -> bool {
-    if key.is_empty() {
-        return false;
-    }
-    // *.suffix
-    if key[0] == b'*' && key.len() > 1 && key[1] == b'.' {
-        return true;
-    }
-    // prefix.*
-    if key.len() > 1 && key[key.len() - 1] == b'*' && key[key.len() - 2] == b'.' {
-        return true;
-    }
-    // .suffix (leading dot)
-    if key[0] == b'.' {
-        return true;
-    }
-    false
+/// ngx_http_map_conf_ctx_t: the state while the map block is parsed
+struct MapConfCtx {
+    keys: HashKeysArrays<MapVal>,
+
+    /// the values seen, so equal values share the same entry
+    values_hash: HashMap<Vec<u8>, MapVal>,
+    regexes: Vec<MapRegex>,
+
+    default_value: Option<MapVal>,
+    hostnames: bool,
+    no_cacheable: bool,
 }
 
-fn wildcard_match(pattern: &[u8], key: &[u8]) -> bool {
-    // All matching is case-insensitive for hostnames
-
-    // Handle *.suffix pattern (left wildcard): *.example.com matches foo.example.com
-    if pattern.len() > 1 && pattern[0] == b'*' && pattern[1] == b'.' {
-        let suffix = &pattern[1..]; // ".example.com"
-        if key.len() >= suffix.len() {
-            let key_end = &key[key.len() - suffix.len()..];
-            return eq_ignore_case(key_end, suffix);
-        }
-        return false;
-    }
-
-    // Handle prefix.* pattern (right wildcard): example.* matches example.com, example.org
-    if pattern.len() > 1 && pattern[pattern.len() - 1] == b'*' && pattern[pattern.len() - 2] == b'.' {
-        let prefix = &pattern[..pattern.len() - 1]; // "example."
-        if key.len() >= prefix.len() {
-            let key_start = &key[..prefix.len()];
-            return eq_ignore_case(key_start, prefix);
-        }
-        return false;
-    }
-
-    // Handle .suffix pattern (leading dot): .example.com matches foo.example.com, dot.example.com, etc
-    // Also matches subdomain.dot.example.com
-    if pattern.len() > 0 && pattern[0] == b'.' {
-        // Match if the key ends with the pattern
-        if key.len() >= pattern.len() {
-            let key_end = &key[key.len() - pattern.len()..];
-            if eq_ignore_case(key_end, pattern) {
-                return true;
-            }
-        }
-        // Also match if key is exactly the pattern without the leading dot
-        // i.e., .example.com matches example.com
-        if key.len() == pattern.len() - 1 {
-            return eq_ignore_case(key, &pattern[1..]);
-        }
-        return false;
-    }
-
-    false
+/// What the hash part of ngx_http_map_find() found for a value
+enum Found<'a> {
+    Value(&'a MapVal),
+    /// not in the hash: the value (a copy) for the regexes
+    Regex(Vec<u8>),
+    None,
 }
 
+/// ngx_http_map_variable
 fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     // data: the index of the map in the module's main conf
-    let ctx = r.main_conf::<MapMainConf>(ctx_index()).borrow().maps[data].clone();
+    let map = r.main_conf::<MapMainConf>(ctx_index()).borrow().maps[data].clone();
 
-    v.valid = true;
-    v.not_found = false;
-    v.no_cacheable = ctx.volatile.get();
-    v.escape = false;
-    v.data.clear();
+    http_debug!(r, "http map started");
 
-    match crate::script::complex_value(r, &ctx.cv) {
-        Ok(mut lookup_key) => {
-            if ctx.hostnames.get() && !lookup_key.is_empty() && lookup_key[lookup_key.len() - 1] == b'.' {
-                lookup_key.pop();
-            }
+    let debug = r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP);
 
-            // Try exact matches first
-            let entries = ctx.entries.borrow();
-            for (key, entry) in entries.iter() {
-                if is_wildcard_pattern(key) || (key.len() > 0 && key[0] == b'~') {
-                    continue;  // Skip wildcard and regex patterns
-                }
-                if eq_ignore_case(key, &lookup_key) {
-                    match entry {
-                        MapEntry::Static(val) => {
-                            v.data.clone_from(val);
-                        }
-                        MapEntry::Complex(cv) => {
-                            if let Ok(val) = crate::script::complex_value(r, cv) {
-                                v.data = val;
-                            }
-                        }
-                    }
-                    return NGX_OK;
-                }
-            }
+    // the value is looked up in the hash where it is (a variable's cached
+    // value); the regexes, which set the captures and the variables of the
+    // request, match a copy of it
+    let looked_up = with_complex_value(r, &map.value, |val| {
+        let val = if map.hostnames && val.last() == Some(&b'.') { &val[..val.len() - 1] } else { val };
 
-            // Wildcard matches: mimic C hostnames hash lookup semantics by
-            // picking the LONGEST matching pattern rather than first match. The
-            // three families sorted separately:
-            //   left-wildcard  (*.suffix and .suffix)  — longest suffix wins
-            //   right-wildcard (prefix.*)              — longest prefix wins
-            // Left-wildcard beats right-wildcard because hwc_head is checked
-            // before hwc_tail in ngx_http_map_find_ctx / ngx_hash_find_combined.
-            let mut best_left: Option<(usize, &MapEntry)> = None;
-            let mut best_right: Option<(usize, &MapEntry)> = None;
-            for (key, entry) in entries.iter() {
-                if !is_wildcard_pattern(key) || (key.len() > 0 && key[0] == b'~') {
-                    continue;
-                }
-                if !wildcard_match(key, &lookup_key) {
-                    continue;
-                }
-                let is_left = key[0] == b'*' || key[0] == b'.';
-                if is_left {
-                    let suffix_len = if key[0] == b'*' { key.len() - 1 } else { key.len() };
-                    if best_left.map_or(true, |(l, _)| suffix_len > l) {
-                        best_left = Some((suffix_len, entry));
-                    }
-                } else {
-                    // prefix.*
-                    let prefix_len = key.len() - 1;
-                    if best_right.map_or(true, |(l, _)| prefix_len > l) {
-                        best_right = Some((prefix_len, entry));
-                    }
-                }
-            }
-            if let Some((_, entry)) = best_left.or(best_right) {
-                match entry {
-                    MapEntry::Static(val) => v.data.clone_from(val),
-                    MapEntry::Complex(cv) => {
-                        if let Ok(val) = crate::script::complex_value(r, cv) {
-                            v.data = val;
-                        }
-                    }
-                }
-                return NGX_OK;
-            }
+        let shown = if debug { val.to_vec() } else { Vec::new() };
 
-            // Try regexes: ngx_http_regex_exec() sets the captures and
-            // the named capture variables the value may use
-            let regexes = ctx.regexes.borrow();
-            for regex_entry in regexes.iter().filter(|_| !lookup_key.is_empty()) {
-                let n = crate::variables::regex_exec(r, &regex_entry.regex, &lookup_key);
-                if n == NGX_DECLINED {
-                    continue;
-                }
-                if n == NGX_OK {
-                    match &regex_entry.value {
-                        MapEntry::Static(val) => {
-                            v.data.clone_from(val);
-                        }
-                        MapEntry::Complex(cv) => {
-                            if let Ok(val) = crate::script::complex_value(r, cv) {
-                                v.data = val;
-                            }
-                        }
-                    }
-                    return NGX_OK;
-                }
-                // NGX_ERROR
-                break;
-            }
-
-            // Try default
-            if let Some(default) = ctx.default.borrow().as_ref() {
-                match default {
-                    MapEntry::Static(val) => {
-                        v.data.clone_from(val);
-                    }
-                    MapEntry::Complex(cv) => {
-                        if let Ok(val) = crate::script::complex_value(r, cv) {
-                            v.data = val;
-                        }
-                    }
-                }
-            }
-
-            NGX_OK
-        }
-        Err(_) => NGX_OK,
-    }
-}
-
-fn map_include_file(cf: &mut Conf, filename: &[u8], ctx: &MapCtx) -> ConfResult {
-    // Read the file
-    let full_path = cf.full_name(filename, true);
-
-    let data = match std::fs::read(std::ffi::OsStr::from_bytes(&full_path)) {
-        Ok(d) => d,
-        Err(e) => {
-            let en = e.raw_os_error().unwrap_or(0);
-            return Err(cf.emerg(format_args!("open() \"{}\" failed", B(&full_path))));
-        }
-    };
-
-    // Register the included file for `nginx -T` dumps. add_config_dump
-    // dedups by name so re-including the same file is fine.
-    cf.cycle.add_config_dump(&full_path, &data);
-
-    let content = match std::str::from_utf8(&data) {
-        Ok(s) => s,
-        Err(_) => return Err(cf.emerg(format_args!("invalid UTF-8 in \"{}\"", B(&full_path)))),
-    };
-
-    // Parse each line as "key value"
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Split on whitespace (first split is key, rest is value)
-        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-
-        let key = parts[0].as_bytes();
-        let mut value_str = parts[1].trim();
-
-        // Strip trailing semicolon if present
-        if value_str.ends_with(';') {
-            value_str = &value_str[..value_str.len()-1].trim_end();
-        }
-
-        let value_bytes = value_str.as_bytes();
-
-        // Parse the value (can be a variable or static string)
-        let value = if value_bytes.contains(&b'$') {
-            MapEntry::Complex(crate::script::compile_complex_value(cf, value_bytes, 0)?)
-        } else {
-            MapEntry::Static(value_bytes.to_vec())
+        let found = match map_find_hash(&map.map, val) {
+            Some(value) => Found::Value(value),
+            None if !val.is_empty() && !map.map.regex.is_empty() => Found::Regex(val.to_vec()),
+            None => Found::None,
         };
 
-        // Add entry to map
-        if !key.is_empty() && key[0] == b'~' {
-            // Regex pattern
-            let is_case_sensitive = key.len() < 2 || key[1] != b'*';
-            let pattern_start = if is_case_sensitive { 1 } else { 2 };
-            let pattern = &key[pattern_start..];
-
-            let flags = if is_case_sensitive { 0 } else { ngx_core::regex::NGX_REGEX_CASELESS };
-            let regex = crate::variables::regex_compile(cf, pattern, flags)?;
-            ctx.regexes.borrow_mut().push(MapRegex { regex, value });
-        } else {
-            // Regular entry
-            ctx.entries.borrow_mut().push((key.to_vec(), value));
-        }
-    }
-
-    Ok(())
-}
-
-fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
-    let args = cf.args.clone();
-
-    let key = &args[0];
-
-    let ctx = conf.downcast::<MapCtx>().map_err(|_| msg("invalid conf"))?;
-    let ctx = &*ctx;
-
-    // Single argument: flags (hostnames / volatile inside the block).
-    // C ngx_http_map_block does the same recognition inside the block body.
-    if args.len() == 1 {
-        if key.as_slice() == b"hostnames" {
-            ctx.hostnames.set(true);
-        } else if key.as_slice() == b"volatile" {
-            ctx.volatile.set(true);
-        }
-        return Ok(());
-    }
-
-    // Two arguments: key value
-    if args.len() != 2 {
-        return Ok(());
-    }
-
-    let value_str = &args[1];
-
-    // Handle "include" directive - but only if the file exists
-    // If key is "include" and the file doesn't exist, treat it as a literal key instead
-    if key == b"include" && !args.is_empty() && args.len() >= 2 {
-        let full_path = cf.full_name(value_str, true);
-        // Check if the file exists
-        if std::fs::metadata(std::ffi::OsStr::from_bytes(&full_path)).is_ok() {
-            return map_include_file(cf, value_str, ctx);
-        }
-        // If file doesn't exist, fall through to treat as literal key
-    }
-
-    let value = if value_str.contains(&b'$') {
-        MapEntry::Complex(crate::script::compile_complex_value(cf, value_str, 0)?)
-    } else {
-        MapEntry::Static(value_str.clone())
-    };
-
-    if key == b"default" {
-        *ctx.default.borrow_mut() = Some(value);
-        return Ok(());
-    }
-
-    // Handle escaped keys: nginx's tokenizer preserves a leading '\' when it
-    // introduces an otherwise-magic word (`\include`, `\default`, ...), which
-    // is how the user tells map "no, this is a literal key, not a directive".
-    // In our config parser the '\' also survives, so strip it here to match
-    // ngx_http_map_module.c's effective behavior of storing just the tail.
-    let key: Vec<u8> = if key.len() >= 2 && key[0] == b'\\' {
-        key[1..].to_vec()
-    } else {
-        key.clone()
-    };
-    let key_ref = key.as_slice();
-
-    if !key_ref.is_empty() && key_ref[0] == b'~' {
-        let is_case_sensitive = key.len() < 2 || key[1] != b'*';
-        let pattern_start = if is_case_sensitive { 1 } else { 2 };
-        let pattern = &key[pattern_start..];
-
-        let flags = if is_case_sensitive { 0 } else { ngx_core::regex::NGX_REGEX_CASELESS };
-        let pattern = pattern.to_vec();
-        let regex = crate::variables::regex_compile(cf, &pattern, flags)?;
-        ctx.regexes.borrow_mut().push(MapRegex { regex, value });
-        Ok(())
-    } else {
-        ctx.entries.borrow_mut().push((key.clone(), value));
-        Ok(())
-    }
-}
-
-fn map_block_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let args = cf.args.clone();
-    if args.len() < 3 {
-        return Err(msg("requires at least 2 arguments"));
-    }
-
-    let cv = crate::script::compile_complex_value(cf, &args[1], 0)?;
-
-    let var_name = &args[2];
-    if var_name.is_empty() || var_name[0] != b'$' {
-        return Err(msg("invalid variable name"));
-    }
-
-    // Parse flags from map directive arguments (volatile, hostnames, etc.)
-    let mut volatile = false;
-    let mut hostnames = false;
-    for arg in args.iter().skip(3) {
-        if arg == b"volatile" {
-            volatile = true;
-        } else if arg == b"hostnames" {
-            hostnames = true;
-        }
-    }
-
-    // If volatile, add NOCACHEABLE flag to prevent caching
-    let var_flags = if volatile {
-        NGX_HTTP_VAR_CHANGEABLE | NGX_HTTP_VAR_NOCACHEABLE
-    } else {
-        NGX_HTTP_VAR_CHANGEABLE
-    };
-
-    let var = add_variable(cf, &var_name[1..], var_flags)?;
-
-    let ctx = Rc::new(MapCtx {
-        cv,
-        default: RefCell::new(None),
-        entries: RefCell::new(Vec::new()),
-        regexes: RefCell::new(Vec::new()),
-        volatile: std::cell::Cell::new(volatile),
-        hostnames: std::cell::Cell::new(hostnames),
+        (found, shown)
     });
 
-    let index = {
-        let mcf = conf_rc::<MapMainConf>(conf.as_ref().ok_or_else(|| msg("no conf"))?);
-        let mut m = mcf.borrow_mut();
-        m.maps.push(ctx.clone());
-        m.maps.len() - 1
+    let (found, shown) = match looked_up {
+        Ok(f) => f,
+        Err(_) => return NGX_ERROR,
     };
 
+    let value = match found {
+        Found::Value(value) => Some(value),
+        Found::Regex(val) => map_find_regex(r, &map.map, &val),
+        Found::None => None,
+    };
+
+    match &**value.unwrap_or(&map.default_value) {
+        MapValue::Complex(cv) => {
+            let str = match complex_value(r, cv) {
+                Ok(s) => s,
+                Err(_) => return NGX_ERROR,
+            };
+
+            *v = VariableValue { data: str, valid: true, no_cacheable: false, not_found: false, escape: false };
+        }
+
+        MapValue::Value(vv) => *v = vv.clone(),
+    }
+
+    http_debug!(r, "http map: \"{}\" \"{}\"", B(&shown), B(&v.data));
+
+    NGX_OK
+}
+
+/// The hash part of ngx_http_map_find(): the value lowercased
+/// (ngx_hash_strlow, on the stack for the usual values) and looked up with
+/// ngx_hash_find_combined()
+fn map_find_hash<'a>(map: &'a HttpMap, val: &[u8]) -> Option<&'a MapVal> {
+    let mut stack = [0u8; 256];
+    let mut heap = Vec::new();
+
+    let low: &mut [u8] = if val.len() <= stack.len() {
+        &mut stack[..val.len()]
+    } else {
+        heap.resize(val.len(), 0);
+        &mut heap
+    };
+
+    let key = hash_strlow(low, val);
+
+    map.hash.find(key, low)
+}
+
+/// The regex part of ngx_http_map_find(): the value of the first regex that
+/// matches the value; None when none does, or on an error (NULL)
+fn map_find_regex<'a>(r: &R, map: &'a HttpMap, val: &[u8]) -> Option<&'a MapVal> {
+    for reg in map.regex.iter() {
+        let n = regex_exec(r, &reg.regex, val);
+
+        if n == NGX_OK {
+            return Some(&reg.value);
+        }
+
+        if n == NGX_DECLINED {
+            continue;
+        }
+
+        // NGX_ERROR
+
+        return None;
+    }
+
+    None
+}
+
+/// ngx_http_map_create_conf
+fn map_create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
+    make_slot(MapMainConf { hash_max_size: Val::unset(), hash_bucket_size: Val::unset(), maps: Vec::new() })
+}
+
+/// ngx_http_map_block
+fn map_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
+    let mcf = conf_rc::<MapMainConf>(conf.as_ref().expect("map conf"));
+
+    let (max_size, bucket_size) = {
+        let mut m = mcf.borrow_mut();
+
+        if !m.hash_max_size.is_set() {
+            m.hash_max_size = Val::set(2048);
+        }
+
+        let cl = ngx_core::os::cacheline_size() as i64;
+
+        if !m.hash_bucket_size.is_set() {
+            m.hash_bucket_size = Val::set(cl);
+        } else {
+            let v = *m.hash_bucket_size;
+            m.hash_bucket_size = Val::set((v + cl - 1) / cl * cl);
+        }
+
+        (*m.hash_max_size, *m.hash_bucket_size)
+    };
+
+    let value = cf.args.clone();
+
+    let map_value = compile_complex_value(cf, &value[1], 0)?;
+
+    let name = &value[2];
+
+    if name.first() != Some(&b'$') {
+        return Err(cf.emerg(format_args!("invalid variable name \"{}\"", B(name))));
+    }
+
+    let var = add_variable(cf, &name[1..], NGX_HTTP_VAR_CHANGEABLE)?;
+
     var.get_handler.set(Some(map_variable));
-    var.data.set(index);
 
-    let saved_h = cf.handler.take();
-    let saved_hc = cf.handler_conf.take();
-    cf.handler = Some(map_item_handler);
-    cf.handler_conf = Some(ctx as Rc<dyn Any>);
+    let ctx = Rc::new(RefCell::new(MapConfCtx {
+        keys: HashKeysArrays::new(HashKind::Large),
+        values_hash: HashMap::new(),
+        regexes: Vec::new(),
+        default_value: None,
+        hostnames: false,
+        no_cacheable: false,
+    }));
 
-    cf.parse_block()?;
+    let saved_handler = cf.handler.take();
+    let saved_handler_conf = cf.handler_conf.take();
 
-    cf.handler = saved_h;
-    cf.handler_conf = saved_hc;
+    cf.handler = Some(map_handler);
+    cf.handler_conf = Some(ctx.clone() as Rc<dyn Any>);
 
-    // Set volatile flag if needed
-    if volatile {
+    let rv = cf.parse_block();
+
+    cf.handler = saved_handler;
+    cf.handler_conf = saved_handler_conf;
+
+    rv?;
+
+    let ctx = match Rc::try_unwrap(ctx) {
+        Ok(c) => c.into_inner(),
+        Err(_) => return Err(ConfError::Logged),
+    };
+
+    if ctx.no_cacheable {
         var.flags.set(var.flags.get() | NGX_HTTP_VAR_NOCACHEABLE);
     }
 
+    // ngx_http_variable_null_value
+    let default_value = ctx.default_value.clone().unwrap_or_else(|| Rc::new(MapValue::Value(VariableValue { valid: true, ..Default::default() })));
+
+    let hinit = HashInit { name: "map_hash", max_size: max_size as usize, bucket_size: bucket_size as usize, log: &cf.log };
+
+    let fail = |e: String| {
+        ngx_log_error!(NGX_LOG_EMERG, cf.log, None, "{}", e);
+        ConfError::Logged
+    };
+
+    let hash = if !ctx.keys.keys().is_empty() {
+        Hash::init(&hinit, ctx.keys.keys().to_vec()).map_err(fail)?
+    } else {
+        // no exact keys: the hash is empty (hash.buckets == NULL in C)
+        Hash::init(&HashInit { name: "map_hash", max_size: 1, bucket_size: bucket_size as usize, log: &cf.log }, Vec::new()).map_err(fail)?
+    };
+
+    let mut wc_head = None;
+    let mut wc_tail = None;
+
+    if !ctx.keys.dns_wc_head().is_empty() {
+        let mut keys = ctx.keys.dns_wc_head().to_vec();
+        keys.sort_by(map_cmp_dns_wildcards);
+        wc_head = Some(HashWildcard::init(&hinit, keys).map_err(fail)?);
+    }
+
+    if !ctx.keys.dns_wc_tail().is_empty() {
+        let mut keys = ctx.keys.dns_wc_tail().to_vec();
+        keys.sort_by(map_cmp_dns_wildcards);
+        wc_tail = Some(HashWildcard::init(&hinit, keys).map_err(fail)?);
+    }
+
+    let map = Rc::new(MapCtx {
+        map: HttpMap { hash: HashCombined { hash, wc_head, wc_tail }, regex: ctx.regexes },
+        value: map_value,
+        default_value,
+        hostnames: ctx.hostnames,
+    });
+
+    let mut m = mcf.borrow_mut();
+
+    var.data.set(m.maps.len());
+
+    m.maps.push(map);
+
     Ok(())
 }
 
-fn set_num(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
-    let slot = conf.ok_or_else(|| msg("no conf"))?;
-    let mut mcf = conf_cell::<MapMainConf>(&slot).borrow_mut();
-    let args = cf.args.clone();
+/// ngx_http_map_cmp_dns_wildcards (ngx_qsort)
+fn map_cmp_dns_wildcards(one: &HashKey<MapVal>, two: &HashKey<MapVal>) -> std::cmp::Ordering {
+    dns_strcmp(&one.key, &two.key).cmp(&0)
+}
 
-    if args.len() < 2 {
-        return Err(msg("requires an argument"));
+/// The "include" of a map block: ngx_conf_include() with the map handler.
+fn map_include(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
+    let dummy = Command::new("include", NGX_ANY_CONF | NGX_CONF_TAKE1, ConfLevel::None, conf_include);
+    conf_include(cf, &dummy, Some(conf))
+}
+
+/// ngx_http_map: a line of the map block
+fn map_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
+    let ctx = conf.clone().downcast::<RefCell<MapConfCtx>>().expect("map conf ctx");
+
+    let mut value = cf.args.clone();
+
+    if value.len() == 1 && value[0] == b"hostnames" {
+        ctx.borrow_mut().hostnames = true;
+        return Ok(());
     }
 
-    let val_str = std::str::from_utf8(&args[1]).map_err(|_| msg("invalid number"))?;
-    let val: u32 = val_str.parse().map_err(|_| msg("invalid number"))?;
-
-    if args[0] == b"map_hash_max_size" {
-        mcf.hash_max_size = Val::set(val);
-    } else if args[0] == b"map_hash_bucket_size" {
-        mcf.hash_bucket_size = Val::set(val);
+    if value.len() == 1 && value[0] == b"volatile" {
+        ctx.borrow_mut().no_cacheable = true;
+        return Ok(());
     }
 
-    Ok(())
+    if value.len() != 2 {
+        return Err(cf.emerg(format_args!("invalid number of the map parameters")));
+    }
+
+    if value[0] == b"include" {
+        return map_include(cf, conf);
+    }
+
+    let existing = ctx.borrow().values_hash.get(&value[1]).cloned();
+
+    let var = match existing {
+        Some(v) => v,
+        None => {
+            let v = value[1].clone();
+
+            let cv = compile_complex_value(cf, &v, 0)?;
+
+            let var = if !cv.is_constant() {
+                Rc::new(MapValue::Complex(cv))
+            } else {
+                Rc::new(MapValue::Value(VariableValue { data: v.clone(), valid: true, no_cacheable: false, not_found: false, escape: false }))
+            };
+
+            ctx.borrow_mut().values_hash.insert(v, var.clone());
+
+            var
+        }
+    };
+
+    // found:
+
+    if value[0] == b"default" {
+        if ctx.borrow().default_value.is_some() {
+            return Err(cf.emerg(format_args!("duplicate default map parameter")));
+        }
+
+        ctx.borrow_mut().default_value = Some(var);
+
+        return Ok(());
+    }
+
+    if value[0].first() == Some(&b'~') {
+        let mut pattern = &value[0][1..];
+        let mut options = 0;
+
+        if pattern.first() == Some(&b'*') {
+            pattern = &pattern[1..];
+            options = NGX_REGEX_CASELESS;
+        }
+
+        let pattern = pattern.to_vec();
+
+        let regex = regex_compile(cf, &pattern, options)?;
+
+        ctx.borrow_mut().regexes.push(MapRegex { regex, value: var });
+
+        return Ok(());
+    }
+
+    if value[0].first() == Some(&b'\\') {
+        value[0].remove(0);
+    }
+
+    let key = value[0].clone();
+
+    let rv = {
+        let mut c = ctx.borrow_mut();
+        let flags = if c.hostnames { NGX_HASH_WILDCARD_KEY } else { 0 };
+        c.keys.add_key(key.clone(), var, flags)
+    };
+
+    if rv == NGX_OK {
+        return Ok(());
+    }
+
+    if rv == NGX_DECLINED {
+        return Err(cf.emerg(format_args!("invalid hostname or wildcard \"{}\"", B(&key))));
+    }
+
+    if rv == NGX_BUSY {
+        // ngx_hash_add_key() lowercases the key in place
+        return Err(cf.emerg(format_args!("conflicting parameter \"{}\"", B(&to_lower_vec(&key)))));
+    }
+
+    Err(ConfError::Logged)
 }
 
 pub fn map_module() -> ModuleDef {
-    let def = HttpModuleDef {
-        create_main_conf: Some(create_main_conf),
-        ..Default::default()
-    };
+    let def = HttpModuleDef { create_main_conf: Some(map_create_conf), ..Default::default() };
     let commands = vec![
-        ngx_core::cmd_fn!(
-            "map",
-            NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE2,
-            ConfLevel::Main,
-            map_block_handler
-        ),
-        ngx_core::cmd_fn!(
-            "map_hash_max_size",
-            NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
-            ConfLevel::Main,
-            set_num
-        ),
-        ngx_core::cmd_fn!(
-            "map_hash_bucket_size",
-            NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
-            ConfLevel::Main,
-            set_num
-        ),
+        cmd_fn!("map", NGX_HTTP_MAIN_CONF | NGX_CONF_BLOCK | NGX_CONF_TAKE2, ConfLevel::Main, map_block),
+        cmd!("map_hash_max_size", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::Main, MapMainConf, hash_max_size, set_num),
+        cmd!("map_hash_bucket_size", NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ConfLevel::Main, MapMainConf, hash_bucket_size, set_num),
     ];
     http_module_def("ngx_http_map_module", def, commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn val(s: &str) -> MapVal {
+        Rc::new(MapValue::Value(VariableValue { data: s.as_bytes().to_vec(), valid: true, ..Default::default() }))
+    }
+
+    /// The combined hash of the keys of a block with "hostnames".
+    fn hostnames_map(keys: &[(&str, &str)]) -> HttpMap {
+        let mut k = HashKeysArrays::new(HashKind::Large);
+        for (key, value) in keys {
+            assert_eq!(k.add_key(key.as_bytes().to_vec(), val(value), NGX_HASH_WILDCARD_KEY), NGX_OK, "{}", key);
+        }
+
+        let log = Log::stderr(NGX_LOG_ALERT);
+        let hinit = HashInit { name: "map_hash", max_size: 2048, bucket_size: 64, log: &log };
+
+        let hash = Hash::init(&hinit, k.keys().to_vec()).unwrap();
+
+        let mut head = k.dns_wc_head().to_vec();
+        head.sort_by(map_cmp_dns_wildcards);
+        let mut tail = k.dns_wc_tail().to_vec();
+        tail.sort_by(map_cmp_dns_wildcards);
+
+        let wc_head = if head.is_empty() { None } else { Some(HashWildcard::init(&hinit, head).unwrap()) };
+        let wc_tail = if tail.is_empty() { None } else { Some(HashWildcard::init(&hinit, tail).unwrap()) };
+
+        HttpMap { hash: HashCombined { hash, wc_head, wc_tail }, regex: Vec::new() }
+    }
+
+    fn find(map: &HttpMap, s: &str) -> Option<String> {
+        map_find_hash(map, s.as_bytes()).map(|v| match &**v {
+            MapValue::Value(vv) => String::from_utf8(vv.data.clone()).unwrap(),
+            MapValue::Complex(_) => "complex".to_string(),
+        })
+    }
+
+    #[test]
+    fn exact_and_wildcards() {
+        // the keys of map.t
+        let map = hostnames_map(&[
+            ("example.com", "foo"),
+            ("example.*", "right-wildcard"),
+            ("*.example.com", "left-wildcard"),
+            (".dot.example.com", "special-wildcard"),
+        ]);
+
+        assert_eq!(find(&map, "example.com").as_deref(), Some("foo"));
+        assert_eq!(find(&map, "EXAMPLE.COM").as_deref(), Some("foo"));
+        assert_eq!(find(&map, "example.org").as_deref(), Some("right-wildcard"));
+        assert_eq!(find(&map, "foo.example.com").as_deref(), Some("left-wildcard"));
+        assert_eq!(find(&map, "dot.example.com").as_deref(), Some("special-wildcard"));
+        assert_eq!(find(&map, "www.dot.example.com").as_deref(), Some("special-wildcard"));
+        assert_eq!(find(&map, "regex.example.org").as_deref(), None);
+        assert_eq!(find(&map, "example").as_deref(), None);
+        assert_eq!(find(&map, "").as_deref(), None);
+
+        // a value longer than the stack buffer is lowercased on the heap
+        let long = format!("{}.example.com", "A".repeat(300));
+        assert_eq!(find(&map, &long).as_deref(), Some("left-wildcard"));
+    }
+
+    #[test]
+    fn many_keys() {
+        let keys: Vec<(String, String)> = (0..5000).map(|i| (format!("key{}", i), format!("value{}", i))).collect();
+        let refs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let map = hostnames_map(&refs);
+
+        for (k, v) in keys.iter().step_by(7) {
+            assert_eq!(find(&map, k).as_deref(), Some(v.as_str()));
+            assert_eq!(find(&map, &k.to_uppercase()).as_deref(), Some(v.as_str()));
+        }
+
+        assert_eq!(find(&map, "key5000"), None);
+    }
+
+    #[test]
+    fn dns_wildcards_sort() {
+        let v = val("");
+        let mut keys = vec![
+            HashKey { key: b"org.example".to_vec(), key_hash: 0, value: v.clone() },
+            HashKey { key: b"com.example.".to_vec(), key_hash: 0, value: v.clone() },
+            HashKey { key: b"com.example".to_vec(), key_hash: 0, value: v.clone() },
+        ];
+        keys.sort_by(map_cmp_dns_wildcards);
+        assert_eq!(keys[0].key, b"com.example");
+        assert_eq!(keys[1].key, b"com.example.");
+        assert_eq!(keys[2].key, b"org.example");
+    }
 }

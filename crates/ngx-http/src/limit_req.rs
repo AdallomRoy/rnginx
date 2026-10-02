@@ -78,8 +78,9 @@ shm_struct! {
 pub struct LimitReqCtx {
     /// ctx->sh: the offset of the shctx in the zone
     sh: Cell<usize>,
-    /// the zone's memory, its slab pool at the start (ctx->shpool)
-    mem: RefCell<Option<Rc<ShmMem>>>,
+    /// the zone's memory, its slab pool at the start (ctx->shpool), set by
+    /// the zone's init
+    mem: std::cell::OnceCell<Rc<ShmMem>>,
     /// integer value, 1 corresponds to 0.001 r/s
     rate: usize,
     key: ComplexValue,
@@ -89,8 +90,8 @@ pub struct LimitReqCtx {
 }
 
 impl LimitReqCtx {
-    fn mem(&self) -> Rc<ShmMem> {
-        self.mem.borrow().clone().expect("limit_req zone memory")
+    fn mem(&self) -> &ShmMem {
+        self.mem.get().expect("limit_req zone memory")
     }
 
     /// &ctx->sh->rbtree
@@ -108,6 +109,9 @@ impl LimitReqCtx {
 #[derive(Clone)]
 pub struct LimitReqLimit {
     shm_zone: Rc<ShmZone>,
+    /// shm_zone->data, looked up on the first request (a limit_req_zone
+    /// may follow the limit_req naming its zone)
+    ctx: std::cell::OnceCell<Rc<LimitReqCtx>>,
     /// integer value, 1 corresponds to 0.001 r/s
     burst: usize,
     delay: usize,
@@ -173,9 +177,10 @@ fn lr_cmp(key: &[u8], lr: LimitReqNode<'_>) -> i32 {
 }
 
 /// The zone's context: shm_zone->data, set by limit_req_zone (a zone that
-/// no limit_req_zone declared has no size, and the configuration fails).
-fn zone_ctx(limit: &LimitReqLimit) -> Rc<LimitReqCtx> {
-    limit.shm_zone.data::<LimitReqCtx>().expect("limit_req zone without data")
+/// no limit_req_zone declared has no size, and the configuration fails),
+/// downcast once per limit.
+fn zone_ctx(limit: &LimitReqLimit) -> &LimitReqCtx {
+    limit.ctx.get_or_init(|| limit.shm_zone.data::<LimitReqCtx>().expect("limit_req zone without data"))
 }
 
 /// ngx_http_limit_req_handler
@@ -211,36 +216,44 @@ async fn limit_req_handler(r: R) -> i64 {
 
         let ctx = zone_ctx(&limits[n]);
 
-        let key = match complex_value(&r, &ctx.key) {
-            Ok(k) => k,
+        // the key is looked up where it is (a variable's cached value):
+        // None for an empty or too long key
+        let looked_up = with_complex_value(&r, &ctx.key, |key| {
+            if key.is_empty() {
+                return None;
+            }
+
+            if key.len() > 65535 {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 65535 bytes: \"{}\"", B(&ctx.key.value), B(key));
+                return None;
+            }
+
+            let hash = crc32fast::hash(key);
+
+            let mem = ctx.mem();
+            let shpool = SlabPool::of(&mem);
+
+            shpool.lock();
+
+            // the zone's rbtree and queue are used under its mutex
+            let rc = limit_req_lookup(&limits[n], hash, key, &mut excess, n == limits.len() - 1);
+
+            shpool.unlock();
+
+            Some(rc)
+        });
+
+        rc = match looked_up {
+            Ok(Some(rc)) => rc,
+            Ok(None) => {
+                n += 1;
+                continue;
+            }
             Err(_) => {
                 limit_req_unlock(limits, n);
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         };
-
-        if key.is_empty() {
-            n += 1;
-            continue;
-        }
-
-        if key.len() > 65535 {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 65535 bytes: \"{}\"", B(&ctx.key.value), B(&key));
-            n += 1;
-            continue;
-        }
-
-        let hash = crc32fast::hash(&key);
-
-        let mem = ctx.mem();
-        let shpool = SlabPool::of(&mem);
-
-        shpool.lock();
-
-        // the zone's rbtree and queue are used under its mutex
-        rc = limit_req_lookup(&limits[n], hash, &key, &mut excess, n == limits.len() - 1);
-
-        shpool.unlock();
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit_req[{}]: {} {}.{:03}", n, rc, excess / 1000, excess % 1000);
 
@@ -693,7 +706,9 @@ fn limit_req_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Res
         }
 
         ctx.sh.set(octx.sh.get());
-        *ctx.mem.borrow_mut() = octx.mem.borrow().clone();
+        if let Some(mem) = octx.mem.get() {
+            let _ = ctx.mem.set(mem.clone());
+        }
 
         return Ok(());
     }
@@ -701,7 +716,7 @@ fn limit_req_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Res
     let mem = shm_zone.mem();
     let shpool = SlabPool::of(&mem);
 
-    *ctx.mem.borrow_mut() = Some(mem.clone());
+    let _ = ctx.mem.set(mem.clone());
 
     if shm_zone.shm.exists.get() {
         ctx.sh.set(shpool.data());
@@ -839,7 +854,7 @@ fn limit_req_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> C
         return Err(cf.emerg(format_args!("{} \"{}\" is already bound to key \"{}\"", cmd.name, B(&name), B(&ctx.key.value))));
     }
 
-    let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: RefCell::new(None), rate, key, node: Cell::new(0) });
+    let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), rate, key, node: Cell::new(0) });
 
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_req_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
@@ -902,7 +917,7 @@ fn limit_req(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRes
         return Err(msg("is duplicate"));
     }
 
-    limits.push(LimitReqLimit { shm_zone, burst: burst.wrapping_mul(1000) as usize, delay: delay.wrapping_mul(1000) as usize });
+    limits.push(LimitReqLimit { shm_zone, ctx: std::cell::OnceCell::new(), burst: burst.wrapping_mul(1000) as usize, delay: delay.wrapping_mul(1000) as usize });
 
     Ok(())
 }
@@ -974,7 +989,7 @@ mod tests {
         let zone = ShmZone::new(b"test".to_vec(), mem.len(), TAG);
         zone.shm.attach(mem);
 
-        let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: RefCell::new(None), rate, key: ComplexValue::constant(b"$binary_remote_addr"), node: Cell::new(0) });
+        let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), rate, key: ComplexValue::constant(b"$binary_remote_addr"), node: Cell::new(0) });
 
         *zone.data.borrow_mut() = Some(ctx);
 
@@ -988,7 +1003,7 @@ mod tests {
     }
 
     fn limit(zone: &Rc<ShmZone>, burst: usize, delay: usize) -> LimitReqLimit {
-        LimitReqLimit { shm_zone: zone.clone(), burst: burst * 1000, delay: delay * 1000 }
+        LimitReqLimit { shm_zone: zone.clone(), ctx: std::cell::OnceCell::new(), burst: burst * 1000, delay: delay * 1000 }
     }
 
     fn lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], account: bool) -> (i64, usize) {

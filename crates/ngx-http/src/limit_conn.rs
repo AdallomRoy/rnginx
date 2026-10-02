@@ -41,10 +41,37 @@ shm_struct! {
     }
 }
 
-/// ngx_http_limit_conn_cleanup_t
+/// ngx_http_limit_conn_cleanup_t: the zone's context instead of the zone
 struct LimitConnCleanup {
-    shm_zone: Rc<ShmZone>,
+    ctx: Rc<LimitConnCtx>,
     node: usize,
+}
+
+/// The cleanups the handler adds to the request's pool: the first inline,
+/// as there is usually one limit, the others in a Vec; popped in the
+/// reverse order of their addition, as the pool runs them.
+#[derive(Default)]
+struct Cleanups {
+    first: Option<LimitConnCleanup>,
+    rest: Vec<LimitConnCleanup>,
+}
+
+impl Cleanups {
+    fn push(&mut self, c: LimitConnCleanup) {
+        if self.first.is_none() && self.rest.is_empty() {
+            self.first = Some(c);
+        } else {
+            self.rest.push(c);
+        }
+    }
+
+    fn pop(&mut self) -> Option<LimitConnCleanup> {
+        self.rest.pop().or_else(|| self.first.take())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none() && self.rest.is_empty()
+    }
 }
 
 shm_struct! {
@@ -66,14 +93,17 @@ shm_struct! {
 pub struct LimitConnCtx {
     /// ctx->sh: the offset of the shctx in the zone
     sh: Cell<usize>,
-    /// the zone's memory, its slab pool at the start (ctx->shpool)
-    mem: RefCell<Option<Rc<ShmMem>>>,
+    /// the zone's memory, its slab pool at the start (ctx->shpool), set by
+    /// the zone's init
+    mem: std::cell::OnceCell<Rc<ShmMem>>,
     key: ComplexValue,
+    /// shm_zone->shm.log, for the cleanups (set by the zone's init)
+    log: RefCell<Option<Log>>,
 }
 
 impl LimitConnCtx {
-    fn mem(&self) -> Rc<ShmMem> {
-        self.mem.borrow().clone().expect("limit_conn zone memory")
+    fn mem(&self) -> &ShmMem {
+        self.mem.get().expect("limit_conn zone memory")
     }
 
     /// &ctx->sh->rbtree
@@ -86,6 +116,9 @@ impl LimitConnCtx {
 #[derive(Clone)]
 pub struct LimitConnLimit {
     shm_zone: Rc<ShmZone>,
+    /// shm_zone->data, looked up on the first request (a limit_conn_zone
+    /// may follow the limit_conn naming its zone)
+    ctx: std::cell::OnceCell<Rc<LimitConnCtx>>,
     conn: usize,
 }
 
@@ -153,6 +186,11 @@ fn zone_ctx(shm_zone: &ShmZone) -> Rc<LimitConnCtx> {
     shm_zone.data::<LimitConnCtx>().expect("limit_conn zone without data")
 }
 
+/// zone_ctx() of a limit, downcast once
+fn limit_ctx(limit: &LimitConnLimit) -> &Rc<LimitConnCtx> {
+    limit.ctx.get_or_init(|| zone_ctx(&limit.shm_zone))
+}
+
 /// ngx_http_limit_conn_handler
 /// limit_conn_handler declines at once: a status set before, or no
 /// limit_conn for the location
@@ -174,104 +212,105 @@ async fn limit_conn_handler(r: R) -> i64 {
     let limits: &[LimitConnLimit] = lccf.limits.as_deref().unwrap_or(&[]);
 
     // the cleanups added to r->pool (the main request's) by this handler
-    let mut cleanups: Vec<LimitConnCleanup> = Vec::new();
+    let mut cleanups = Cleanups::default();
 
     for limit in limits {
-        let ctx = zone_ctx(&limit.shm_zone);
+        let ctx = limit_ctx(limit);
 
-        let key = match complex_value(&r, &ctx.key) {
-            Ok(k) => k,
+        // the key is looked up where it is (a variable's cached value)
+        let counted = with_complex_value(&r, &ctx.key, |key| {
+            if key.is_empty() {
+                return Counted::Skipped;
+            }
+
+            if key.len() > 255 {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 255 bytes: \"{}\"", B(&ctx.key.value), B(key));
+                return Counted::Skipped;
+            }
+
+            main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_PASSED);
+
+            let hash = crc32fast::hash(key);
+
+            let mem = ctx.mem();
+            let shpool = SlabPool::of(&mem);
+
+            shpool.lock();
+
+            // the zone's rbtree and its nodes are used under its mutex
+            let tree = ctx.rbtree(&mem);
+
+            let mut node = limit_conn_lookup(&tree, key, hash);
+
+            if node == 0 {
+                let n = COLOR_OFF + DATA_OFF + key.len();
+
+                node = shpool.alloc_locked(n);
+
+                if node == 0 {
+                    shpool.unlock();
+                    return Counted::Rejected;
+                }
+
+                let lc = lc_of(&mem, node);
+
+                tree.set_key(node, hash as usize);
+                lc.set(LimitConnNode::len, key.len() as u8);
+                lc.set(LimitConnNode::conn, 1);
+                mem.write(lc.field(LimitConnNode::data), key);
+
+                rb::insert(&tree, node, limit_conn_rbtree_insert_value);
+            } else {
+                let lc = lc_of(&mem, node);
+
+                if lc.get(LimitConnNode::conn) as usize >= limit.conn {
+                    shpool.unlock();
+
+                    ngx_log_error!(
+                        *lccf.log_level,
+                        r.connection.log,
+                        None,
+                        "limiting connections{} by zone \"{}\"",
+                        if *lccf.dry_run { ", dry run," } else { "" },
+                        B(limit.shm_zone.name())
+                    );
+
+                    return Counted::Rejected;
+                }
+
+                lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn).wrapping_add(1));
+            }
+
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit conn: {:08X} {}", tree.key(node), lc_of(&mem, node).get(LimitConnNode::conn));
+
+            shpool.unlock();
+
+            Counted::Node(node)
+        });
+
+        match counted {
+            Ok(Counted::Node(node)) => cleanups.push(LimitConnCleanup { ctx: ctx.clone(), node }),
+
+            Ok(Counted::Skipped) => {}
+
+            Ok(Counted::Rejected) => {
+                limit_conn_cleanup_all(&mut cleanups);
+
+                if *lccf.dry_run {
+                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
+                    return NGX_DECLINED;
+                }
+
+                main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
+
+                return *lccf.status_code;
+            }
+
             Err(_) => {
                 pool_cleanup_add(&r, cleanups);
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
-        };
-
-        if key.is_empty() {
-            continue;
         }
-
-        if key.len() > 255 {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 255 bytes: \"{}\"", B(&ctx.key.value), B(&key));
-            continue;
-        }
-
-        main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_PASSED);
-
-        let hash = crc32fast::hash(&key);
-
-        let mem = ctx.mem();
-        let shpool = SlabPool::of(&mem);
-
-        shpool.lock();
-
-        // the zone's rbtree and its nodes are used under its mutex
-        let tree = ctx.rbtree(&mem);
-
-        let mut node = limit_conn_lookup(&tree, &key, hash);
-
-        if node == 0 {
-            let n = COLOR_OFF + DATA_OFF + key.len();
-
-            node = shpool.alloc_locked(n);
-
-            if node == 0 {
-                shpool.unlock();
-                limit_conn_cleanup_all(&mut cleanups);
-
-                if *lccf.dry_run {
-                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
-                    return NGX_DECLINED;
-                }
-
-                main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
-
-                return *lccf.status_code;
-            }
-
-            let lc = lc_of(&mem, node);
-
-            tree.set_key(node, hash as usize);
-            lc.set(LimitConnNode::len, key.len() as u8);
-            lc.set(LimitConnNode::conn, 1);
-            mem.write(lc.field(LimitConnNode::data), &key);
-
-            rb::insert(&tree, node, limit_conn_rbtree_insert_value);
-        } else {
-            let lc = lc_of(&mem, node);
-
-            if lc.get(LimitConnNode::conn) as usize >= limit.conn {
-                shpool.unlock();
-
-                ngx_log_error!(
-                    *lccf.log_level,
-                    r.connection.log,
-                    None,
-                    "limiting connections{} by zone \"{}\"",
-                    if *lccf.dry_run { ", dry run," } else { "" },
-                    B(limit.shm_zone.name())
-                );
-
-                limit_conn_cleanup_all(&mut cleanups);
-
-                if *lccf.dry_run {
-                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
-                    return NGX_DECLINED;
-                }
-
-                main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
-
-                return *lccf.status_code;
-            }
-
-            lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn).wrapping_add(1));
-        }
-
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit conn: {:08X} {}", tree.key(node), lc_of(&mem, node).get(LimitConnNode::conn));
-
-        shpool.unlock();
-
-        cleanups.push(LimitConnCleanup { shm_zone: limit.shm_zone.clone(), node });
     }
 
     pool_cleanup_add(&r, cleanups);
@@ -279,11 +318,21 @@ async fn limit_conn_handler(r: R) -> i64 {
     NGX_DECLINED
 }
 
+/// What the handler did with the key of a limit
+enum Counted {
+    /// an empty or too long key: the limit does not apply
+    Skipped,
+    /// the connection counted in the node
+    Node(usize),
+    /// no memory for a node, or the limit reached (logged)
+    Rejected,
+}
+
 /// ngx_pool_cleanup_add(r->pool) of the handler's cleanups, with
 /// ngx_http_limit_conn_cleanup as the handler: the pool of a request is
 /// that of its main request; the cleanups run in the order of the pool's
 /// list, the last added first.
-fn pool_cleanup_add(r: &R, mut cleanups: Vec<LimitConnCleanup>) {
+fn pool_cleanup_add(r: &R, mut cleanups: Cleanups) {
     if cleanups.is_empty() {
         return;
     }
@@ -346,7 +395,7 @@ fn limit_conn_lookup(rbtree: &ShmRbtree<'_>, key: &[u8], hash: u32) -> usize {
 
 /// ngx_http_limit_conn_cleanup
 fn limit_conn_cleanup(lccln: &LimitConnCleanup) {
-    let ctx = zone_ctx(&lccln.shm_zone);
+    let ctx = &lccln.ctx;
     let node = lccln.node;
 
     // the node stays in the zone while its conn is not zero; it is changed
@@ -358,7 +407,7 @@ fn limit_conn_cleanup(lccln: &LimitConnCleanup) {
 
     shpool.lock();
 
-    if let Some(log) = lccln.shm_zone.shm.log.borrow().as_ref() {
+    if let Some(log) = ctx.log.borrow().as_ref() {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "limit conn cleanup: {:08X} {}", tree.key(node), lc.get(LimitConnNode::conn));
     }
 
@@ -374,7 +423,7 @@ fn limit_conn_cleanup(lccln: &LimitConnCleanup) {
 
 /// ngx_http_limit_conn_cleanup_all: the cleanups the handler added, at
 /// the head of the pool's list, run and removed
-fn limit_conn_cleanup_all(cleanups: &mut Vec<LimitConnCleanup>) {
+fn limit_conn_cleanup_all(cleanups: &mut Cleanups) {
     while let Some(lccln) = cleanups.pop() {
         limit_conn_cleanup(&lccln);
     }
@@ -401,7 +450,10 @@ fn limit_conn_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Re
         }
 
         ctx.sh.set(octx.sh.get());
-        *ctx.mem.borrow_mut() = octx.mem.borrow().clone();
+        if let Some(mem) = octx.mem.get() {
+            let _ = ctx.mem.set(mem.clone());
+        }
+        *ctx.log.borrow_mut() = shm_zone.shm.log.borrow().clone();
 
         return Ok(());
     }
@@ -409,7 +461,8 @@ fn limit_conn_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Re
     let mem = shm_zone.mem();
     let shpool = SlabPool::of(&mem);
 
-    *ctx.mem.borrow_mut() = Some(mem.clone());
+    let _ = ctx.mem.set(mem.clone());
+    *ctx.log.borrow_mut() = shm_zone.shm.log.borrow().clone();
 
     if shm_zone.shm.exists.get() {
         ctx.sh.set(shpool.data());
@@ -516,7 +569,7 @@ fn limit_conn_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
         return Err(cf.emerg(format_args!("{} \"{}\" is already bound to key \"{}\"", cmd.name, B(&name), B(&ctx.key.value))));
     }
 
-    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key });
+    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), key, log: RefCell::new(None) });
 
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_conn_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
@@ -549,7 +602,7 @@ fn limit_conn(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfR
         return Err(cf.emerg(format_args!("connection limit must be less 65536")));
     }
 
-    limits.push(LimitConnLimit { shm_zone, conn: n as usize });
+    limits.push(LimitConnLimit { shm_zone, ctx: std::cell::OnceCell::new(), conn: n as usize });
 
     Ok(())
 }
@@ -606,7 +659,7 @@ mod tests {
         let zone = ShmZone::new(b"test".to_vec(), mem.len(), TAG);
         zone.shm.attach(mem);
 
-        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key: ComplexValue::constant(b"$binary_remote_addr") });
+        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), key: ComplexValue::constant(b"$binary_remote_addr"), log: RefCell::new(None) });
 
         *zone.data.borrow_mut() = Some(ctx);
 
@@ -639,7 +692,7 @@ mod tests {
             }
             lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn) + 1);
         }
-        Some(LimitConnCleanup { shm_zone: zone.clone(), node })
+        Some(LimitConnCleanup { ctx: zone_ctx(zone), node })
     }
 
     fn conn(zone: &Rc<ShmZone>, key: &[u8], hash: u32) -> Option<u16> {
@@ -697,7 +750,9 @@ mod tests {
         assert_eq!(conn(&zone, b"127.0.0.1", 5), Some(1));
 
         // the last connection of a key frees its node
-        let mut all = vec![c2, c3];
+        let mut all = Cleanups::default();
+        all.push(c2);
+        all.push(c3);
         limit_conn_cleanup_all(&mut all);
         assert!(all.is_empty());
         assert_eq!(conn(&zone, b"127.0.0.1", 5), None);

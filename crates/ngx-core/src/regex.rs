@@ -23,6 +23,10 @@ pub struct Regex {
     /// (name, index)
     pub names: Vec<(Vec<u8>, usize)>,
     pub ncaptures: usize,
+    /// The match data of the matches with captures, made once and reused
+    /// (ngx_regex_match_data): taken out for a match and put back, so a
+    /// nested match on the same regex would make its own.
+    locs: Cell<Option<pcre2::bytes::CaptureLocations>>,
 }
 
 pub struct RegexCompile {
@@ -64,26 +68,68 @@ impl Regex {
                 names.push((n.as_bytes().to_vec(), i));
             }
         }
-        Ok(Rc::new(Regex { re, pattern: pattern.to_vec(), captures: ncaptures, names, ncaptures }))
+        Ok(Rc::new(Regex { re, pattern: pattern.to_vec(), captures: ncaptures, names, ncaptures, locs: Cell::new(None) }))
+    }
+
+    /// A match of `s` with captures, in the reused match data: `f` gets
+    /// the capture locations of a match, None without one (or when PCRE2
+    /// fails).
+    fn with_match<T>(&self, s: &[u8], f: impl FnOnce(Option<&pcre2::bytes::CaptureLocations>) -> T) -> T {
+        let mut locs = match self.locs.take() {
+            Some(locs) => locs,
+            None => self.re.capture_locations(),
+        };
+
+        let matched = matches!(self.re.captures_read(&mut locs, s), Ok(Some(_)));
+
+        let t = f(if matched { Some(&locs) } else { None });
+
+        self.locs.set(Some(locs));
+
+        t
     }
 
     /// ngx_regex_exec: returns capture offsets (start,end) pairs; None if no match.
     /// The returned vector has (ncaptures+1) entries, unmatched groups are (-1,-1).
     pub fn exec(&self, s: &[u8]) -> Option<Vec<(i32, i32)>> {
-        let mut locs = self.re.capture_locations();
-        match self.re.captures_read(&mut locs, s) {
-            Ok(Some(_)) => {
-                let mut v = Vec::with_capacity(locs.len());
-                for i in 0..locs.len() {
-                    match locs.get(i) {
-                        Some((a, b)) => v.push((a as i32, b as i32)),
-                        None => v.push((-1, -1)),
+        self.with_match(s, |locs| {
+            let locs = locs?;
+            let mut v = Vec::with_capacity(locs.len());
+            for i in 0..locs.len() {
+                match locs.get(i) {
+                    Some((a, b)) => v.push((a as i32, b as i32)),
+                    None => v.push((-1, -1)),
+                }
+            }
+            Some(v)
+        })
+    }
+
+    /// ngx_regex_exec into the captures array of the caller, as C's int
+    /// array of start and end offsets: on a match `captures` is cleared
+    /// and filled with the (ncaptures+1) pairs, -1 for the unmatched
+    /// groups, and the number of pairs returned; without a match (None)
+    /// it is left as it was. Its capacity is reused.
+    pub fn exec_into(&self, s: &[u8], captures: &mut Vec<i32>) -> Option<usize> {
+        self.with_match(s, |locs| {
+            let locs = locs?;
+            let n = locs.len();
+            captures.clear();
+            captures.reserve(2 * n);
+            for i in 0..n {
+                match locs.get(i) {
+                    Some((a, b)) => {
+                        captures.push(a as i32);
+                        captures.push(b as i32);
+                    }
+                    None => {
+                        captures.push(-1);
+                        captures.push(-1);
                     }
                 }
-                Some(v)
             }
-            _ => None,
-        }
+            Some(n)
+        })
     }
 
     pub fn is_match(&self, s: &[u8]) -> bool {
@@ -146,3 +192,41 @@ pub fn log_compile_error(log: &crate::log::Log, e: &str) {
 
 #[allow(dead_code)]
 fn _unused(_: RefCell<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_into() {
+        let re = Regex::compile(b"^/(a)?(b+)(c)?", 0).unwrap();
+
+        let mut caps = vec![7, 7];
+
+        // no match: the captures are left as they were
+        assert_eq!(re.exec_into(b"/x", &mut caps), None);
+        assert_eq!(caps, vec![7, 7]);
+
+        // the pairs of all the groups, -1 for the unmatched ones
+        assert_eq!(re.exec_into(b"/bbc", &mut caps), Some(4));
+        assert_eq!(caps, vec![0, 4, -1, -1, 1, 3, 3, 4]);
+
+        // the match data is reused, and gives the same as exec()
+        assert_eq!(re.exec_into(b"/ab", &mut caps), Some(4));
+        assert_eq!(caps, vec![0, 3, 1, 2, 2, 3, -1, -1]);
+        assert_eq!(re.exec(b"/ab"), Some(vec![(0, 3), (1, 2), (2, 3), (-1, -1)]));
+        assert_eq!(re.exec(b"/"), None);
+
+        // a pattern without captures: the whole match
+        let re = Regex::compile(b"b", 0).unwrap();
+        assert_eq!(re.exec_into(b"abc", &mut caps), Some(1));
+        assert_eq!(caps, vec![1, 2]);
+    }
+
+    #[test]
+    fn replace() {
+        let re = Regex::compile(b"^/(\\w+)/(\\w+)$", 0).unwrap();
+        assert_eq!(re.replace(b"/a/b", b"/$2/$1/$3"), Some(b"/b/a/".to_vec()));
+        assert_eq!(re.replace(b"/a", b"$1"), None);
+    }
+}
