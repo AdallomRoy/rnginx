@@ -307,8 +307,55 @@ macro_rules! http_module_index {
 
 // --- filter chains ---
 
-pub type HeaderFilter = Rc<dyn Fn(R) -> BoxFut<i64>>;
-pub type BodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> BoxFut<i64>>;
+/// What a filter or a phase handler comes to: its result at once, or, when
+/// it has to wait (where C returns NGX_AGAIN and goes on in an event
+/// handler), the future that goes on. Awaiting a Step gives the result
+/// either way, so a caller awaits it as it awaited the future of an async
+/// function, and only a call that really waits boxes a future.
+pub enum Step {
+    Ready(i64),
+    Pending(BoxFut<i64>),
+}
+
+impl Step {
+    /// The step of `fut`, boxed: a call that goes on asynchronously
+    pub fn boxed(fut: impl Future<Output = i64> + 'static) -> Step {
+        Step::Pending(Box::pin(fut))
+    }
+
+    /// The step whose result is `f` of this one's: `f` runs at once if
+    /// this one is ready, else once it is
+    pub fn map(self, f: impl FnOnce(i64) -> i64 + 'static) -> Step {
+        match self {
+            Step::Ready(rc) => Step::Ready(f(rc)),
+            Step::Pending(fut) => Step::boxed(async move { f(fut.await) }),
+        }
+    }
+}
+
+impl Future for Step {
+    type Output = i64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        // Unpin: a boxed future and an integer
+        let this = self.get_mut();
+
+        match this {
+            Step::Ready(rc) => std::task::Poll::Ready(*rc),
+            Step::Pending(fut) => match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(rc) => {
+                    // the future is done: freed at once
+                    *this = Step::Ready(rc);
+                    std::task::Poll::Ready(rc)
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+        }
+    }
+}
+
+pub type HeaderFilter = Rc<dyn Fn(R) -> Step>;
+pub type BodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> Step>;
 pub type RequestBodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> BoxFut<i64>>;
 
 thread_local! {
@@ -342,12 +389,7 @@ where
     Fut: Future<Output = i64> + 'static,
 {
     let next = top_early_hints_filter();
-    let f = Rc::new(f);
-    set_top_early_hints_filter(Rc::new(move |r| {
-        let f = f.clone();
-        let next = next.clone();
-        Box::pin(async move { f(r, next).await })
-    }));
+    set_top_early_hints_filter(Rc::new(move |r| Step::boxed(f(r, next.clone()))));
 }
 
 pub fn top_body_filter() -> BodyFilter {
@@ -373,7 +415,7 @@ where
     Fut: Future<Output = i64> + 'static,
 {
     let next = top_header_filter();
-    set_top_header_filter(Rc::new(move |r| Box::pin(f(r, next.clone()))));
+    set_top_header_filter(Rc::new(move |r| Step::boxed(f(r, next.clone()))));
 }
 
 /// Install a header filter wrapping the current top that passes the
@@ -394,8 +436,16 @@ where
             return next(r);
         }
 
-        Box::pin(f(r, next.clone()))
+        Step::boxed(f(r, next.clone()))
     }));
+}
+
+/// Install a header filter wrapping the current top that runs as a plain
+/// function call, as C's do: it calls the next filter itself and returns
+/// its step (a filter that has to wait returns a boxed one).
+pub fn install_header_filter_fn(f: fn(R, &HeaderFilter) -> Step) {
+    let next = top_header_filter();
+    set_top_header_filter(Rc::new(move |r| f(r, &next)));
 }
 
 /// Install a body filter wrapping the current top.
@@ -405,7 +455,7 @@ where
     Fut: Future<Output = i64> + 'static,
 {
     let next = top_body_filter();
-    set_top_body_filter(Rc::new(move |r, chain| Box::pin(f(r, chain, next.clone()))));
+    set_top_body_filter(Rc::new(move |r, chain| Step::boxed(f(r, chain, next.clone()))));
 }
 
 /// install_header_filter_idle() for a body filter: `idle` sees the chain
@@ -421,8 +471,14 @@ where
             return next(r, chain);
         }
 
-        Box::pin(f(r, chain, next.clone()))
+        Step::boxed(f(r, chain, next.clone()))
     }));
+}
+
+/// install_header_filter_fn() for a body filter
+pub fn install_body_filter_fn(f: fn(R, ngx_core::buf::Chain, &BodyFilter) -> Step) {
+    let next = top_body_filter();
+    set_top_body_filter(Rc::new(move |r, chain| f(r, chain, &next)));
 }
 
 pub fn install_request_body_filter<F, Fut>(f: F)
@@ -729,4 +785,32 @@ pub fn dbg_str(s: &[u8]) -> String {
 fn _log_use(log: &Log) {
     ngx_log_error!(NGX_LOG_DEBUG, log, None, "unused");
     let _ = NGX_OK;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn test_step() {
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // ready: the result at once, and again
+        let mut s = Step::Ready(NGX_AGAIN);
+        assert_eq!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(NGX_AGAIN));
+        assert_eq!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(NGX_AGAIN));
+
+        // mapped at once
+        assert!(matches!(Step::Ready(NGX_OK).map(|rc| rc + 7), Step::Ready(7)));
+
+        // pending until the future is done, then ready, the future freed
+        let (tx, rx) = tokio::sync::oneshot::channel::<i64>();
+        let mut s = Step::boxed(async move { rx.await.unwrap() }).map(|rc| rc * 2);
+        assert_eq!(Pin::new(&mut s).poll(&mut cx), Poll::Pending);
+        tx.send(21).unwrap();
+        assert_eq!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(42));
+        assert!(matches!(s, Step::Ready(42)));
+    }
 }

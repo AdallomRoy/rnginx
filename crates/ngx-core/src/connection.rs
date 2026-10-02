@@ -753,6 +753,18 @@ impl Connection {
         Ok(n)
     }
 
+    /// One non-blocking write attempt on the socket while it is write-ready
+    /// (c->write->ready): WouldBlock without trying otherwise; WouldBlock
+    /// from `op` clears the readiness (wev->ready = 0).
+    pub fn try_write_io<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
+        self.fake_io_error()?;
+        let afd = self.afd()?;
+        afd.try_io(Interest::WRITABLE, |inner| {
+            let s = fd::get(inner.0)?;
+            op(s.as_fd())
+        })
+    }
+
     /// Drive a non-blocking operation that does its own socket I/O (an
     /// OpenSSL call) until it completes. The first attempt runs at once.
     /// An attempt that wants reading found the socket drained (EAGAIN), so

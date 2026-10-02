@@ -82,19 +82,7 @@ pub fn range_body_filter_module() -> ModuleDef {
 }
 
 /// ngx_http_range_header_filter
-/// range_header_filter passes the response on as it is: ranges do not
-/// apply to it
-fn range_header_idle(r: &R) -> bool {
-    let ho = r.headers_out.borrow();
-
-    r.http_version.get() < NGX_HTTP_VERSION_10
-        || ho.status != NGX_HTTP_OK
-        || (!r.is_main() && !r.subrequest_ranges.get())
-        || ho.content_length_n == -1
-        || !r.allow_ranges.get()
-}
-
-async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
+fn range_header_filter(r: R, next: &HeaderFilter) -> Step {
     let (status, content_length_n, content_offset) = {
         let ho = r.headers_out.borrow();
         (ho.status, ho.content_length_n, ho.content_offset)
@@ -106,13 +94,13 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
         || content_length_n == -1
         || !r.allow_ranges.get()
     {
-        return next(r).await;
+        return next(r);
     }
 
     let max_ranges = *r.clcf().borrow().max_ranges;
 
     if max_ranges == 0 {
-        return next(r).await;
+        return next(r);
     }
 
     'next_filter: {
@@ -178,15 +166,15 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
                 }
 
                 if single {
-                    return range_singlepart_header(r, &ctx, next).await;
+                    return range_singlepart_header(r, &ctx, next);
                 }
 
-                return range_multipart_header(r, &ctx, next).await;
+                return range_multipart_header(r, &ctx, next);
             }
 
-            NGX_HTTP_RANGE_NOT_SATISFIABLE => return range_not_satisfiable(&r),
+            NGX_HTTP_RANGE_NOT_SATISFIABLE => return Step::Ready(range_not_satisfiable(&r)),
 
-            NGX_ERROR => return NGX_ERROR,
+            NGX_ERROR => return Step::Ready(NGX_ERROR),
 
             _ => {} // NGX_DECLINED
         }
@@ -200,7 +188,7 @@ async fn range_header_filter(r: R, next: HeaderFilter) -> i64 {
         ho.accept_ranges = Some(h);
     }
 
-    next(r).await
+    next(r)
 }
 
 /// ngx_http_range_parse: `value` is the Range header, NUL-terminated in C
@@ -363,9 +351,9 @@ fn range_parse(r: &R, ctx: &mut RangeFilterCtx, value: &[u8], mut ranges: i64) -
 }
 
 /// ngx_http_range_singlepart_header
-async fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: HeaderFilter) -> i64 {
+fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: &HeaderFilter) -> Step {
     if !r.is_main() {
-        return next(r).await;
+        return next(r);
     }
 
     {
@@ -395,11 +383,11 @@ async fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: 
         }
     }
 
-    next(r).await
+    next(r)
 }
 
 /// ngx_http_range_multipart_header
-async fn range_multipart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: HeaderFilter) -> i64 {
+fn range_multipart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: &HeaderFilter) -> Step {
     // ngx_next_temp_number(0)
     let boundary = ngx_core::connection::stats().temp_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let boundary = format!("{:0width$}", boundary, width = NGX_ATOMIC_T_LEN);
@@ -473,7 +461,7 @@ async fn range_multipart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: H
         }
     }
 
-    next(r).await
+    next(r)
 }
 
 /// ngx_http_range_not_satisfiable: the header is not sent, the request is
@@ -500,23 +488,18 @@ fn range_not_satisfiable(r: &R) -> i64 {
 }
 
 /// ngx_http_range_body_filter
-/// range_body_filter passes the chain on as it is
-fn range_body_idle(r: &R, input: &Chain) -> bool {
-    input.is_empty() || !r.has_ctx(ctx_index())
-}
-
-async fn range_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
-    if input.is_empty() {
-        return next(r, input).await;
+fn range_body_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
+    if input.is_empty() || !r.has_ctx(ctx_index()) {
+        return next(r, input);
     }
 
     let ctx = match r.get_ctx::<RangeFilterCtx>(ctx_index()) {
         Some(ctx) => ctx,
-        None => return next(r, input).await,
+        None => return next(r, input),
     };
 
     if ctx.borrow().ranges.len() == 1 {
-        return range_singlepart_body(r, &ctx, input, next).await;
+        return range_singlepart_body(r, &ctx, input, next);
     }
 
     /*
@@ -524,14 +507,14 @@ async fn range_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
      */
 
     if input[0].special_buf() {
-        return next(r, input).await;
+        return next(r, input);
     }
 
     if range_test_overlapped(&r, &ctx, &input) != NGX_OK {
-        return NGX_ERROR;
+        return Step::Ready(NGX_ERROR);
     }
 
-    range_multipart_body(r, &ctx, input, next).await
+    range_multipart_body(r, &ctx, input, next)
 }
 
 /// ngx_http_range_test_overlapped
@@ -567,7 +550,7 @@ fn range_test_overlapped(r: &R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: &Chain
 }
 
 /// ngx_http_range_singlepart_body
-async fn range_singlepart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: BodyFilter) -> i64 {
+fn range_singlepart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: &BodyFilter) -> Step {
     let mut out = Chain::new();
 
     {
@@ -637,11 +620,11 @@ async fn range_singlepart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: C
         }
     }
 
-    next(r, out).await
+    next(r, out)
 }
 
 /// ngx_http_range_multipart_body: the ranges of the single buffer in->buf
-async fn range_multipart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: BodyFilter) -> i64 {
+fn range_multipart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Chain, next: &BodyFilter) -> Step {
     let buf = &input[0];
 
     let mut out = Chain::new();
@@ -711,17 +694,17 @@ async fn range_multipart_body(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, input: Ch
 
     out.push_back(b);
 
-    next(r, out).await
+    next(r, out)
 }
 
 /// ngx_http_range_header_filter_init
 fn range_header_filter_init(_cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter_idle(range_header_idle, range_header_filter);
+    crate::install_header_filter_fn(range_header_filter);
     Ok(())
 }
 
 /// ngx_http_range_body_filter_init
 fn range_body_filter_init(_cf: &mut Conf) -> ConfResult {
-    crate::install_body_filter_idle(range_body_idle, range_body_filter);
+    crate::install_body_filter_fn(range_body_filter);
     Ok(())
 }

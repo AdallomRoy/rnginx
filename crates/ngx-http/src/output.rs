@@ -1,6 +1,7 @@
 //! Sending buffer chains to a connection (ngx_linux_sendfile_chain / ngx_writev_chain).
 
 use std::io;
+use std::io::IoSlice;
 
 use ngx_core::buf::{BufData, Chain};
 use ngx_core::connection::{Connection, TcpNodelay, TcpNopush};
@@ -8,20 +9,210 @@ use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf, SslChainFile
 use ngx_core::log::*;
 use ngx_core::ngx_log_debug;
 
+/// NGX_IOVS_PREALLOCATE: the iovecs of a writev(), on the stack
+pub const NGX_IOVS_PREALLOCATE: usize = 64;
+
+/// What a pass of c->send_chain() without waiting came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// the chain is sent, or `limit` bytes of it
+    Done,
+    /// the connection takes no more now: the rest waits for the write
+    /// event (NGX_AGAIN, wev->ready = 0)
+    Again,
+    /// not tried: c->send_chain() of a TLS connection is run by
+    /// send_chain() (its passes count the data in c->ssl->buf)
+    Async,
+}
+
+/// One pass of c->send_chain() without waiting: as much of `chain` as the
+/// connection takes now, up to `limit` bytes of it (0: no limit). The
+/// buffers sent are advanced in place, those fully sent removed
+/// (ngx_chain_update_sent); the bytes sent are added to `total`. A pass
+/// after Again goes on where it stopped, as send_chain() does once the
+/// connection is writable.
+pub fn send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
+    if c.is_quic_stream() {
+        return quic_send_chain_pass(c, chain, limit, total);
+    }
+
+    if c.ssl.borrow().is_some() {
+        return Ok(Pass::Async);
+    }
+
+    plain_send_chain_pass(c, chain, limit, total)
+}
+
 /// Send as much of `chain` as possible up to `limit` bytes; returns bytes sent.
 /// Buffers are advanced in place (like ngx_chain_update_sent); fully sent buffers are removed.
 pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
     if c.is_quic_stream() {
         return quic_send_chain(c, chain, limit).await;
     }
-    if c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get()) {
-        return ssl_send_chain(c, chain, limit).await;
+
+    let ssl = c.ssl.borrow().as_ref().map(|sc| sc.state.ngx.get());
+
+    match ssl {
+        Some(true) => return ssl_send_chain(c, chain, limit).await,
+        Some(false) => return send_chain_io(c, chain, limit).await,
+        None => {}
     }
 
     let mut total: i64 = 0;
+
+    loop {
+        if plain_send_chain_pass(c, chain, limit, &mut total)? == Pass::Done {
+            return Ok(total);
+        }
+
+        // NGX_AGAIN: the write event
+        c.writable().await?;
+    }
+}
+
+/// A pass of ngx_linux_sendfile_chain on a plain socket: writev() of the
+/// memory buffers (from an iovec array on the stack, as
+/// ngx_output_chain_to_iovec), sendfile() of the file ones, each tried
+/// only while the socket is write-ready.
+fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
     let limit = if limit <= 0 { i64::MAX } else { limit };
+
     loop {
         // drop empty non-special buffers at the front
+        while let Some(b) = chain.front() {
+            if b.buf_size() == 0 {
+                chain.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let first = match chain.front() {
+            Some(b) => b,
+            None => return Ok(Pass::Done),
+        };
+
+        if *total >= limit {
+            return Ok(Pass::Done);
+        }
+
+        let budget = limit - *total;
+
+        if first.in_file && !first.in_memory() {
+            let (fd, off, size) = match &first.data {
+                BufData::File(f) => (f.fd, first.file_pos, (first.file_last - first.file_pos).min(budget)),
+                _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+
+            let n = match sendfile(c, fd, off, size as usize) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Pass::Again),
+                Err(e) => return Err(e),
+            };
+
+            if n == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+
+            *total += n as i64;
+            ngx_core::buf::chain_update_sent(chain, n as i64);
+            continue;
+        }
+
+        // gather memory buffers
+        let mut iovs = [IoSlice::new(&[]); NGX_IOVS_PREALLOCATE];
+        let mut niovs = 0;
+        // the buffers gathered, empty ones included
+        let mut nbufs = 0;
+        let mut gathered: i64 = 0;
+        // the buffer after the header is in a file
+        let mut file_next = false;
+
+        for b in chain.iter() {
+            // ngx_output_chain_to_iovec: special buffers are skipped
+            if b.special_buf() {
+                continue;
+            }
+            if !b.in_memory() {
+                file_next = b.in_file;
+                break;
+            }
+            if gathered >= budget {
+                break;
+            }
+            let slice = match &b.data {
+                BufData::Memory(v) => &v[b.pos..b.last],
+                _ => break,
+            };
+            let take = ((budget - gathered) as usize).min(slice.len());
+            if take > 0 {
+                iovs[niovs] = IoSlice::new(&slice[..take]);
+                niovs += 1;
+            }
+            nbufs += 1;
+            gathered += take as i64;
+            if nbufs >= NGX_IOVS_PREALLOCATE {
+                break;
+            }
+        }
+
+        if nbufs == 0 {
+            return Ok(Pass::Done);
+        }
+
+        // TCP_CORK if there is a header before a file
+        if file_next && c.tcp_nopush.get() == TcpNopush::Unset {
+            tcp_nopush(c)?;
+        }
+
+        let n = if niovs == 0 {
+            0
+        } else {
+            match writev(c, &iovs[..niovs]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Pass::Again),
+                Err(e) => return Err(e),
+            }
+        };
+
+        *total += n as i64;
+        ngx_core::buf::chain_update_sent(chain, n as i64);
+
+        // a partial write: the next attempt finds out whether the socket
+        // takes more
+    }
+}
+
+/// writev() on the socket while it is write-ready; WouldBlock otherwise
+fn writev(c: &Connection, iovs: &[IoSlice<'_>]) -> io::Result<usize> {
+    let n = c.try_write_io(|s| nix::sys::uio::writev(s, iovs).map_err(io::Error::from))?;
+
+    c.sent.set(c.sent.get() + n as u64);
+
+    Ok(n)
+}
+
+/// sendfile(2) of `count` bytes from `file_fd` at `offset` to the socket
+/// while it is write-ready; WouldBlock otherwise
+fn sendfile(c: &Connection, file_fd: i32, offset: i64, count: usize) -> io::Result<usize> {
+    let n = c.try_write_io(|s| {
+        let file = ngx_core::fd::get(file_fd)?;
+        // the off_t of the kernel, as unsigned
+        let mut off = offset as u64;
+        rustix::fs::sendfile(s, &file, Some(&mut off), count).map_err(io::Error::from)
+    })?;
+
+    c.sent.set(c.sent.get() + n as u64);
+
+    Ok(n)
+}
+
+/// send_chain() of a connection with an SSL object that ngx_ssl does not
+/// run (none is made so): its writev() and sendfile() as they are
+async fn send_chain_io(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
+    let mut total: i64 = 0;
+    let limit = if limit <= 0 { i64::MAX } else { limit };
+    loop {
         while let Some(b) = chain.front() {
             if b.buf_size() == 0 {
                 chain.pop_front();
@@ -50,13 +241,10 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
             ngx_core::buf::chain_update_sent(chain, n as i64);
             continue;
         }
-        // gather memory buffers
         let mut iov: Vec<&[u8]> = Vec::new();
         let mut gathered: i64 = 0;
-        // the buffer after the header is in a file
         let mut file_next = false;
         for b in chain.iter() {
-            // ngx_output_chain_to_iovec: special buffers are skipped
             if b.special_buf() {
                 continue;
             }
@@ -74,14 +262,13 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
             let take = ((budget - gathered) as usize).min(slice.len());
             iov.push(&slice[..take]);
             gathered += take as i64;
-            if iov.len() >= 64 {
+            if iov.len() >= NGX_IOVS_PREALLOCATE {
                 break;
             }
         }
         if iov.is_empty() {
             return Ok(total);
         }
-        // TCP_CORK if there is a header before a file
         if file_next && c.tcp_nopush.get() == TcpNopush::Unset {
             tcp_nopush(c)?;
         }
@@ -89,10 +276,6 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
         total += n as i64;
         drop(iov);
         ngx_core::buf::chain_update_sent(chain, n as i64);
-        if (n as i64) < gathered {
-            // partial write; let caller decide (we loop again which awaits writability)
-            continue;
-        }
     }
 }
 
@@ -164,52 +347,77 @@ async fn quic_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::R
     let mut total: i64 = 0;
 
     loop {
-        while let Some(b) = chain.front() {
-            if b.buf_size() == 0 {
-                chain.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        let (n, left) = {
-            let mut iov: Vec<&[u8]> = chain
-                .iter()
-                .filter(|b| b.in_memory() && b.last > b.pos)
-                .filter_map(|b| match &b.data {
-                    BufData::Memory(v) => Some(&v[b.pos..b.last]),
-                    _ => None,
-                })
-                .collect();
-
-            if iov.is_empty() {
-                return Ok(total);
-            }
-
-            let before: usize = iov.iter().map(|s| s.len()).sum();
-
-            let budget = if limit > 0 { (limit - total) as u64 } else { 0 };
-
-            if ngx_core::quic::streams::ngx_quic_stream_send_chain(c, &mut iov, budget).is_err() {
-                return Err(io::Error::other("quic stream send failed"));
-            }
-
-            let after: usize = iov.iter().map(|s| s.len()).sum();
-
-            (before - after, after)
-        };
-
-        total += n as i64;
-
-        ngx_core::buf::chain_update_sent(chain, n as i64);
-
-        if left == 0 || (limit > 0 && total >= limit) {
+        if quic_send_chain_pass(c, chain, limit, &mut total)? == Pass::Done {
             return Ok(total);
         }
 
         // wev->ready = 0: the write event, once the peer acknowledges data
         c.writable().await?;
     }
+}
+
+/// A pass of quic_send_chain(): what the stream's window takes now
+fn quic_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
+    while let Some(b) = chain.front() {
+        if b.buf_size() == 0 {
+            chain.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    /// the data of a buffer in memory
+    fn data(b: &ngx_core::buf::Buf) -> Option<&[u8]> {
+        if !(b.in_memory() && b.last > b.pos) {
+            return None;
+        }
+
+        match &b.data {
+            BufData::Memory(v) => Some(&v[b.pos..b.last]),
+            _ => None,
+        }
+    }
+
+    let budget = if limit > 0 { (limit - *total) as u64 } else { 0 };
+
+    let nbufs = chain.iter().filter(|b| data(b).is_some()).count();
+
+    if nbufs == 0 {
+        return Ok(Pass::Done);
+    }
+
+    // the input slices on the stack, unless there are many
+    let mut stack: [&[u8]; NGX_IOVS_PREALLOCATE] = [&[]; NGX_IOVS_PREALLOCATE];
+    let mut heap: Vec<&[u8]>;
+
+    let iov: &mut [&[u8]] = if nbufs <= NGX_IOVS_PREALLOCATE {
+        for (slot, s) in stack.iter_mut().zip(chain.iter().filter_map(data)) {
+            *slot = s;
+        }
+        &mut stack[..nbufs]
+    } else {
+        heap = chain.iter().filter_map(data).collect();
+        &mut heap[..]
+    };
+
+    let before: usize = iov.iter().map(|s| s.len()).sum();
+
+    if ngx_core::quic::streams::ngx_quic_stream_send_chain(c, iov, budget).is_err() {
+        return Err(io::Error::other("quic stream send failed"));
+    }
+
+    let left: usize = iov.iter().map(|s| s.len()).sum();
+    let n = before - left;
+
+    *total += n as i64;
+
+    ngx_core::buf::chain_update_sent(chain, n as i64);
+
+    if left == 0 || (limit > 0 && *total >= limit) {
+        return Ok(Pass::Done);
+    }
+
+    Ok(Pass::Again)
 }
 
 /// Convenience: send a whole chain (awaiting writability) — used by simple paths.

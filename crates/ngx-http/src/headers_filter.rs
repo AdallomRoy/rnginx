@@ -109,21 +109,9 @@ fn safe_status(status: i64) -> bool {
 }
 
 /// ngx_http_headers_filter
-/// headers_filter passes the response on as it is: a subrequest, or no
-/// expires, add_header, add_trailer
-fn headers_idle(r: &R) -> bool {
+fn headers_filter(r: R, next: &HeaderFilter) -> Step {
     if !r.is_main() {
-        return true;
-    }
-
-    let conf = r.loc_conf::<HeadersConf>(ctx_index());
-    let c = conf.borrow();
-    c.expires == Expires::Off && c.headers.is_none() && c.trailers.is_none()
-}
-
-async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
-    if !r.is_main() {
-        return next(r).await;
+        return next(r);
     }
 
     let conf = r.loc_conf::<HeadersConf>(ctx_index());
@@ -133,14 +121,14 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
 
         if c.expires == Expires::Off && c.headers.is_none() && c.trailers.is_none() {
             drop(c);
-            return next(r).await;
+            return next(r);
         }
     }
 
     let safe_status = safe_status(r.headers_out.borrow().status);
 
     if conf.borrow().expires != Expires::Off && safe_status && set_expires(&r, &conf.borrow()) != NGX_OK {
-        return NGX_ERROR;
+        return Step::Ready(NGX_ERROR);
     }
 
     let headers = conf.borrow().headers.clone();
@@ -153,7 +141,7 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
 
             let value = match complex_value(&r, &hv.value) {
                 Ok(v) => v,
-                Err(_) => return NGX_ERROR,
+                Err(_) => return Step::Ready(NGX_ERROR),
             };
 
             set_header(&r, hv, &value);
@@ -166,30 +154,26 @@ async fn headers_filter(r: R, next: HeaderFilter) -> i64 {
         }
     }
 
-    next(r).await
+    next(r)
 }
 
 /// ngx_http_trailers_filter
-/// trailers_filter passes the chain on as it is
-fn trailers_idle(r: &R, input: &Chain) -> bool {
-    input.is_empty()
-        || !r.expect_trailers.get()
-        || r.header_only.get()
-        || r.loc_conf::<HeadersConf>(ctx_index()).borrow().trailers.is_none()
-}
+fn trailers_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
+    if input.is_empty() || !r.expect_trailers.get() || r.header_only.get() {
+        return next(r, input);
+    }
 
-async fn trailers_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let conf = r.loc_conf::<HeadersConf>(ctx_index());
 
     let trailers = conf.borrow().trailers.clone();
 
     let trailers = match trailers {
-        Some(t) if !input.is_empty() && r.expect_trailers.get() && !r.header_only.get() => t,
-        _ => return next(r, input).await,
+        Some(t) => t,
+        None => return next(r, input),
     };
 
     if !input.iter().any(|b| b.last_buf) {
-        return next(r, input).await;
+        return next(r, input);
     }
 
     let safe_status = safe_status(r.headers_out.borrow().status);
@@ -201,7 +185,7 @@ async fn trailers_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
 
         let value = match complex_value(&r, &hv.value) {
             Ok(v) => v,
-            Err(_) => return NGX_ERROR,
+            Err(_) => return Step::Ready(NGX_ERROR),
         };
 
         if !value.is_empty() {
@@ -209,7 +193,7 @@ async fn trailers_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         }
     }
 
-    next(r, input).await
+    next(r, input)
 }
 
 /// ngx_http_set_expires
@@ -477,8 +461,8 @@ fn inherit(headers: &mut Option<Vec<HeaderVal>>, prev: Option<&Vec<HeaderVal>>, 
 
 /// ngx_http_headers_filter_init
 fn filter_init(_cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter_idle(headers_idle, headers_filter);
-    crate::install_body_filter_idle(trailers_idle, trailers_filter);
+    crate::install_header_filter_fn(headers_filter);
+    crate::install_body_filter_fn(trailers_filter);
     Ok(())
 }
 

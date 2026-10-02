@@ -20,20 +20,20 @@ pub fn header_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    set_top_header_filter(Rc::new(|r| Box::pin(header_filter(r))));
-    set_top_early_hints_filter(Rc::new(|r| Box::pin(early_hints_filter(r))));
+    set_top_header_filter(Rc::new(header_filter));
+    set_top_early_hints_filter(Rc::new(early_hints_filter));
     Ok(())
 }
 
 /// ngx_http_early_hints_filter: "103 Early Hints" with the headers of
 /// r->headers_out, flushed
-pub async fn early_hints_filter(r: R) -> i64 {
+pub fn early_hints_filter(r: R) -> Step {
     if !r.is_main() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
 
     if r.http_version.get() < NGX_HTTP_VERSION_11 {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
 
     let mut headers: Vec<u8> = Vec::new();
@@ -50,7 +50,7 @@ pub async fn early_hints_filter(r: R) -> i64 {
     }
 
     if headers.is_empty() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
 
     // ngx_http_early_hints_status_line
@@ -71,7 +71,7 @@ pub async fn early_hints_filter(r: R) -> i64 {
     let mut chain = Chain::new();
     chain.push_back(b);
 
-    crate::write_filter::write_filter(r.clone(), chain).await
+    crate::write_filter::write_filter(r, chain)
 }
 
 pub const SERVER_STRING: &[u8] = b"Server: nginx\r\n";
@@ -125,16 +125,16 @@ pub fn status_line(status: i64) -> Option<&'static str> {
 }
 
 /// ngx_http_header_filter
-pub async fn header_filter(r: R) -> i64 {
+pub fn header_filter(r: R) -> Step {
     if r.header_sent.get() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
     r.header_sent.set(true);
     if !r.is_main() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
     if r.http_version.get() < NGX_HTTP_VERSION_10 {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
     if r.method.get() == NGX_HTTP_HEAD {
         r.header_only.set(true);
@@ -319,5 +319,5 @@ pub async fn header_filter(r: R) -> i64 {
     let mut chain = Chain::new();
     chain.push_back(b);
     // Header bytes go directly to the write filter (they bypass body filters like range/gzip/sub).
-    crate::write_filter::write_filter(r.clone(), chain).await
+    crate::write_filter::write_filter(r, chain)
 }

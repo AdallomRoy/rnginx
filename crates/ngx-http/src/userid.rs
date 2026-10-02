@@ -136,30 +136,24 @@ pub fn userid_module() -> ModuleDef {
 }
 
 /// ngx_http_userid_filter
-/// userid_filter passes the response on as it is: a subrequest, or userid
-/// off / log
-fn userid_idle(r: &R) -> bool {
-    !r.is_main() || *r.loc_conf::<UserIdConf>(ctx_index()).borrow().enable < NGX_HTTP_USERID_V1
-}
-
-async fn userid_filter(r: R, next: HeaderFilter) -> i64 {
+fn userid_filter(r: R, next: &HeaderFilter) -> Step {
     if !r.is_main() {
-        return next(r).await;
+        return next(r);
     }
 
     let conf = r.loc_conf::<UserIdConf>(ctx_index());
 
     if *conf.borrow().enable < NGX_HTTP_USERID_V1 {
-        return next(r).await;
+        return next(r);
     }
 
     let ctx = userid_get_uid(&r, &conf.borrow());
 
     if userid_set_uid(&r, &ctx, &conf.borrow()) == NGX_OK {
-        return next(r).await;
+        return next(r);
     }
 
-    NGX_ERROR
+    Step::Ready(NGX_ERROR)
 }
 
 /// ngx_http_userid_got_variable
@@ -585,7 +579,7 @@ fn userid_add_variables(cf: &mut Conf) -> ConfResult {
 
 /// ngx_http_userid_init
 fn userid_init(_cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter_idle(userid_idle, userid_filter);
+    crate::install_header_filter_fn(userid_filter);
 
     Ok(())
 }

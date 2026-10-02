@@ -16,27 +16,13 @@ pub fn chunked_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter_idle(chunked_header_idle, chunked_header_filter);
-    crate::install_body_filter_idle(chunked_body_idle, chunked_body_filter);
+    crate::install_header_filter_fn(chunked_header_filter);
+    crate::install_body_filter_fn(chunked_body_filter);
     Ok(())
 }
 
-/// chunked_header_filter passes the response on as it is: no body, a
-/// subrequest, or a known length without trailers
-fn chunked_header_idle(r: &R) -> bool {
-    let ho = r.headers_out.borrow();
-    let status = ho.status;
-
-    status == NGX_HTTP_NOT_MODIFIED
-        || status == NGX_HTTP_NO_CONTENT
-        || status < NGX_HTTP_OK
-        || !r.is_main()
-        || r.method.get() == NGX_HTTP_HEAD
-        || (r.method.get() == NGX_HTTP_CONNECT && status < NGX_HTTP_SPECIAL_RESPONSE)
-        || (ho.content_length_n != -1 && !r.expect_trailers.get())
-}
-
-async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
+/// ngx_http_chunked_header_filter
+fn chunked_header_filter(r: R, next: &HeaderFilter) -> Step {
     let status = r.headers_out.borrow().status;
     if status == NGX_HTTP_NOT_MODIFIED
         || status == NGX_HTTP_NO_CONTENT
@@ -45,7 +31,7 @@ async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
         || r.method.get() == NGX_HTTP_HEAD
         || (r.method.get() == NGX_HTTP_CONNECT && status < NGX_HTTP_SPECIAL_RESPONSE)
     {
-        return next(r).await;
+        return next(r);
     }
     let cl = r.headers_out.borrow().content_length_n;
     if cl == -1 || r.expect_trailers.get() {
@@ -61,25 +47,17 @@ async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
             r.keepalive.set(false);
         }
     }
-    next(r).await
+    next(r)
 }
 
 pub struct ChunkedCtx {
     pub done: bool,
 }
 
-/// chunked_body_filter passes the chain on as it is
-fn chunked_body_idle(r: &R, input: &Chain) -> bool {
-    !r.chunked.get() || input.is_empty() || !r.has_ctx(ctx_index())
-}
-
-async fn chunked_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
-    if !r.chunked.get() || input.is_empty() {
-        return next(r, input).await;
-    }
-    let ctx = r.get_ctx::<ChunkedCtx>(ctx_index());
-    if ctx.is_none() {
-        return next(r, input).await;
+/// ngx_http_chunked_body_filter
+fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
+    if !r.chunked.get() || input.is_empty() || !r.has_ctx(ctx_index()) {
+        return next(r, input);
     }
     let mut out = Chain::new();
     let mut size: i64 = 0;
@@ -147,7 +125,7 @@ async fn chunked_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
         out.push_back(Buf::special());
     }
     if out.is_empty() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
-    next(r, out).await
+    next(r, out)
 }

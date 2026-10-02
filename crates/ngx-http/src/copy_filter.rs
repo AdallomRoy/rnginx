@@ -1,7 +1,9 @@
 //! ngx_http_copy_filter_module: reads file buffers into memory when needed,
 //! as ngx_output_chain() does.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::*;
@@ -41,7 +43,7 @@ pub fn copy_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    install_body_filter(|r, chain, next| async move { copy_filter(r, chain, next).await });
+    install_body_filter_fn(copy_filter);
     Ok(())
 }
 
@@ -77,7 +79,7 @@ struct CopyCtx {
 }
 
 /// ngx_http_copy_filter
-async fn copy_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
+fn copy_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
     let ctx = match r.get_ctx::<CopyCtx>(ctx_index()) {
         Some(ctx) => ctx,
         None => {
@@ -104,120 +106,193 @@ async fn copy_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         }
     };
 
-    let rc = output_chain(&r, &ctx, input, next).await;
-
-    http_debug!(r, "http copy filter: {} \"{}?{}\"", rc, B(&r.uri.borrow()), B(&r.args.borrow()));
-
-    rc
+    match output_chain(&r, &ctx, input, next) {
+        Step::Ready(rc) => {
+            http_debug!(r, "http copy filter: {} \"{}?{}\"", rc, B(&r.uri.borrow()), B(&r.args.borrow()));
+            Step::Ready(rc)
+        }
+        Step::Pending(fut) => Step::boxed(async move {
+            let rc = fut.await;
+            http_debug!(r, "http copy filter: {} \"{}?{}\"", rc, B(&r.uri.borrow()), B(&r.args.borrow()));
+            rc
+        }),
+    }
 }
 
-/// ngx_output_chain
-async fn output_chain(r: &R, ctx: &std::rc::Rc<std::cell::RefCell<CopyCtx>>, input: Chain, next: BodyFilter) -> i64 {
+/// ngx_output_chain: the output goes to the next filter at once, as long
+/// as it does not have to wait; the rest of the loop goes on once it has.
+fn output_chain(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: Chain, next: &BodyFilter) -> Step {
     update_chains(r, &mut ctx.borrow_mut(), Vec::new());
 
     if ctx.borrow().busy.is_empty() && (input.is_empty() || (input.len() == 1 && as_is(&ctx.borrow(), &input[0]))) {
         // the short path for the case when the busy chain is empty (the
         // input is never kept), the incoming chain is empty too or has the
-        // single buf that does not require the copy
-        let rc = next(r.clone(), input).await;
-        update_chains(r, &mut ctx.borrow_mut(), Vec::new());
-        return rc;
+        // single buf that does not require the copy: no copy buffer is
+        // passed on, the busy chain stays empty
+        return next(r.clone(), input);
     }
 
     let mut input = input;
-    let mut out = Chain::new();
-    let mut copies: Vec<CopyBuf> = Vec::new();
     let mut last = NGX_NONE;
 
     loop {
-        while let Some(src) = input.front_mut() {
-            let bsize = src.buf_size();
+        let (out, copies) = match fill(r, ctx, &mut input, last) {
+            Fill::Done(rc) => return Step::Ready(rc),
+            Fill::Out(out, copies) => (out, copies),
+        };
 
-            if bsize == 0 && !src.special_buf() {
-                ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "zero size buf in output {}", buf_info(src));
-                input.pop_front();
-                continue;
-            }
+        match next(r.clone(), out) {
+            Step::Ready(rc) => {
+                last = rc;
 
-            if bsize < 0 {
-                ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "negative size buf in output {}", buf_info(src));
-                return NGX_ERROR;
-            }
-
-            if as_is(&ctx.borrow(), src) {
-                // move the buf to the output chain
-                out.push_back(input.pop_front().unwrap());
-                continue;
-            }
-
-            // ctx->buf == NULL: the buffer to copy in
-
-            let mut c = ctx.borrow_mut();
-            let tagged: Option<CopyBuf>;
-            let unaligned: bool;
-            let size: usize;
-
-            if let Some(n) = align_file_buf(&mut c, src, bsize) {
-                // not reused via the ctx->free list
-                size = n;
-                tagged = None;
-                unaligned = true;
-            } else {
-                if let Some(b) = c.free.pop() {
-                    // get the free buf
-                    tagged = Some(b);
-                } else if !out.is_empty() {
-                    break;
-                } else if c.allocated == c.bufs.num && !c.busy.is_empty() {
-                    // All the buffers are passed on and not sent: C waits
-                    // for the write events to free them, the write filter
-                    // has bounded what is in flight.
-                    let busy: Vec<CopyBuf> = c.busy.drain(..).collect();
-                    c.free.extend(busy);
-                    continue;
-                } else {
-                    let b = get_buf(&c, src, bsize);
-                    c.allocated += 1;
-                    tagged = Some(b);
+                if passed(r, ctx, last, copies) {
+                    return Step::Ready(last);
                 }
-
-                size = tagged.map(|b| b.size).unwrap_or(0);
-                unaligned = false;
             }
 
-            let directio = c.directio;
-            let alignment = c.alignment;
-            drop(c);
+            Step::Pending(fut) => {
+                let (r, ctx, next) = (r.clone(), ctx.clone(), next.clone());
 
-            let dst = match copy_buf(r, src, size, directio, alignment, unaligned, tagged.is_some_and(|b| b.recycled)) {
-                Ok(dst) => dst,
-                Err(rc) => return rc,
-            };
+                return Step::boxed(async move {
+                    let mut last = fut.await;
+                    let mut copies = copies;
 
-            // delete the completed buf from the input chain
-            if src.buf_size() == 0 {
-                input.pop_front();
+                    loop {
+                        if passed(&r, &ctx, last, copies) {
+                            return last;
+                        }
+
+                        let out;
+
+                        (out, copies) = match fill(&r, &ctx, &mut input, last) {
+                            Fill::Done(rc) => return rc,
+                            Fill::Out(out, copies) => (out, copies),
+                        };
+
+                        last = next(r.clone(), out).await;
+                    }
+                });
             }
-
-            out.push_back(dst);
-
-            if let Some(b) = tagged {
-                copies.push(b);
-            }
         }
-
-        if out.is_empty() && last != NGX_NONE {
-            return last;
-        }
-
-        last = next(r.clone(), std::mem::take(&mut out)).await;
-
-        if last == NGX_ERROR || last == NGX_DONE {
-            return last;
-        }
-
-        update_chains(r, &mut ctx.borrow_mut(), std::mem::take(&mut copies));
     }
+}
+
+/// What a pass of the loop of ngx_output_chain over the input came to
+enum Fill {
+    /// the result of ngx_output_chain
+    Done(i64),
+    /// the output for the next filter, and the copy buffers of it
+    Out(Chain, Vec<CopyBuf>),
+}
+
+/// A pass of the loop of ngx_output_chain: the buffers of the input that
+/// go as they are, and copies of the others, as long as there are buffers
+/// to copy into. `last` is the result of the last call of the next filter.
+fn fill(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: &mut Chain, last: i64) -> Fill {
+    let mut out = Chain::new();
+    let mut copies: Vec<CopyBuf> = Vec::new();
+
+    // every buffer goes as it is: the input is the output
+    if !input.is_empty() && {
+        let c = ctx.borrow();
+        input.iter().all(|b| as_is(&c, b) && (b.buf_size() > 0 || (b.buf_size() == 0 && b.special_buf())))
+    } {
+        std::mem::swap(&mut out, input);
+    }
+
+    while let Some(src) = input.front_mut() {
+        let bsize = src.buf_size();
+
+        if bsize == 0 && !src.special_buf() {
+            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "zero size buf in output {}", buf_info(src));
+            input.pop_front();
+            continue;
+        }
+
+        if bsize < 0 {
+            ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "negative size buf in output {}", buf_info(src));
+            return Fill::Done(NGX_ERROR);
+        }
+
+        if as_is(&ctx.borrow(), src) {
+            // move the buf to the output chain
+            out.push_back(input.pop_front().unwrap());
+            continue;
+        }
+
+        // ctx->buf == NULL: the buffer to copy in
+
+        let mut c = ctx.borrow_mut();
+        let tagged: Option<CopyBuf>;
+        let unaligned: bool;
+        let size: usize;
+
+        if let Some(n) = align_file_buf(&mut c, src, bsize) {
+            // not reused via the ctx->free list
+            size = n;
+            tagged = None;
+            unaligned = true;
+        } else {
+            if let Some(b) = c.free.pop() {
+                // get the free buf
+                tagged = Some(b);
+            } else if !out.is_empty() {
+                break;
+            } else if c.allocated == c.bufs.num && !c.busy.is_empty() {
+                // All the buffers are passed on and not sent: C waits
+                // for the write events to free them, the write filter
+                // has bounded what is in flight.
+                let busy: Vec<CopyBuf> = c.busy.drain(..).collect();
+                c.free.extend(busy);
+                continue;
+            } else {
+                let b = get_buf(&c, src, bsize);
+                c.allocated += 1;
+                tagged = Some(b);
+            }
+
+            size = tagged.map(|b| b.size).unwrap_or(0);
+            unaligned = false;
+        }
+
+        let directio = c.directio;
+        let alignment = c.alignment;
+        drop(c);
+
+        let dst = match copy_buf(r, src, size, directio, alignment, unaligned, tagged.is_some_and(|b| b.recycled)) {
+            Ok(dst) => dst,
+            Err(rc) => return Fill::Done(rc),
+        };
+
+        // delete the completed buf from the input chain
+        if src.buf_size() == 0 {
+            input.pop_front();
+        }
+
+        out.push_back(dst);
+
+        if let Some(b) = tagged {
+            copies.push(b);
+        }
+    }
+
+    if out.is_empty() && last != NGX_NONE {
+        return Fill::Done(last);
+    }
+
+    Fill::Out(out, copies)
+}
+
+/// After a call of the next filter with `last` as its result: the loop is
+/// over on an error, else the copy buffers passed on join the busy ones.
+fn passed(r: &R, ctx: &Rc<RefCell<CopyCtx>>, last: i64, copies: Vec<CopyBuf>) -> bool {
+    if last == NGX_ERROR || last == NGX_DONE {
+        return true;
+    }
+
+    update_chains(r, &mut ctx.borrow_mut(), copies);
+
+    false
 }
 
 /// ngx_chain_update_chains for the copy buffers: those passed on join the

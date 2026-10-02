@@ -546,14 +546,14 @@ pub fn weak_etag(r: &R) {
 
 /// ngx_http_send_early_hints: the early hints of r->headers_out, if the
 /// "early_hints" predicates let them go
-pub async fn send_early_hints(r: &R) -> i64 {
+pub fn send_early_hints(r: &R) -> Step {
     if r.post_action.get() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
 
     if r.header_sent.get() {
         ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ALERT, r.connection.log, None, "header already sent");
-        return NGX_ERROR;
+        return Step::Ready(NGX_ERROR);
     }
 
     let early_hints = r.clcf().borrow().early_hints.get_or(None);
@@ -561,22 +561,23 @@ pub async fn send_early_hints(r: &R) -> i64 {
     let rc = crate::script::test_predicates(r, &early_hints);
 
     if rc != NGX_DECLINED {
-        return rc;
+        return Step::Ready(rc);
     }
 
     ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http send early hints \"{}?{}\"", ngx_core::string::B(&r.uri.borrow()), ngx_core::string::B(&r.args.borrow()));
 
-    crate::top_early_hints_filter()(r.clone()).await
+    crate::top_early_hints_filter()(r.clone())
 }
 
-/// ngx_http_send_header
-pub async fn send_header(r: &R) -> i64 {
+/// ngx_http_send_header: the header filters run at once; the step is
+/// pending only if one of them has to wait
+pub fn send_header(r: &R) -> Step {
     if r.post_action.get() {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
     if r.header_sent.get() {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "header already sent");
-        return NGX_ERROR;
+        return Step::Ready(NGX_ERROR);
     }
     if r.err_status.get() != 0 {
         let mut ho = r.headers_out.borrow_mut();
@@ -584,18 +585,70 @@ pub async fn send_header(r: &R) -> i64 {
         ho.status_line.clear();
     }
     let f = top_header_filter();
-    f(r.clone()).await
+    f(r.clone())
 }
 
-/// ngx_http_output_filter
-pub async fn output_filter(r: &R, chain: Chain) -> i64 {
+/// ngx_http_output_filter: the body filters run at once; the future is
+/// pending only if one of them has to wait
+pub fn output_filter(r: &R, chain: Chain) -> OutputFilter {
     http_debug!(r, "http output filter \"{}?{}\"", B(&r.uri.borrow()), B(&r.args.borrow()));
     let f = top_body_filter();
-    let rc = f(r.clone(), chain).await;
-    if rc == NGX_ERROR {
-        r.connection.error.set(true);
+    match f(r.clone(), chain) {
+        Step::Ready(rc) => {
+            if rc == NGX_ERROR {
+                // NGX_ERROR may be returned by any filter
+                r.connection.error.set(true);
+            }
+            OutputFilter { step: Step::Ready(rc), r: None }
+        }
+        step => OutputFilter { step, r: Some(r.clone()) },
     }
-    rc
+}
+
+/// The future of ngx_http_output_filter(): the result of the body filters,
+/// with c->error set if it is NGX_ERROR once they are done
+pub struct OutputFilter {
+    step: Step,
+    /// the request, while the filters are not done
+    r: Option<R>,
+}
+
+impl OutputFilter {
+    /// The step of the call; one that is not done goes on in a new boxed
+    /// future
+    pub fn into_step(self) -> Step {
+        match self.r {
+            None => self.step,
+            Some(r) => self.step.map(move |rc| {
+                if rc == NGX_ERROR {
+                    r.connection.error.set(true);
+                }
+                rc
+            }),
+        }
+    }
+}
+
+impl std::future::Future for OutputFilter {
+    type Output = i64;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        let this = self.get_mut();
+
+        let rc = match std::pin::Pin::new(&mut this.step).poll(cx) {
+            std::task::Poll::Ready(rc) => rc,
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+
+        if let Some(r) = this.r.take() {
+            if rc == NGX_ERROR {
+                // NGX_ERROR may be returned by any filter
+                r.connection.error.set(true);
+            }
+        }
+
+        std::task::Poll::Ready(rc)
+    }
 }
 
 /// ngx_http_map_uri_to_path: returns (path, root_length).

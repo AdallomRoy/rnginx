@@ -14,38 +14,31 @@ pub fn not_modified_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    crate::install_header_filter_idle(not_modified_idle, not_modified_header_filter);
+    crate::install_header_filter_fn(not_modified_header_filter);
     Ok(())
 }
 
-/// not_modified_header_filter passes the response on as it is: not a 200
-/// of the main request, or no conditional headers
-fn not_modified_idle(r: &R) -> bool {
+/// ngx_http_not_modified_header_filter
+fn not_modified_header_filter(r: R, next: &HeaderFilter) -> Step {
     if r.headers_out.borrow().status != NGX_HTTP_OK || !r.is_main() || r.disable_not_modified.get() {
-        return true;
-    }
-
-    let hin = r.headers_in.borrow();
-    hin.if_unmodified_since.is_none() && hin.if_match.is_none() && hin.if_modified_since.is_none() && hin.if_none_match.is_none()
-}
-
-async fn not_modified_header_filter(r: R, next: HeaderFilter) -> i64 {
-    let status = r.headers_out.borrow().status;
-    if status != NGX_HTTP_OK || !r.is_main() || r.disable_not_modified.get() {
-        return next(r).await;
+        return next(r);
     }
     let (ius, im, ims, inm) = {
         let hin = r.headers_in.borrow();
+        if hin.if_unmodified_since.is_none() && hin.if_match.is_none() && hin.if_modified_since.is_none() && hin.if_none_match.is_none() {
+            drop(hin);
+            return next(r);
+        }
         (hin.if_unmodified_since.clone(), hin.if_match.clone(), hin.if_modified_since.clone(), hin.if_none_match.clone())
     };
     if let Some(h) = &ius {
         if !test_if_unmodified(&r, &h.value.borrow()) {
-            return crate::special_response::filter_finalize_request(&r, NGX_HTTP_PRECONDITION_FAILED).await;
+            return precondition_failed(r);
         }
     }
     if let Some(h) = &im {
         if !test_if_match(&r, &h.value.borrow(), false) {
-            return crate::special_response::filter_finalize_request(&r, NGX_HTTP_PRECONDITION_FAILED).await;
+            return precondition_failed(r);
         }
     }
     if ims.is_some() || inm.is_some() {
@@ -54,20 +47,25 @@ async fn not_modified_header_filter(r: R, next: HeaderFilter) -> i64 {
         // otherwise fall through to 304.
         if let Some(h) = &ims {
             if test_if_modified(&r, &h.value.borrow()) {
-                return next(r).await;
+                return next(r);
             }
         }
         if let Some(h) = &inm {
             if !test_if_match(&r, &h.value.borrow(), true) {
-                return next(r).await;
+                return next(r);
             }
         }
-        return not_modified(&r, next).await;
+        return not_modified(r, next);
     }
-    next(r).await
+    next(r)
 }
 
-async fn not_modified(r: &R, next: HeaderFilter) -> i64 {
+/// ngx_http_filter_finalize_request(r, NULL, NGX_HTTP_PRECONDITION_FAILED)
+fn precondition_failed(r: R) -> Step {
+    Step::boxed(async move { crate::special_response::filter_finalize_request(&r, NGX_HTTP_PRECONDITION_FAILED).await })
+}
+
+fn not_modified(r: R, next: &HeaderFilter) -> Step {
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = NGX_HTTP_NOT_MODIFIED;
@@ -77,12 +75,7 @@ async fn not_modified(r: &R, next: HeaderFilter) -> i64 {
     }
     r.clear_content_length();
     r.clear_accept_ranges();
-    let ho = r.headers_out.borrow();
-    if let Some(cc) = ho.cache_control.first() {
-        let _ = cc;
-    }
-    drop(ho);
-    next(r.clone()).await
+    next(r)
 }
 
 fn test_if_unmodified(r: &R, v: &[u8]) -> bool {

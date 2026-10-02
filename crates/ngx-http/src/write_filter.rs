@@ -1,6 +1,8 @@
 //! ngx_http_write_filter_module
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ngx_core::buf::{Buf, Chain};
 use ngx_core::log::*;
@@ -8,6 +10,7 @@ use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
 use ngx_core::ngx_log_error;
 
+use crate::output::Pass;
 use crate::request::*;
 use crate::*;
 
@@ -19,15 +22,27 @@ pub fn write_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    set_top_body_filter(Rc::new(|r, chain| Box::pin(write_filter(r, chain))));
+    set_top_body_filter(Rc::new(write_filter));
     Ok(())
 }
 
-/// ngx_http_write_filter
-pub async fn write_filter(r: R, mut input: Chain) -> i64 {
-    let c = r.connection.clone();
+/// What the sending of r->out goes by, taken once per call
+struct Send {
+    last: bool,
+    limit_rate: usize,
+    limit_rate_after: usize,
+    sendfile_max_chunk: usize,
+    send_timeout: u64,
+}
+
+/// ngx_http_write_filter: the output is sent at once, as far as the
+/// connection takes it; only output that has to wait for the connection
+/// (or for limit_rate) goes on in a boxed future, which sends the rest
+/// before it returns.
+pub fn write_filter(r: R, mut input: Chain) -> Step {
+    let c = &r.connection;
     if c.error.get() {
-        return NGX_ERROR;
+        return Step::Ready(NGX_ERROR);
     }
     let mut size: i64 = 0;
     let mut flush = false;
@@ -54,9 +69,6 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
         }
     }
     for b in input.iter() {
-        if b.in_memory() && b.last > b.pos && b.pos > 0 {
-            // fine
-        }
         size += b.buf_size();
         if b.flush || b.recycled {
             flush = true;
@@ -73,20 +85,22 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     }
     {
         let mut out = r.out.borrow_mut();
-        out.append(&mut input);
+        if out.is_empty() {
+            // the input's links become r->out
+            std::mem::swap(&mut *out, &mut input);
+        } else {
+            out.append(&mut input);
+        }
     }
     http_debug!(r, "http write filter: l:{} f:{} s:{}", last as i32, flush as i32, size);
     let clcf = r.clcf();
     let postpone = *clcf.borrow().postpone_output;
     if !last && !flush && size < postpone as i64 {
-        return NGX_OK;
+        return Step::Ready(NGX_OK);
     }
     if c.write_delayed.get() {
         r.buffered.set(r.buffered.get() | NGX_HTTP_WRITE_BUFFERED);
-        return NGX_AGAIN;
-    }
-    if size == 0 && !(c.buffer.borrow().is_empty() == false) && !flush && !sync {
-        // nothing to send
+        return Step::Ready(NGX_AGAIN);
     }
     // an HTTP/2 stream's connection wants empty last/flush chains too
     // (c->need_last_buf / c->need_flush_buf): they end the stream
@@ -96,10 +110,10 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
             r.out.borrow_mut().clear();
             r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
             r.response_sent.set(true);
-            return NGX_OK;
+            return Step::Ready(NGX_OK);
         }
         if r.out.borrow().is_empty() {
-            return NGX_OK;
+            return Step::Ready(NGX_OK);
         }
     }
     if size == 0 && !flush && sync && !pass_empty {
@@ -109,7 +123,7 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     if size == 0 && !flush && !pass_empty {
         // last_buf only: nothing to write
         if !last {
-            return NGX_OK;
+            return Step::Ready(NGX_OK);
         }
     }
 
@@ -119,16 +133,15 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     // the new location's limit_rate needs to take effect, and caching the
     // old location's value here freezes the wrong value for the rest of
     // the response — see the X-Accel-Redirect check in limit_rate.t.
-    let (limit_rate, limit_rate_after) = {
+    let s = {
         let cl = clcf.borrow();
-        let lr = if r.limit_rate_set.get() { r.limit_rate.get() } else { crate::script::complex_value_size(&r, &cl.limit_rate, 0) };
-        let lra = if r.limit_rate_after_set.get() { r.limit_rate_after.get() } else { crate::script::complex_value_size(&r, &cl.limit_rate_after, 0) };
-        (lr, lra)
+        let limit_rate = if r.limit_rate_set.get() { r.limit_rate.get() } else { crate::script::complex_value_size(&r, &cl.limit_rate, 0) };
+        let limit_rate_after = if r.limit_rate_after_set.get() { r.limit_rate_after.get() } else { crate::script::complex_value_size(&r, &cl.limit_rate_after, 0) };
+        Send { last, limit_rate, limit_rate_after, sendfile_max_chunk: *cl.sendfile_max_chunk, send_timeout: *cl.send_timeout }
     };
-    r.limit_rate.set(limit_rate);
-    r.limit_rate_after.set(limit_rate_after);
-    let sendfile_max_chunk = *clcf.borrow().sendfile_max_chunk;
-    let send_timeout = *clcf.borrow().send_timeout;
+    drop(clcf);
+    r.limit_rate.set(s.limit_rate);
+    r.limit_rate_after.set(s.limit_rate_after);
 
     // HTTP/2: queue what the flow control windows allow and let the body
     // producer go on while the output in flight stays below the output
@@ -137,30 +150,177 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
     // flushes, but does not stop it). The remainder joins later output in
     // the same DATA frame. The last buffer, flushes and rate limited output
     // are sent in full below.
-    if r.stream.borrow().is_some() && !last && !flush_buf && !sync && limit_rate == 0 {
-        match crate::v2::filter::send_nowait(&r).await {
-            Err(()) => {
-                c.error.set(true);
-                return NGX_ERROR;
-            }
-            Ok(unsent) => {
-                if unsent < crate::copy_filter::output_buffers_size(&r) {
-                    if r.out.borrow().is_empty() {
-                        r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
-                    } else {
-                        r.buffered.set(r.buffered.get() | NGX_HTTP_WRITE_BUFFERED);
+    if r.stream.borrow().is_some() && !last && !flush_buf && !sync && s.limit_rate == 0 {
+        return Step::boxed(async move {
+            match crate::v2::filter::send_nowait(&r).await {
+                Err(()) => {
+                    r.connection.error.set(true);
+                    return NGX_ERROR;
+                }
+                Ok(unsent) => {
+                    if unsent < crate::copy_filter::output_buffers_size(&r) {
+                        if r.out.borrow().is_empty() {
+                            r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
+                        } else {
+                            r.buffered.set(r.buffered.get() | NGX_HTTP_WRITE_BUFFERED);
+                        }
+                        return NGX_OK;
                     }
-                    return NGX_OK;
                 }
             }
-        }
+
+            write_loop(r, s, Resume::Iteration).await
+        });
     }
 
     loop {
-        // c->write->delayed by the last send: the output waits for the
-        // timer (the read event is ngx_http_test_reading meanwhile)
-        if let Some(until) = c.write_delay_until.get() {
-            if std::time::Instant::now() < until {
+        match iteration(&r, &s) {
+            Iteration::Done(rc) => return Step::Ready(rc),
+            Iteration::Next => continue,
+            Iteration::Wait(resume) => return Step::boxed(write_loop(r, s, resume)),
+        }
+    }
+}
+
+/// What an iteration of the sending of r->out came to
+enum Iteration {
+    /// the result of the write filter
+    Done(i64),
+    /// the output is sent up to the limit of the iteration: the next one
+    Next,
+    /// it has to wait
+    Wait(Resume),
+}
+
+/// What the sending of r->out waits for, and goes on with
+enum Resume {
+    /// nothing: an iteration
+    Iteration,
+    /// the timer of the write delayed by the last send (c->write->delayed),
+    /// then the iteration
+    Delayed(Instant),
+    /// the limit_rate delay of an iteration, in ms, then the next one
+    RateLimited(u64),
+    /// the write event: the send of the iteration goes on, `limit` bytes
+    /// of it left (0: no limit), `before` the c->sent before it
+    Send { limit: i64, before: u64 },
+}
+
+/// An iteration of the sending of r->out, without waiting
+fn iteration(r: &R, s: &Send) -> Iteration {
+    let c = &r.connection;
+
+    // c->write->delayed by the last send: the output waits for the timer
+    // (the read event is ngx_http_test_reading meanwhile)
+    if let Some(until) = c.write_delay_until.get() {
+        if Instant::now() < until {
+            return Iteration::Wait(Resume::Delayed(until));
+        }
+
+        c.write_delay_until.set(None);
+    }
+
+    let mut limit: i64;
+    if s.limit_rate > 0 {
+        let now = ngx_core::times::time();
+        limit = s.limit_rate as i64 * (now - r.start_sec.get() + 1) - (c.sent.get() as i64 - s.limit_rate_after as i64);
+        if limit <= 0 {
+            c.write_delayed.set(true);
+            let delay = (-limit) as u64 * 1000 / s.limit_rate as u64 + 1;
+            http_debug!(r, "delayed for {}ms", delay);
+            return Iteration::Wait(Resume::RateLimited(delay));
+        }
+        if s.sendfile_max_chunk > 0 && limit > s.sendfile_max_chunk as i64 {
+            limit = s.sendfile_max_chunk as i64;
+        }
+    } else {
+        limit = s.sendfile_max_chunk as i64;
+    }
+
+    // c->send_chain(), as far as the connection takes the output now (an
+    // HTTP/2 stream's send_chain waits on the stream)
+    let before = c.sent.get();
+    let mut total: i64 = 0;
+    let pass = if r.stream.borrow().is_some() {
+        Ok(Pass::Async)
+    } else {
+        let mut out = std::mem::take(&mut *r.out.borrow_mut());
+        let pass = crate::output::send_chain_pass(c, &mut out, limit, &mut total);
+        *r.out.borrow_mut() = out;
+        pass
+    };
+
+    match pass {
+        Ok(Pass::Done) => {}
+        Ok(Pass::Again) | Ok(Pass::Async) => {
+            // what the pass sent counts against the limit of the send
+            // (less than the limit here)
+            let limit = if limit <= 0 { 0 } else { limit - total };
+            return Iteration::Wait(Resume::Send { limit, before });
+        }
+        Err(e) => return Iteration::Done(send_failed(r, e)),
+    }
+
+    match sent(r, s, before) {
+        Some(rc) => Iteration::Done(rc),
+        None => Iteration::Next,
+    }
+}
+
+/// After the send of an iteration: the limit_rate delay of the write
+/// event, and the result once r->out is all sent (None: the next iteration)
+fn sent(r: &R, s: &Send, before: u64) -> Option<i64> {
+    let c = &r.connection;
+
+    if s.limit_rate > 0 {
+        // delay = (nsent - sent) * 1000 / r->limit_rate, the counts
+        // past limit_rate_after
+        let lra = s.limit_rate_after as u64;
+        let sent = before.saturating_sub(lra);
+        let nsent = c.sent.get().saturating_sub(lra);
+        let delay = (nsent - sent) * 1000 / s.limit_rate as u64;
+
+        if delay > 0 {
+            c.write_delay_until.set(Some(Instant::now() + Duration::from_millis(delay)));
+        }
+    }
+    let remaining: i64 = r.out.borrow().iter().map(|b| b.buf_size()).sum();
+    if remaining == 0 {
+        // drop special (sync/flush/last) buffers as sent
+        r.out.borrow_mut().clear();
+        r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
+        if s.last {
+            r.response_sent.set(true);
+        }
+        return Some(NGX_OK);
+    }
+    // partial due to sendfile_max_chunk or limit_rate: the next iteration
+    None
+}
+
+/// The send failed (ngx_writev() and others log the error)
+fn send_failed(r: &R, e: std::io::Error) -> i64 {
+    let c = &r.connection;
+    let en = e.raw_os_error().unwrap_or(0);
+    if en == libc::EPIPE || en == libc::ECONNRESET || en == libc::ENOTCONN {
+        ngx_log_error!(NGX_LOG_INFO, c.log, Some(en), "writev() failed");
+    } else if en != 0 {
+        ngx_log_error!(NGX_LOG_ALERT, c.log, Some(en), "writev() failed");
+    }
+    c.error.set(true);
+    NGX_ERROR
+}
+
+/// The sending of r->out once it has to wait: the waits, each followed by
+/// iterations as long as they need none.
+async fn write_loop(r: R, s: Send, mut resume: Resume) -> i64 {
+    let c = r.connection.clone();
+
+    loop {
+        match resume {
+            Resume::Iteration => {}
+
+            Resume::Delayed(until) => {
                 c.write_delayed.set(true);
 
                 let closed = {
@@ -176,20 +336,11 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
                 if let Some(err) = closed {
                     return test_reading_closed(&r, err);
                 }
+
+                c.write_delay_until.set(None);
             }
 
-            c.write_delay_until.set(None);
-        }
-
-        let mut limit: i64;
-        if limit_rate > 0 {
-            let now = ngx_core::times::time();
-            limit = limit_rate as i64 * (now - r.start_sec.get() + 1) - (c.sent.get() as i64 - limit_rate_after as i64);
-            if limit <= 0 {
-                c.write_delayed.set(true);
-                let delay = (-limit) as u64 * 1000 / limit_rate as u64 + 1;
-                http_debug!(r, "delayed for {}ms", delay);
-
+            Resume::RateLimited(delay) => {
                 // the write event timer; meanwhile the read event handler is
                 // ngx_http_test_reading (ngx_http_set_write_handler)
                 let closed = if test_reading_on(&r) {
@@ -197,11 +348,11 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
                     let _stream = StreamTestReading::new(&r);
 
                     tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => None,
+                        _ = tokio::time::sleep(Duration::from_millis(delay)) => None,
                         err = watch.closed() => Some(err),
                     }
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                     None
                 };
 
@@ -210,69 +361,39 @@ pub async fn write_filter(r: R, mut input: Chain) -> i64 {
                 if let Some(err) = closed {
                     return test_reading_closed(&r, err);
                 }
+            }
 
-                continue;
-            }
-            if sendfile_max_chunk > 0 && limit > sendfile_max_chunk as i64 {
-                limit = sendfile_max_chunk as i64;
-            }
-        } else {
-            limit = sendfile_max_chunk as i64;
-        }
-        let mut out = std::mem::take(&mut *r.out.borrow_mut());
-        let before = c.sent.get();
-        let sent = send_out(&r, &mut out, limit, send_timeout).await;
-        let sent_now = c.sent.get() - before;
-        *r.out.borrow_mut() = out;
-        let res = match sent {
-            Sent::Done(res) => res,
-            Sent::Closed(err) => return test_reading_closed(&r, err),
-        };
-        match res {
-            Err(_) => {
-                ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
-                c.timedout.set(true);
-                c.error.set(true);
-                return NGX_ERROR;
-            }
-            Ok(Err(e)) => {
-                let en = e.raw_os_error().unwrap_or(0);
-                if en == libc::EPIPE || en == libc::ECONNRESET || en == libc::ENOTCONN {
-                    ngx_log_error!(NGX_LOG_INFO, c.log, Some(en), "writev() failed");
-                } else if en != 0 {
-                    ngx_log_error!(NGX_LOG_ALERT, c.log, Some(en), "writev() failed");
+            Resume::Send { limit, before } => {
+                let mut out = std::mem::take(&mut *r.out.borrow_mut());
+                let sent_out = send_out(&r, &mut out, limit, s.send_timeout).await;
+                *r.out.borrow_mut() = out;
+                let res = match sent_out {
+                    Sent::Done(res) => res,
+                    Sent::Closed(err) => return test_reading_closed(&r, err),
+                };
+                match res {
+                    Err(_) => {
+                        ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
+                        c.timedout.set(true);
+                        c.error.set(true);
+                        return NGX_ERROR;
+                    }
+                    Ok(Err(e)) => return send_failed(&r, e),
+                    Ok(Ok(_)) => {}
                 }
-                c.error.set(true);
-                return NGX_ERROR;
+                if let Some(rc) = sent(&r, &s, before) {
+                    return rc;
+                }
             }
-            Ok(Ok(_)) => {}
         }
-        if limit_rate > 0 {
-            // delay = (nsent - sent) * 1000 / r->limit_rate, the counts
-            // past limit_rate_after
-            let lra = limit_rate_after as u64;
-            let sent = before.saturating_sub(lra);
-            let nsent = (before + sent_now).saturating_sub(lra);
-            let delay = (nsent - sent) * 1000 / limit_rate as u64;
 
-            if delay > 0 {
-                c.write_delay_until.set(Some(std::time::Instant::now() + std::time::Duration::from_millis(delay)));
+        resume = loop {
+            match iteration(&r, &s) {
+                Iteration::Done(rc) => return rc,
+                Iteration::Next => continue,
+                Iteration::Wait(resume) => break resume,
             }
-        }
-        let remaining: i64 = r.out.borrow().iter().map(|b| b.buf_size()).sum();
-        if remaining == 0 {
-            // drop special (sync/flush/last) buffers as sent
-            r.out.borrow_mut().clear();
-            r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
-            if last {
-                r.response_sent.set(true);
-            }
-            return NGX_OK;
-        }
-        if limit_rate > 0 {
-            continue;
-        }
-        // partial due to sendfile_max_chunk: keep looping
+        };
     }
 }
 
@@ -301,7 +422,7 @@ async fn send_out(r: &R, out: &mut Chain, limit: i64, send_timeout: u64) -> Sent
         }
     };
 
-    let send = tokio::time::timeout(std::time::Duration::from_millis(send_timeout), chain);
+    let send = tokio::time::timeout(Duration::from_millis(send_timeout), chain);
     tokio::pin!(send);
 
     if let Some(res) = poll_once(&mut send).await {
@@ -373,12 +494,17 @@ impl Drop for StreamTestReading {
 }
 
 /// ngx_http_test_reading, as the Linux build runs it (epoll with
-/// EPOLLRDHUP), on a duplicate of the client socket, so that the readiness
-/// of the connection itself (pipelined requests) is not disturbed: the
-/// client closed its side of an HTTP/1.x connection. An HTTP/2 stream is
-/// not tested.
+/// EPOLLRDHUP): the client closed its side of an HTTP/1.x connection
+/// (rev->pending_eof), on the read event of the connection, as in C. Its
+/// readiness is shared with the request's readers (of pipelined requests),
+/// so it is not cleared while there is data to read: once the client sends
+/// data meanwhile, a duplicate of the client socket, whose readiness is its
+/// own, waits for the end of the stream. An HTTP/2 stream is not tested.
 pub(crate) struct TestReading {
-    afd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+    /// the connection of an HTTP/1.x request
+    conn: Option<Rc<ngx_core::connection::Connection>>,
+    /// the duplicate, made when data came from the client
+    dup: RefCell<Option<Rc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>>>,
     /// the stream of an HTTP/3 request: ngx_http_test_reading tests
     /// rev->error
     quic: Option<(Rc<ngx_core::connection::Connection>, Rc<ngx_core::quic::QuicStream>)>,
@@ -387,26 +513,14 @@ pub(crate) struct TestReading {
 impl TestReading {
     pub(crate) fn new(r: &R) -> TestReading {
         if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(&r.connection) {
-            return TestReading { afd: None, quic: Some((r.connection.clone(), qs)) };
+            return TestReading { conn: None, dup: RefCell::new(None), quic: Some((r.connection.clone(), qs)) };
         }
 
         if r.stream.borrow().is_some() || r.connection.fd.get() < 0 {
-            return TestReading { afd: None, quic: None };
+            return TestReading { conn: None, dup: RefCell::new(None), quic: None };
         }
 
-        // a dup() of the connection's open socket, owned (and closed) by
-        // the OwnedFd
-        let dup = match ngx_core::fd::get(r.connection.fd.get()) {
-            Ok(s) => rustix::io::fcntl_dupfd_cloexec(&s, 0),
-            Err(_) => return TestReading { afd: None, quic: None },
-        };
-
-        let owned = match dup {
-            Ok(owned) => owned,
-            Err(_) => return TestReading { afd: None, quic: None },
-        };
-
-        TestReading { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), quic: None }
+        TestReading { conn: Some(r.connection.clone()), dup: RefCell::new(None), quic: None }
     }
 
     /// Resolves with the pending socket error (0 if none) when the client
@@ -418,7 +532,46 @@ impl TestReading {
             return 0;
         }
 
-        let afd = match &self.afd {
+        let c = match &self.conn {
+            Some(c) => c,
+            None => return std::future::pending().await,
+        };
+
+        if self.dup.borrow().is_none() {
+            loop {
+                match c.read_event().await {
+                    // EPOLLRDHUP: ev->pending_eof
+                    Ok(ready) if ready.is_read_closed() => return conn_so_error(c),
+                    Ok(_) => {}
+                    Err(_) => return std::future::pending().await,
+                }
+
+                // a read event without the end of the stream: data from the
+                // client, or the readiness a read of a whole buffer left
+                match peek(c.fd.get()) {
+                    // nothing to read: the readiness is cleared, as a read
+                    // that finds the socket drained does (rev->ready = 0)
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => c.read_drained(),
+                    Ok(n) if n > 0 => break,
+                    _ => return conn_so_error(c),
+                }
+            }
+
+            // data from the client: the readiness stays for its readers,
+            // the end of the stream is waited for on a duplicate (owned, and
+            // closed, by the OwnedFd)
+            let owned = match ngx_core::fd::get(c.fd.get()).map(|s| rustix::io::fcntl_dupfd_cloexec(&s, 0)) {
+                Ok(Ok(owned)) => owned,
+                _ => return std::future::pending().await,
+            };
+
+            match tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE) {
+                Ok(a) => *self.dup.borrow_mut() = Some(Rc::new(a)),
+                Err(_) => return std::future::pending().await,
+            }
+        }
+
+        let afd = match self.dup.borrow().clone() {
             Some(a) => a,
             None => return std::future::pending().await,
         };
@@ -436,12 +589,28 @@ impl TestReading {
             guard.clear_ready();
         }
 
-        // getsockopt(SO_ERROR): a pending error, if any
-        match rustix::net::sockopt::socket_error(afd.get_ref()) {
-            Ok(Err(err)) => err.raw_os_error(),
-            _ => 0,
-        }
+        so_error(afd.get_ref())
     }
+}
+
+/// recv(MSG_PEEK) of a byte, without waiting
+fn peek(fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+    let mut b = [0u8; 1];
+
+    nix::sys::socket::recv(fd, &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT).map_err(std::io::Error::from)
+}
+
+/// getsockopt(SO_ERROR): the pending error of the socket, if any
+fn so_error(fd: impl std::os::fd::AsFd) -> i32 {
+    match rustix::net::sockopt::socket_error(fd) {
+        Ok(Err(err)) => err.raw_os_error(),
+        _ => 0,
+    }
+}
+
+/// so_error() of a connection's socket
+fn conn_so_error(c: &ngx_core::connection::Connection) -> i32 {
+    ngx_core::fd::get(c.fd.get()).map(so_error).unwrap_or(0)
 }
 
 /// The "closed:" part of ngx_http_test_reading: the request is finalized
@@ -469,12 +638,12 @@ pub(crate) fn test_reading_closed(r: &R, err: i32) -> i64 {
 }
 
 /// Force out any pending buffered output (called at request end).
-pub async fn flush(r: &R) -> i64 {
+pub fn flush(r: &R) -> Step {
     let mut chain = Chain::new();
     let mut b = Buf::special();
     b.flush = true;
     chain.push_back(b);
-    write_filter(r.clone(), chain).await
+    write_filter(r.clone(), chain)
 }
 
 use ngx_core::conf::{Conf, ConfResult};
