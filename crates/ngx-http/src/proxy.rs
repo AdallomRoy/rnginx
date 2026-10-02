@@ -2240,13 +2240,13 @@ impl ProxyModule {
         use ngx_core::log::*;
 
         if buf.is_empty() {
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
         if p.upstream_done {
             ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy data after close");
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -2256,7 +2256,7 @@ impl ProxyModule {
             u.keepalive = false;
             p.upstream_done = true;
 
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -2264,7 +2264,7 @@ impl ProxyModule {
 
         let slot = buf.slot;
         let mut pos = buf.pos;
-        let data = buf.data;
+        let data = &buf.data[..buf.last];
         let mut produced = false;
 
         if self.trailers.is_some() {
@@ -2344,9 +2344,13 @@ impl ProxyModule {
 
         ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy chunked state {}, length {}", self.chunked.state, p.length);
 
+        // the data of the chunks was copied: the memory of the raw buffer
+        // is kept for its next use
         if !produced {
             // there is no data record in the buf, add it to free chain
-            p.release_raw(slot);
+            p.release_raw_buf(buf);
+        } else {
+            p.recycle(buf);
         }
 
         NGX_OK

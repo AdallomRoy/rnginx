@@ -1054,7 +1054,7 @@ impl UpstreamModule for FastcgiModule {
     /// fastcgi_keep_conn, p->length for the rest of the record.
     fn pipe_input_filter(&mut self, r: &R, u: &mut Upstream, p: &mut EventPipe, buf: RawBuf) -> i64 {
         if buf.is_empty() {
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -1063,7 +1063,7 @@ impl UpstreamModule for FastcgiModule {
 
             http_debug!(r, "http fastcgi data after close");
 
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -1260,13 +1260,16 @@ impl UpstreamModule for FastcgiModule {
             };
         }
 
+        // the data of the records was copied: the memory of the raw buffer
+        // is kept for its next use
         if let Some((b_pos, b_last)) = shadow {
             http_debug!(r, "input buf {} {}", b_pos, b_last - b_pos);
+            p.recycle(buf);
             return NGX_OK;
         }
 
         // there is no data record in the buf, add it to free chain
-        p.release_raw(buf.slot);
+        p.release_raw_buf(buf);
 
         NGX_OK
     }

@@ -398,7 +398,7 @@ impl UpstreamModule for ProxyV2Module {
     /// p->in
     fn pipe_input_filter(&mut self, r: &R, u: &mut Upstream, p: &mut EventPipe, raw: RawBuf) -> i64 {
         if raw.is_empty() {
-            p.release_raw(raw.slot);
+            p.release_raw_buf(raw);
             return NGX_OK;
         }
 
@@ -456,14 +456,17 @@ impl UpstreamModule for ProxyV2Module {
             return NGX_ERROR;
         }
 
+        // the payloads were copied: the memory of the raw buffer is kept for
+        // its next use
         if copied {
             ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_EVENT, r.connection.log, "input buf #{}", raw.slot);
+            p.recycle(raw);
             return NGX_OK;
         }
 
         // there is no data record in the buf, add it to free chain
 
-        p.release_raw(raw.slot);
+        p.release_raw_buf(raw);
 
         NGX_OK
     }
