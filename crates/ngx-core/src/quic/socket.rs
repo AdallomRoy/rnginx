@@ -16,7 +16,7 @@ use super::{ngx_quic_get_connection, QuicConnection, QuicServerId, QuicSocket, N
 
 /// ngx_quic_open_sockets
 pub fn ngx_quic_open_sockets(c: &Rc<Connection>, qc: &Rc<QuicConnection>, pkt: &QuicHeader<'_>) -> i64 {
-    qc.tp.borrow_mut().original_dcid = pkt.odcid.clone();
+    qc.tp.borrow_mut().original_dcid = pkt.odcid.to_vec();
 
     /* socket to use for further processing (id auto-generated) */
     let qsock = match ngx_quic_create_socket(c, qc) {
@@ -59,7 +59,7 @@ pub fn ngx_quic_open_sockets(c: &Rc<Connection>, qc: &Rc<QuicConnection>, pkt: &
     let tmp = Rc::new(QuicSocket {
         quic: RefCell::new(Weak::new()),
         connection: RefCell::new(Weak::new()),
-        sid: RefCell::new(QuicServerId { seqnum: NGX_QUIC_UNSET_PN, /* temporary socket */ id: pkt.dcid.clone() }),
+        sid: RefCell::new(QuicServerId { seqnum: NGX_QUIC_UNSET_PN, /* temporary socket */ id: pkt.dcid.to_vec() }),
         sockaddr: RefCell::new(c.sockaddr.borrow().clone()),
         used: Cell::new(false),
         key: RefCell::new(None),

@@ -713,17 +713,8 @@ pub fn ngx_quic_stream_recv(c: &Connection, buf: &mut [u8]) -> isize {
         return 0;
     }
 
-    let input = ngx_quic_read_buffer(&pc, &mut qs.recv.borrow_mut(), buf.len() as u64);
-
-    let mut len = 0usize;
-
-    for b in input.iter() {
-        let n = b.len();
-        buf[len..len + n].copy_from_slice(&b.block.borrow()[b.pos..b.last]);
-        len += n;
-    }
-
-    ngx_quic_free_chain(&pc, input);
+    // ngx_quic_read_buffer(), the data copied, ngx_quic_free_chain()
+    let len = ngx_quic_read_buffer_copy(&pc, &mut qs.recv.borrow_mut(), buf);
 
     if len == 0 {
         qs.read_ready.set(false);
@@ -816,14 +807,16 @@ fn ngx_quic_stream_flush(qs: &Rc<QuicStream>) -> i64 {
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, pc.log, "quic stream id:0x{:x} flush limit:{}", qs.id, limit);
 
-    let len = qs.send.borrow().offset;
+    // the data ngx_quic_read_buffer() takes, read below into the chain of
+    // the frame (which keeps its room from the free list)
+    let (offset, len) = {
+        let send = qs.send.borrow();
+        (send.offset, ngx_quic_buffer_readable(&send, limit as u64))
+    };
 
-    let out = ngx_quic_read_buffer(&pc, &mut qs.send.borrow_mut(), limit as u64);
-
-    let len = qs.send.borrow().offset - len;
     let mut last = false;
 
-    if qs.send_final_size.get() != u64::MAX && qs.send_final_size.get() == qs.send.borrow().offset {
+    if qs.send_final_size.get() != u64::MAX && qs.send_final_size.get() == offset + len {
         qs.send_state.set(QuicStreamSendState::DataSent);
         last = true;
     }
@@ -837,9 +830,10 @@ fn ngx_quic_stream_flush(qs: &Rc<QuicStream>) -> i64 {
         None => return NGX_ERROR,
     };
 
+    ngx_quic_read_buffer_into(&pc, &mut qs.send.borrow_mut(), limit as u64, &mut frame.data);
+
     frame.level = NGX_QUIC_ENCRYPTION_APPLICATION;
     frame.ty = NGX_QUIC_FT_STREAM;
-    frame.data = out;
 
     frame.u.stream.off = true;
     frame.u.stream.len = true;

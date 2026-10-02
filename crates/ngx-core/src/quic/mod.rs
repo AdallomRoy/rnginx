@@ -25,6 +25,7 @@ pub mod migration;
 pub mod openssl_compat;
 pub mod output;
 pub mod protection;
+pub mod scratch;
 pub mod socket;
 pub mod ssl;
 pub mod streams;
@@ -524,6 +525,9 @@ pub struct QuicConnection {
     pub nframes: Cell<usize>,
     pub free_frames: Cell<usize>,
     pub max_frames: Cell<usize>,
+    /// qc->free_frames itself: the frames freed, reset, for reuse (at most
+    /// frames::NGX_QUIC_FREE_FRAMES_KEPT of them; the counters go on)
+    pub frames_free: RefCell<Vec<Box<QuicFrame>>>,
 
     pub compat: RefCell<Option<openssl_compat::QuicCompat>>,
 
@@ -761,15 +765,17 @@ pub fn ngx_quic_run(c: &Rc<Connection>, conf: &Rc<QuicConf>) {
     });
 }
 
-/// ngx_quic_new_connection
-fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHeader<'_>) -> Option<Rc<QuicConnection>> {
-    let posted = Rc::new(RefCell::new(VecDeque::new()));
-    let wake = Rc::new(tokio::sync::Notify::new());
+impl QuicConnection {
+    /// The ngx_quic_connection_t of ngx_quic_new_connection(), as
+    /// ngx_pcalloc() makes it.
+    fn alloc(version: u32, conf: &Rc<QuicConf>) -> QuicConnection {
+        let posted = Rc::new(RefCell::new(VecDeque::new()));
+        let wake = Rc::new(tokio::sync::Notify::new());
 
-    let ev = |kind: QEventKind| Rc::new(QEvent { timer: Cell::new(None), posted: Cell::new(false), timedout: Cell::new(false), kind, wake: wake.clone(), queue: Rc::downgrade(&posted) });
+        let ev = |kind: QEventKind| Rc::new(QEvent { timer: Cell::new(None), posted: Cell::new(false), timedout: Cell::new(false), kind, wake: wake.clone(), queue: Rc::downgrade(&posted) });
 
-    let qc = Rc::new(QuicConnection {
-        version: Cell::new(pkt.version),
+        QuicConnection {
+        version: Cell::new(version),
         path: RefCell::new(None),
         sockets: RefCell::new(Vec::new()),
         paths: RefCell::new(Vec::new()),
@@ -802,6 +808,7 @@ fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHe
         nframes: Cell::new(0),
         free_frames: Cell::new(0),
         max_frames: Cell::new(0),
+        frames_free: RefCell::new(Vec::new()),
         compat: RefCell::new(None),
         streams: QuicStreams::default(),
         congestion: QuicCongestion::default(),
@@ -826,7 +833,19 @@ fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHe
         posted,
         wake,
         app_events: RefCell::new(Vec::new()),
-    });
+        }
+    }
+
+    /// A connection for the unit tests of the frames.
+    #[cfg(test)]
+    pub fn new_for_tests(_c: &Connection) -> QuicConnection {
+        QuicConnection::alloc(1, &Rc::new(QuicConf::default()))
+    }
+}
+
+/// ngx_quic_new_connection
+fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHeader<'_>) -> Option<Rc<QuicConnection>> {
+    let qc = Rc::new(QuicConnection::alloc(pkt.version, conf));
 
     qc.init_rtt();
 
@@ -862,7 +881,7 @@ fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHe
     qc.max_frames.set(((conf.max_concurrent_streams_uni + conf.max_concurrent_streams_bidi) as usize * conf.stream_buffer_size) / 2000);
 
     if pkt.validated && pkt.retried {
-        qc.tp.borrow_mut().retry_scid = pkt.dcid.clone();
+        qc.tp.borrow_mut().retry_scid = pkt.dcid.to_vec();
     }
 
     if ngx_quic_keys_set_initial_secret(&mut qc.keys.borrow_mut(), &pkt.dcid, &c.log) != NGX_OK {
@@ -1209,6 +1228,11 @@ fn ngx_quic_handle_datagram(c: &Rc<Connection>, b: &[u8], conf: Option<&Rc<QuicC
         };
 
         let rc = ngx_quic_handle_packet(c, conf, &mut pkt);
+
+        // the plaintext buffer back to the worker
+        if pkt.payload_range.is_some() {
+            scratch::give_back(scratch::Kind::Plain, std::mem::take(&mut pkt.payload));
+        }
 
         if pkt.parsed {
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic packet done rc:{} level:{} decr:{} pn:{} perr:{}", rc, ngx_quic_level_name(pkt.level), pkt.decrypted as u32, pkt.pn as i64, pkt.error);
@@ -1586,15 +1610,27 @@ fn ngx_quic_check_csid(qc: &QuicConnection, pkt: &QuicHeader<'_>) -> i64 {
 
 /// ngx_quic_handle_frames
 fn ngx_quic_handle_frames(c: &Rc<Connection>, pkt: &mut QuicHeader<'_>) -> i64 {
+    // the frames are parsed from the payload while the packet is passed
+    // on: lent out of it, and put back
+    let payload = std::mem::take(&mut pkt.payload);
+
+    let (start, end) = pkt.payload_range.unwrap_or((0, payload.len()));
+
+    let rc = ngx_quic_handle_frames_of(c, pkt, &payload, start, end);
+
+    pkt.payload = payload;
+
+    rc
+}
+
+/// ngx_quic_handle_frames of payload[start..end]
+fn ngx_quic_handle_frames_of(c: &Rc<Connection>, pkt: &mut QuicHeader<'_>, payload: &[u8], start: usize, end: usize) -> i64 {
     let qc = match ngx_quic_get_connection(c) {
         Some(qc) => qc,
         None => return NGX_ERROR,
     };
 
-    let payload = std::mem::take(&mut pkt.payload);
-
-    let mut p = 0usize;
-    let end = payload.len();
+    let mut p = start;
 
     let mut do_close = false;
     let mut nonprobing = false;
@@ -1605,11 +1641,10 @@ fn ngx_quic_handle_frames(c: &Rc<Connection>, pkt: &mut QuicHeader<'_>) -> i64 {
         let mut frame = QuicFrame::default();
         let mut data = (0usize, 0usize);
 
-        let len = ngx_quic_parse_frame(pkt, &payload, p, end, &mut frame, &mut data);
+        let len = ngx_quic_parse_frame(pkt, payload, p, end, &mut frame, &mut data);
 
         if len < 0 {
             qc.error.set(pkt.error);
-            pkt.payload = payload;
             return NGX_ERROR;
         }
 
@@ -1804,6 +1839,9 @@ pub fn ngx_quic_input(c: &Rc<Connection>, data: &[u8]) {
 /// events, as an iteration of ngx_process_events_and_timers() (the
 /// datagrams are handled when they are read, see udp.rs).
 async fn ngx_quic_drive(c: Rc<Connection>) {
+    // the expired timers of an iteration (kept for its capacity)
+    let mut expired: Vec<(u64, Rc<QEvent>)> = Vec::new();
+
     loop {
         let qc = match ngx_quic_get_connection(&c) {
             Some(qc) => qc,
@@ -1821,28 +1859,37 @@ async fn ngx_quic_drive(c: Rc<Connection>) {
         // the expired timers, in the order of their expiry
 
         let now = times::event_msec();
-        let mut expired: Vec<(u64, Rc<QEvent>)> = Vec::new();
 
-        let app: Vec<Rc<QEvent>> = {
+        expired.clear();
+
+        {
             let mut events = qc.app_events.borrow_mut();
             events.retain(|w| w.strong_count() > 0);
-            events.iter().filter_map(|w| w.upgrade()).collect()
-        };
 
-        for ev in [&qc.read, &qc.push, &qc.pto, &qc.close, &qc.path_validation].into_iter().chain(app.iter()) {
-            if let Some(key) = ev.timer.get() {
-                if key <= now {
-                    expired.push((key, ev.clone()));
+            let mut check = |ev: &Rc<QEvent>| {
+                if let Some(key) = ev.timer.get() {
+                    if key <= now {
+                        expired.push((key, ev.clone()));
+                    }
+                }
+            };
+
+            for ev in [&qc.read, &qc.push, &qc.pto, &qc.close, &qc.path_validation] {
+                check(ev);
+            }
+
+            for w in events.iter() {
+                if let Some(ev) = w.upgrade() {
+                    check(&ev);
                 }
             }
         }
 
-        drop(app);
         drop(qc);
 
         expired.sort_by_key(|(k, _)| *k);
 
-        for (_, ev) in expired {
+        for (_, ev) in expired.drain(..) {
             if ngx_quic_get_connection(&c).is_none() {
                 return;
             }
@@ -1874,15 +1921,23 @@ async fn ngx_quic_drive(c: Rc<Connection>) {
 
         let mut next: Option<u64> = None;
 
-        let app: Vec<Rc<QEvent>> = qc.app_events.borrow().iter().filter_map(|w| w.upgrade()).collect();
+        {
+            let mut check = |ev: &QEvent| {
+                if let Some(key) = ev.timer.get() {
+                    next = Some(next.map_or(key, |n: u64| n.min(key)));
+                }
+            };
 
-        for ev in [&qc.read, &qc.push, &qc.pto, &qc.close, &qc.path_validation].into_iter().chain(app.iter()) {
-            if let Some(key) = ev.timer.get() {
-                next = Some(next.map_or(key, |n: u64| n.min(key)));
+            for ev in [&qc.read, &qc.push, &qc.pto, &qc.close, &qc.path_validation] {
+                check(ev);
+            }
+
+            for w in qc.app_events.borrow().iter() {
+                if let Some(ev) = w.upgrade() {
+                    check(&ev);
+                }
             }
         }
-
-        drop(app);
 
         let wake = qc.wake.clone();
 

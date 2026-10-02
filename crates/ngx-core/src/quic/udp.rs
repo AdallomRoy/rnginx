@@ -17,13 +17,14 @@ use crate::log::*;
 use crate::string::B;
 use crate::ngx_log_debug;
 
-use super::transport::ngx_quic_get_packet_dcid;
+use super::transport::{ngx_quic_get_packet_dcid, QuicCid, NGX_QUIC_CID_LEN_MAX};
 use super::{ngx_quic_input, QuicSocket};
 
-/// The key of a socket in the lookup of its listening.
+/// The key of a socket in the lookup of its listening: made without an
+/// allocation for the lookup of each datagram.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct QuicKey {
-    id: Vec<u8>,
+    id: QuicCid,
     local: Option<SockAddr>,
 }
 
@@ -58,7 +59,7 @@ pub fn ngx_quic_close_listening(ls: &Listening) {
 fn socket_key(ql: &QuicListening, c: &Connection, id: &[u8]) -> QuicKey {
     let local = if ql.wildcard { c.local_sockaddr.borrow().clone() } else { None };
 
-    QuicKey { id: id.to_vec(), local }
+    QuicKey { id: QuicCid::new(id), local }
 }
 
 /// ngx_rbtree_insert(&c->listening->rbtree, &qsock->udp.node)
@@ -100,11 +101,12 @@ pub fn ngx_quic_unlisten(c: &Connection, qsock: &Rc<QuicSocket>) {
 
 /// ngx_quic_lookup_connection
 fn ngx_quic_lookup_connection(ql: &QuicListening, key: &[u8], local_sockaddr: &SockAddr) -> Option<(Rc<Connection>, Rc<QuicSocket>)> {
-    if key.is_empty() {
+    // the sockets' ids are at most NGX_QUIC_CID_LEN_MAX bytes long
+    if key.is_empty() || key.len() > NGX_QUIC_CID_LEN_MAX {
         return None;
     }
 
-    let key = QuicKey { id: key.to_vec(), local: if ql.wildcard { Some(local_sockaddr.clone()) } else { None } };
+    let key = QuicKey { id: QuicCid::new(key), local: if ql.wildcard { Some(local_sockaddr.clone()) } else { None } };
 
     let qsock = ql.tree.borrow().get(&key).and_then(|w| w.upgrade())?;
 

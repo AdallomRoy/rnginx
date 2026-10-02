@@ -27,7 +27,7 @@ use std::rc::{Rc, Weak};
 
 use ngx_core::connection::Connection;
 
-use crate::request::{HttpConnection, R};
+use crate::request::{HttpConnection, HttpLogCtx, R};
 
 pub const NGX_HTTP_V2_ALPN_PROTO: &[u8] = b"\x02h2";
 
@@ -137,6 +137,13 @@ pub const NGX_HTTP_V2_VARY_INDEX: u8 = 59;
 /// it in place.
 pub type Handler = fn(&Rc<H2Connection>, &mut [u8], usize) -> Option<usize>;
 
+/// State::field_in: the last field read is in `field`
+pub const FIELD_IN_FIELD: u8 = 0;
+/// in header_name
+pub const FIELD_IN_NAME: u8 = 1;
+/// in header_value
+pub const FIELD_IN_VALUE: u8 = 2;
+
 /// ngx_http_v2_state_t
 pub struct State {
     pub sid: Cell<u32>,
@@ -157,6 +164,10 @@ pub struct State {
     pub field_state: Cell<u8>,
     /// The field being collected (C: field_start..field_end).
     pub field: RefCell<Vec<u8>>,
+    /// Where the last field read is (FIELD_IN_*): C's header name and
+    /// value point to it, here it is moved to header_name / header_value
+    /// rather than copied, and moved back before they are overwritten.
+    pub field_in: Cell<u8>,
     pub field_rest: Cell<usize>,
 
     pub stream: RefCell<Option<Rc<H2Stream>>>,
@@ -206,12 +217,63 @@ impl State {
             header_limit: Cell::new(0),
             field_state: Cell::new(0),
             field: RefCell::new(Vec::new()),
+            field_in: Cell::new(FIELD_IN_FIELD),
             field_rest: Cell::new(0),
             stream: RefCell::new(None),
             buffer: RefCell::new([0; NGX_HTTP_V2_STATE_BUFFER_SIZE]),
             buffer_used: Cell::new(0),
             handler: Cell::new(handler),
         }
+    }
+
+    /// A field is read into `field` (a new field_start, with room for
+    /// `size` bytes): the last field read from now on.
+    pub fn new_field(&self, size: usize) {
+        let mut field = self.field.borrow_mut();
+        field.clear();
+        field.reserve(size);
+        self.field_in.set(FIELD_IN_FIELD);
+    }
+
+    /// header->name (`value` false) or header->value = field_start..
+    /// field_end: the last field read, moved there.
+    pub fn take_field(&self, value: bool) {
+        let (dst, src, to, other) = if value {
+            (&self.header_value, &self.header_name, FIELD_IN_VALUE, FIELD_IN_NAME)
+        } else {
+            (&self.header_name, &self.header_value, FIELD_IN_NAME, FIELD_IN_VALUE)
+        };
+
+        match self.field_in.get() {
+            FIELD_IN_FIELD => {
+                std::mem::swap(&mut *self.field.borrow_mut(), &mut *dst.borrow_mut());
+                self.field_in.set(to);
+            }
+
+            // a field skipped after the one read (a refused stream): the
+            // name and the value are both the last field read
+            f if f == other => {
+                let mut dst = dst.borrow_mut();
+                dst.clear();
+                dst.extend_from_slice(&src.borrow());
+            }
+
+            _ => {}
+        }
+    }
+
+    /// header_name, and header_value unless `name_only`, are about to be
+    /// overwritten (by an indexed header): the last field read goes back
+    /// to `field` if it is in one of them.
+    pub fn keep_field(&self, name_only: bool) {
+        let from = match self.field_in.get() {
+            FIELD_IN_NAME => &self.header_name,
+            FIELD_IN_VALUE if !name_only => &self.header_value,
+            _ => return,
+        };
+
+        std::mem::swap(&mut *self.field.borrow_mut(), &mut *from.borrow_mut());
+        self.field_in.set(FIELD_IN_FIELD);
     }
 }
 
@@ -293,6 +355,38 @@ pub struct H2Stream {
     /// The main request's upstream as its read event handler: the fake
     /// connection's read event goes to it.
     pub upstream_watch: RefCell<Option<Weak<StreamWatch>>>,
+    /// The log context of the fake connection (fc->log->data), kept with
+    /// it for reuse.
+    pub log_ctx: Rc<HttpLogCtx>,
+}
+
+/// The most fake connections an HTTP/2 connection keeps for its next
+/// streams.
+pub const NGX_HTTP_V2_FREE_FAKE_KEPT: usize = 64;
+
+impl Drop for H2Stream {
+    /// ngx_http_v2_close_stream: the fake connection, and its log context,
+    /// to h2c->free_fake_connections, unless something else still refers
+    /// to them (then they go as they are).
+    fn drop(&mut self) {
+        let fc = &self.fc;
+
+        let free = Rc::strong_count(fc) == 1
+            && Rc::weak_count(fc) <= 1
+            && Rc::strong_count(&fc.log.inner) == 1
+            && Rc::strong_count(&self.log_ctx) <= 2
+            && fc.cleanups.borrow().is_empty();
+
+        if !free {
+            return;
+        }
+
+        if let Ok(mut list) = self.connection.free_fake_connections.try_borrow_mut() {
+            if list.len() < NGX_HTTP_V2_FREE_FAKE_KEPT {
+                list.push((fc.clone(), self.log_ctx.clone()));
+            }
+        }
+    }
 }
 
 /// The read event handler of a request that its upstream sets
@@ -396,8 +490,8 @@ pub struct H2Connection {
     pub streams_index_mask: usize,
 
     /// The output queue; index 0 is C's last_out and each next element is
-    /// its ->next, so frames go out in reverse order.
-    pub last_out: RefCell<Vec<OutFrame>>,
+    /// its ->next, so frames go out in reverse order (from the back).
+    pub last_out: RefCell<VecDeque<OutFrame>>,
 
     /// Root nodes of the priority tree (ngx_queue_t dependencies).
     pub dependencies: RefCell<Vec<Rc<H2Node>>>,
@@ -431,6 +525,9 @@ pub struct H2Connection {
     /// The connection's read timer (client_header_timeout, then
     /// keepalive_timeout while idle); streams delete it when created.
     pub read_timer: Cell<Option<tokio::time::Instant>>,
+    /// h2c->free_fake_connections: the fake connections of the streams
+    /// that went, with their log contexts (released while idle)
+    pub free_fake_connections: RefCell<Vec<(Rc<Connection>, Rc<HttpLogCtx>)>>,
 }
 
 /// An effect of a state handler that C performs by calling into a stream
@@ -490,7 +587,57 @@ impl H2Connection {
 
     /// ngx_http_v2_queue_ordered_frame
     pub fn queue_ordered_frame(&self, frame: OutFrame) {
-        self.last_out.borrow_mut().insert(0, frame);
+        self.last_out.borrow_mut().push_front(frame);
+    }
+}
+
+/// The most frame buffers a worker keeps for reuse, and the largest kept.
+const FRAME_BUFS_MAX: usize = 64;
+const FRAME_BUF_MAX_SIZE: usize = 16 * 1024 + 64;
+
+thread_local! {
+    /// The buffers of frames written out, for the next frames: C reuses
+    /// the frames of the connection and of its streams (free_frames).
+    static FRAME_BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An empty buffer for a frame of `size` bytes, one written out before if
+/// there is one: the last one freed which holds the frame, else the last
+/// one freed (grown).
+pub fn frame_buf(size: usize) -> Vec<u8> {
+    let v = FRAME_BUFS.try_with(|bufs| {
+        let mut bufs = bufs.try_borrow_mut().ok()?;
+        let i = bufs.iter().rposition(|b| b.capacity() >= size).or_else(|| bufs.len().checked_sub(1))?;
+        Some(bufs.swap_remove(i))
+    });
+
+    let mut v = v.ok().flatten().unwrap_or_default();
+
+    v.reserve(size);
+
+    v
+}
+
+/// The buffer of a frame written out (or dropped), for frame_buf().
+pub fn free_frame_buf(mut v: Vec<u8>) {
+    if v.capacity() == 0 || v.capacity() > FRAME_BUF_MAX_SIZE {
+        return;
+    }
+
+    v.clear();
+
+    let _ = FRAME_BUFS.try_with(|bufs| {
+        if let Ok(mut bufs) = bufs.try_borrow_mut() {
+            if bufs.len() < FRAME_BUFS_MAX {
+                bufs.push(v);
+            }
+        }
+    });
+}
+
+impl Drop for OutFrame {
+    fn drop(&mut self) {
+        free_frame_buf(std::mem::take(&mut self.data));
     }
 }
 
@@ -538,4 +685,191 @@ pub fn write_frame_head(dst: &mut Vec<u8>, len: usize, ty: u8, flags: u8, sid: u
     write_len_and_type(dst, len, ty);
     dst.push(flags);
     write_uint32(dst, sid);
+}
+
+/// The frame header over the first NGX_HTTP_V2_FRAME_HEADER_SIZE bytes of
+/// `dst`, the room left for it in front of the payload.
+pub fn set_frame_head(dst: &mut [u8], len: usize, ty: u8, flags: u8, sid: u32) {
+    dst[..4].copy_from_slice(&(((len as u32) << 8) | ty as u32).to_be_bytes());
+    dst[4] = flags;
+    dst[5..9].copy_from_slice(&sid.to_be_bytes());
+}
+
+/// A buffer for a frame: room for its header, the payload to follow.
+pub fn frame_buf_with_head(payload: usize) -> Vec<u8> {
+    let mut v = frame_buf(NGX_HTTP_V2_FRAME_HEADER_SIZE + payload);
+    v.resize(NGX_HTTP_V2_FRAME_HEADER_SIZE, 0);
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st() -> State {
+        fn h(_: &Rc<H2Connection>, _: &mut [u8], pos: usize) -> Option<usize> {
+            Some(pos)
+        }
+        State::new(h)
+    }
+
+    fn read(s: &State, data: &[u8]) {
+        s.new_field(data.len());
+        s.field.borrow_mut().extend_from_slice(data);
+    }
+
+    fn header(s: &State) -> (Vec<u8>, Vec<u8>) {
+        (s.header_name.borrow().clone(), s.header_value.borrow().clone())
+    }
+
+    /// The fields of a fake connection a new stream sees.
+    fn fake_state(fc: &Connection) -> String {
+        format!(
+            "fd:{} sock:{:?} addr:{:?} orig:{:?}/{:?} local:{:?} pp:{} ssl:{} buf:{:?} sent:{} req:{} st:{}/{} to:{} err:{} destr:{} idle:{} close:{} shared:{} nodelay:{:?} nopush:{:?} last:{} flush:{} sf:{} udp:{} data:{} reus:{} ch:{} pipe:{} rd:{} wd:{} wdu:{:?} ueof:{} wr:{} reof:{} rpe:{} le:{} cln:{} pl:{} quic:{}/{}/{} log:{}/{}/{:?}/{}",
+            fc.fd.get(),
+            fc.sockaddr.borrow(),
+            fc.addr_text.borrow(),
+            fc.original_sockaddr.borrow(),
+            fc.original_addr_text.borrow(),
+            fc.local_sockaddr.borrow(),
+            fc.proxy_protocol.borrow().is_some(),
+            fc.ssl.borrow().is_some(),
+            fc.buffer.borrow(),
+            fc.sent.get(),
+            fc.requests.get(),
+            fc.start_time.get(),
+            fc.start_msec.get(),
+            fc.timedout.get(),
+            fc.error.get(),
+            fc.destroyed.get(),
+            fc.idle.get(),
+            fc.close.get(),
+            fc.shared.get(),
+            fc.tcp_nodelay.get(),
+            fc.tcp_nopush.get(),
+            fc.need_last_buf.get(),
+            fc.need_flush_buf.get(),
+            fc.sendfile.get(),
+            fc.udp.get(),
+            fc.data.borrow().is_some(),
+            fc.reusable.get(),
+            fc.close_handler.borrow().is_some(),
+            fc.pipeline.get(),
+            fc.read_delayed.get(),
+            fc.write_delayed.get(),
+            fc.write_delay_until.get(),
+            fc.unexpected_eof.get(),
+            fc.write_ready.get(),
+            fc.read_eof.get(),
+            fc.read_pending_eof.get(),
+            fc.log_error.get(),
+            fc.cleanups.borrow().len(),
+            fc.passed_listening.borrow().is_some(),
+            fc.quic_conn.borrow().is_some(),
+            fc.quic_sock.borrow().is_some(),
+            fc.quic_stream.borrow().is_some(),
+            fc.log.level(),
+            fc.log.connection(),
+            fc.log.action(),
+            fc.log.context().is_some(),
+        )
+    }
+
+    #[test]
+    fn fake_connection_made_again() {
+        let log = ngx_core::log::Log::stderr(ngx_core::log::NGX_LOG_WARN);
+        ngx_core::connection::set_connection_n(16);
+
+        let c = Connection::get(-1, &log).expect("connection");
+        *c.addr_text.borrow_mut() = b"127.0.0.1".to_vec();
+        c.requests.set(7);
+        c.sendfile.set(true);
+
+        let fresh = Connection::new_fake(&c);
+
+        // a stream's request ran on it
+        let fc = Connection::new_fake(&c);
+
+        fc.sent.set(1000);
+        fc.requests.set(9);
+        fc.timedout.set(true);
+        fc.error.set(true);
+        fc.destroyed.set(true);
+        fc.close.set(true);
+        fc.idle.set(true);
+        fc.need_last_buf.set(true);
+        fc.need_flush_buf.set(true);
+        fc.read_eof.set(true);
+        fc.write_delay_until.set(Some(std::time::Instant::now()));
+        fc.addr_text.borrow_mut().extend_from_slice(b":changed");
+        fc.buffer.borrow_mut().extend_from_slice(b"data");
+        *fc.data.borrow_mut() = Some(Rc::new(5u32));
+        *fc.proxy_protocol.borrow_mut() = Some(Rc::new(1u8));
+        *fc.close_handler.borrow_mut() = Some(Rc::new(|_c: &Rc<Connection>| {}));
+        fc.add_cleanup(ngx_core::connection::PoolCleanup { tag: "test", data: None, handler: None });
+        fc.log.set_action(Some("sending to client"));
+        fc.log.set_level(ngx_core::log::NGX_LOG_DEBUG);
+        fc.log.set_connection(99);
+
+        struct Ctx;
+        impl ngx_core::log::LogContext for Ctx {
+            fn write_context(&self, _buf: &mut Vec<u8>) {}
+        }
+        fc.log.set_context(Some(Rc::new(Ctx)));
+
+        // a notify_one() nothing waited for
+        fc.close_notify.notify_one();
+
+        assert_ne!(fake_state(&fc), fake_state(&fresh));
+
+        fc.reset_fake(&c);
+
+        assert_eq!(fake_state(&fc), fake_state(&fresh));
+
+        // no permit left over
+        let notified = fc.close_notify.notified();
+        assert!(!std::pin::pin!(notified).enable());
+
+        // still not counted as a connection, the same number
+        assert!(fc.fake);
+        assert_eq!(fc.number, c.number);
+    }
+
+    #[test]
+    fn fields_moved_not_copied() {
+        let s = st();
+
+        // a literal name and value: moved from `field`
+        read(&s, b"name");
+        let p = s.field.borrow().as_ptr();
+        s.take_field(false);
+        assert_eq!(s.header_name.borrow().as_ptr(), p);
+
+        read(&s, b"value");
+        s.take_field(true);
+        assert_eq!(header(&s), (b"name".to_vec(), b"value".to_vec()));
+        assert_eq!(s.field_in.get(), FIELD_IN_VALUE);
+
+        // skipped name and value (no field read): both the last field read
+        s.take_field(false);
+        s.take_field(true);
+        assert_eq!(header(&s), (b"value".to_vec(), b"value".to_vec()));
+
+        // an indexed header keeps the last field read for later skips
+        s.keep_field(false);
+        assert_eq!(s.field_in.get(), FIELD_IN_FIELD);
+        *s.header_name.borrow_mut() = b"idx".to_vec();
+        *s.header_value.borrow_mut() = b"idxv".to_vec();
+        s.take_field(false);
+        assert_eq!(&s.header_name.borrow()[..], b"value");
+
+        // an indexed name leaves the value, where the last field read is
+        read(&s, b"v2");
+        s.take_field(true);
+        s.keep_field(true);
+        assert_eq!(s.field_in.get(), FIELD_IN_VALUE);
+        *s.header_name.borrow_mut() = b"idx".to_vec();
+        s.take_field(false);
+        assert_eq!(header(&s), (b"v2".to_vec(), b"v2".to_vec()));
+    }
 }

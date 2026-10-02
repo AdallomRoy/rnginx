@@ -111,6 +111,15 @@ impl Hpack {
     /// ngx_http_v2_get_indexed_header: resolve an HPACK index to (name,
     /// value). With `name_only`, the value of a dynamic entry is not copied.
     pub fn get_indexed_header(&self, index: usize, name_only: bool, log: &Log) -> Result<(Vec<u8>, Vec<u8>), ()> {
+        let (mut name, mut value) = (Vec::new(), Vec::new());
+        self.get_indexed_header_into(index, name_only, log, &mut name, &mut value)?;
+        Ok((name, value))
+    }
+
+    /// ngx_http_v2_get_indexed_header into the caller's buffers, which
+    /// keep their capacity: the name, and unless `name_only` the value,
+    /// replace what they hold. Nothing changes on an error.
+    pub fn get_indexed_header_into(&self, index: usize, name_only: bool, log: &Log, name: &mut Vec<u8>, value: &mut Vec<u8>) -> Result<(), ()> {
         if index == 0 {
             ngx_log_error!(NGX_LOG_INFO, log, None, "client sent invalid hpack table index 0");
             return Err(());
@@ -121,19 +130,31 @@ impl Hpack {
         let mut index = index - 1;
 
         if index < STATIC_TABLE.len() {
-            let (name, value) = STATIC_TABLE[index];
-            return Ok((name.to_vec(), value.to_vec()));
+            let (n, v) = STATIC_TABLE[index];
+
+            name.clear();
+            name.extend_from_slice(n);
+
+            if !name_only {
+                value.clear();
+                value.extend_from_slice(v);
+            }
+
+            return Ok(());
         }
 
         index -= STATIC_TABLE.len();
 
         if index < self.added - self.deleted {
             let entry = self.entries[(self.added - index - 1) % self.allocated];
-            let name = self.read(entry.name);
-            if name_only {
-                return Ok((name, Vec::new()));
+
+            self.read_into(entry.name, name);
+
+            if !name_only {
+                self.read_into(entry.value, value);
             }
-            return Ok((name, self.read(entry.value)));
+
+            return Ok(());
         }
 
         ngx_log_error!(NGX_LOG_INFO, log, None, "client sent out of bound hpack table index: {}", index);
@@ -141,15 +162,17 @@ impl Hpack {
         Err(())
     }
 
-    /// Copy a (possibly wrapped) string out of the storage ring.
-    fn read(&self, (pos, len): (usize, usize)) -> Vec<u8> {
+    /// A (possibly wrapped) string of the storage ring into `dst`.
+    fn read_into(&self, (pos, len): (usize, usize), dst: &mut Vec<u8>) {
+        dst.clear();
+
         let rest = NGX_HTTP_V2_TABLE_SIZE - pos;
+
         if len > rest {
-            let mut v = self.storage[pos..].to_vec();
-            v.extend_from_slice(&self.storage[..len - rest]);
-            v
+            dst.extend_from_slice(&self.storage[pos..]);
+            dst.extend_from_slice(&self.storage[..len - rest]);
         } else {
-            self.storage[pos..pos + len].to_vec()
+            dst.extend_from_slice(&self.storage[pos..pos + len]);
         }
     }
 

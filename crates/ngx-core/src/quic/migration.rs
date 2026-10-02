@@ -279,16 +279,29 @@ pub fn ngx_quic_set_path(c: &Rc<Connection>, pkt: &mut QuicHeader<'_>) -> i64 {
 
         let mut probe = None;
 
-        let paths = qc.paths.borrow().clone();
+        // the paths looked at in place, no list of them made per datagram
+        let found = {
+            let paths = qc.paths.borrow();
+            let sockaddr = qsock.sockaddr.borrow();
 
-        for path in paths {
-            if cmp_sockaddr(&qsock.sockaddr.borrow(), &path.sockaddr.borrow(), true) == NGX_OK {
-                break 'found path;
+            let mut found = None;
+
+            for path in paths.iter() {
+                if cmp_sockaddr(&sockaddr, &path.sockaddr.borrow(), true) == NGX_OK {
+                    found = Some(path.clone());
+                    break;
+                }
+
+                if path.tag.get() == NGX_QUIC_PATH_PROBE {
+                    probe = Some(path.clone());
+                }
             }
 
-            if path.tag.get() == NGX_QUIC_PATH_PROBE {
-                probe = Some(path);
-            }
+            found
+        };
+
+        if let Some(path) = found {
+            break 'found path;
         }
 
         /* packet from new path, drop current probe, if any */
