@@ -318,18 +318,27 @@ fn tcp_nopush(c: &Connection) -> io::Result<()> {
 /// the data in c->ssl->buf until a flush (NGX_SSL_BUFFER), and sends the
 /// file buffers with kernel TLS.
 async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
-    let n = {
-        let links: Vec<SslChainBuf> = chain
-            .iter()
-            .map(|b| {
-                let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
-                    BufData::Memory(v) if b.in_memory() => (&v[b.pos..b.last], None),
-                    BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos, last: b.file_last })),
-                    _ => (&[], None),
-                };
-                SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf }
-            })
-            .collect();
+    /// the links of a chain, on the stack unless there are many
+    const LINKS: usize = 16;
+
+    fn link(b: &ngx_core::buf::Buf) -> SslChainBuf<'_> {
+        let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
+            BufData::Memory(v) if b.in_memory() => (&v[b.pos..b.last], None),
+            BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos, last: b.file_last })),
+            _ => (&[], None),
+        };
+        SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf }
+    }
+
+    let n = if chain.len() <= LINKS {
+        let mut links: [SslChainBuf; LINKS] = std::array::from_fn(|_| SslChainBuf { mem: &[], file: None, flush: false, last_buf: false });
+        for (l, b) in links.iter_mut().zip(chain.iter()) {
+            *l = link(b);
+        }
+
+        ngx_ssl_send_chain_wait(c, &links[..chain.len()], limit).await?
+    } else {
+        let links: Vec<SslChainBuf> = chain.iter().map(link).collect();
 
         ngx_ssl_send_chain_wait(c, &links, limit).await?
     };
