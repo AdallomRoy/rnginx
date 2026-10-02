@@ -17,13 +17,14 @@ use ngx_core::buf::{Buf, BufFile, Chain};
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::open_file_cache::{open_cached_file, CachedFileHandle, OpenFileInfo};
-use ngx_core::queue::{queue_empty, queue_init, queue_insert_head, queue_last, queue_remove, Queue};
-use ngx_core::rbtree::{rbt_red, Rbtree, RbtreeNode};
 use ngx_core::rc::*;
 use ngx_core::shm::ShmZone;
-use ngx_core::slab::SlabPool;
+use ngx_core::shmem::queue;
+use ngx_core::shmem::rbtree::{self as rb, RbTree, ShmRbtree};
+use ngx_core::shmem::slab::SlabPool;
+use ngx_core::shmem::{Field, ShmMem};
 use ngx_core::string::B;
-use ngx_core::{ngx_log_debug, ngx_log_error};
+use ngx_core::{ngx_log_debug, ngx_log_error, shm_struct};
 
 use crate::http_debug;
 use crate::request::*;
@@ -65,59 +66,185 @@ pub struct CacheValid {
     pub valid: i64,
 }
 
-/// ngx_http_file_cache_node_t, in the keys zone. The bit fields of C
-/// (count:20, uses:10, valid_msec:10, error:10) are kept to their widths.
-#[repr(C)]
-pub struct FileCacheNode {
-    pub node: RbtreeNode,
-    pub queue: Queue,
-    pub key: [u8; NGX_HTTP_CACHE_KEY_LEN - RBTREE_KEY_SIZE],
-    pub count: u32,
-    pub uses: u32,
-    pub valid_msec: u32,
-    pub error: u32,
-    pub exists: bool,
-    pub updating: bool,
-    pub deleting: bool,
-    pub purged: bool,
-    pub uniq: u64,
-    pub expire: i64,
-    pub valid_sec: i64,
-    pub body_start: usize,
-    pub fs_size: i64,
-    pub lock_time: u64,
+shm_struct! {
+    /// ngx_http_file_cache_node_t, in the keys zone, laid out as C lays it
+    /// out (120 bytes on LP64): the rbtree node, the queue, the rest of the
+    /// key, then the bit fields of C in their two 32-bit units: count:20
+    /// and uses:10 in bits0; valid_msec:10, error:10, exists:1, updating:1,
+    /// deleting:1 and purged:1 in bits1 (the first field in the low bits,
+    /// as gcc allocates them).
+    pub struct FileCacheNode {
+        node_key: usize,
+        node_left: usize,
+        node_right: usize,
+        node_parent: usize,
+        node_color: u8,
+        node_data: u8,
+        queue_prev: usize,
+        queue_next: usize,
+        /// u_char key[NGX_HTTP_CACHE_KEY_LEN - sizeof(ngx_rbtree_key_t)]:
+        /// its bytes (word aligned after the queue, as in C)
+        key: u64,
+        bits0: u32,
+        bits1: u32,
+        /// ngx_file_uniq_t
+        uniq: u64,
+        expire: i64,
+        valid_sec: i64,
+        body_start: usize,
+        fs_size: i64,
+        /// ngx_msec_t
+        lock_time: u64,
+    }
 }
 
+/// fcn->count (bits0)
 const COUNT_MASK: u32 = (1 << 20) - 1;
+/// fcn->uses (bits0)
+const USES_SHIFT: u32 = 20;
 const USES_MASK: u32 = (1 << 10) - 1;
+/// fcn->valid_msec (bits1)
 const MSEC_MASK: u32 = (1 << 10) - 1;
+/// fcn->error (bits1)
+const ERROR_SHIFT: u32 = 10;
 const ERROR_MASK: u32 = (1 << 10) - 1;
+/// fcn->exists, fcn->updating, fcn->deleting (bits1)
+const EXISTS_SHIFT: u32 = 20;
+const UPDATING_SHIFT: u32 = 21;
+const DELETING_SHIFT: u32 = 22;
 
-impl FileCacheNode {
-    fn count_inc(&mut self) {
-        self.count = (self.count + 1) & COUNT_MASK;
+/// sizeof(fcn->key)
+const NODE_KEY_LEN: usize = NGX_HTTP_CACHE_KEY_LEN - RBTREE_KEY_SIZE;
+
+/// The bit fields and the key of a node. The node is changed under the
+/// zone's mutex.
+impl FileCacheNode<'_> {
+    fn bits(&self, f: Field<u32>, shift: u32, mask: u32) -> u32 {
+        (self.get(f) >> shift) & mask
     }
 
-    fn count_dec(&mut self) {
-        self.count = self.count.wrapping_sub(1) & COUNT_MASK;
+    /// The bit field set to `v`, cut to its width as C does.
+    fn set_bits(&self, f: Field<u32>, shift: u32, mask: u32, v: u32) {
+        let w = self.get(f);
+        self.set(f, (w & !(mask << shift)) | ((v & mask) << shift));
     }
 
-    fn uses_inc(&mut self) {
-        self.uses = (self.uses + 1) & USES_MASK;
+    /// fcn->count
+    fn count(&self) -> u32 {
+        self.bits(Self::bits0, 0, COUNT_MASK)
+    }
+
+    fn set_count(&self, v: u32) {
+        self.set_bits(Self::bits0, 0, COUNT_MASK, v)
+    }
+
+    /// fcn->count++
+    fn count_inc(&self) {
+        self.set_count(self.count().wrapping_add(1))
+    }
+
+    /// fcn->count--
+    fn count_dec(&self) {
+        self.set_count(self.count().wrapping_sub(1))
+    }
+
+    /// fcn->uses
+    fn uses(&self) -> u32 {
+        self.bits(Self::bits0, USES_SHIFT, USES_MASK)
+    }
+
+    fn set_uses(&self, v: u32) {
+        self.set_bits(Self::bits0, USES_SHIFT, USES_MASK, v)
+    }
+
+    /// fcn->uses++
+    fn uses_inc(&self) {
+        self.set_uses(self.uses().wrapping_add(1))
+    }
+
+    /// fcn->valid_msec
+    fn set_valid_msec(&self, v: u32) {
+        self.set_bits(Self::bits1, 0, MSEC_MASK, v)
+    }
+
+    /// fcn->error
+    fn error(&self) -> u32 {
+        self.bits(Self::bits1, ERROR_SHIFT, ERROR_MASK)
+    }
+
+    fn set_error(&self, v: u32) {
+        self.set_bits(Self::bits1, ERROR_SHIFT, ERROR_MASK, v)
+    }
+
+    /// fcn->exists
+    fn exists(&self) -> bool {
+        self.bits(Self::bits1, EXISTS_SHIFT, 1) != 0
+    }
+
+    fn set_exists(&self, on: bool) {
+        self.set_bits(Self::bits1, EXISTS_SHIFT, 1, on as u32)
+    }
+
+    /// fcn->updating
+    fn updating(&self) -> bool {
+        self.bits(Self::bits1, UPDATING_SHIFT, 1) != 0
+    }
+
+    fn set_updating(&self, on: bool) {
+        self.set_bits(Self::bits1, UPDATING_SHIFT, 1, on as u32)
+    }
+
+    /// fcn->deleting
+    fn deleting(&self) -> bool {
+        self.bits(Self::bits1, DELETING_SHIFT, 1) != 0
+    }
+
+    fn set_deleting(&self, on: bool) {
+        self.set_bits(Self::bits1, DELETING_SHIFT, 1, on as u32)
+    }
+
+    /// fcn->key
+    fn key_bytes(&self) -> [u8; NODE_KEY_LEN] {
+        let mut key = [0u8; NODE_KEY_LEN];
+        self.mem.read(self.field(Self::key), &mut key);
+        key
+    }
+
+    /// The hex of the whole key: fcn->node.key, then fcn->key.
+    fn key_hex(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(2 * NGX_HTTP_CACHE_KEY_LEN);
+
+        ngx_core::string::hex_dump(&mut key, &self.get(Self::node_key).to_ne_bytes());
+        ngx_core::string::hex_dump(&mut key, &self.key_bytes());
+
+        key
     }
 }
 
-/// ngx_http_file_cache_sh_t
-#[repr(C)]
-pub struct FileCacheSh {
-    pub rbtree: Rbtree,
-    pub sentinel: RbtreeNode,
-    pub queue: Queue,
-    pub cold: AtomicUsize,
-    pub loading: AtomicUsize,
-    pub size: i64,
-    pub count: usize,
-    pub watermark: usize,
+shm_struct! {
+    /// ngx_http_file_cache_sh_t: the rbtree, its sentinel node, the LRU
+    /// queue of the nodes, then the counters
+    pub struct FileCacheSh {
+        rbtree_root: usize,
+        rbtree_sentinel: usize,
+        rbtree_insert: usize,
+        sentinel_key: usize,
+        sentinel_left: usize,
+        sentinel_right: usize,
+        sentinel_parent: usize,
+        sentinel_color: u8,
+        sentinel_data: u8,
+        queue_prev: usize,
+        queue_next: usize,
+        /// ngx_atomic_t
+        cold: usize,
+        /// ngx_atomic_t
+        loading: usize,
+        /// off_t
+        size: i64,
+        count: usize,
+        watermark: usize,
+    }
 }
 
 /// ngx_http_file_cache_header_t, as C lays it out
@@ -226,8 +353,10 @@ impl FileCacheHeader {
 /// ngx_http_file_cache_t: a cache of proxy_cache_path and the like, the
 /// data of its keys zone and of its path (the manager and the loader).
 pub struct FileCache {
-    pub sh: Cell<*mut FileCacheSh>,
-    pub shpool: Cell<*mut SlabPool>,
+    /// cache->sh: the offset of the ngx_http_file_cache_sh_t in the zone
+    pub sh: Cell<usize>,
+    /// the keys zone's memory, its slab pool at the start (cache->shpool)
+    pub mem: RefCell<Option<Rc<ShmMem>>>,
 
     pub path: Rc<PathConf>,
 
@@ -257,20 +386,51 @@ pub struct FileCache {
 }
 
 impl FileCache {
-    fn sh(&self) -> &mut FileCacheSh {
-        // the zone is mapped at the same address in all processes and
-        // is initialized before any request or the manager uses it
-        unsafe { &mut *self.sh.get() }
+    /// The memory of the keys zone: it is initialized before any request
+    /// or the manager uses it.
+    fn mem(&self) -> Rc<ShmMem> {
+        self.mem.borrow().clone().expect("cache keys zone memory")
     }
 
-    fn shpool(&self) -> &SlabPool {
-        unsafe { &*self.shpool.get() }
+    /// cache->sh
+    fn sh<'a>(&self, mem: &'a ShmMem) -> FileCacheSh<'a> {
+        FileCacheSh::at(mem, self.sh.get())
+    }
+
+    /// &cache->sh->rbtree
+    fn rbtree<'a>(&self, mem: &'a ShmMem) -> ShmRbtree<'a> {
+        ShmRbtree::at(mem, self.sh.get() + FileCacheSh::rbtree_root.off)
     }
 
     /// &cache->sh->queue
-    fn queue(&self) -> *mut Queue {
-        unsafe { std::ptr::addr_of_mut!((*self.sh.get()).queue) }
+    fn queue(&self) -> usize {
+        self.sh.get() + FileCacheSh::queue_prev.off
     }
+
+    /// cache->sh->cold, used without the mutex
+    fn cold<'a>(&self, mem: &'a ShmMem) -> &'a AtomicUsize {
+        mem.word(self.sh.get() + FileCacheSh::cold.off)
+    }
+
+    /// cache->sh->loading, used without the mutex
+    fn loading<'a>(&self, mem: &'a ShmMem) -> &'a AtomicUsize {
+        mem.word(self.sh.get() + FileCacheSh::loading.off)
+    }
+}
+
+/// ngx_queue_data(q, ngx_http_file_cache_node_t, queue)
+fn queue_data(mem: &ShmMem, q: usize) -> FileCacheNode<'_> {
+    FileCacheNode::at(mem, q - FileCacheNode::queue_prev.off)
+}
+
+/// cache->sh->size += n (the zone is locked)
+fn sh_size_add(sh: FileCacheSh<'_>, n: i64) {
+    sh.set(FileCacheSh::size, sh.get(FileCacheSh::size) + n);
+}
+
+/// cache->sh->count++ or count-- (the zone is locked)
+fn sh_count_add(sh: FileCacheSh<'_>, n: isize) {
+    sh.set(FileCacheSh::count, sh.get(FileCacheSh::count).wrapping_add_signed(n));
 }
 
 
@@ -316,7 +476,10 @@ pub struct HttpCache {
     pub buf: Vec<u8>,
 
     pub file_cache: Option<Rc<FileCache>>,
-    pub node: *mut FileCacheNode,
+    /// c->node: the offset of the node in the keys zone, 0 for NULL; set
+    /// by ngx_http_file_cache_exists(), it stays valid while the node's
+    /// count holds it
+    pub node: usize,
 
     pub lock_timeout: u64,
     pub lock_age: u64,
@@ -373,7 +536,7 @@ impl HttpCache {
             vary_tag: 0,
             buf: Vec::new(),
             file_cache: None,
-            node: std::ptr::null_mut(),
+            node: 0,
             lock_timeout: 0,
             lock_age: 0,
             lock_time: 0,
@@ -399,10 +562,9 @@ impl HttpCache {
         self.file_cache.clone().expect("file cache")
     }
 
-    fn node<'a>(&self) -> &'a mut FileCacheNode {
-        // c->node is set by ngx_http_file_cache_exists() and stays valid
-        // while the node's count holds it
-        unsafe { &mut *self.node }
+    /// c->node, in the memory of the keys zone
+    fn node<'a>(&self, mem: &'a ShmMem) -> FileCacheNode<'a> {
+        FileCacheNode::at(mem, self.node)
     }
 
     /// ngx_pool_run_cleanup_file(r->pool, c->file.fd): the cache file is
@@ -426,14 +588,12 @@ fn hex(src: &[u8]) -> Vec<u8> {
 
 /// ngx_fs_bsize
 fn fs_bsize(name: &[u8]) -> usize {
-    let path = ngx_core::os::cstr(name);
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let fs = match nix::sys::statfs::statfs(ngx_core::os::path(name)) {
+        Ok(fs) => fs,
+        Err(_) => return 512,
+    };
 
-    if unsafe { libc::statfs(path.as_ptr(), &mut fs) } == -1 {
-        return 512;
-    }
-
-    let bsize = fs.f_bsize as usize;
+    let bsize = fs.block_size() as usize;
 
     if bsize % 512 != 0 {
         return 512;
@@ -448,14 +608,10 @@ fn fs_bsize(name: &[u8]) -> usize {
 
 /// ngx_fs_available
 fn fs_available(name: &[u8]) -> i64 {
-    let path = ngx_core::os::cstr(name);
-    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-
-    if unsafe { libc::statfs(path.as_ptr(), &mut fs) } == -1 {
-        return i64::MAX;
+    match nix::sys::statfs::statfs(ngx_core::os::path(name)) {
+        Ok(fs) => fs.blocks_available() as i64 * fs.block_size() as i64,
+        Err(_) => i64::MAX,
     }
-
-    fs.f_bavail as i64 * fs.f_bsize as i64
 }
 
 /// ngx_file_uniq, as the open file cache has it (of.uniq)
@@ -470,16 +626,15 @@ fn file_fs_size(st: &libc::stat) -> i64 {
 
 /// ngx_read_file: pread() of up to `buf.len()` bytes at `offset`.
 fn read_file(fd: i32, name: &[u8], buf: &mut [u8], offset: i64, log: &Log) -> isize {
-    ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "read: {}, {:p}, {}, {}", fd, buf.as_ptr(), buf.len(), offset);
+    ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "read: {}, {:p}, {}, {}", fd, buf, buf.len(), offset);
 
-    let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset) };
-
-    if n == -1 {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "pread() \"{}\" failed", B(name));
-        return NGX_ERROR as isize;
+    match ngx_core::os::pread(fd, buf, offset) {
+        Ok(n) => n as isize,
+        Err(err) => {
+            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pread() \"{}\" failed", B(name));
+            NGX_ERROR as isize
+        }
     }
-
-    n
 }
 
 // ---------------------------------------------------------------------------
@@ -519,63 +674,64 @@ fn file_cache_init(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Result<
 
         cache.sh.set(ocache.sh.get());
 
-        cache.shpool.set(ocache.shpool.get());
+        *cache.mem.borrow_mut() = ocache.mem.borrow().clone();
         cache.bsize.set(ocache.bsize.get());
 
         cache.max_size.set(cache.max_size.get() / cache.bsize.get() as i64);
 
-        let sh = cache.sh();
+        let mem = cache.mem();
 
-        if sh.cold.load(Ordering::SeqCst) == 0 || sh.loading.load(Ordering::SeqCst) != 0 {
+        if cache.cold(&mem).load(Ordering::SeqCst) == 0 || cache.loading(&mem).load(Ordering::SeqCst) != 0 {
             *cache.path.loader.borrow_mut() = None;
         }
 
         return Ok(());
     }
 
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
+    let mem = shm_zone.mem();
+    let shpool = SlabPool::of(&mem);
 
-    cache.shpool.set(shpool);
+    *cache.mem.borrow_mut() = Some(mem.clone());
 
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            cache.sh.set((*shpool).data as *mut FileCacheSh);
-            cache.bsize.set(fs_bsize(&cache.path.name));
-            cache.max_size.set(cache.max_size.get() / cache.bsize.get() as i64);
-
-            return Ok(());
-        }
-
-        let sh = (*shpool).alloc(std::mem::size_of::<FileCacheSh>()) as *mut FileCacheSh;
-
-        if sh.is_null() {
-            return Err(());
-        }
-
-        cache.sh.set(sh);
-
-        (*shpool).data = sh as *mut u8;
-
-        (*sh).rbtree.init(&mut (*sh).sentinel, file_cache_rbtree_insert_value);
-
-        queue_init(std::ptr::addr_of_mut!((*sh).queue));
-
-        std::ptr::write(&mut (*sh).cold, AtomicUsize::new(1));
-        std::ptr::write(&mut (*sh).loading, AtomicUsize::new(0));
-        (*sh).size = 0;
-        (*sh).count = 0;
-        (*sh).watermark = usize::MAX;
-
+    if shm_zone.shm.exists.get() {
+        cache.sh.set(shpool.data());
         cache.bsize.set(fs_bsize(&cache.path.name));
-
         cache.max_size.set(cache.max_size.get() / cache.bsize.get() as i64);
 
-        let ctx = format!(" in cache keys zone \"{}\"", B(shm_zone.name()));
-
-        (*shpool).set_log_ctx(ctx.as_bytes())?;
-
-        (*shpool).log_nomem = false;
+        return Ok(());
     }
+
+    let sh = shpool.alloc(FileCacheSh::SIZE);
+
+    if sh == 0 {
+        return Err(());
+    }
+
+    cache.sh.set(sh);
+
+    shpool.set_data(sh);
+
+    let shm = cache.sh(&mem);
+
+    cache.rbtree(&mem).init(shm.field(FileCacheSh::sentinel_key));
+
+    queue::init(&mem, cache.queue());
+
+    shm.set(FileCacheSh::cold, 1);
+    shm.set(FileCacheSh::loading, 0);
+    shm.set(FileCacheSh::size, 0);
+    shm.set(FileCacheSh::count, 0);
+    shm.set(FileCacheSh::watermark, usize::MAX);
+
+    cache.bsize.set(fs_bsize(&cache.path.name));
+
+    cache.max_size.set(cache.max_size.get() / cache.bsize.get() as i64);
+
+    let ctx = format!(" in cache keys zone \"{}\"", B(shm_zone.name()));
+
+    shpool.set_log_ctx(ctx.as_bytes())?;
+
+    shpool.set_log_nomem(false);
 
     Ok(())
 }
@@ -675,7 +831,7 @@ fn open(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i64 {
 
     let cache = c.cache();
 
-    if c.node.is_null() {
+    if c.node == 0 {
         add_cleanup(r, c_rc);
     }
 
@@ -707,7 +863,7 @@ fn open(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i64 {
     } else {
         // rc == NGX_DECLINED
 
-        test = cache.sh().cold.load(Ordering::SeqCst) != 0;
+        test = cache.cold(&cache.mem()).load(Ordering::SeqCst) != 0;
 
         if c.min_uses > 1 {
             if !test {
@@ -790,23 +946,23 @@ fn file_cache_lock(r: &R, c: &mut HttpCache) -> i64 {
     let now = ngx_core::times::current_msec();
 
     let cache = c.cache();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    cache.shpool().lock();
+    shpool.lock();
 
-    {
-        let node = c.node();
+    let node = c.node(&mem);
 
-        let timer = node.lock_time.wrapping_sub(now) as i64;
+    let timer = node.get(FileCacheNode::lock_time).wrapping_sub(now) as i64;
 
-        if !node.updating || timer <= 0 {
-            node.updating = true;
-            node.lock_time = now.wrapping_add(c.lock_age);
-            c.updating = true;
-            c.lock_time = node.lock_time;
-        }
+    if !node.updating() || timer <= 0 {
+        node.set_updating(true);
+        node.set(FileCacheNode::lock_time, now.wrapping_add(c.lock_age));
+        c.updating = true;
+        c.lock_time = node.get(FileCacheNode::lock_time);
     }
 
-    cache.shpool().unlock();
+    shpool.unlock();
 
     http_debug!(r, "http file cache lock u:{} wt:{}", c.updating as i32, c.wait_time);
 
@@ -884,24 +1040,22 @@ fn file_cache_lock_wait(r: &R, c: &mut HttpCache) -> i64 {
     }
 
     let cache = c.cache();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
     let mut wait = false;
 
-    cache.shpool().lock();
+    shpool.lock();
 
-    let timer = {
-        let node = c.node();
+    let node = c.node(&mem);
 
-        let timer = node.lock_time.wrapping_sub(now) as i64;
+    let timer = node.get(FileCacheNode::lock_time).wrapping_sub(now) as i64;
 
-        if node.updating && timer > 0 {
-            wait = true;
-        }
+    if node.updating() && timer > 0 {
+        wait = true;
+    }
 
-        timer
-    };
-
-    cache.shpool().unlock();
+    shpool.unlock();
 
     if wait {
         c.wait_timer = if timer > 500 { 500 } else { timer as u64 };
@@ -989,24 +1143,25 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
     r.cached.set(true);
 
     let cache = c.cache();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    if cache.sh().cold.load(Ordering::SeqCst) != 0 {
-        cache.shpool().lock();
+    if cache.cold(&mem).load(Ordering::SeqCst) != 0 {
+        shpool.lock();
 
-        let (body_start, uniq, fs_size) = (c.body_start, c.uniq, c.fs_size);
-        let node = c.node();
+        let node = c.node(&mem);
 
-        if !node.exists {
-            node.uses = 1;
-            node.body_start = body_start;
-            node.exists = true;
-            node.uniq = uniq;
-            node.fs_size = fs_size;
+        if !node.exists() {
+            node.set_uses(1);
+            node.set(FileCacheNode::body_start, c.body_start);
+            node.set_exists(true);
+            node.set(FileCacheNode::uniq, c.uniq);
+            node.set(FileCacheNode::fs_size, c.fs_size);
 
-            cache.sh().size += fs_size;
+            sh_size_add(cache.sh(&mem), c.fs_size);
         }
 
-        cache.shpool().unlock();
+        shpool.unlock();
     }
 
     let now = ngx_core::times::time();
@@ -1015,20 +1170,21 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
         c.stale_updating = c.valid_sec + c.updating_sec >= now;
         c.stale_error = c.valid_sec + c.error_sec >= now;
 
-        cache.shpool().lock();
+        shpool.lock();
 
         let rc;
+        let node = c.node(&mem);
 
-        if c.node().updating {
+        if node.updating() {
             rc = NGX_HTTP_CACHE_UPDATING as i64;
         } else {
-            c.node().updating = true;
+            node.set_updating(true);
             c.updating = true;
-            c.lock_time = c.node().lock_time;
+            c.lock_time = node.get(FileCacheNode::lock_time);
             rc = NGX_HTTP_CACHE_STALE as i64;
         }
 
-        cache.shpool().unlock();
+        shpool.unlock();
 
         http_debug!(r, "http file cache expired: {} {} {}", rc, c.valid_sec, now);
 
@@ -1043,111 +1199,121 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
 fn file_cache_exists(cache: &FileCache, c: &mut HttpCache) -> i64 {
     let rc;
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
+
+    shpool.lock();
 
     let mut fcn = c.node;
 
-    if fcn.is_null() {
-        fcn = unsafe { file_cache_lookup(cache, &c.key) };
+    if fcn == 0 {
+        fcn = file_cache_lookup(cache, &mem, &c.key);
     }
 
-    unsafe {
-        'done: {
-            'renew: {
-                if !fcn.is_null() {
-                    queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
+    'done: {
+        'renew: {
+            if fcn != 0 {
+                let n = FileCacheNode::at(&mem, fcn);
 
-                    if c.node.is_null() {
-                        (*fcn).uses_inc();
-                        (*fcn).count_inc();
+                queue::remove(&mem, n.field(FileCacheNode::queue_prev));
+
+                if c.node == 0 {
+                    n.uses_inc();
+                    n.count_inc();
+                }
+
+                if n.error() != 0 {
+                    if n.get(FileCacheNode::valid_sec) < ngx_core::times::time() {
+                        break 'renew;
                     }
 
-                    if (*fcn).error != 0 {
-                        if (*fcn).valid_sec < ngx_core::times::time() {
-                            break 'renew;
-                        }
-
-                        rc = NGX_OK;
-
-                        break 'done;
-                    }
-
-                    if (*fcn).exists || (*fcn).uses as usize >= c.min_uses {
-                        c.exists = (*fcn).exists;
-
-                        if (*fcn).body_start != 0 && !c.update_variant {
-                            c.body_start = (*fcn).body_start;
-                        }
-
-                        rc = NGX_OK;
-
-                        break 'done;
-                    }
-
-                    rc = NGX_AGAIN;
+                    rc = NGX_OK;
 
                     break 'done;
                 }
 
-                fcn = cache.shpool().calloc_locked(std::mem::size_of::<FileCacheNode>()) as *mut FileCacheNode;
+                if n.exists() || n.uses() as usize >= c.min_uses {
+                    c.exists = n.exists();
 
-                if fcn.is_null() {
-                    file_cache_set_watermark(cache);
-
-                    cache.shpool().unlock();
-
-                    let _ = file_cache_forced_expire(cache);
-
-                    cache.shpool().lock();
-
-                    fcn = cache.shpool().calloc_locked(std::mem::size_of::<FileCacheNode>()) as *mut FileCacheNode;
-
-                    if fcn.is_null() {
-                        ngx_log_error!(NGX_LOG_ALERT, cycle_log(), None, "could not allocate node{}", B(cache.shpool().log_ctx()));
-
-                        cache.shpool().unlock();
-
-                        return NGX_ERROR;
+                    if n.get(FileCacheNode::body_start) != 0 && !c.update_variant {
+                        c.body_start = n.get(FileCacheNode::body_start);
                     }
+
+                    rc = NGX_OK;
+
+                    break 'done;
                 }
 
-                cache.sh().count += 1;
+                rc = NGX_AGAIN;
 
-                (*fcn).node.key = usize::from_ne_bytes(c.key[..RBTREE_KEY_SIZE].try_into().unwrap());
-
-                (*fcn).key.copy_from_slice(&c.key[RBTREE_KEY_SIZE..]);
-
-                cache.sh().rbtree.insert(&mut (*fcn).node);
-
-                (*fcn).uses = 1;
-                (*fcn).count = 1;
+                break 'done;
             }
 
-            // renew:
+            fcn = shpool.calloc_locked(FileCacheNode::SIZE);
 
-            rc = NGX_DECLINED;
+            if fcn == 0 {
+                file_cache_set_watermark(cache, &mem);
 
-            (*fcn).valid_msec = 0;
-            (*fcn).error = 0;
-            (*fcn).exists = false;
-            (*fcn).valid_sec = 0;
-            (*fcn).uniq = 0;
-            (*fcn).body_start = 0;
-            (*fcn).fs_size = 0;
+                shpool.unlock();
+
+                let _ = file_cache_forced_expire(cache);
+
+                shpool.lock();
+
+                fcn = shpool.calloc_locked(FileCacheNode::SIZE);
+
+                if fcn == 0 {
+                    ngx_log_error!(NGX_LOG_ALERT, cycle_log(), None, "could not allocate node{}", B(&shpool.log_ctx()));
+
+                    shpool.unlock();
+
+                    return NGX_ERROR;
+                }
+            }
+
+            sh_count_add(cache.sh(&mem), 1);
+
+            let n = FileCacheNode::at(&mem, fcn);
+
+            // ngx_memcpy((u_char *) &fcn->node.key, c->key, sizeof(ngx_rbtree_key_t))
+            n.set(FileCacheNode::node_key, usize::from_ne_bytes(c.key[..RBTREE_KEY_SIZE].try_into().unwrap()));
+
+            mem.write(n.field(FileCacheNode::key), &c.key[RBTREE_KEY_SIZE..]);
+
+            rb::insert(&cache.rbtree(&mem), fcn, file_cache_rbtree_insert_value);
+
+            n.set_uses(1);
+            n.set_count(1);
         }
 
-        // done:
+        // renew:
 
-        (*fcn).expire = ngx_core::times::time() + cache.inactive;
+        rc = NGX_DECLINED;
 
-        queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
+        let n = FileCacheNode::at(&mem, fcn);
 
-        c.uniq = (*fcn).uniq;
-        c.error = (*fcn).error as usize;
-        c.node = fcn;
+        n.set_valid_msec(0);
+        n.set_error(0);
+        n.set_exists(false);
+        n.set(FileCacheNode::valid_sec, 0);
+        n.set(FileCacheNode::uniq, 0);
+        n.set(FileCacheNode::body_start, 0);
+        n.set(FileCacheNode::fs_size, 0);
     }
 
-    cache.shpool().unlock();
+    // done:
+
+    let n = FileCacheNode::at(&mem, fcn);
+
+    n.set(FileCacheNode::expire, ngx_core::times::time() + cache.inactive);
+
+    queue::insert_head(&mem, cache.queue(), n.field(FileCacheNode::queue_prev));
+
+    c.uniq = n.get(FileCacheNode::uniq);
+    c.error = n.error() as usize;
+    c.node = fcn;
+
+    shpool.unlock();
 
     rc
 }
@@ -1170,77 +1336,64 @@ fn file_cache_name(r: &R, c: &mut HttpCache, path: &PathConf) -> i64 {
     NGX_OK
 }
 
-/// ngx_http_file_cache_lookup
-unsafe fn file_cache_lookup(cache: &FileCache, key: &[u8; NGX_HTTP_CACHE_KEY_LEN]) -> *mut FileCacheNode {
+/// ngx_http_file_cache_lookup: the node of the key, 0 if none (the zone is
+/// locked)
+fn file_cache_lookup(cache: &FileCache, mem: &ShmMem, key: &[u8; NGX_HTTP_CACHE_KEY_LEN]) -> usize {
     let node_key = usize::from_ne_bytes(key[..RBTREE_KEY_SIZE].try_into().unwrap());
 
-    let sh = cache.sh();
+    let tree = cache.rbtree(mem);
 
-    let mut node = sh.rbtree.root;
-    let sentinel = sh.rbtree.sentinel;
+    let mut node = tree.root();
+    let sentinel = tree.sentinel();
 
     while node != sentinel {
-        if node_key < (*node).key {
-            node = (*node).left;
+        let k = tree.key(node);
+
+        if node_key < k {
+            node = tree.left(node);
             continue;
         }
 
-        if node_key > (*node).key {
-            node = (*node).right;
+        if node_key > k {
+            node = tree.right(node);
             continue;
         }
 
         // node_key == node->key
 
-        let fcn = node as *mut FileCacheNode;
+        let fcn = FileCacheNode::at(mem, node);
 
-        let fkey = &(*fcn).key;
-        let rc = key[RBTREE_KEY_SIZE..].cmp(&fkey[..]);
+        // ngx_memcmp(&key[sizeof(ngx_rbtree_key_t)], fcn->key, ...)
+        let rc = mem.cmp_bytes(fcn.field(FileCacheNode::key), &key[RBTREE_KEY_SIZE..]).reverse();
 
         if rc == std::cmp::Ordering::Equal {
-            return fcn;
+            return node;
         }
 
-        node = if rc == std::cmp::Ordering::Less { (*node).left } else { (*node).right };
+        node = if rc == std::cmp::Ordering::Less { tree.left(node) } else { tree.right(node) };
     }
 
     // not found
 
-    std::ptr::null_mut()
+    0
 }
 
 /// ngx_http_file_cache_rbtree_insert_value
-unsafe fn file_cache_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let mut p: *mut *mut RbtreeNode;
+fn file_cache_rbtree_insert_value(tree: &ShmRbtree<'_>, temp: usize, node: usize, sentinel: usize) {
+    rb::insert_by(tree, temp, node, sentinel, |t, node, temp| {
+        let (nk, tk) = (t.key(node), t.key(temp));
 
-    loop {
-        if (*node).key < (*temp).key {
-            p = &mut (*temp).left;
-        } else if (*node).key > (*temp).key {
-            p = &mut (*temp).right;
-        } else {
-            // node->key == temp->key
-
-            let cn = node as *mut FileCacheNode;
-            let cnt = temp as *mut FileCacheNode;
-
-            let (a, b) = (&(*cn).key, &(*cnt).key);
-
-            p = if a[..] < b[..] { &mut (*temp).left } else { &mut (*temp).right };
+        if nk != tk {
+            return nk < tk;
         }
 
-        if *p == sentinel {
-            break;
-        }
+        // node->key == temp->key: ngx_memcmp(cn->key, cnt->key, ...) < 0
 
-        temp = *p;
-    }
+        let cn = FileCacheNode::at(t.mem, node);
+        let cnt = FileCacheNode::at(t.mem, temp);
 
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
+        t.mem.cmp_bytes(cnt.field(FileCacheNode::key), &cn.key_bytes()) == std::cmp::Ordering::Greater
+    });
 }
 
 /// ngx_http_file_cache_vary: the md5 of the main key and of the request
@@ -1368,13 +1521,15 @@ fn file_cache_reopen(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) ->
     }
 
     let cache = c.cache();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    cache.shpool().lock();
+    shpool.lock();
 
-    c.node().count_dec();
-    c.node = std::ptr::null_mut();
+    c.node(&mem).count_dec();
+    c.node = 0;
 
-    cache.shpool().unlock();
+    shpool.unlock();
 
     c.secondary = true;
     c.file_name.clear();
@@ -1458,13 +1613,18 @@ fn file_cache_update_variant(r: &R, c: &mut HttpCache) -> i64 {
 
     http_debug!(r, "http file cache main key");
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    c.node().count_dec();
-    c.node().updating = false;
-    c.node = std::ptr::null_mut();
+    shpool.lock();
 
-    cache.shpool().unlock();
+    let node = c.node(&mem);
+
+    node.count_dec();
+    node.set_updating(false);
+    c.node = 0;
+
+    shpool.unlock();
 
     c.file_name.clear();
     c.update_variant = true;
@@ -1517,26 +1677,28 @@ pub fn file_cache_update(r: &R, c: &mut HttpCache, tf: &CacheTempFile) {
         }
     }
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    let body_start = c.body_start;
-    let node = c.node();
+    shpool.lock();
+
+    let node = c.node(&mem);
 
     node.count_dec();
-    node.error = 0;
-    node.uniq = uniq;
-    node.body_start = body_start;
+    node.set_error(0);
+    node.set(FileCacheNode::uniq, uniq);
+    node.set(FileCacheNode::body_start, c.body_start);
 
-    cache.sh().size += fs_size - node.fs_size;
-    node.fs_size = fs_size;
+    sh_size_add(cache.sh(&mem), fs_size - node.get(FileCacheNode::fs_size));
+    node.set(FileCacheNode::fs_size, fs_size);
 
     if rc == NGX_OK {
-        node.exists = true;
+        node.set_exists(true);
     }
 
-    node.updating = false;
+    node.set_updating(false);
 
-    cache.shpool().unlock();
+    shpool.unlock();
 }
 
 /// ngx_http_file_cache_update_header: the header of the cache file, after
@@ -1640,19 +1802,21 @@ pub fn file_cache_update_header(r: &R, c: &mut HttpCache) {
         // ngx_write_file()
         let bytes = h.to_bytes();
 
-        let n = unsafe { libc::pwrite(fd, bytes.as_ptr() as *const libc::c_void, bytes.len(), 0) };
-
-        if n == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(ngx_core::os::errno()), "pwrite() \"{}\" failed", B(&name));
-        } else if n as usize != bytes.len() {
-            ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "pwrite() \"{}\" has written only {} of {}", B(&name), n, bytes.len());
+        match ngx_core::os::pwrite(fd, &bytes, 0) {
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, r.connection.log, Some(err), "pwrite() \"{}\" failed", B(&name));
+            }
+            Ok(n) if n != bytes.len() => {
+                ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "pwrite() \"{}\" has written only {} of {}", B(&name), n, bytes.len());
+            }
+            Ok(_) => {}
         }
     }
 
     // done:
 
-    if unsafe { libc::close(fd) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(ngx_core::os::errno()), "close() \"{}\" failed", B(&name));
+    if let Err(err) = ngx_core::os::close_fd(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(err), "close() \"{}\" failed", B(&name));
     }
 }
 
@@ -1692,7 +1856,7 @@ pub async fn cache_send(r: &R) -> i64 {
 /// ngx_http_file_cache_free: the node is released, an incomplete temporary
 /// file deleted.
 pub fn file_cache_free(c: &mut HttpCache, tf: Option<&CacheTempFile>) {
-    if c.updated || c.node.is_null() {
+    if c.updated || c.node == 0 {
         return;
     }
 
@@ -1700,34 +1864,35 @@ pub fn file_cache_free(c: &mut HttpCache, tf: Option<&CacheTempFile>) {
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http file cache free, fd: {}", c.fd);
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    unsafe {
-        let fcn = c.node;
+    shpool.lock();
 
-        (*fcn).count_dec();
+    let fcn = c.node(&mem);
 
-        if c.updating && (*fcn).lock_time == c.lock_time {
-            (*fcn).updating = false;
-        }
+    fcn.count_dec();
 
-        if c.error != 0 {
-            (*fcn).error = c.error as u32 & ERROR_MASK;
-
-            if c.valid_sec != 0 {
-                (*fcn).valid_sec = c.valid_sec;
-                (*fcn).valid_msec = c.valid_msec as u32 & MSEC_MASK;
-            }
-        } else if !(*fcn).exists && (*fcn).count == 0 && c.min_uses == 1 {
-            queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
-            cache.sh().rbtree.delete(&mut (*fcn).node);
-            cache.shpool().free_locked(fcn as *mut u8);
-            cache.sh().count -= 1;
-            c.node = std::ptr::null_mut();
-        }
+    if c.updating && fcn.get(FileCacheNode::lock_time) == c.lock_time {
+        fcn.set_updating(false);
     }
 
-    cache.shpool().unlock();
+    if c.error != 0 {
+        fcn.set_error(c.error as u32);
+
+        if c.valid_sec != 0 {
+            fcn.set(FileCacheNode::valid_sec, c.valid_sec);
+            fcn.set_valid_msec(c.valid_msec as u32);
+        }
+    } else if !fcn.exists() && fcn.count() == 0 && c.min_uses == 1 {
+        queue::remove(&mem, fcn.field(FileCacheNode::queue_prev));
+        rb::delete(&cache.rbtree(&mem), fcn.off);
+        shpool.free_locked(fcn.off);
+        sh_count_add(cache.sh(&mem), -1);
+        c.node = 0;
+    }
+
+    shpool.unlock();
 
     c.updated = true;
     c.updating = false;
@@ -1836,20 +2001,16 @@ impl CacheTempFile {
         let mut off = 0;
 
         while off < data.len() {
-            let n = unsafe { libc::pwrite(self.fd, data[off..].as_ptr() as *const libc::c_void, data.len() - off, self.offset) };
-
-            if n == -1 {
-                let err = ngx_core::os::errno();
-
-                if err == libc::EINTR {
-                    continue;
+            let n = match ngx_core::os::pwrite(self.fd, &data[off..], self.offset) {
+                Ok(n) => n,
+                Err(libc::EINTR) => continue,
+                Err(err) => {
+                    ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwrite() \"{}\" failed", B(&self.name));
+                    return Err(());
                 }
+            };
 
-                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwrite() \"{}\" failed", B(&self.name));
-                return Err(());
-            }
-
-            off += n as usize;
+            off += n;
             self.offset += n as i64;
         }
 
@@ -1921,20 +2082,17 @@ pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u
 
     'failed: {
         if access != 0 {
-            let s = ngx_core::os::cstr(src);
-
-            if unsafe { libc::chmod(s.as_ptr(), access as libc::mode_t) } == -1 {
-                ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "chmod() \"{}\" failed", B(src));
+            if let Err(e) = ngx_core::os::chmod(src, access) {
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "chmod() \"{}\" failed", B(src));
                 err = 0;
                 break 'failed;
             }
         }
 
-        if rename(src, to).is_ok() {
-            return NGX_OK;
+        match ngx_core::os::rename(src, to) {
+            Ok(()) => return NGX_OK,
+            Err(e) => err = e,
         }
-
-        err = ngx_core::os::errno();
 
         if err == libc::ENOENT {
             if !create_path {
@@ -1947,11 +2105,10 @@ pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u
                 break 'failed;
             }
 
-            if rename(src, to).is_ok() {
-                return NGX_OK;
+            match ngx_core::os::rename(src, to) {
+                Ok(()) => return NGX_OK,
+                Err(e) => err = e,
             }
-
-            err = ngx_core::os::errno();
         }
 
         if err == libc::EXDEV {
@@ -1963,16 +2120,19 @@ pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u
             name.extend_from_slice(format!("{:010}", n).as_bytes());
 
             if copy_file(src, &name, access, log).is_ok() {
-                if rename(&name, to).is_ok() {
-                    if let Err(e) = ngx_core::os::unlink(src) {
-                        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(src));
-                        return NGX_ERROR;
+                match ngx_core::os::rename(&name, to) {
+                    Ok(()) => {
+                        if let Err(e) = ngx_core::os::unlink(src) {
+                            ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(src));
+                            return NGX_ERROR;
+                        }
+
+                        return NGX_OK;
                     }
-
-                    return NGX_OK;
+                    Err(e) => {
+                        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "rename() \"{}\" to \"{}\" failed", B(&name), B(to));
+                    }
                 }
-
-                ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "rename() \"{}\" to \"{}\" failed", B(&name), B(to));
 
                 if let Err(e) = ngx_core::os::unlink(&name) {
                     ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "unlink() \"{}\" failed", B(&name));
@@ -1996,17 +2156,6 @@ pub(crate) fn ext_rename_file(src: &[u8], to: &[u8], access: u32, path_access: u
     }
 
     NGX_ERROR
-}
-
-fn rename(from: &[u8], to: &[u8]) -> Result<(), ()> {
-    let f = ngx_core::os::cstr(from);
-    let t = ngx_core::os::cstr(to);
-
-    if unsafe { libc::rename(f.as_ptr(), t.as_ptr()) } == -1 {
-        return Err(());
-    }
-
-    Ok(())
 }
 
 /// ngx_copy_file
@@ -2050,13 +2199,8 @@ fn quitting() -> bool {
 
 /// The name of the cache file of a node: the path, the levels and the hex
 /// of the key.
-fn node_file_name(path: &PathConf, fcn: &FileCacheNode) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 * NGX_HTTP_CACHE_KEY_LEN);
-
-    ngx_core::string::hex_dump(&mut key, &fcn.node.key.to_ne_bytes());
-    ngx_core::string::hex_dump(&mut key, &fcn.key);
-
-    path.hashed_filename(&key)
+fn node_file_name(path: &PathConf, fcn: FileCacheNode<'_>) -> Vec<u8> {
+    path.hashed_filename(&fcn.key_hex())
 }
 
 /// ngx_http_file_cache_forced_expire: the least recently used node that is
@@ -2068,84 +2212,69 @@ fn file_cache_forced_expire(cache: &FileCache) -> i64 {
 
     let mut wait = 10;
     let mut tries = 20;
-    let mut sentinel: *mut Queue = std::ptr::null_mut();
+    let mut sentinel: usize = 0;
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
+    let head = cache.queue();
 
-    unsafe {
-        loop {
-            if queue_empty(cache.queue()) {
-                break;
-            }
+    shpool.lock();
 
-            let q = queue_last(cache.queue());
+    loop {
+        if queue::empty(&mem, head) {
+            break;
+        }
 
-            if q == sentinel {
-                break;
-            }
+        let q = queue::last(&mem, head);
 
-            let fcn = queue_data(q);
+        if q == sentinel {
+            break;
+        }
 
-            ngx_log_debug!(
-                NGX_LOG_DEBUG_HTTP,
-                log,
-                "http file cache forced expire: #{} {} {:02x}{:02x}{:02x}{:02x}",
-                (*fcn).count,
-                (*fcn).exists as i32,
-                (*fcn).key[0],
-                (*fcn).key[1],
-                (*fcn).key[2],
-                (*fcn).key[3]
-            );
+        let fcn = queue_data(&mem, q);
 
-            if (*fcn).count == 0 {
-                file_cache_delete(cache, q);
-                wait = 0;
-                break;
-            }
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "http file cache forced expire: #{} {} {}", fcn.count(), fcn.exists() as i32, B(&hex(&fcn.key_bytes()[..4])));
 
-            if (*fcn).deleting {
-                wait = 1;
-                break;
-            }
+        if fcn.count() == 0 {
+            file_cache_delete(cache, &mem, q);
+            wait = 0;
+            break;
+        }
 
-            let mut key = Vec::with_capacity(2 * NGX_HTTP_CACHE_KEY_LEN);
-            ngx_core::string::hex_dump(&mut key, &(*fcn).node.key.to_ne_bytes());
-            ngx_core::string::hex_dump(&mut key, &(*fcn).key);
-
-            // abnormally exited workers may leave locked cache entries,
-            // and although it may be safe to remove them completely,
-            // we prefer to just move them to the top of the inactive queue
-
-            queue_remove(q);
-            (*fcn).expire = ngx_core::times::time() + cache.inactive;
-            queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
-
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), (*fcn).count);
-
-            if sentinel.is_null() {
-                sentinel = q;
-            }
-
-            tries -= 1;
-
-            if tries != 0 {
-                continue;
-            }
-
+        if fcn.deleting() {
             wait = 1;
             break;
         }
+
+        let key = fcn.key_hex();
+
+        // abnormally exited workers may leave locked cache entries,
+        // and although it may be safe to remove them completely,
+        // we prefer to just move them to the top of the inactive queue
+
+        queue::remove(&mem, q);
+        fcn.set(FileCacheNode::expire, ngx_core::times::time() + cache.inactive);
+        queue::insert_head(&mem, head, q);
+
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), fcn.count());
+
+        if sentinel == 0 {
+            sentinel = q;
+        }
+
+        tries -= 1;
+
+        if tries != 0 {
+            continue;
+        }
+
+        wait = 1;
+        break;
     }
 
-    cache.shpool().unlock();
+    shpool.unlock();
 
     wait
-}
-
-/// ngx_queue_data(q, ngx_http_file_cache_node_t, queue)
-unsafe fn queue_data(q: *mut Queue) -> *mut FileCacheNode {
-    (q as *mut u8).sub(std::mem::offset_of!(FileCacheNode, queue)) as *mut FileCacheNode
 }
 
 /// ngx_http_file_cache_expire: the nodes inactive for too long go.
@@ -2158,108 +2287,99 @@ fn file_cache_expire(cache: &FileCache) -> i64 {
 
     let mut wait;
 
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
+    let head = cache.queue();
 
-    unsafe {
-        loop {
-            if quitting() {
+    shpool.lock();
+
+    loop {
+        if quitting() {
+            wait = 1;
+            break;
+        }
+
+        if queue::empty(&mem, head) {
+            wait = 10;
+            break;
+        }
+
+        let q = queue::last(&mem, head);
+
+        let fcn = queue_data(&mem, q);
+
+        wait = fcn.get(FileCacheNode::expire) - now;
+
+        if wait > 0 {
+            wait = if wait > 10 { 10 } else { wait };
+            break;
+        }
+
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "http file cache expire: #{} {} {}", fcn.count(), fcn.exists() as i32, B(&hex(&fcn.key_bytes()[..4])));
+
+        'next: {
+            if fcn.count() == 0 {
+                file_cache_delete(cache, &mem, q);
+                break 'next;
+            }
+
+            if fcn.deleting() {
                 wait = 1;
-                break;
+                shpool.unlock();
+                return wait;
             }
 
-            if queue_empty(cache.queue()) {
-                wait = 10;
-                break;
-            }
+            let key = fcn.key_hex();
 
-            let q = queue_last(cache.queue());
+            // abnormally exited workers may leave locked cache entries,
+            // and although it may be safe to remove them completely,
+            // we prefer to just move them to the top of the inactive queue
 
-            let fcn = queue_data(q);
+            queue::remove(&mem, q);
+            fcn.set(FileCacheNode::expire, ngx_core::times::time() + cache.inactive);
+            queue::insert_head(&mem, head, q);
 
-            wait = (*fcn).expire - now;
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), fcn.count());
+        }
 
-            if wait > 0 {
-                wait = if wait > 10 { 10 } else { wait };
-                break;
-            }
+        // next:
 
-            ngx_log_debug!(
-                NGX_LOG_DEBUG_HTTP,
-                log,
-                "http file cache expire: #{} {} {:02x}{:02x}{:02x}{:02x}",
-                (*fcn).count,
-                (*fcn).exists as i32,
-                (*fcn).key[0],
-                (*fcn).key[1],
-                (*fcn).key[2],
-                (*fcn).key[3]
-            );
+        cache.files.set(cache.files.get() + 1);
 
-            'next: {
-                if (*fcn).count == 0 {
-                    file_cache_delete(cache, q);
-                    break 'next;
-                }
+        if cache.files.get() >= cache.manager_files {
+            wait = 0;
+            break;
+        }
 
-                if (*fcn).deleting {
-                    wait = 1;
-                    cache.shpool().unlock();
-                    return wait;
-                }
+        ngx_core::times::update();
 
-                let mut key = Vec::with_capacity(2 * NGX_HTTP_CACHE_KEY_LEN);
-                ngx_core::string::hex_dump(&mut key, &(*fcn).node.key.to_ne_bytes());
-                ngx_core::string::hex_dump(&mut key, &(*fcn).key);
+        let elapsed = (ngx_core::times::current_msec().wrapping_sub(cache.last.get()) as i64).unsigned_abs();
 
-                // abnormally exited workers may leave locked cache entries,
-                // and although it may be safe to remove them completely,
-                // we prefer to just move them to the top of the inactive queue
-
-                queue_remove(q);
-                (*fcn).expire = ngx_core::times::time() + cache.inactive;
-                queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
-
-                ngx_log_error!(NGX_LOG_ALERT, log, None, "ignore long locked inactive cache entry {}, count:{}", B(&key), (*fcn).count);
-            }
-
-            // next:
-
-            cache.files.set(cache.files.get() + 1);
-
-            if cache.files.get() >= cache.manager_files {
-                wait = 0;
-                break;
-            }
-
-            ngx_core::times::update();
-
-            let elapsed = (ngx_core::times::current_msec().wrapping_sub(cache.last.get()) as i64).unsigned_abs();
-
-            if elapsed >= cache.manager_threshold {
-                wait = 0;
-                break;
-            }
+        if elapsed >= cache.manager_threshold {
+            wait = 0;
+            break;
         }
     }
 
-    cache.shpool().unlock();
+    shpool.unlock();
 
     wait
 }
 
 /// ngx_http_file_cache_delete: the file of a node, and the node when it is
 /// not used. The zone is locked on entry and on return.
-unsafe fn file_cache_delete(cache: &FileCache, q: *mut Queue) {
-    let fcn = queue_data(q);
+fn file_cache_delete(cache: &FileCache, mem: &ShmMem, q: usize) {
+    let fcn = queue_data(mem, q);
+    let shpool = SlabPool::of(mem);
 
-    if (*fcn).exists {
-        cache.sh().size -= (*fcn).fs_size;
+    if fcn.exists() {
+        sh_size_add(cache.sh(mem), -fcn.get(FileCacheNode::fs_size));
 
-        let name = node_file_name(&cache.path, &*fcn);
+        let name = node_file_name(&cache.path, fcn);
 
-        (*fcn).count_inc();
-        (*fcn).deleting = true;
-        cache.shpool().unlock();
+        fcn.count_inc();
+        fcn.set_deleting(true);
+        shpool.unlock();
 
         let log = cycle_log();
 
@@ -2269,16 +2389,16 @@ unsafe fn file_cache_delete(cache: &FileCache, q: *mut Queue) {
             ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "unlink() \"{}\" failed", B(&name));
         }
 
-        cache.shpool().lock();
-        (*fcn).count_dec();
-        (*fcn).deleting = false;
+        shpool.lock();
+        fcn.count_dec();
+        fcn.set_deleting(false);
     }
 
-    if (*fcn).count == 0 {
-        queue_remove(q);
-        cache.sh().rbtree.delete(&mut (*fcn).node);
-        cache.shpool().free_locked(fcn as *mut u8);
-        cache.sh().count -= 1;
+    if fcn.count() == 0 {
+        queue::remove(mem, q);
+        rb::delete(&cache.rbtree(mem), fcn.off);
+        shpool.free_locked(fcn.off);
+        sh_count_add(cache.sh(mem), -1);
     }
 }
 
@@ -2298,14 +2418,18 @@ fn file_cache_manager(cache: &FileCache) -> u64 {
             break 'done;
         }
 
+        let mem = cache.mem();
+        let shpool = SlabPool::of(&mem);
+        let sh = cache.sh(&mem);
+
         loop {
-            cache.shpool().lock();
+            shpool.lock();
 
-            let size = cache.sh().size;
-            let count = cache.sh().count;
-            let watermark = cache.sh().watermark;
+            let size = sh.get(FileCacheSh::size);
+            let count = sh.get(FileCacheSh::count);
+            let watermark = sh.get(FileCacheSh::watermark);
 
-            cache.shpool().unlock();
+            shpool.unlock();
 
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "http file cache size: {} c:{} w:{}", size, count, watermark as i64);
 
@@ -2364,15 +2488,18 @@ fn file_cache_manager(cache: &FileCache) -> u64 {
 /// ngx_http_file_cache_loader: the nodes of the files in the cache
 /// directory, once after the start.
 fn file_cache_loader(cache: &FileCache) {
-    let sh = cache.sh();
+    let mem = cache.mem();
+    let cold = cache.cold(&mem);
+    let loading = cache.loading(&mem);
 
-    if sh.cold.load(Ordering::SeqCst) == 0 || sh.loading.load(Ordering::SeqCst) != 0 {
+    if cold.load(Ordering::SeqCst) == 0 || loading.load(Ordering::SeqCst) != 0 {
         return;
     }
 
     let pid = ngx_core::os::getpid() as usize;
 
-    if sh.loading.compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    // ngx_atomic_cmp_set(&cache->sh->loading, 0, ngx_pid)
+    if loading.compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
     }
 
@@ -2384,12 +2511,12 @@ fn file_cache_loader(cache: &FileCache) {
     cache.files.set(0);
 
     if walk_tree(cache, &cache.path.name, &log) == NGX_ABORT {
-        sh.loading.store(0, Ordering::SeqCst);
+        loading.store(0, Ordering::SeqCst);
         return;
     }
 
-    sh.cold.store(0, Ordering::SeqCst);
-    sh.loading.store(0, Ordering::SeqCst);
+    cold.store(0, Ordering::SeqCst);
+    loading.store(0, Ordering::SeqCst);
 
     ngx_log_error!(
         NGX_LOG_NOTICE,
@@ -2397,7 +2524,7 @@ fn file_cache_loader(cache: &FileCache) {
         None,
         "http file cache: {} {:.3}M, bsize: {}",
         B(&cache.path.name),
-        (sh.size as f64 * cache.bsize.get() as f64) / (1024.0 * 1024.0),
+        (cache.sh(&mem).get(FileCacheSh::size) as f64 * cache.bsize.get() as f64) / (1024.0 * 1024.0),
         cache.bsize.get()
     );
 }
@@ -2555,49 +2682,57 @@ fn file_cache_add_file(cache: &FileCache, name: &[u8], size: i64, fs_size: i64, 
 
 /// ngx_http_file_cache_add
 fn file_cache_add(cache: &FileCache, key: &[u8; NGX_HTTP_CACHE_KEY_LEN], fs_size: i64) -> i64 {
-    cache.shpool().lock();
+    let mem = cache.mem();
+    let shpool = SlabPool::of(&mem);
 
-    unsafe {
-        let mut fcn = file_cache_lookup(cache, key);
+    shpool.lock();
 
-        if fcn.is_null() {
-            fcn = cache.shpool().calloc_locked(std::mem::size_of::<FileCacheNode>()) as *mut FileCacheNode;
+    let mut fcn = file_cache_lookup(cache, &mem, key);
 
-            if fcn.is_null() {
-                file_cache_set_watermark(cache);
+    if fcn == 0 {
+        fcn = shpool.calloc_locked(FileCacheNode::SIZE);
 
-                if cache.fail_time.get() != ngx_core::times::time() {
-                    cache.fail_time.set(ngx_core::times::time());
-                    ngx_log_error!(NGX_LOG_ALERT, cycle_log(), None, "could not allocate node{}", B(cache.shpool().log_ctx()));
-                }
+        if fcn == 0 {
+            file_cache_set_watermark(cache, &mem);
 
-                cache.shpool().unlock();
-                return NGX_ERROR;
+            if cache.fail_time.get() != ngx_core::times::time() {
+                cache.fail_time.set(ngx_core::times::time());
+                ngx_log_error!(NGX_LOG_ALERT, cycle_log(), None, "could not allocate node{}", B(&shpool.log_ctx()));
             }
 
-            cache.sh().count += 1;
-
-            (*fcn).node.key = usize::from_ne_bytes(key[..RBTREE_KEY_SIZE].try_into().unwrap());
-
-            (*fcn).key.copy_from_slice(&key[RBTREE_KEY_SIZE..]);
-
-            cache.sh().rbtree.insert(&mut (*fcn).node);
-
-            (*fcn).uses = 1;
-            (*fcn).exists = true;
-            (*fcn).fs_size = fs_size;
-
-            cache.sh().size += fs_size;
-        } else {
-            queue_remove(std::ptr::addr_of_mut!((*fcn).queue));
+            shpool.unlock();
+            return NGX_ERROR;
         }
 
-        (*fcn).expire = ngx_core::times::time() + cache.inactive;
+        let sh = cache.sh(&mem);
 
-        queue_insert_head(cache.queue(), std::ptr::addr_of_mut!((*fcn).queue));
+        sh_count_add(sh, 1);
+
+        let n = FileCacheNode::at(&mem, fcn);
+
+        // ngx_memcpy((u_char *) &fcn->node.key, key, sizeof(ngx_rbtree_key_t))
+        n.set(FileCacheNode::node_key, usize::from_ne_bytes(key[..RBTREE_KEY_SIZE].try_into().unwrap()));
+
+        mem.write(n.field(FileCacheNode::key), &key[RBTREE_KEY_SIZE..]);
+
+        rb::insert(&cache.rbtree(&mem), fcn, file_cache_rbtree_insert_value);
+
+        n.set_uses(1);
+        n.set_exists(true);
+        n.set(FileCacheNode::fs_size, fs_size);
+
+        sh_size_add(sh, fs_size);
+    } else {
+        queue::remove(&mem, FileCacheNode::at(&mem, fcn).field(FileCacheNode::queue_prev));
     }
 
-    cache.shpool().unlock();
+    let n = FileCacheNode::at(&mem, fcn);
+
+    n.set(FileCacheNode::expire, ngx_core::times::time() + cache.inactive);
+
+    queue::insert_head(&mem, cache.queue(), n.field(FileCacheNode::queue_prev));
+
+    shpool.unlock();
 
     NGX_OK
 }
@@ -2611,13 +2746,15 @@ fn file_cache_delete_file(path: &[u8], log: &Log) {
     }
 }
 
-/// ngx_http_file_cache_set_watermark
-fn file_cache_set_watermark(cache: &FileCache) {
-    let sh = cache.sh();
+/// ngx_http_file_cache_set_watermark (the zone is locked)
+fn file_cache_set_watermark(cache: &FileCache, mem: &ShmMem) {
+    let sh = cache.sh(mem);
 
-    sh.watermark = sh.count - sh.count / 8;
+    let count = sh.get(FileCacheSh::count);
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, cycle_log(), "http file cache watermark: {}", sh.watermark);
+    sh.set(FileCacheSh::watermark, count - count / 8);
+
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, cycle_log(), "http file cache watermark: {}", sh.get(FileCacheSh::watermark));
 }
 
 /// ngx_http_file_cache_valid: the time a response of the status is valid
@@ -2882,8 +3019,8 @@ pub fn file_cache_set_slot(cf: &mut Conf, cmd: &Command, caches: &mut Vec<Rc<Fil
     }
 
     let cache = Rc::new(FileCache {
-        sh: Cell::new(std::ptr::null_mut()),
-        shpool: Cell::new(std::ptr::null_mut()),
+        sh: Cell::new(0),
+        mem: RefCell::new(None),
         path: path.clone(),
         min_free,
         max_size: Cell::new(max_size),
@@ -2905,6 +3042,7 @@ pub fn file_cache_set_slot(cf: &mut Conf, cmd: &Command, caches: &mut Vec<Rc<Fil
 
     *path.data.borrow_mut() = Some(Rc::new(PathData(Rc::downgrade(&cache))));
 
+    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(file_cache_init));
     *shm_zone.data.borrow_mut() = Some(cache.clone());
 
@@ -3033,19 +3171,443 @@ mod tests {
 
     #[test]
     fn test_node_bits() {
-        let mut n: FileCacheNode = unsafe { std::mem::zeroed() };
-        n.uses = USES_MASK;
+        let mem = ShmMem::private(4096).unwrap();
+        let n = FileCacheNode::at(&mem, 128);
+
+        n.set_uses(USES_MASK);
         n.uses_inc();
-        assert_eq!(n.uses, 0);
+        assert_eq!(n.uses(), 0);
         n.count_dec();
-        assert_eq!(n.count, COUNT_MASK);
+        assert_eq!(n.count(), COUNT_MASK);
         n.count_inc();
-        assert_eq!(n.count, 0);
+        assert_eq!(n.count(), 0);
+
+        // the fields of a unit do not overlap, and are cut to their widths
+        n.set_count(5);
+        n.set_uses(1023);
+        assert_eq!((n.count(), n.uses()), (5, 1023));
+        n.set_uses(1024);
+        assert_eq!((n.count(), n.uses()), (5, 0));
+        assert_eq!(n.get(FileCacheNode::bits0), 5);
+
+        n.set_error(502);
+        n.set_valid_msec(999);
+        n.set_exists(true);
+        n.set_deleting(true);
+        assert_eq!(n.error(), 502);
+        assert!(n.exists() && !n.updating() && n.deleting());
+        n.set_updating(true);
+        n.set_deleting(false);
+        assert!(n.exists() && n.updating() && !n.deleting());
+        assert_eq!(n.get(FileCacheNode::bits1), 999 | 502 << 10 | 1 << 20 | 1 << 21);
+        assert_eq!(n.count(), 5, "the other unit is kept");
+
+        // the key bytes, after the queue
+        mem.write(n.field(FileCacheNode::key), b"\x01\x02\x03\x04\x05\x06\x07\x08");
+        n.set(FileCacheNode::node_key, usize::from_ne_bytes([0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7]));
+        assert_eq!(n.key_bytes(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(n.key_hex(), b"a0a1a2a3a4a5a6a70102030405060708");
+        assert_eq!(n.get(FileCacheNode::bits0), 5);
+    }
+
+    #[test]
+    fn test_zone_layout() {
+        // sizeof(ngx_http_file_cache_node_t) and sizeof(ngx_http_file_cache_sh_t) on LP64
+        assert_eq!(FileCacheNode::SIZE, 120);
+        assert_eq!(FileCacheNode::queue_prev.off, 40);
+        assert_eq!(FileCacheNode::key.off, 56);
+        assert_eq!(FileCacheNode::bits0.off, 64);
+        assert_eq!(FileCacheNode::bits1.off, 68);
+        assert_eq!(FileCacheNode::uniq.off, 72);
+        assert_eq!(FileCacheNode::expire.off, 80);
+        assert_eq!(FileCacheNode::fs_size.off, 104);
+        assert_eq!(FileCacheNode::lock_time.off, 112);
+        assert_eq!(FileCacheNode::node_color.off, ngx_core::shmem::rbtree::RbNode::color.off);
+
+        assert_eq!(FileCacheSh::SIZE, 120);
+        assert_eq!(FileCacheSh::sentinel_key.off, 24);
+        assert_eq!(FileCacheSh::queue_prev.off, 64);
+        assert_eq!(FileCacheSh::cold.off, 80);
+        assert_eq!(FileCacheSh::size.off, 96);
+        assert_eq!(FileCacheSh::watermark.off, 112);
     }
 
     #[test]
     fn test_dir_access() {
         assert_eq!(dir_access(0o600), 0o700);
         assert_eq!(dir_access(0o644), 0o755);
+    }
+
+    /// ngx_cycle, for the messages of the cache (quiet: emerg only)
+    fn test_cycle() {
+        if ngx_core::cycle::try_cycle().is_none() {
+            ngx_core::cycle::set_cycle(Rc::new(ngx_core::cycle::Cycle::init_cycle(Log::stderr(NGX_LOG_EMERG), Rc::new(Vec::new()))));
+        }
+    }
+
+    /// A keys zone of `size` bytes and its cache, initialized by the zone
+    /// init; the cache path does not exist.
+    fn cache_of(size: usize) -> (Rc<ShmZone>, Rc<FileCache>) {
+        test_cycle();
+
+        let mem = Rc::new(ShmMem::private(size).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"one".to_vec(), mem.len(), "ngx_http_proxy_module");
+        zone.shm.attach(mem);
+        *zone.shm.log.borrow_mut() = Some(ngx_core::cycle::cycle().log.clone());
+
+        let cache = Rc::new(FileCache {
+            sh: Cell::new(0),
+            mem: RefCell::new(None),
+            path: Rc::new(PathConf::new(b"/nonexistent/rnginx/cache".to_vec(), [1, 2, 0])),
+            min_free: 0,
+            max_size: Cell::new(i64::MAX),
+            bsize: Cell::new(512),
+            inactive: 600,
+            fail_time: Cell::new(0),
+            files: Cell::new(0),
+            loader_files: 100,
+            last: Cell::new(0),
+            loader_sleep: 50,
+            loader_threshold: 200,
+            manager_files: 100,
+            manager_sleep: 50,
+            manager_threshold: 200,
+            name: b"one".to_vec(),
+            shm_zone: Rc::downgrade(&zone),
+            use_temp_path: true,
+        });
+
+        *zone.data.borrow_mut() = Some(cache.clone());
+
+        file_cache_init(&zone, None).unwrap();
+
+        (zone, cache)
+    }
+
+    /// The r->cache of a request for `key`.
+    fn request_cache(cache: &Rc<FileCache>, key: [u8; NGX_HTTP_CACHE_KEY_LEN], min_uses: usize) -> HttpCache {
+        let mut c = HttpCache::new(ngx_core::cycle::cycle().log.clone());
+        c.file_cache = Some(cache.clone());
+        c.key = key;
+        c.main = key;
+        c.min_uses = min_uses;
+        c
+    }
+
+    /// A key: the rbtree key (the first 8 bytes) is `hash`, the rest `n`.
+    fn key(hash: u64, n: u64) -> [u8; NGX_HTTP_CACHE_KEY_LEN] {
+        let mut k = [0u8; NGX_HTTP_CACHE_KEY_LEN];
+        k[..8].copy_from_slice(&hash.to_ne_bytes());
+        k[8..].copy_from_slice(&n.to_be_bytes());
+        k
+    }
+
+    /// The nodes of the LRU queue, the most recently used first.
+    fn lru(cache: &FileCache) -> Vec<usize> {
+        let mem = cache.mem();
+        queue::walk(&mem, cache.queue()).into_iter().map(|q| queue_data(&mem, q).off).collect()
+    }
+
+    #[test]
+    fn test_zone_init() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+        let shpool = SlabPool::of(&mem);
+
+        assert_eq!(shpool.data(), cache.sh.get());
+        assert_eq!(cache.cold(&mem).load(Ordering::SeqCst), 1);
+        assert_eq!(cache.loading(&mem).load(Ordering::SeqCst), 0);
+        assert_eq!(sh.get(FileCacheSh::size), 0);
+        assert_eq!(sh.get(FileCacheSh::count), 0);
+        assert_eq!(sh.get(FileCacheSh::watermark), usize::MAX);
+        assert!(queue::empty(&mem, cache.queue()));
+        assert_eq!(shpool.log_ctx(), b" in cache keys zone \"one\"");
+        assert!(!shpool.log_nomem());
+        // no such path: the default block size
+        assert_eq!(cache.bsize.get(), 512);
+    }
+
+    #[test]
+    fn test_exists_and_free() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+        let k = key(7, 1);
+
+        let t0 = ngx_core::times::time();
+
+        let mut c1 = request_cache(&cache, k, 1);
+        assert_eq!(file_cache_exists(&cache, &mut c1), NGX_DECLINED);
+        assert!(c1.node != 0);
+
+        let n = FileCacheNode::at(&mem, c1.node);
+        assert_eq!((n.count(), n.uses()), (1, 1));
+        assert_eq!(n.key_bytes(), k[8..]);
+        assert_eq!(cache.rbtree(&mem).key(c1.node), 7);
+        assert_eq!(sh.get(FileCacheSh::count), 1);
+        assert!((t0 + 600..=ngx_core::times::time() + 600).contains(&n.get(FileCacheNode::expire)));
+
+        // another request: the node is found and used again
+        let mut c2 = request_cache(&cache, k, 1);
+        assert_eq!(file_cache_exists(&cache, &mut c2), NGX_OK);
+        assert_eq!(c2.node, c1.node);
+        assert_eq!((n.count(), n.uses()), (2, 2));
+        assert!(!c2.exists);
+
+        // min_uses not reached
+        let mut c3 = request_cache(&cache, k, 5);
+        assert_eq!(file_cache_exists(&cache, &mut c3), NGX_AGAIN);
+        assert_eq!(n.count(), 3);
+
+        // the same request again (c->node set): not counted again
+        assert_eq!(file_cache_exists(&cache, &mut c3), NGX_AGAIN);
+        assert_eq!((n.count(), n.uses()), (3, 3));
+
+        file_cache_free(&mut c3, None);
+        file_cache_free(&mut c2, None);
+        assert_eq!(n.count(), 1);
+        assert!(c2.updated);
+        assert_eq!(c2.node, c1.node, "the node is kept while used");
+
+        // the last user of a node never cached frees it
+        file_cache_free(&mut c1, None);
+        assert_eq!(c1.node, 0);
+        assert_eq!(sh.get(FileCacheSh::count), 0);
+        assert!(queue::empty(&mem, cache.queue()));
+        let tree = cache.rbtree(&mem);
+        assert_eq!(tree.root(), tree.sentinel());
+    }
+
+    #[test]
+    fn test_cached_error_and_lock() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let k = key(9, 9);
+
+        // a cached error: kept on free with its validity
+        let mut c1 = request_cache(&cache, k, 1);
+        assert_eq!(file_cache_exists(&cache, &mut c1), NGX_DECLINED);
+        c1.error = 502;
+        c1.valid_sec = ngx_core::times::time() + 60;
+        c1.valid_msec = 5;
+        file_cache_free(&mut c1, None);
+
+        let n = FileCacheNode::at(&mem, c1.node);
+        assert_eq!((n.count(), n.error()), (0, 502));
+        assert_eq!(n.get(FileCacheNode::valid_sec), c1.valid_sec);
+
+        let mut c2 = request_cache(&cache, k, 1);
+        assert_eq!(file_cache_exists(&cache, &mut c2), NGX_OK);
+        assert_eq!(c2.error, 502);
+
+        // expired: renewed
+        n.set(FileCacheNode::valid_sec, ngx_core::times::time() - 1);
+        let mut c3 = request_cache(&cache, k, 1);
+        assert_eq!(file_cache_exists(&cache, &mut c3), NGX_DECLINED);
+        assert_eq!((c3.error, n.error()), (0, 0));
+        assert_eq!(n.count(), 2);
+
+        // the updating flag goes with the lock time of its owner
+        c3.updating = true;
+        c3.lock_time = 1234;
+        n.set_updating(true);
+        n.set(FileCacheNode::lock_time, 1234);
+        file_cache_free(&mut c3, None);
+        assert!(!n.updating());
+    }
+
+    #[test]
+    fn test_colliding_keys() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+
+        // the same rbtree key for all: the rest of the key orders them
+        let keys: Vec<[u8; 16]> = (0..200u64).map(|i| key(42, (i * 7919) % 200)).collect();
+
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(file_cache_add(&cache, k, i as i64 + 1), NGX_OK);
+        }
+
+        assert_eq!(sh.get(FileCacheSh::count), 200);
+        assert_eq!(sh.get(FileCacheSh::size), (1..=200).sum::<i64>());
+
+        for (i, k) in keys.iter().enumerate() {
+            let n = file_cache_lookup(&cache, &mem, k);
+            assert!(n != 0);
+            let n = FileCacheNode::at(&mem, n);
+            assert_eq!(n.get(FileCacheNode::fs_size), i as i64 + 1);
+            assert!(n.exists());
+            assert_eq!((n.uses(), n.count()), (1, 0));
+        }
+
+        assert_eq!(file_cache_lookup(&cache, &mem, &key(42, 200)), 0);
+        assert_eq!(file_cache_lookup(&cache, &mem, &key(43, 1)), 0);
+
+        // in order of the key bytes
+        let tree = cache.rbtree(&mem);
+        let walked: Vec<[u8; 8]> = rb::walk(&tree).into_iter().map(|n| FileCacheNode::at(&mem, n).key_bytes()).collect();
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted);
+        assert_eq!(walked.len(), 200);
+
+        // added again (the loader meets a file twice): moved to the head,
+        // nothing else changes
+        let first = file_cache_lookup(&cache, &mem, &keys[0]);
+        assert_eq!(*lru(&cache).last().unwrap(), first);
+        assert_eq!(file_cache_add(&cache, &keys[0], 1000), NGX_OK);
+        assert_eq!(lru(&cache)[0], first);
+        assert_eq!(sh.get(FileCacheSh::count), 200);
+        assert_eq!(sh.get(FileCacheSh::size), (1..=200).sum::<i64>());
+    }
+
+    #[test]
+    fn test_forced_expire() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+
+        for i in 0..30u64 {
+            assert_eq!(file_cache_add(&cache, &key(i, i), 2), NGX_OK);
+        }
+
+        // the least recently used node goes (its file is deleted: here
+        // unlink() fails, as the path does not exist)
+        let oldest = *lru(&cache).last().unwrap();
+        assert_eq!(file_cache_forced_expire(&cache), 0);
+        assert_eq!(sh.get(FileCacheSh::count), 29);
+        assert_eq!(sh.get(FileCacheSh::size), 58);
+        assert!(!lru(&cache).contains(&oldest));
+
+        // a locked entry is moved to the head, the next one goes
+        let locked = *lru(&cache).last().unwrap();
+        FileCacheNode::at(&mem, locked).set_count(1);
+        assert_eq!(file_cache_forced_expire(&cache), 0);
+        assert_eq!(lru(&cache)[0], locked);
+        assert_eq!(sh.get(FileCacheSh::count), 28);
+
+        // a node being deleted stops it
+        let deleting = *lru(&cache).last().unwrap();
+        FileCacheNode::at(&mem, deleting).set_count(1);
+        FileCacheNode::at(&mem, deleting).set_deleting(true);
+        assert_eq!(file_cache_forced_expire(&cache), 1);
+        assert_eq!(sh.get(FileCacheSh::count), 28);
+        FileCacheNode::at(&mem, deleting).set_deleting(false);
+
+        // all locked: 20 tries
+        for n in lru(&cache) {
+            FileCacheNode::at(&mem, n).set_count(1);
+        }
+        assert_eq!(file_cache_forced_expire(&cache), 1);
+        assert_eq!(sh.get(FileCacheSh::count), 28);
+
+        // fewer than 20, all locked: back to the first one moved
+        let (_zone2, cache2) = cache_of(1 << 20);
+        for i in 0..5u64 {
+            assert_eq!(file_cache_add(&cache2, &key(i, i), 1), NGX_OK);
+        }
+        let mem2 = cache2.mem();
+        let before = lru(&cache2);
+        for &n in &before {
+            FileCacheNode::at(&mem2, n).set_count(1);
+        }
+        assert_eq!(file_cache_forced_expire(&cache2), 10);
+        assert_eq!(lru(&cache2), before, "each moved to the head once");
+    }
+
+    #[test]
+    fn test_expire() {
+        let (_zone, cache) = cache_of(1 << 20);
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+
+        // an empty queue: 10 seconds
+        assert_eq!(file_cache_expire(&cache), 10);
+
+        for i in 0..10u64 {
+            assert_eq!(file_cache_add(&cache, &key(i, 0), 1), NGX_OK);
+        }
+
+        // not inactive yet: the time till the oldest is, at most 10s
+        assert_eq!(file_cache_expire(&cache), 10);
+        let oldest = *lru(&cache).last().unwrap();
+        FileCacheNode::at(&mem, oldest).set(FileCacheNode::expire, ngx_core::times::time() + 3);
+        let wait = file_cache_expire(&cache);
+        assert!(wait == 3 || wait == 2, "{}", wait);
+
+        // the inactive nodes go, up to the first one still active
+        let nodes = lru(&cache);
+        let now = ngx_core::times::time();
+        for &n in &nodes[6..] {
+            FileCacheNode::at(&mem, n).set(FileCacheNode::expire, now - 1);
+        }
+        // a locked inactive one is moved to the head
+        FileCacheNode::at(&mem, nodes[7]).set_count(1);
+
+        // as file_cache_manager() does
+        cache.last.set(ngx_core::times::current_msec());
+        cache.files.set(0);
+
+        let wait = file_cache_expire(&cache);
+        assert!(wait > 0 && wait <= 10, "{}", wait);
+        assert_eq!(sh.get(FileCacheSh::count), 7);
+        assert_eq!(lru(&cache)[0], nodes[7]);
+        assert!(FileCacheNode::at(&mem, nodes[7]).get(FileCacheNode::expire) >= now + 600);
+        assert_eq!(cache.files.get(), 4);
+
+        // the manager's limits: manager_threshold since cache->last...
+        for n in lru(&cache) {
+            FileCacheNode::at(&mem, n).set_count(0);
+            FileCacheNode::at(&mem, n).set(FileCacheNode::expire, now - 1);
+        }
+        cache.last.set(0);
+        cache.files.set(0);
+        assert_eq!(file_cache_expire(&cache), 0);
+        assert_eq!(sh.get(FileCacheSh::count), 6);
+        assert_eq!(cache.files.get(), 1);
+    }
+
+    #[test]
+    fn test_no_memory() {
+        // a small keys zone
+        let (_zone, cache) = cache_of(8 * ngx_core::os::pagesize());
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+
+        let t0 = ngx_core::times::time();
+
+        let mut n = 0u64;
+        while file_cache_add(&cache, &key(n, n), 1) == NGX_OK {
+            n += 1;
+            assert!(n < 10000);
+        }
+
+        // "could not allocate node", once a second; the watermark is set
+        let count = sh.get(FileCacheSh::count);
+        assert_eq!(count as u64, n);
+        assert!(n > 100, "{}", n);
+        assert_eq!(sh.get(FileCacheSh::watermark), count - count / 8);
+        assert!(cache.fail_time.get() >= t0);
+
+        // a request for a new key: the least recently used node is expired
+        // to make room
+        let oldest = *lru(&cache).last().unwrap();
+        let mut c = request_cache(&cache, key(n, n), 1);
+        assert_eq!(file_cache_exists(&cache, &mut c), NGX_DECLINED);
+        assert_eq!(c.node, oldest, "the freed chunk is reused");
+        assert_eq!(sh.get(FileCacheSh::count), count);
+
+        // all in use: "could not allocate node"
+        for q in lru(&cache) {
+            FileCacheNode::at(&mem, q).set_count(1);
+        }
+        let mut c = request_cache(&cache, key(n + 1, n + 1), 1);
+        assert_eq!(file_cache_exists(&cache, &mut c), NGX_ERROR);
+        assert_eq!(c.node, 0);
+        assert_eq!(sh.get(FileCacheSh::count), count);
     }
 }
