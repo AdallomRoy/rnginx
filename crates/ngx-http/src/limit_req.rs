@@ -1313,4 +1313,75 @@ mod tests {
         // the pool does not log "ngx_slab_alloc() failed: no memory"
         assert!(!SlabPool::of(&zone_ctx(&l).mem()).log_nomem());
     }
+
+    /// The tree and the queue hold the same nodes: their number.
+    fn check_zone(limit: &LimitReqLimit) -> usize {
+        let ctx = zone_ctx(limit);
+        let mem = ctx.mem();
+        let tree = ctx.rbtree(&mem);
+
+        let mut in_tree: Vec<usize> = rb::walk(&tree).into_iter().map(|n| lr_of(&mem, n).off).collect();
+        let mut in_queue: Vec<usize> = queue::walk(&mem, ctx.queue()).into_iter().map(|q| lr_of_queue(&mem, q).off).collect();
+
+        in_tree.sort_unstable();
+        in_queue.sort_unstable();
+        assert_eq!(in_tree, in_queue);
+
+        // and the tree is ordered by the hash, then by the key
+        let keys: Vec<(usize, Vec<u8>)> = rb::walk(&tree).into_iter().map(|n| (tree.key(n), lr_data(lr_of(&mem, n)))).collect();
+        for w in keys.windows(2) {
+            assert!(w[0].0 < w[1].0 || (w[0].0 == w[1].0 && memn2cmp(&w[0].1, &w[1].1) < 0), "{:?}", w);
+        }
+
+        in_tree.len()
+    }
+
+    #[test]
+    fn random_operations_keep_the_zone_consistent() {
+        // a small zone: the nodes are expired to make room
+        let zone = zone_of(16 * ngx_core::os::pagesize(), 1000);
+        let l = limit(&zone, 3, 0);
+        let ctx = zone_ctx(&l);
+
+        let mut seed: u32 = 12345;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) & 0x7fff
+        };
+
+        let mut max = 0;
+
+        for i in 0..20000 {
+            let k = rnd() % 500;
+            let key = format!("key-{}-{}", k, "x".repeat((k % 64) as usize)).into_bytes();
+            // few hashes: many keys collide
+            let hash = crc32fast::hash(&key) % 32;
+
+            match lookup(&l, hash, &key, rnd() % 4 != 0).0 {
+                NGX_AGAIN => limit_req_unlock(std::slice::from_ref(&l), 1),
+                // NGX_ERROR: the node expired by force was of another
+                // size, no room yet ("could not allocate node")
+                NGX_OK | NGX_BUSY | NGX_ERROR => {}
+                rc => panic!("rc {}", rc),
+            }
+
+            assert_eq!(ctx.node.get(), 0);
+
+            if i % 500 == 0 {
+                max = max.max(check_zone(&l));
+
+                // some nodes get old
+                let mem = ctx.mem();
+                for (j, q) in queue::walk(&mem, ctx.queue()).into_iter().enumerate() {
+                    if j % 3 == 0 {
+                        let lr = lr_of_queue(&mem, q);
+                        lr.set(LimitReqNode::last, current_msec().wrapping_sub(120000));
+                    }
+                }
+            }
+        }
+
+        assert!(max > 50, "{}", max);
+        check_zone(&l);
+    }
 }

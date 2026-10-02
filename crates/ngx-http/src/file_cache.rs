@@ -3610,4 +3610,91 @@ mod tests {
         assert_eq!(c.node, 0);
         assert_eq!(sh.get(FileCacheSh::count), count);
     }
+
+    /// The tree, the queue and the counters agree: the number of nodes.
+    fn check_zone(cache: &FileCache) -> usize {
+        let mem = cache.mem();
+        let sh = cache.sh(&mem);
+        let tree = cache.rbtree(&mem);
+
+        let mut in_tree = rb::walk(&tree);
+        let mut in_queue = lru(cache);
+
+        // ordered by the rbtree key, then by the rest of the key
+        let keys: Vec<(usize, [u8; 8])> = in_tree.iter().map(|&n| (tree.key(n), FileCacheNode::at(&mem, n).key_bytes())).collect();
+        for w in keys.windows(2) {
+            assert!(w[0] < w[1], "{:?}", w);
+        }
+
+        in_tree.sort_unstable();
+        in_queue.sort_unstable();
+        assert_eq!(in_tree, in_queue);
+
+        assert_eq!(sh.get(FileCacheSh::count), in_tree.len());
+
+        let size: i64 = in_tree.iter().map(|&n| FileCacheNode::at(&mem, n)).filter(|n| n.exists()).map(|n| n.get(FileCacheNode::fs_size)).sum();
+        assert_eq!(sh.get(FileCacheSh::size), size);
+
+        in_tree.len()
+    }
+
+    #[test]
+    fn test_random_operations() {
+        let (_zone, cache) = cache_of(16 * ngx_core::os::pagesize());
+
+        let mut seed: u32 = 4242;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            ((seed >> 16) & 0x7fff) as u64
+        };
+
+        // the requests holding a node
+        let mut held: Vec<HttpCache> = Vec::new();
+        let mut max = 0;
+
+        for i in 0..20000 {
+            // few rbtree keys: many collide
+            let k = key(rnd() % 8, rnd() % 1000);
+
+            match rnd() % 6 {
+                // the loader
+                0 => {
+                    let _ = file_cache_add(&cache, &k, (rnd() % 10) as i64);
+                }
+                // the manager
+                1 if i % 50 == 0 => {
+                    let _ = file_cache_forced_expire(&cache);
+                }
+                // a request done
+                2 | 3 if !held.is_empty() => {
+                    let mut c = held.swap_remove((rnd() as usize) % held.len());
+                    file_cache_free(&mut c, None);
+                }
+                // a request
+                _ => {
+                    let mut c = request_cache(&cache, k, 1 + (rnd() % 2) as usize);
+                    match file_cache_exists(&cache, &mut c) {
+                        NGX_ERROR => assert_eq!(c.node, 0),
+                        _ if held.len() < 50 => held.push(c),
+                        _ => file_cache_free(&mut c, None),
+                    }
+                }
+            }
+
+            if i % 100 == 0 {
+                max = max.max(check_zone(&cache));
+            }
+        }
+
+        for mut c in held.drain(..) {
+            file_cache_free(&mut c, None);
+        }
+
+        assert!(max > 100, "{}", max);
+        check_zone(&cache);
+
+        // nothing is used any more: all can be expired
+        while file_cache_forced_expire(&cache) == 0 {}
+        assert_eq!(check_zone(&cache), 0);
+    }
 }
