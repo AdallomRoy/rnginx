@@ -203,8 +203,9 @@ enum Resume {
     /// the limit_rate delay of an iteration, in ms, then the next one
     RateLimited(u64),
     /// the write event: the send of the iteration goes on, `limit` bytes
-    /// of it left (0: no limit), `before` the c->sent before it
-    Send { limit: i64, before: u64 },
+    /// of it left (0: no limit), `before` the c->sent before it; on TLS
+    /// from the pass's result and position, with the iteration's limit
+    Send { limit: i64, before: u64, ssl: Option<(bool, ngx_core::event_openssl::SslChainPos)> },
 }
 
 /// An iteration of the sending of r->out, without waiting
@@ -257,7 +258,10 @@ fn iteration(r: &R, s: &Send) -> Iteration {
             // what the pass sent counts against the limit of the send
             // (less than the limit here)
             let limit = if limit <= 0 { 0 } else { limit - total };
-            return Iteration::Wait(Resume::Send { limit, before });
+            return Iteration::Wait(Resume::Send { limit, before, ssl: None });
+        }
+        Ok(Pass::SslAgain { want_read, pos }) => {
+            return Iteration::Wait(Resume::Send { limit, before, ssl: Some((want_read, pos)) });
         }
         Err(e) => return Iteration::Done(send_failed(r, e)),
     }
@@ -374,9 +378,9 @@ async fn write_loop(r: R, s: Send, mut resume: Resume) -> i64 {
                 }
             }
 
-            Resume::Send { limit, before } => {
+            Resume::Send { limit, before, ssl } => {
                 let mut out = std::mem::take(&mut *r.out.borrow_mut());
-                let sent_out = send_out(&r, &mut out, limit, s.send_timeout).await;
+                let sent_out = send_out(&r, &mut out, limit, s.send_timeout, ssl).await;
                 *r.out.borrow_mut() = out;
                 let res = match sent_out {
                     Sent::Done(res) => res,
@@ -421,13 +425,16 @@ enum Sent {
 /// ngx_http_test_reading as its read event handler if test_reading_on():
 /// the client closing the connection ends the request, before the write
 /// fails, as epoll reports the read event of a connection first.
-async fn send_out(r: &R, out: &mut Chain, limit: i64, send_timeout: u64) -> Sent {
+async fn send_out(r: &R, out: &mut Chain, limit: i64, send_timeout: u64, ssl: Option<(bool, ngx_core::event_openssl::SslChainPos)>) -> Sent {
     let h2 = r.stream.borrow().is_some();
 
     let chain = async {
         if h2 {
             // fc->send_chain = ngx_http_v2_send_chain
             crate::v2::filter::send_chain(r, out, limit).await
+        } else if let Some((want_read, pos)) = ssl {
+            // the TLS pass made at once goes on
+            crate::output::ssl_send_chain_from(&r.connection, out, limit, want_read, pos).await
         } else {
             crate::output::send_chain(&r.connection, out, limit).await
         }

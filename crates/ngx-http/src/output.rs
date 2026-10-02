@@ -6,8 +6,8 @@ use std::io::IoSlice;
 use ngx_core::buf::{BufData, Chain};
 
 use crate::copy_filter::recycle;
-use ngx_core::connection::{Connection, TcpNodelay, TcpNopush};
-use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf, SslChainFile};
+use ngx_core::connection::{Connection, IoStep, TcpNodelay, TcpNopush};
+use ngx_core::event_openssl::{ngx_ssl_chain_taken, ngx_ssl_send_chain_wait_chain, ngx_ssl_send_chain_wait_step, ssl_error_logged, SslChainPos};
 use ngx_core::log::*;
 use ngx_core::ngx_log_debug;
 
@@ -22,8 +22,11 @@ pub enum Pass {
     /// the connection takes no more now: the rest waits for the write
     /// event (NGX_AGAIN, wev->ready = 0)
     Again,
-    /// not tried: c->send_chain() of a TLS connection is run by
-    /// send_chain() (its passes count the data in c->ssl->buf)
+    /// a TLS connection takes no more now: ngx_ssl_send_chain() goes on
+    /// from `pos` once the socket is writable (readable for WantRead), the
+    /// chain not updated yet (ssl_send_chain_from())
+    SslAgain { want_read: bool, pos: SslChainPos },
+    /// not tried: an SSL object ngx_ssl does not run (none is made so)
     Async,
 }
 
@@ -38,8 +41,12 @@ pub fn send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mu
         return quic_send_chain_pass(c, chain, limit, total);
     }
 
-    if c.ssl.borrow().is_some() {
-        return Ok(Pass::Async);
+    let ssl = c.ssl.borrow().as_ref().map(|sc| sc.state.ngx.get());
+
+    match ssl {
+        Some(true) => return ssl_send_chain_pass(c, chain, limit, total),
+        Some(false) => return Ok(Pass::Async),
+        None => {}
     }
 
     plain_send_chain_pass(c, chain, limit, total)
@@ -320,34 +327,56 @@ fn tcp_nopush(c: &Connection) -> io::Result<()> {
 /// the data in c->ssl->buf until a flush (NGX_SSL_BUFFER), and sends the
 /// file buffers with kernel TLS.
 async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Result<i64> {
-    /// the links of a chain, on the stack unless there are many
-    const LINKS: usize = 16;
-
-    fn link(b: &ngx_core::buf::Buf) -> SslChainBuf<'_> {
-        let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
-            BufData::Memory(v) if b.in_memory() => (&v[b.pos..b.last], None),
-            BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos, last: b.file_last })),
-            _ => (&[], None),
-        };
-        SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf }
-    }
-
-    let n = if chain.len() <= LINKS {
-        let mut links: [SslChainBuf; LINKS] = std::array::from_fn(|_| SslChainBuf { mem: &[], file: None, flush: false, last_buf: false });
-        for (l, b) in links.iter_mut().zip(chain.iter()) {
-            *l = link(b);
-        }
-
-        ngx_ssl_send_chain_wait(c, &links[..chain.len()], limit).await?
-    } else {
-        let links: Vec<SslChainBuf> = chain.iter().map(link).collect();
-
-        ngx_ssl_send_chain_wait(c, &links, limit).await?
-    };
+    let n = ngx_ssl_send_chain_wait_chain(c, chain, limit).await?;
 
     update_sent(chain, n);
 
     Ok(n)
+}
+
+/// A pass of ssl_send_chain() without waiting: the first step of
+/// ngx_ssl_send_chain_wait()
+fn ssl_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
+    let mut pos = SslChainPos::default();
+
+    match ngx_ssl_send_chain_wait_step(c, &*chain, &mut pos, limit) {
+        IoStep::Done(Ok(())) => {
+            let n = ngx_ssl_chain_taken(&*chain, pos);
+
+            update_sent(chain, n);
+            *total += n;
+
+            Ok(Pass::Done)
+        }
+        IoStep::Done(Err(())) => Err(ssl_error_logged()),
+        IoStep::WantRead => Ok(Pass::SslAgain { want_read: true, pos }),
+        IoStep::WantWrite => Ok(Pass::SslAgain { want_read: false, pos }),
+    }
+}
+
+/// ssl_send_chain() after a pass that came to SslAgain: the steps of
+/// ngx_ssl_send_chain_wait() go on from that pass's result and position,
+/// as if its drive_io had made the pass (the same SSL calls). Returns the
+/// bytes of the chain taken, the pass's included.
+pub async fn ssl_send_chain_from(c: &Connection, chain: &mut Chain, limit: i64, want_read: bool, pos: SslChainPos) -> io::Result<i64> {
+    let mut pos = pos;
+    let mut first = Some(if want_read { IoStep::WantRead } else { IoStep::WantWrite });
+
+    let r = c
+        .drive_io(|| match first.take() {
+            Some(step) => step,
+            None => ngx_ssl_send_chain_wait_step(c, &*chain, &mut pos, limit),
+        })
+        .await?;
+
+    match r {
+        Ok(()) => {
+            let n = ngx_ssl_chain_taken(&*chain, pos);
+            update_sent(chain, n);
+            Ok(n)
+        }
+        Err(()) => Err(ssl_error_logged()),
+    }
 }
 
 /// c->send_chain of a QUIC stream: ngx_quic_stream_send_chain(), the data
