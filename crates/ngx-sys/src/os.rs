@@ -169,10 +169,11 @@ mod tests {
 // The process title (ngx_setproctitle).
 
 /// The block of argument and environment strings that execve() copied to
-/// the top of the stack: [arg_start, env_end) of /proc/self/stat (fields 48
-/// to 51), or [arg_start, arg_end) if the environment strings do not follow
-/// the arguments. /proc/self/cmdline, and so ps, shows its bytes.
-fn cmdline_area() -> io::Result<(usize, usize)> {
+/// the top of the stack, from /proc/self/stat (fields 48 to 51): the start
+/// of the arguments, their end, and the end of the environment strings
+/// (that of the arguments if the environment strings do not follow them).
+/// /proc/self/cmdline, and so ps, shows its bytes.
+fn cmdline_area() -> io::Result<(usize, usize, usize)> {
     let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
     let stat = std::fs::read_to_string("/proc/self/stat")?;
 
@@ -186,49 +187,71 @@ fn cmdline_area() -> io::Result<(usize, usize)> {
 
     let end = if env_start == arg_end && env_end > env_start { env_end } else { arg_end };
 
-    if arg_start == 0 || end <= arg_start {
+    if arg_start == 0 || arg_end <= arg_start || end < arg_end {
         return Err(invalid());
     }
 
-    Ok((arg_start, end))
+    Ok((arg_start, arg_end, end))
 }
 
-/// ngx_setproctitle(): the title written over the argument and environment
-/// strings of the process, then NULs up to their end, so that
-/// /proc/self/cmdline (and ps) shows it; the title is cut to the size of
-/// the strings, one NUL kept at their end.
+/// ngx_setproctitle(): the title written over the argument strings of the
+/// process, and over the first `room` bytes of the environment strings
+/// which follow them if it is longer, so that /proc/self/cmdline (and ps)
+/// shows it: the title (cut to that size, a NUL kept), a NUL, and NULs up
+/// to the end of the arguments.
 ///
-/// The environment strings are written over too: the caller moves the
-/// environment out of them first, as ngx_init_setproctitle() does (a
-/// setenv() of each variable makes glibc copy it), or getenv() returns
-/// pieces of the title from then on.
+/// The caller moves the variables of those environment strings out of
+/// them first, as ngx_init_setproctitle() does (a setenv() of a variable
+/// makes glibc copy it), or getenv() returns pieces of the title for them.
 ///
 /// Fails with EAGAIN while the process has other threads, which could read
 /// the strings while they are written.
-pub fn setproctitle(title: &[u8]) -> io::Result<()> {
+pub fn setproctitle(title: &[u8], room: usize) -> io::Result<()> {
     if threads()? != 1 {
         return Err(io::Error::from_raw_os_error(libc::EAGAIN));
     }
 
-    let (start, end) = cmdline_area()?;
-    let len = end - start;
-    let n = title.len().min(len - 1);
+    let (start, arg_end, end) = cmdline_area()?;
+    let limit = arg_end.saturating_add(room).min(end);
+    let n = title.len().min(limit - start - 1);
+    let fill = (start + n + 1).max(arg_end);
 
     let p = std::ptr::with_exposed_provenance_mut::<u8>(start);
 
-    // SAFETY: [start, start + len) is the block of strings the kernel put
-    // on the stack at execve() (/proc/self/stat), mapped read-write as long
-    // as the process lives and not in any allocation of the program: nothing
-    // in it is referenced by Rust. glibc and std keep only raw pointers to
-    // it (argv[], environ[], program_invocation_name) and read it through
-    // them without synchronization, which no other thread can do while it
-    // is written (the process has one thread, checked above, and creates
-    // none here). n < len, so both writes stay in the block, and the block
-    // still ends with a NUL after them: the C strings argv[] and environ[]
-    // point to stay terminated within it.
+    // SAFETY: [start, end) is the block of strings the kernel put on the
+    // stack at execve() (/proc/self/stat), mapped read-write as long as the
+    // process lives and not in any allocation of the program: nothing in it
+    // is referenced by Rust. glibc and std keep only raw pointers to it
+    // (argv[], environ[], program_invocation_name) and read it through them
+    // without synchronization, which no other thread can do while it is
+    // written (the process has one thread, checked above, and creates none
+    // here). start + n < fill <= limit <= end, so the writes stay in the
+    // block; the byte before `fill` is a NUL after them and the bytes from
+    // `fill` on are not changed, so the C strings argv[] and environ[] point
+    // to stay terminated within the block.
     unsafe {
         std::ptr::copy_nonoverlapping(title.as_ptr(), p, n);
-        std::ptr::write_bytes(p.add(n), 0, len - n);
+        std::ptr::write_bytes(p.add(n), 0, fill - start - n);
+    }
+
+    Ok(())
+}
+
+/// clearenv(3): an empty environment, as ngx_set_environment() makes it
+/// (std has no call for it, and unsetting the variables one by one is
+/// quadratic in glibc). Fails with EAGAIN while the process has other
+/// threads, which could read the environment meanwhile.
+pub fn clearenv() -> io::Result<()> {
+    if threads()? != 1 {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+
+    // SAFETY: clearenv() takes no argument: it frees the array of environ
+    // if glibc allocated it and sets environ to NULL, which no other thread
+    // reads meanwhile (the process has one, checked above); std keeps no
+    // reference into the environment, copying what it reads of it.
+    if unsafe { libc::clearenv() } != 0 {
+        return Err(io::Error::last_os_error());
     }
 
     Ok(())
@@ -240,15 +263,18 @@ mod proctitle_tests {
 
     #[test]
     fn area_of_the_strings() {
-        let (start, end) = cmdline_area().unwrap();
+        let (start, arg_end, end) = cmdline_area().unwrap();
         let cmdline = std::fs::read("/proc/self/cmdline").unwrap();
 
         // the arguments are at the start of the area
-        assert!(end - start >= cmdline.len());
+        assert_eq!(arg_end - start, cmdline.len());
+        assert!(end >= arg_end);
 
-        // the test harness has threads: the title is refused
+        // the test harness has threads: the title is refused, and so is
+        // clearenv()
         if threads().unwrap() > 1 {
-            assert_eq!(setproctitle(b"x").unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+            assert_eq!(setproctitle(b"x", 0).unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+            assert_eq!(clearenv().unwrap_err().raw_os_error(), Some(libc::EAGAIN));
         }
     }
 }

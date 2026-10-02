@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use nix::sys::signal::{SigSet, SigmaskHow, Signal};
@@ -1264,12 +1264,15 @@ pub fn set_environment(cycle: &Rc<Cycle>) {
             vars.push((b"TZ".to_vec(), v.as_bytes().to_vec()));
         }
     }
-    // environ = the variables only: the others removed (those whose names
-    // unsetenv() refuses cannot be)
-    let names: Vec<std::ffi::OsString> = std::env::vars_os().map(|(k, _)| k).collect();
-    for k in names {
-        if !k.is_empty() && !k.as_bytes().contains(&b'=') {
-            std::env::remove_var(&k);
+    // environ = the variables only
+    if ngx_sys::os::clearenv().is_err() {
+        // a process with threads: the variables removed one by one (those
+        // whose names unsetenv() refuses cannot be)
+        let names: Vec<std::ffi::OsString> = std::env::vars_os().map(|(k, _)| k).collect();
+        for k in names {
+            if !k.is_empty() && !k.as_bytes().contains(&b'=') {
+                std::env::remove_var(&k);
+            }
         }
     }
     for (k, v) in vars {
@@ -1279,16 +1282,36 @@ pub fn set_environment(cycle: &Rc<Cycle>) {
 
 // --- the process title ---
 
+/// The bytes of the environment strings after the arguments which a title
+/// may be written over: more than the longest titles take beyond the
+/// arguments ("nginx: master process " and the arguments, "nginx: worker
+/// process is shutting down").
+const PROCTITLE_ENV_ROOM: usize = 64;
+
 /// ngx_init_setproctitle() was called
 static PROCTITLE: AtomicBool = AtomicBool::new(false);
 
-/// ngx_init_setproctitle: the environment moved out of the argument and
-/// environment strings the title is written over (glibc copies a variable
-/// that setenv() sets).
+/// The bytes of the environment strings moved out of the way of the title.
+static PROCTITLE_ROOM: AtomicUsize = AtomicUsize::new(0);
+
+/// ngx_init_setproctitle: the first environment strings, which follow the
+/// arguments, moved out of the way of the title (glibc copies a variable
+/// that setenv() sets). Those the title cannot reach stay where they are,
+/// with the variables after them (setenv() of each would take quadratic
+/// time with a large environment).
 pub fn init_setproctitle() {
+    let mut room = 0;
     let mut names = HashSet::new();
 
+    // the variables in the order of environ[], which is the order of their
+    // strings after the arguments
     for (k, v) in std::env::vars_os() {
+        if room >= PROCTITLE_ENV_ROOM {
+            break;
+        }
+
+        room += k.len() + v.len() + 2;
+
         // the first of a name, which getenv() finds
         if k.is_empty() || k.as_bytes().contains(&b'=') || !names.insert(k.clone()) {
             continue;
@@ -1297,6 +1320,7 @@ pub fn init_setproctitle() {
         std::env::set_var(&k, &v);
     }
 
+    PROCTITLE_ROOM.store(room, Ordering::Relaxed);
     PROCTITLE.store(true, Ordering::Relaxed);
 }
 
@@ -1309,7 +1333,7 @@ pub fn setproctitle(title: &[u8]) {
     let mut buf = b"nginx: ".to_vec();
     buf.extend_from_slice(title);
 
-    let _ = ngx_sys::os::setproctitle(&buf);
+    let _ = ngx_sys::os::setproctitle(&buf, PROCTITLE_ROOM.load(Ordering::Relaxed));
 }
 
 /// A descriptor inherited across execve() (by the number the old binary
