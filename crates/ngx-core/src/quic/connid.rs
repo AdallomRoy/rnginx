@@ -4,9 +4,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use openssl::rand::rand_bytes;
+
 use crate::connection::Connection;
 use crate::log::*;
-use crate::openssl_ffi::RAND_bytes;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
@@ -20,8 +21,9 @@ const NGX_QUIC_MAX_SERVER_IDS: u64 = 8;
 
 /// ngx_quic_create_server_id
 pub fn ngx_quic_create_server_id(c: &Connection, id: &mut [u8; NGX_QUIC_SERVER_CID_LEN]) -> i64 {
-    // SAFETY: the buffer has NGX_QUIC_SERVER_CID_LEN bytes
-    if unsafe { RAND_bytes(id.as_mut_ptr(), NGX_QUIC_SERVER_CID_LEN as i32) } != 1 {
+    if let Err(e) = rand_bytes(id) {
+        /* the C leaves the errors on OpenSSL's queue */
+        e.put();
         return NGX_ERROR;
     }
 
@@ -40,15 +42,14 @@ fn ngx_quic_bpf_attach_id(c: &Connection, id: &mut [u8; NGX_QUIC_SERVER_CID_LEN]
         None => c.fd.get(),
     };
 
-    let mut cookie: u64 = 0;
-    let mut optlen = std::mem::size_of::<u64>() as libc::socklen_t;
+    let cookie = match crate::fd::get(fd).and_then(|fd| rustix::net::sockopt::socket_cookie(&fd).map_err(std::io::Error::from)) {
+        Ok(cookie) => cookie,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ERR, c.log, e.raw_os_error(), "quic getsockopt(SO_COOKIE) failed");
 
-    // SAFETY: cookie is a u64 of optlen bytes
-    if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_COOKIE, &mut cookie as *mut u64 as *mut libc::c_void, &mut optlen) } == -1 {
-        ngx_log_error!(NGX_LOG_ERR, c.log, Some(crate::os::errno()), "quic getsockopt(SO_COOKIE) failed");
-
-        return NGX_ERROR;
-    }
+            return NGX_ERROR;
+        }
+    };
 
     ngx_quic_dcid_encode_key(id, cookie);
 
@@ -363,4 +364,52 @@ pub fn ngx_quic_free_client_id(c: &Connection, cid: &Rc<QuicClientId>) -> i64 {
     qc.nclient_ids.set(qc.nclient_ids.get() - 1);
 
     NGX_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+
+    use super::*;
+    use crate::inet::SockAddr;
+
+    fn conn(fd: i32) -> Rc<Connection> {
+        crate::connection::set_connection_n(16);
+        Connection::peer(fd, libc::SOCK_DGRAM, SockAddr::v4(std::net::Ipv4Addr::LOCALHOST, 0), &Log::stderr(0)).expect("connection")
+    }
+
+    /// The socket's cookie in the first 8 bytes of a server id, for the BPF
+    /// program to route the packets with (ngx_quic_bpf_attach_id)
+    #[test]
+    fn server_id_with_socket_cookie() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cookie = rustix::net::sockopt::socket_cookie(&sock).unwrap();
+        let fd = crate::fd::register(OwnedFd::from(sock));
+
+        let c = conn(fd);
+        let mut id = [0u8; NGX_QUIC_SERVER_CID_LEN];
+        let mut other = [0u8; NGX_QUIC_SERVER_CID_LEN];
+
+        assert_eq!(ngx_quic_create_server_id(&c, &mut id), NGX_OK);
+        assert_eq!(ngx_quic_create_server_id(&c, &mut other), NGX_OK);
+
+        assert_eq!(id[..8], cookie.to_be_bytes());
+        assert_eq!(other[..8], cookie.to_be_bytes());
+        assert_ne!(id[8..], other[8..], "random");
+
+        c.fd.set(-1);
+        crate::fd::close(fd).unwrap();
+    }
+
+    /// getsockopt(SO_COOKIE) failing is logged, and the id stays random
+    #[test]
+    fn server_id_without_socket() {
+        let c = conn(-1);
+        let mut id = [0u8; NGX_QUIC_SERVER_CID_LEN];
+        let mut other = [0u8; NGX_QUIC_SERVER_CID_LEN];
+
+        assert_eq!(ngx_quic_create_server_id(&c, &mut id), NGX_OK);
+        assert_eq!(ngx_quic_create_server_id(&c, &mut other), NGX_OK);
+        assert_ne!(id, other);
+    }
 }
