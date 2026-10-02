@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::io::IoSlice;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -146,16 +145,17 @@ pub fn init_shared_stats(log: &Log) {
 }
 
 thread_local! {
-    static CONNECTIONS: RefCell<HashMap<u64, Weak<Connection>>> = RefCell::new(HashMap::new());
+    /// the connection objects, by slot (the cycle->connections array: a
+    /// slot freed is the next one taken)
+    static CONNECTIONS: RefCell<LinkedSlab<Weak<Connection>>> = const { RefCell::new(LinkedSlab::new()) };
     static ACTIVE: Cell<usize> = const { Cell::new(0) };
     /// the connections taken of connection_n, from ngx_get_connection() to
     /// ngx_free_connection() (cycle->free_connection_n is what is left)
     static USED: Cell<usize> = const { Cell::new(0) };
     static CONNECTION_N: Cell<usize> = const { Cell::new(512) };
-    /// cycle->reusable_connections_queue: the reusable connections by the
-    /// time they became reusable, the first one first
-    static REUSABLE: RefCell<BTreeMap<u64, Weak<Connection>>> = const { RefCell::new(BTreeMap::new()) };
-    static REUSABLE_SEQ: Cell<u64> = const { Cell::new(0) };
+    /// cycle->reusable_connections_queue: the reusable connections, the
+    /// last one reusable for the longest time
+    static REUSABLE: RefCell<LinkedSlab<Weak<Connection>>> = const { RefCell::new(LinkedSlab::new()) };
     /// cycle->connections_reuse_time
     static REUSE_TIME: Cell<i64> = const { Cell::new(0) };
     static CLOSE_NOTIFY: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
@@ -208,12 +208,12 @@ fn drain_connections() {
 
     for _ in 0..n {
         // ngx_queue_last(): the connection reusable for the longest time
-        let last = REUSABLE.with(|q| q.borrow().first_key_value().map(|(k, w)| (*k, w.upgrade())));
+        let last = REUSABLE.with(|q| q.borrow().last().map(|(k, w)| (k, w.upgrade())));
 
         let rc = match last {
             Some((_, Some(rc))) => rc,
             Some((key, None)) => {
-                REUSABLE.with(|q| q.borrow_mut().remove(&key));
+                REUSABLE.with(|q| q.borrow_mut().remove(key));
                 continue;
             }
             None => break,
@@ -241,29 +241,134 @@ fn drain_connections() {
     }
 }
 
-/// Notified whenever a connection is closed (used by graceful shutdown).
+/// Notified, while the worker is exiting, whenever a connection or other
+/// pending work is gone (graceful shutdown waits for the last one).
 pub fn close_notify() -> Rc<tokio::sync::Notify> {
     CLOSE_NOTIFY.with(|n| n.clone())
 }
 
 pub fn for_each_connection(mut f: impl FnMut(&Rc<Connection>)) {
-    let conns: Vec<Rc<Connection>> = CONNECTIONS.with(|c| c.borrow().values().filter_map(|w| w.upgrade()).collect());
+    // in the order of their slots, as C walks cycle->connections
+    let conns: Vec<Rc<Connection>> = CONNECTIONS.with(|c| c.borrow().items().filter_map(|w| w.upgrade()).collect());
     for c in conns {
         f(&c);
     }
 }
 
 /// The Rc of a connection known by reference only (the OpenSSL callbacks
-/// find the connection by a pointer, ngx_ssl_get_connection()).
+/// find the connection by a pointer, ngx_ssl_get_connection()); None for a
+/// per-stream copy of an HTTP/2 connection.
 pub fn connection_rc(c: &Connection) -> Option<Rc<Connection>> {
-    CONNECTIONS
-        .with(|m| m.borrow().get(&c.number).and_then(|w| w.upgrade()))
-        .filter(|rc| std::ptr::eq(Rc::as_ptr(rc), c))
+    if c.fake {
+        return None;
+    }
+
+    c.this.upgrade()
+}
+
+/// Nodes in a slab linked by index, for the queues C links through the
+/// objects themselves (ngx_queue_t): inserting at the head, removing an
+/// item by its key and finding the last one take constant time, the order
+/// is the insertion order, and nothing is allocated once the slab is as
+/// large as the queue has been. A key is a node's index plus one; 0 is no
+/// key (an item not in the queue).
+struct LinkedSlab<T> {
+    nodes: Vec<SlabNode<T>>,
+    /// the first node (the last inserted), the last one, the first free one
+    head: u32,
+    tail: u32,
+    free: u32,
+    len: usize,
+}
+
+struct SlabNode<T> {
+    prev: u32,
+    next: u32,
+    /// None in a free node
+    item: Option<T>,
+}
+
+impl<T> LinkedSlab<T> {
+    const fn new() -> LinkedSlab<T> {
+        LinkedSlab { nodes: Vec::new(), head: 0, tail: 0, free: 0, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// ngx_queue_insert_head: the key of the item's node.
+    fn insert_head(&mut self, item: T) -> u32 {
+        let node = SlabNode { prev: 0, next: self.head, item: Some(item) };
+
+        let key = if self.free != 0 {
+            let key = self.free;
+            self.free = self.nodes[key as usize - 1].next;
+            self.nodes[key as usize - 1] = node;
+            key
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() as u32
+        };
+
+        if self.head != 0 {
+            self.nodes[self.head as usize - 1].prev = key;
+        } else {
+            self.tail = key;
+        }
+
+        self.head = key;
+        self.len += 1;
+
+        key
+    }
+
+    /// ngx_queue_remove of the item of `key`, which is returned; None for a
+    /// key of no item.
+    fn remove(&mut self, key: u32) -> Option<T> {
+        let i = (key as usize).checked_sub(1)?;
+        let node = self.nodes.get_mut(i)?;
+        let item = node.item.take()?;
+        let (prev, next) = (node.prev, node.next);
+
+        node.next = self.free;
+        self.free = key;
+
+        if prev != 0 {
+            self.nodes[prev as usize - 1].next = next;
+        } else {
+            self.head = next;
+        }
+
+        if next != 0 {
+            self.nodes[next as usize - 1].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+
+        self.len -= 1;
+
+        Some(item)
+    }
+
+    /// ngx_queue_last: the key and the item inserted first of those left.
+    fn last(&self) -> Option<(u32, &T)> {
+        if self.tail == 0 {
+            return None;
+        }
+
+        self.nodes[self.tail as usize - 1].item.as_ref().map(|item| (self.tail, item))
+    }
+
+    /// The items in the order of their nodes in the slab (of their keys).
+    fn items(&self) -> impl Iterator<Item = &T> {
+        self.nodes.iter().filter_map(|n| n.item.as_ref())
+    }
 }
 
 pub struct Connection {
     pub fd: Cell<RawFd>,
-    afd: RefCell<Option<Rc<AsyncFd<Fd>>>>,
+    afd: RefCell<Option<Rc<AsyncFd<fd::Fd>>>>,
     pub number: u64,
     pub log: Log,
     pub listening: Option<Rc<Listening>>,
@@ -305,7 +410,12 @@ pub struct Connection {
     pub reusable: Cell<bool>,
     /// c->queue: the key of the connection in the reusable connections
     /// queue, 0 if not there
-    queue: Cell<u64>,
+    queue: Cell<u32>,
+    /// the connection's own Rc, weak (none for a per-stream copy of an
+    /// HTTP/2 connection)
+    this: Weak<Connection>,
+    /// the key of the connection in CONNECTIONS, 0 if not there
+    slot_key: Cell<u32>,
     /// the connection holds one of connection_n (ngx_free_connection()
     /// not called yet)
     slot: Cell<bool>,
@@ -384,8 +494,8 @@ impl Connection {
             clog.set_connection(number);
             clog
         };
-        let now = crate::times::cached();
-        let c = Rc::new(Connection {
+        let (now_sec, now_msec) = crate::times::with_cached(|t| (t.sec, t.msec));
+        let c = Rc::new_cyclic(|this| Connection {
             fd: Cell::new(fd),
             afd: RefCell::new(None),
             number,
@@ -402,8 +512,8 @@ impl Connection {
             buffer: RefCell::new(Vec::new()),
             sent: Cell::new(0),
             requests: Cell::new(0),
-            start_time: Cell::new(now.sec),
-            start_msec: Cell::new(now.sec as u64 * 1000 + now.msec),
+            start_time: Cell::new(now_sec),
+            start_msec: Cell::new(now_sec as u64 * 1000 + now_msec),
             timedout: Cell::new(false),
             error: Cell::new(false),
             destroyed: Cell::new(false),
@@ -420,6 +530,8 @@ impl Connection {
             data: RefCell::new(None),
             reusable: Cell::new(false),
             queue: Cell::new(0),
+            this: this.clone(),
+            slot_key: Cell::new(0),
             slot: Cell::new(true),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -441,7 +553,7 @@ impl Connection {
         });
         USED.with(|u| u.set(u.get() + 1));
         ACTIVE.with(|a| a.set(a.get() + 1));
-        CONNECTIONS.with(|m| m.borrow_mut().insert(number, Rc::downgrade(&c)));
+        c.slot_key.set(CONNECTIONS.with(|m| m.borrow_mut().insert_head(Rc::downgrade(&c))));
         Some(c)
     }
 
@@ -521,6 +633,8 @@ impl Connection {
             data: RefCell::new(c.data.borrow().clone()),
             reusable: Cell::new(false),
             queue: Cell::new(0),
+            this: Weak::new(),
+            slot_key: Cell::new(0),
             slot: Cell::new(false),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -593,20 +707,13 @@ impl Connection {
 
     /// ngx_queue_insert_head(&cycle->reusable_connections_queue, &c->queue)
     fn enqueue(&self) {
-        if self.fd.get() == -1 {
+        // not a per-stream copy of an HTTP/2 connection
+        if self.fd.get() == -1 || self.fake {
             return;
         }
 
-        // not a per-stream copy of an HTTP/2 connection
-        if let Some(rc) = connection_rc(self) {
-            let key = REUSABLE_SEQ.with(|s| {
-                s.set(s.get() + 1);
-                s.get()
-            });
-
-            REUSABLE.with(|q| q.borrow_mut().insert(key, Rc::downgrade(&rc)));
-            self.queue.set(key);
-        }
+        let key = REUSABLE.with(|q| q.borrow_mut().insert_head(self.this.clone()));
+        self.queue.set(key);
     }
 
     /// ngx_queue_remove(&c->queue) of a reusable connection
@@ -614,7 +721,7 @@ impl Connection {
         let key = self.queue.replace(0);
 
         if key != 0 {
-            REUSABLE.with(|q| q.borrow_mut().remove(&key));
+            REUSABLE.with(|q| q.borrow_mut().remove(key));
         }
     }
 
@@ -656,7 +763,7 @@ impl Connection {
         Ok(())
     }
 
-    fn afd(&self) -> io::Result<Rc<AsyncFd<Fd>>> {
+    fn afd(&self) -> io::Result<Rc<AsyncFd<fd::Fd>>> {
         if let Some(a) = self.afd.borrow().as_ref() {
             return Ok(a.clone());
         }
@@ -666,7 +773,11 @@ impl Connection {
             // and written through its UDP state (event_udp.rs)
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        let a = Rc::new(AsyncFd::with_interest(Fd(fd), Interest::READABLE | Interest::WRITABLE)?);
+        // the registration holds the connection's handle of its socket:
+        // the I/O borrows it without a lookup in the descriptor table, and
+        // the socket stays open until the registration is gone, so a late
+        // deregistration cannot hit a number given to another descriptor
+        let a = Rc::new(AsyncFd::with_interest(fd::get(fd)?, Interest::READABLE | Interest::WRITABLE)?);
         *self.afd.borrow_mut() = Some(a.clone());
         Ok(a)
     }
@@ -705,6 +816,17 @@ impl Connection {
     pub fn read_drained(&self) {
         if let Some(afd) = self.afd.borrow().as_ref() {
             let _ = afd.try_io(Interest::READABLE, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
+        }
+    }
+
+    /// c->read->ready: a read event came since a read last found the socket
+    /// drained (see read_drained()), tested without touching the socket. A
+    /// pending EOF keeps it, as rev->pending_eof keeps rev->ready in
+    /// ngx_unix_recv. False for a socket never waited for.
+    pub fn read_ready(&self) -> bool {
+        match self.afd.borrow().as_ref() {
+            Some(afd) => afd.try_io(Interest::READABLE, |_| Ok(())).is_ok(),
+            None => false,
         }
     }
 
@@ -1006,7 +1128,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::empty()).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)) {
                 Ok(r) => {
                     let r = r?;
                     if r == 0 && self.ty != libc::SOCK_DGRAM {
@@ -1046,7 +1168,7 @@ impl Connection {
 
             let peek = guard.try_io(|inner| {
                 let mut b = [0u8; 1];
-                nix::sys::socket::recv(inner.get_ref().0, &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
+                nix::sys::socket::recv(inner.get_ref().as_raw_fd(), &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
             });
 
             match peek {
@@ -1066,7 +1188,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::MSG_PEEK).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().as_raw_fd(), buf, MsgFlags::MSG_PEEK).map_err(io::Error::from)) {
                 Ok(r) => return r,
                 Err(_) => continue,
             }
@@ -1118,7 +1240,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
-            match guard.try_io(|inner| nix::sys::socket::send(inner.get_ref().0, buf, MsgFlags::MSG_NOSIGNAL).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::send(inner.get_ref().as_raw_fd(), buf, MsgFlags::MSG_NOSIGNAL).map_err(io::Error::from)) {
                 Ok(r) => {
                     let n = r?;
                     self.sent.set(self.sent.get() + n as u64);
@@ -1148,17 +1270,29 @@ impl Connection {
             return Ok(0);
         }
         let afd = self.afd()?;
-        let iovs: Vec<IoSlice<'_>> = iov.iter().filter(|s| !s.is_empty()).map(|s| IoSlice::new(s)).collect();
+        // the iovecs on the stack, as ngx_writev_chain has them; a Vec
+        // only for more than fit there (at most IOV_MAX of them)
+        let mut stack = [IoSlice::new(&[]); 16];
+        let mut n = 0;
+        let mut more: Vec<IoSlice<'_>> = Vec::new();
+        for s in iov.iter().filter(|s| !s.is_empty()) {
+            if n < stack.len() {
+                stack[n] = IoSlice::new(s);
+                n += 1;
+                continue;
+            }
+            if more.is_empty() {
+                more.extend_from_slice(&stack);
+            }
+            more.push(IoSlice::new(s));
+        }
+        let iovs: &[IoSlice<'_>] = if more.is_empty() { &stack[..n] } else { &more[..more.len().min(1024)] };
         if iovs.is_empty() {
             return Ok(0);
         }
-        let iovs = &iovs[..iovs.len().min(1024)];
         loop {
             let mut guard = afd.writable().await?;
-            match guard.try_io(|inner| {
-                let s = fd::get(inner.get_ref().0)?;
-                nix::sys::uio::writev(&s, iovs).map_err(io::Error::from)
-            }) {
+            match guard.try_io(|inner| nix::sys::uio::writev(inner.get_ref(), iovs).map_err(io::Error::from)) {
                 Ok(r) => {
                     let n = r?;
                     self.sent.set(self.sent.get() + n as u64);
@@ -1176,11 +1310,10 @@ impl Connection {
         loop {
             let mut guard = afd.writable().await?;
             match guard.try_io(|inner| {
-                let s = fd::get(inner.get_ref().0)?;
                 let file = fd::get(file_fd)?;
                 // the off_t of the kernel, as unsigned
                 let mut off = offset as u64;
-                rustix::fs::sendfile(&s, &file, Some(&mut off), count).map_err(io::Error::from)
+                rustix::fs::sendfile(inner.get_ref(), &file, Some(&mut off), count).map_err(io::Error::from)
             }) {
                 Ok(r) => {
                     let n = r?;
@@ -1192,22 +1325,53 @@ impl Connection {
         }
     }
 
-    /// Write everything in `buf`.
+    /// Write everything in `buf`: c->send (ngx_unix_send) until all is
+    /// sent, as ngx_http_upstream_process_upgraded does. A send shorter
+    /// than asked found the socket full and sets wev->ready = 0 there: the
+    /// next one waits for a write event instead of failing with EAGAIN (an
+    /// SSL write, ngx_ssl_write, keeps the readiness).
     pub async fn send_all(&self, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {
             let n = self.send(buf).await?;
+            if n < buf.len() && self.plain_stream() {
+                self.write_drained();
+            }
             buf = &buf[n..];
         }
         Ok(())
     }
 
-    pub fn setsockopt_int(&self, level: i32, name: i32, value: i32) -> io::Result<()> {
-        let s = fd::get(self.fd.get())?;
-        ngx_sys::os::setsockopt_int(s.as_fd(), level, name, value)
+    /// A TCP or unix stream socket read and written directly (not SSL, not
+    /// a QUIC stream, not UDP).
+    fn plain_stream(&self) -> bool {
+        self.ty == libc::SOCK_STREAM && !self.fake && !self.is_quic_stream() && self.ssl.borrow().is_none() && !self.is_udp_shared()
     }
 
-    /// An option set on the socket, the error as io::Error.
-    fn with_socket<T, E: Into<io::Error>>(&self, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> io::Result<T> {
+    /// c->write->ready = 0: a write found the socket full (a send shorter
+    /// than asked, ngx_unix_send). The write readiness kept since the last
+    /// event is cleared, so the next wait blocks for a new event instead of
+    /// trying a write that fails with EAGAIN; tokio keeps the closed bits,
+    /// so an error or a reset still wakes the writer. (ngx_linux_sendfile_chain
+    /// clears it only on EAGAIN: it retries a short writev() or sendfile().)
+    pub fn write_drained(&self) {
+        if let Some(afd) = self.afd.borrow().as_ref() {
+            let _ = afd.try_io(Interest::WRITABLE, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
+        }
+    }
+
+    pub fn setsockopt_int(&self, level: i32, name: i32, value: i32) -> io::Result<()> {
+        self.with_socket(|s| ngx_sys::os::setsockopt_int(s, level, name, value))
+    }
+
+    /// An operation on the connection's socket (an option set, a system
+    /// call the connection has no method for), the error as io::Error. The
+    /// socket is borrowed from the connection's own handle once it waited
+    /// for an event, else from the descriptor table; EBADF for a closed
+    /// connection.
+    pub fn with_socket<T, E: Into<io::Error>>(&self, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> io::Result<T> {
+        if let Some(afd) = self.afd.borrow().as_ref() {
+            return op(afd.get_ref().as_fd()).map_err(Into::into);
+        }
         let s = fd::get(self.fd.get())?;
         op(s.as_fd()).map_err(Into::into)
     }
@@ -1409,7 +1573,20 @@ impl Drop for Connection {
         self.unqueue();
         self.free_connection();
         ACTIVE.with(|a| a.set(a.get().saturating_sub(1)));
-        CONNECTIONS.with(|m| m.borrow_mut().remove(&self.number));
+        let key = self.slot_key.replace(0);
+        if key != 0 {
+            CONNECTIONS.with(|m| m.borrow_mut().remove(key));
+        }
+        wake_exiting_cycle();
+    }
+}
+
+/// A connection or other work is gone: an exiting worker cycle is woken to
+/// check whether it is the last (C checks ngx_exiting once per iteration of
+/// the cycle). A worker not exiting waits for no connection to go: it is
+/// not woken, which would make it re-arm its waits for nothing.
+pub(crate) fn wake_exiting_cycle() {
+    if crate::event::is_exiting() {
         CLOSE_NOTIFY.with(|n| n.notify_waiters());
     }
 }
@@ -2019,5 +2196,319 @@ mod tests {
         os::close(pipe[1]);
         os::close(netlink);
         os::close(tcp);
+    }
+
+    fn run_local<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, f);
+    }
+
+    /// A connection of the accepted end of a TCP pair (non-blocking, in
+    /// the descriptor table), and the other end.
+    fn tcp_pair(sndbuf: Option<usize>) -> (Rc<Connection>, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        s.set_nonblocking(true).unwrap();
+        if let Some(n) = sndbuf {
+            socket2::SockRef::from(&s).set_send_buffer_size(n).unwrap();
+        }
+        let (log, _) = capture();
+        let c = Connection::get(fd::register(OwnedFd::from(s)), &log).unwrap();
+        (c, peer)
+    }
+
+    /// c->write->ready
+    fn write_ready(c: &Connection) -> bool {
+        c.afd.borrow().as_ref().is_some_and(|a| a.try_io(Interest::WRITABLE, |_| Ok(())).is_ok())
+    }
+
+    #[test]
+    fn read_ready_is_the_kept_readiness() {
+        run_local(async {
+            let (c, mut peer) = tcp_pair(None);
+
+            // never waited for
+            assert!(!c.read_ready());
+
+            c.writable().await.unwrap();
+            assert!(!c.read_ready());
+
+            std::io::Write::write_all(&mut peer, b"abc").unwrap();
+            c.readable().await.unwrap();
+            assert!(c.read_ready());
+            assert!(c.read_ready(), "testing does not clear it");
+
+            // a short read drained the socket
+            let mut buf = [0u8; 16];
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 3);
+            assert!(!c.read_ready());
+
+            // the data of a new event, then the end of the stream: a
+            // pending EOF stays ready after a read drained the data
+            std::io::Write::write_all(&mut peer, b"de").unwrap();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            c.readable().await.unwrap();
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 2);
+            assert!(c.read_ready());
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 0);
+
+            c.close();
+        });
+    }
+
+    #[test]
+    fn write_drained_waits_for_a_new_event() {
+        run_local(async {
+            let (c, _peer) = tcp_pair(None);
+
+            c.writable().await.unwrap();
+            assert!(write_ready(&c));
+
+            c.write_drained();
+            assert!(!write_ready(&c));
+
+            // the socket is still writable, but no new event comes
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), c.writable()).await.is_err());
+            assert_eq!(c.try_send(b"x").unwrap(), 1, "the socket itself is untouched");
+
+            c.close();
+        });
+    }
+
+    #[test]
+    fn linked_slab_queue() {
+        let mut q: LinkedSlab<u32> = LinkedSlab::new();
+        assert!(q.last().is_none());
+
+        let a = q.insert_head(1);
+        let b = q.insert_head(2);
+        let c = q.insert_head(3);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.last(), Some((a, &1)));
+
+        // the middle one
+        assert_eq!(q.remove(b), Some(2));
+        assert_eq!(q.remove(b), None, "removed already");
+        assert_eq!(q.last(), Some((a, &1)));
+
+        // the last one, then the first one
+        assert_eq!(q.remove(a), Some(1));
+        assert_eq!(q.last(), Some((c, &3)));
+        let d = q.insert_head(4);
+        assert!(d == a || d == b, "a free node is used again");
+        assert_eq!(q.last(), Some((c, &3)));
+        assert_eq!(q.remove(d), Some(4));
+        assert_eq!(q.last(), Some((c, &3)));
+        assert_eq!(q.remove(c), Some(3));
+        assert!(q.last().is_none());
+        assert_eq!(q.len(), 0);
+
+        assert_eq!(q.remove(0), None);
+        assert_eq!(q.remove(99), None);
+
+        // in and out: the slab does not grow
+        for i in 0..1000 {
+            let k = q.insert_head(i);
+            assert_eq!(q.remove(k), Some(i));
+        }
+        assert!(q.nodes.len() <= 3);
+    }
+
+    #[test]
+    fn linked_slab_as_a_deque() {
+        // against a model: insert at the front, remove anywhere, the last
+        // one at the back
+        let mut q: LinkedSlab<u64> = LinkedSlab::new();
+        let mut model: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+        let mut seed: u64 = 0x2545f4914f6cdd1d;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for i in 0..20000u64 {
+            let r = next();
+            if model.is_empty() || r % 3 != 0 {
+                let k = q.insert_head(i);
+                model.push_front((k, i));
+            } else {
+                let at = (next() % model.len() as u64) as usize;
+                let (k, v) = model.remove(at).unwrap();
+                assert_eq!(q.remove(k), Some(v));
+            }
+            assert_eq!(q.len(), model.len());
+            assert_eq!(q.last(), model.back().map(|(k, v)| (*k, v)));
+        }
+
+        assert!(q.nodes.len() <= model.len() + 64);
+    }
+
+    #[test]
+    fn drain_takes_the_oldest_reusable() {
+        run_local(async {
+            let saved = connection_n();
+            set_connection_n(connection_n() - free_connections() + 4);
+
+            let pairs: Vec<_> = (0..4).map(|_| tcp_pair(None)).collect();
+            assert_eq!(free_connections(), 0);
+
+            for i in [2, 0, 3, 1] {
+                pairs[i].0.set_reusable(true);
+            }
+
+            // no longer reusable, then again: the newest
+            pairs[2].0.set_reusable(false);
+            pairs[2].0.set_reusable(true);
+
+            // oldest first: 0, 3, 1, 2; one of 4 is closed (n = 4 / 8,
+            // at least 1)
+            let (c4, _p4) = tcp_pair(None);
+            let closed: Vec<bool> = pairs.iter().map(|(c, _)| c.close.get()).collect();
+            assert_eq!(closed, [true, false, false, false]);
+            assert_eq!(free_connections(), 0);
+
+            let (c5, _p5) = tcp_pair(None);
+            let closed: Vec<bool> = pairs.iter().map(|(c, _)| c.close.get()).collect();
+            assert_eq!(closed, [true, false, false, true]);
+
+            // the per-stream copies of HTTP/2 are never queued
+            let fake = Connection::new_fake(&pairs[1].0);
+            fake.set_reusable(true);
+            assert_eq!(fake.queue.get(), 0);
+            assert!(connection_rc(&fake).is_none());
+            assert!(Rc::ptr_eq(&connection_rc(&pairs[1].0).unwrap(), &pairs[1].0));
+
+            for (c, _) in &pairs {
+                c.close();
+            }
+            c4.close();
+            c5.close();
+            assert_eq!(REUSABLE.with(|q| q.borrow().len()), 0);
+            set_connection_n(saved);
+        });
+    }
+
+    #[test]
+    fn connections_by_slot() {
+        run_local(async {
+            let numbers = || {
+                let mut v = Vec::new();
+                for_each_connection(|c| v.push(c.number));
+                v
+            };
+            let before = numbers();
+
+            let (a, _pa) = tcp_pair(None);
+            let (b, _pb) = tcp_pair(None);
+            let (c, _pc) = tcp_pair(None);
+            assert_eq!(numbers()[before.len()..], [a.number, b.number, c.number]);
+
+            // a freed slot is the next one taken
+            let bn = b.number;
+            b.close();
+            drop(b);
+            assert!(!numbers().contains(&bn));
+            let (d, _pd) = tcp_pair(None);
+            assert_eq!(numbers()[before.len()..], [a.number, d.number, c.number]);
+
+            // a per-stream copy of HTTP/2 is not one of them
+            let fake = Connection::new_fake(&a);
+            assert_eq!(numbers().len(), before.len() + 3);
+            drop(fake);
+            assert_eq!(numbers().len(), before.len() + 3);
+
+            for x in [a, c, d] {
+                x.close();
+            }
+            assert_eq!(numbers(), before, "dropped: gone");
+        });
+    }
+
+    #[test]
+    fn registration_holds_the_socket() {
+        run_local(async {
+            let (c, peer) = tcp_pair(None);
+            let n = c.fd.get();
+
+            c.writable().await.unwrap();
+            assert!(c.with_socket(|s| rustix::net::sockopt::set_tcp_nodelay(s, true)).is_ok());
+            assert!(c.set_tcp_nodelay());
+
+            // a wait still holding the registration when the connection
+            // is closed (a task not yet dropped)
+            let late = c.afd().unwrap();
+            c.close();
+            assert!(!fd::contains(n));
+            assert_eq!(c.with_socket(|_| Ok::<(), io::Error>(())).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+
+            // the socket stays open until the registration goes
+            peer.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+            let mut b = [0u8; 1];
+            assert!(std::io::Read::read(&mut &peer, &mut b).is_err(), "no end of stream yet");
+
+            drop(late);
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            assert_eq!(std::io::Read::read(&mut &peer, &mut b).unwrap(), 0, "closed with the registration");
+        });
+    }
+
+    #[test]
+    fn writev_slices() {
+        run_local(async {
+            let (c, mut peer) = tcp_pair(None);
+
+            // a few, empty ones skipped
+            let n = c.writev(&[b"ab", b"", b"cde", b""]).await.unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(c.writev(&[b"", b""]).await.unwrap(), 0);
+
+            // more than the stack holds
+            let parts: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'a' + i % 26; i as usize % 3 + 1]).collect();
+            let slices: Vec<&[u8]> = parts.iter().flat_map(|p| [p.as_slice(), b"".as_slice()]).collect();
+            let total: usize = parts.iter().map(|p| p.len()).sum();
+            assert_eq!(c.writev(&slices).await.unwrap(), total);
+
+            let mut got = vec![0u8; 5 + total];
+            std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+            assert_eq!(&got[..5], b"abcde");
+            assert_eq!(got[5..], parts.concat()[..]);
+            assert_eq!(c.sent.get(), (5 + total) as u64);
+
+            c.close();
+        });
+    }
+
+    #[test]
+    fn send_all_through_short_sends() {
+        run_local(async {
+            let (c, peer) = tcp_pair(Some(4096));
+            peer.set_nonblocking(true).unwrap();
+            let mut peer = tokio::net::TcpStream::from_std(peer).unwrap();
+
+            let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+
+            let reader = async {
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; 8192];
+                while got.len() < data.len() {
+                    let n = tokio::io::AsyncReadExt::read(&mut peer, &mut buf).await.unwrap();
+                    assert!(n > 0);
+                    got.extend_from_slice(&buf[..n]);
+                    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                }
+                got
+            };
+
+            let (sent, got) = tokio::join!(c.send_all(&data), reader);
+            sent.unwrap();
+            assert!(got == data);
+            assert_eq!(c.sent.get(), data.len() as u64);
+
+            c.close();
+        });
     }
 }

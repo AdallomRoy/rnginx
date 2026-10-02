@@ -93,9 +93,9 @@ fn split_clients_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
     v.escape = false;
     v.data.clear();
 
-    match crate::script::complex_value(r, &ctx.cv) {
-        Ok(val) => {
-            let hash = murmur_hash2(&val);
+    // the value is hashed where it is (a variable's cached value)
+    match crate::script::with_complex_value(r, &ctx.cv, murmur_hash2) {
+        Ok(hash) => {
             let parts = ctx.parts.borrow();
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http split: hash={}", hash);
 

@@ -125,43 +125,130 @@ pub fn compile_complex_value(cf: &mut Conf, v: &[u8], flags: u32) -> Result<Comp
     Ok(ComplexValue { value, parts: Some(parts), flags })
 }
 
-/// ngx_http_complex_value
+/// ngx_http_complex_value, into a buffer of its own: a copy of a constant
+/// or of a single variable's value, else the parts evaluated into one
+/// buffer sized up front.
+///
+/// (A terminating zero of NGX_HTTP_COMPLEX_VALUE_ZERO is irrelevant
+/// here.)
 pub fn complex_value(r: &R, cv: &ComplexValue) -> Result<Vec<u8>, i64> {
     let parts = match &cv.parts {
         None => return Ok(cv.value.clone()),
         Some(p) => p,
     };
+    if let [Part::Var(index)] = parts[..] {
+        return with_flushed_variable(r, index, |v| match v {
+            None => Err(NGX_ERROR),
+            Some(v) if v.not_found => Ok(Vec::new()),
+            Some(v) => Ok(v.data.clone()),
+        });
+    }
     let mut out = Vec::new();
+    complex_value_parts(r, parts, &mut out)?;
+    Ok(out)
+}
+
+/// ngx_http_complex_value, copied only when it has variables: a constant
+/// is its stored bytes.
+pub fn complex_value_cow<'a>(r: &R, cv: &'a ComplexValue) -> Result<std::borrow::Cow<'a, [u8]>, i64> {
+    match &cv.parts {
+        None => Ok(std::borrow::Cow::Borrowed(&cv.value)),
+        Some(_) => complex_value(r, cv).map(std::borrow::Cow::Owned),
+    }
+}
+
+/// ngx_http_complex_value lent to `f`, without a copy: a constant's stored
+/// bytes, a single variable's value where r->variables caches it, else the
+/// parts evaluated into one buffer sized up front. Err when a variable
+/// cannot be evaluated.
+///
+/// `f` must not evaluate variables (r->variables may be borrowed while it
+/// runs).
+pub fn with_complex_value<T>(r: &R, cv: &ComplexValue, f: impl FnOnce(&[u8]) -> T) -> Result<T, i64> {
+    let parts = match &cv.parts {
+        None => return Ok(f(&cv.value)),
+        Some(p) => p,
+    };
+    if let [Part::Var(index)] = parts[..] {
+        return with_flushed_variable(r, index, |v| match v {
+            None => Err(NGX_ERROR),
+            Some(v) if v.not_found => Ok(f(b"")),
+            Some(v) => Ok(f(&v.data)),
+        });
+    }
+    let mut out = Vec::new();
+    complex_value_parts(r, parts, &mut out)?;
+    Ok(f(&out))
+}
+
+/// The codes of a complex value with variables, as ngx_http_complex_value()
+/// runs them: the non-cacheable variables of the value flushed
+/// (ngx_http_script_flush_complex_value), the lengths codes, then the
+/// values codes into `out`, reserved for the value; the variables are taken
+/// with ngx_http_get_indexed_variable() (e.flushed = 1), so a variable is
+/// evaluated once even if the value has it twice.
+fn complex_value_parts(r: &R, parts: &[Part], out: &mut Vec<u8>) -> Result<(), i64> {
+    for p in parts {
+        if let Part::Var(index) = p {
+            flush_variable(r, *index);
+        }
+    }
+
+    let mut len = 0;
+
+    for p in parts {
+        len += match p {
+            Part::Literal(l) => l.len(),
+            Part::Var(index) => match with_indexed_variable(r, *index, |v| v.map(|v| if v.not_found { 0 } else { v.data.len() })) {
+                Some(n) => n,
+                None => return Err(NGX_ERROR),
+            },
+            Part::Capture(n) => capture(r, *n, |c| c.len()),
+        };
+    }
+
+    out.reserve(len);
+
     for p in parts {
         match p {
             Part::Literal(l) => out.extend_from_slice(l),
-            Part::Var(idx) => {
-                let vv = match crate::variables::get_flushed_variable(r, *idx) {
-                    Some(v) => v,
-                    None => return Err(NGX_ERROR),
-                };
-                if !vv.not_found {
-                    out.extend_from_slice(&vv.data);
+            Part::Var(index) => {
+                let found = with_indexed_variable(r, *index, |v| match v {
+                    None => false,
+                    Some(v) => {
+                        if !v.not_found {
+                            out.extend_from_slice(&v.data);
+                        }
+                        true
+                    }
+                });
+                if !found {
+                    return Err(NGX_ERROR);
                 }
             }
-            Part::Capture(n) => {
-                let caps = r.captures.borrow();
+            Part::Capture(n) => capture(r, *n, |c| out.extend_from_slice(c)),
+        }
+    }
+
+    Ok(())
+}
+
+/// The capture n (2 * $n) of the request, empty if there is none
+/// (ngx_http_script_copy_capture_code: n < r->ncaptures)
+fn capture<T>(r: &R, n: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+    if n < r.ncaptures.get() {
+        let caps = r.captures.borrow();
+        if n + 1 < caps.len() {
+            let (s, e) = (caps[n], caps[n + 1]);
+            if s >= 0 && e >= s {
                 let data = r.captures_data.borrow();
-                // ngx_http_script_copy_capture_code: n < r->ncaptures
-                if *n < r.ncaptures.get() && *n + 1 < caps.len() {
-                    let s = caps[*n];
-                    let e = caps[*n + 1];
-                    if s >= 0 && e >= s {
-                        out.extend_from_slice(&data[s as usize..e as usize]);
-                    }
+                if (e as usize) <= data.len() {
+                    return f(&data[s as usize..e as usize]);
                 }
             }
         }
     }
-    if cv.flags & NGX_HTTP_COMPLEX_VALUE_ZERO != 0 {
-        // C appends a terminating zero; irrelevant here
-    }
-    Ok(out)
+    f(b"")
 }
 
 /// ngx_http_complex_value_size: parse the value as a size; `default` on empty.
@@ -173,16 +260,14 @@ pub fn complex_value_size(r: &R, cv: &Option<Rc<ComplexValue>>, default: usize) 
     if cv.is_constant() {
         return ngx_core::parse::parse_size(&cv.value).unwrap_or(default);
     }
-    match complex_value(r, cv) {
-        Ok(v) => match ngx_core::parse::parse_size(&v) {
-            Some(s) => s,
-            None => {
-                ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "invalid size \"{}\"", B(&v));
-                default
-            }
-        },
-        Err(_) => default,
-    }
+    let size = with_complex_value(r, cv, |v| match ngx_core::parse::parse_size(v) {
+        Some(s) => s,
+        None => {
+            ngx_core::ngx_log_error!(ngx_core::log::NGX_LOG_ERR, r.connection.log, None, "invalid size \"{}\"", B(v));
+            default
+        }
+    });
+    size.unwrap_or(default)
 }
 
 /// ngx_http_set_complex_value_slot
@@ -242,12 +327,10 @@ pub fn test_predicates(r: &R, preds: &Option<Rc<Vec<ComplexValue>>>) -> i64 {
     // Matches ngx_http_test_predicates in C: any truthy predicate ⇒
     // NGX_DECLINED; all empty/"0" (and predicates non-empty) ⇒ NGX_OK.
     for cv in preds.iter() {
-        let val = match complex_value(r, cv) {
-            Ok(v) => v,
+        match with_complex_value(r, cv, |val| !val.is_empty() && !(val.len() == 1 && val[0] == b'0')) {
+            Ok(true) => return NGX_DECLINED,
+            Ok(false) => {}
             Err(_) => return NGX_ERROR,
-        };
-        if !val.is_empty() && !(val.len() == 1 && val[0] == b'0') {
-            return NGX_DECLINED;
         }
     }
     NGX_OK
@@ -260,12 +343,10 @@ pub fn test_required_predicates(r: &R, preds: &Option<Rc<Vec<ComplexValue>>>) ->
         Some(p) => p,
     };
     for cv in preds.iter() {
-        let val = match complex_value(r, cv) {
-            Ok(v) => v,
+        match with_complex_value(r, cv, |val| val.is_empty() || (val.len() == 1 && val[0] == b'0')) {
+            Ok(true) => return NGX_DECLINED,
+            Ok(false) => {}
             Err(_) => return NGX_ERROR,
-        };
-        if val.is_empty() || (val.len() == 1 && val[0] == b'0') {
-            return NGX_DECLINED;
         }
     }
     NGX_OK
@@ -364,7 +445,8 @@ pub fn script_compile(cf: &mut Conf, source: &[u8]) -> Result<Vec<Part>, ConfErr
 
 /// ngx_http_script_run: the value of the codes of script_compile(), the
 /// no cacheable variables are flushed first and the variables are taken
-/// with ngx_http_get_indexed_variable() (e.flushed = 1)
+/// with ngx_http_get_indexed_variable() (e.flushed = 1): the lengths codes,
+/// then the values codes into a buffer of that length
 pub fn script_run(r: &R, codes: &[Part]) -> Option<Vec<u8>> {
     {
         let mut vars = r.variables.borrow_mut();
@@ -377,7 +459,20 @@ pub fn script_run(r: &R, codes: &[Part]) -> Option<Vec<u8>> {
         }
     }
 
-    let mut value = Vec::new();
+    let mut len = 0;
+
+    for code in codes {
+        len += match code {
+            Part::Literal(data) => data.len(),
+            Part::Var(index) => with_indexed_variable(r, *index, |v| match v {
+                Some(v) if !v.not_found => v.data.len(),
+                _ => 0,
+            }),
+            Part::Capture(n) => capture(r, *n, |c| c.len()),
+        };
+    }
+
+    let mut value = Vec::with_capacity(len);
 
     for code in codes {
         match code {
@@ -388,34 +483,21 @@ pub fn script_run(r: &R, codes: &[Part]) -> Option<Vec<u8>> {
             }
 
             Part::Var(index) => {
-                if let Some(v) = get_indexed_variable(r, *index) {
-                    if !v.not_found {
-                        value.extend_from_slice(&v.data);
+                with_indexed_variable(r, *index, |v| {
+                    if let Some(v) = v {
+                        if !v.not_found {
+                            value.extend_from_slice(&v.data);
 
-                        http_debug!(r, "http script var: \"{}\"", B(&v.data));
+                            http_debug!(r, "http script var: \"{}\"", B(&v.data));
+                        }
                     }
-                }
+                });
             }
 
             Part::Capture(n) => {
-                let n = *n;
                 let pos = value.len();
 
-                if n < r.ncaptures.get() {
-                    let cap = r.captures.borrow();
-
-                    if n + 1 < cap.len() {
-                        let (a, b) = (cap[n], cap[n + 1]);
-
-                        if a >= 0 && b >= a {
-                            let data = r.captures_data.borrow();
-
-                            if (b as usize) <= data.len() {
-                                value.extend_from_slice(&data[a as usize..b as usize]);
-                            }
-                        }
-                    }
-                }
+                capture(r, *n, |c| value.extend_from_slice(c));
 
                 http_debug!(r, "http script capture: \"{}\"", B(&value[pos..]));
             }

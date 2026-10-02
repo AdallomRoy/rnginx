@@ -61,14 +61,17 @@ shm_struct! {
 pub struct LimitConnCtx {
     /// ctx->sh: the offset of the shctx in the zone
     sh: Cell<usize>,
-    /// the zone's memory, its slab pool at the start (ctx->shpool)
-    mem: RefCell<Option<Rc<ShmMem>>>,
+    /// the zone's memory, its slab pool at the start (ctx->shpool), set by
+    /// the zone's init
+    mem: std::cell::OnceCell<Rc<ShmMem>>,
     key: ComplexValue,
+    /// shm_zone->shm.log, for the cleanups (set by the zone's init)
+    log: RefCell<Option<Log>>,
 }
 
 impl LimitConnCtx {
-    fn mem(&self) -> Rc<ShmMem> {
-        self.mem.borrow().clone().expect("limit_conn zone memory")
+    fn mem(&self) -> &ShmMem {
+        self.mem.get().expect("limit_conn zone memory")
     }
 
     /// &ctx->sh->rbtree
@@ -107,6 +110,17 @@ fn lc_cmp(key: &[u8], lc: LimitConnNode<'_>) -> std::cmp::Ordering {
 pub struct LimitConnLimit {
     pub shm_zone: Rc<ShmZone>,
     pub conn: usize,
+    /// shm_zone->data, looked up on the first session
+    ctx: std::cell::OnceCell<Rc<LimitConnCtx>>,
+}
+
+/// shm_zone->data of a limit, downcast once; None if the zone has none
+fn limit_ctx(limit: &LimitConnLimit) -> Option<&Rc<LimitConnCtx>> {
+    if limit.ctx.get().is_none() {
+        let _ = limit.ctx.set(limit.shm_zone.data::<LimitConnCtx>()?);
+    }
+
+    limit.ctx.get()
 }
 
 /// ngx_stream_limit_conn_conf_t
@@ -123,13 +137,13 @@ static LIMIT_CONN_STATUS: [&str; 3] = ["PASSED", "REJECTED", "REJECTED_DRY_RUN"]
 async fn limit_conn_handler(s: S) -> i64 {
     let lccf = s.srv_conf::<LimitConnConf>(ctx_index());
 
-    let (limits, log_level, dry_run) = {
-        let l = lccf.borrow();
-        (l.limits.clone().unwrap_or_default(), *l.log_level, *l.dry_run)
-    };
+    // the limits are used where the configuration has them
+    let l = lccf.borrow();
+
+    let (limits, log_level, dry_run) = (l.limits.as_deref().unwrap_or(&[]), *l.log_level, *l.dry_run);
 
     for limit in limits.iter() {
-        let ctx = match limit.shm_zone.data::<LimitConnCtx>() {
+        let ctx = match limit_ctx(limit) {
             Some(c) => c,
             None => return NGX_ERROR,
         };
@@ -217,9 +231,9 @@ async fn limit_conn_handler(s: S) -> i64 {
 
         shpool.unlock();
 
-        let shm_zone = limit.shm_zone.clone();
+        let ctx = ctx.clone();
 
-        s.connection.add_cleanup(PoolCleanup { tag: TAG, data: None, handler: Some(Box::new(move || limit_conn_cleanup(&shm_zone, node))) });
+        s.connection.add_cleanup(PoolCleanup { tag: TAG, data: None, handler: Some(Box::new(move || limit_conn_cleanup(&ctx, node))) });
     }
 
     NGX_DECLINED
@@ -273,12 +287,7 @@ fn limit_conn_lookup(rbtree: &ShmRbtree<'_>, key: &[u8], hash: u32) -> usize {
 }
 
 /// ngx_stream_limit_conn_cleanup
-fn limit_conn_cleanup(shm_zone: &Rc<ShmZone>, node: usize) {
-    let ctx = match shm_zone.data::<LimitConnCtx>() {
-        Some(c) => c,
-        None => return,
-    };
-
+fn limit_conn_cleanup(ctx: &LimitConnCtx, node: usize) {
     // the node stays in the zone while its conn is not zero; it is changed
     // under the zone's mutex
     let mem = ctx.mem();
@@ -288,7 +297,7 @@ fn limit_conn_cleanup(shm_zone: &Rc<ShmZone>, node: usize) {
 
     shpool.lock();
 
-    if let Some(log) = shm_zone.shm.log.borrow().as_ref() {
+    if let Some(log) = ctx.log.borrow().as_ref() {
         ngx_log_debug!(NGX_LOG_DEBUG_STREAM, log, "limit conn cleanup: {:08X} {}", tree.key(node), lc.get(LimitConnNode::conn));
     }
 
@@ -338,7 +347,10 @@ fn limit_conn_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Re
         }
 
         ctx.sh.set(octx.sh.get());
-        *ctx.mem.borrow_mut() = octx.mem.borrow().clone();
+        if let Some(mem) = octx.mem.get() {
+            let _ = ctx.mem.set(mem.clone());
+        }
+        *ctx.log.borrow_mut() = shm_zone.shm.log.borrow().clone();
 
         return Ok(());
     }
@@ -346,7 +358,8 @@ fn limit_conn_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Re
     let mem = shm_zone.mem();
     let shpool = SlabPool::of(&mem);
 
-    *ctx.mem.borrow_mut() = Some(mem.clone());
+    let _ = ctx.mem.set(mem.clone());
+    *ctx.log.borrow_mut() = shm_zone.shm.log.borrow().clone();
 
     if shm_zone.shm.exists.get() {
         ctx.sh.set(shpool.data());
@@ -449,7 +462,7 @@ fn limit_conn_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
         return Err(cf.emerg(format_args!("{} \"{}\" is already bound to key \"{}\"", cmd.name, B(&name), B(&ctx.key.value))));
     }
 
-    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key });
+    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), key, log: RefCell::new(None) });
 
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_conn_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
@@ -483,7 +496,7 @@ fn limit_conn(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfR
         return Err(cf.emerg(format_args!("connection limit must be less 65536")));
     }
 
-    lccf.borrow_mut().limits.get_or_insert_with(Vec::new).push(LimitConnLimit { shm_zone, conn: n as usize });
+    lccf.borrow_mut().limits.get_or_insert_with(Vec::new).push(LimitConnLimit { shm_zone, conn: n as usize, ctx: std::cell::OnceCell::new() });
 
     Ok(())
 }
@@ -549,7 +562,7 @@ mod tests {
         let zone = ShmZone::new(b"test".to_vec(), mem.len(), TAG);
         zone.shm.attach(mem);
 
-        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key: ComplexValue::constant(b"$binary_remote_addr") });
+        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: std::cell::OnceCell::new(), key: ComplexValue::constant(b"$binary_remote_addr"), log: RefCell::new(None) });
 
         *zone.data.borrow_mut() = Some(ctx);
 
@@ -640,12 +653,12 @@ mod tests {
         let n3 = acquire(&zone, b"127.0.0.2", 5, 2).unwrap();
         assert_eq!(conn(&zone, b"127.0.0.2", 5), Some(1));
 
-        limit_conn_cleanup(&zone, n1);
+        limit_conn_cleanup(&zone_ctx(&zone), n1);
         assert_eq!(conn(&zone, b"127.0.0.1", 5), Some(1));
 
         // the last connection of a key frees its node
-        limit_conn_cleanup(&zone, n2);
-        limit_conn_cleanup(&zone, n3);
+        limit_conn_cleanup(&zone_ctx(&zone), n2);
+        limit_conn_cleanup(&zone_ctx(&zone), n3);
         assert_eq!(conn(&zone, b"127.0.0.1", 5), None);
         assert_eq!(conn(&zone, b"127.0.0.2", 5), None);
 
@@ -670,7 +683,7 @@ mod tests {
         assert_eq!(conn(&zone, b"200", crc32fast::hash(b"200") % 16), None);
 
         for n in nodes.iter().rev() {
-            limit_conn_cleanup(&zone, *n);
+            limit_conn_cleanup(&zone_ctx(&zone), *n);
         }
 
         for k in &keys {

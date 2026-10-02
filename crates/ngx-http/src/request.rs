@@ -46,6 +46,23 @@ impl TableElt {
         Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key, null: Cell::new(false) })
     }
 
+    /// with_hash() taking its parts as they are, without copying them: a
+    /// parsed header line (key and value as read, the hash and lowcase key
+    /// of the parser). One allocation, the element itself.
+    pub fn owned(key: Vec<u8>, value: Vec<u8>, hash: usize, lowcase_key: Vec<u8>) -> Header {
+        Rc::new(TableElt { hash: Cell::new(hash), key, value: RefCell::new(value), lowcase_key, null: Cell::new(false) })
+    }
+
+    /// A header a module adds to r->headers_out (hash 1), with the value
+    /// moved in. As in C, where the modules set only the hash, key and value
+    /// of the headers they generate (lowcase_key stays NULL), it has no
+    /// lowcase key: nothing looks r->headers_out up by it (HeadersOut::find
+    /// compares the keys). Two allocations (the element and the key), where
+    /// new() makes four and copies the value.
+    pub fn generated(key: &[u8], value: Vec<u8>) -> Header {
+        Rc::new(TableElt { hash: Cell::new(1), key: key.to_vec(), value: RefCell::new(value), lowcase_key: Vec::new(), null: Cell::new(false) })
+    }
+
     pub fn value(&self) -> Vec<u8> {
         self.value.borrow().clone()
     }
@@ -199,9 +216,17 @@ impl HeadersOut {
         h
     }
 
-    /// Find first non-removed header by lowercase key.
+    /// add() with the value moved in, as TableElt::generated() makes it.
+    pub fn add_generated(&mut self, key: &[u8], value: Vec<u8>) -> Header {
+        let h = TableElt::generated(key, value);
+        self.headers.push(h.clone());
+        h
+    }
+
+    /// Find first non-removed header by name (lowercase), comparing the
+    /// keys as C does: the generated headers have no lowcase key.
     pub fn find(&self, lowcase: &[u8]) -> Option<&Header> {
-        self.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == lowcase)
+        self.headers.iter().find(|h| h.hash.get() != 0 && h.key.eq_ignore_ascii_case(lowcase))
     }
 }
 
@@ -282,6 +307,13 @@ pub struct HttpConnection {
     pub v3_session: RefCell<Option<Rc<crate::v3::H3Session>>>,
 }
 
+impl Drop for HttpConnection {
+    fn drop(&mut self) {
+        // c->buffer goes with the connection's pool: the worker keeps it
+        crate::request_rt::free_header_buffer(std::mem::take(&mut self.buffer.get_mut().data));
+    }
+}
+
 /// In-memory header buffer: data[pos..last] unread.
 #[derive(Default)]
 pub struct HeaderBuf {
@@ -347,7 +379,7 @@ impl LogContext for HttpLogCtx {
 
 /// ngx_http_log_error_handler
 pub fn log_error_handler(r: &R, sr: &R, buf: &mut Vec<u8>) {
-    let cscf = r.srv_conf::<CoreSrvConf>(core::ctx_index());
+    let cscf = r.cscf();
     buf.extend_from_slice(b", server: ");
     buf.extend_from_slice(&cscf.borrow().server_name);
     let rl = r.request_line.borrow();
@@ -383,6 +415,90 @@ pub fn log_error_handler(r: &R, sr: &R, buf: &mut Vec<u8>) {
     }
 }
 
+/// The contexts kept inline in RequestCtx.
+const CTX_INLINE: usize = 4;
+
+/// The key of a free inline slot of RequestCtx.
+const CTX_FREE: usize = usize::MAX;
+
+/// r->ctx: the modules' contexts of a request, by module index. C has an
+/// array of ngx_http_max_module pointers, zeroed with the request; a
+/// request sets a few of them, which are kept here inline, the others in a
+/// vector allocated only when more are set. Indexing gives a module's slot
+/// (an index not set reads as None, and is added when written), iter_mut()
+/// the slots set (ngx_memzero(r->ctx) sets them all to None).
+pub struct RequestCtx {
+    inline: [(usize, Option<Rc<dyn Any>>); CTX_INLINE],
+    more: Vec<(usize, Option<Rc<dyn Any>>)>,
+    /// what an index not set reads as
+    none: Option<Rc<dyn Any>>,
+}
+
+impl RequestCtx {
+    pub fn new() -> RequestCtx {
+        RequestCtx { inline: [(CTX_FREE, None), (CTX_FREE, None), (CTX_FREE, None), (CTX_FREE, None)], more: Vec::new(), none: None }
+    }
+
+    fn slot(&self, idx: usize) -> Option<&Option<Rc<dyn Any>>> {
+        self.inline.iter().chain(self.more.iter()).find(|(k, _)| *k == idx).map(|(_, v)| v)
+    }
+
+    /// The context of a module, if set.
+    pub fn get(&self, idx: usize) -> Option<&Rc<dyn Any>> {
+        self.slot(idx).and_then(|v| v.as_ref())
+    }
+
+    /// The slots set, to read or reset.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<Rc<dyn Any>>> {
+        self.inline.iter_mut().chain(self.more.iter_mut()).filter(|(k, _)| *k != CTX_FREE).map(|(_, v)| v)
+    }
+}
+
+impl Default for RequestCtx {
+    fn default() -> Self {
+        RequestCtx::new()
+    }
+}
+
+impl std::ops::Index<usize> for RequestCtx {
+    type Output = Option<Rc<dyn Any>>;
+
+    fn index(&self, idx: usize) -> &Option<Rc<dyn Any>> {
+        self.slot(idx).unwrap_or(&self.none)
+    }
+}
+
+impl std::ops::IndexMut<usize> for RequestCtx {
+    fn index_mut(&mut self, idx: usize) -> &mut Option<Rc<dyn Any>> {
+        let pos = self.inline.iter().position(|(k, _)| *k == idx);
+        if let Some(i) = pos {
+            return &mut self.inline[i].1;
+        }
+        let pos = self.more.iter().position(|(k, _)| *k == idx);
+        if let Some(i) = pos {
+            return &mut self.more[i].1;
+        }
+        // a new slot: a free one, or one reset to None
+        let pos = self.inline.iter().position(|(_, v)| v.is_none());
+        if let Some(i) = pos {
+            self.inline[i].0 = idx;
+            return &mut self.inline[i].1;
+        }
+        let pos = self.more.iter().position(|(_, v)| v.is_none());
+        let i = match pos {
+            Some(i) => {
+                self.more[i].0 = idx;
+                i
+            }
+            None => {
+                self.more.push((idx, None));
+                self.more.len() - 1
+            }
+        };
+        &mut self.more[i].1
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HttpState {
     InitializingRequest = 0,
@@ -399,7 +515,7 @@ pub enum HttpState {
 pub struct Request {
     pub connection: Rc<Connection>,
     pub http_connection: Rc<HttpConnection>,
-    pub ctx: RefCell<Vec<Option<Rc<dyn Any>>>>,
+    pub ctx: RefCell<RequestCtx>,
     pub main_conf: RefCell<Rc<ConfSlots>>,
     pub srv_conf: RefCell<Rc<ConfSlots>>,
     pub loc_conf: RefCell<Rc<ConfSlots>>,
@@ -562,6 +678,52 @@ pub struct Request {
     /// subrequests (c->data, r->main->count of theirs): not a module
     /// context, which an internal redirect clears.
     pub posted_subrequests: RefCell<Option<Rc<dyn Any>>>,
+    /// the core module's confs of main_conf, srv_conf and loc_conf
+    pub(crate) core_conf: CoreConfs,
+}
+
+/// A core module conf of the request (ngx_http_get_module_loc_conf(r,
+/// ngx_http_core_module) and the like), kept with the conf slots it was
+/// taken from: r.clcf() and the like give it without a lookup and a
+/// downcast while the slots stay the same, and take it again from the
+/// slots set since (find_config, an internal redirect or a server switch
+/// set r.loc_conf / r.srv_conf).
+pub(crate) struct CoreConf<T>(RefCell<Option<(Rc<ConfSlots>, Rc<RefCell<T>>)>>);
+
+impl<T: 'static> CoreConf<T> {
+    fn new() -> CoreConf<T> {
+        CoreConf(RefCell::new(None))
+    }
+
+    fn get(&self, slots: &RefCell<Rc<ConfSlots>>) -> Rc<RefCell<T>> {
+        self.get_at(slots, core::ctx_index)
+    }
+
+    /// The conf of slot index(), the core module's.
+    fn get_at(&self, slots: &RefCell<Rc<ConfSlots>>, index: fn() -> usize) -> Rc<RefCell<T>> {
+        let slots = slots.borrow();
+        if let Some((from, conf)) = &*self.0.borrow() {
+            if Rc::ptr_eq(from, &slots) {
+                return conf.clone();
+            }
+        }
+        let conf = slot_of::<T>(&slots, index());
+        *self.0.borrow_mut() = Some((slots.clone(), conf.clone()));
+        conf
+    }
+}
+
+/// The cached core module confs of a request.
+pub(crate) struct CoreConfs {
+    main: CoreConf<CoreMainConf>,
+    srv: CoreConf<CoreSrvConf>,
+    loc: CoreConf<CoreLocConf>,
+}
+
+impl CoreConfs {
+    fn new() -> CoreConfs {
+        CoreConfs { main: CoreConf::new(), srv: CoreConf::new(), loc: CoreConf::new() }
+    }
 }
 
 impl Request {
@@ -601,19 +763,19 @@ impl Request {
     }
 
     pub fn clcf(&self) -> Rc<RefCell<CoreLocConf>> {
-        self.loc_conf::<CoreLocConf>(core::ctx_index())
+        self.core_conf.loc.get(&self.loc_conf)
     }
 
     pub fn cscf(&self) -> Rc<RefCell<CoreSrvConf>> {
-        self.srv_conf::<CoreSrvConf>(core::ctx_index())
+        self.core_conf.srv.get(&self.srv_conf)
     }
 
     pub fn cmcf(&self) -> Rc<RefCell<CoreMainConf>> {
-        self.main_conf::<CoreMainConf>(core::ctx_index())
+        self.core_conf.main.get(&self.main_conf)
     }
 
     pub fn get_ctx<T: 'static>(&self, idx: usize) -> Option<Rc<RefCell<T>>> {
-        self.ctx.borrow()[idx].clone().and_then(|c| c.downcast::<RefCell<T>>().ok())
+        self.ctx.borrow().get(idx).cloned().and_then(|c| c.downcast::<RefCell<T>>().ok())
     }
 
     pub fn set_ctx<T: 'static>(&self, idx: usize, v: T) -> Rc<RefCell<T>> {
@@ -624,11 +786,14 @@ impl Request {
 
     /// A module context is set (ngx_http_get_module_ctx() != NULL)
     pub fn has_ctx(&self, idx: usize) -> bool {
-        self.ctx.borrow()[idx].is_some()
+        self.ctx.borrow().get(idx).is_some()
     }
 
     pub fn clear_ctx(&self, idx: usize) {
-        self.ctx.borrow_mut()[idx] = None;
+        let mut ctx = self.ctx.borrow_mut();
+        if ctx.get(idx).is_some() {
+            ctx[idx] = None;
+        }
     }
 
     pub fn add_cleanup(&self, f: CleanupFn) {
@@ -664,10 +829,13 @@ impl Request {
     pub fn partial_request_line(&self) -> Option<Vec<u8>> {
         let p = self.parse.borrow();
         if p.request_start_set {
-            let hb = self.http_connection.buffer.borrow();
-            let start = p.request_start.min(hb.last);
+            // (a read into the buffer does not log while it borrows it, see
+            // request_rt::read_header_buffer; nothing to show if it did)
+            let hb = self.http_connection.buffer.try_borrow().ok()?;
+            let last = hb.last.min(hb.data.len());
+            let start = p.request_start.min(last);
             let mut end = start;
-            while end < hb.last && hb.data[end] != b'\r' && hb.data[end] != b'\n' {
+            while end < last && hb.data[end] != b'\r' && hb.data[end] != b'\n' {
                 end += 1;
             }
             return Some(hb.data[start..end].to_vec());
@@ -739,13 +907,11 @@ impl Request {
 /// Allocate a new main request on a connection (ngx_http_alloc_request + create_request).
 pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<HttpLogCtx>) -> R {
     let ctx = hc.conf_ctx.borrow().clone();
-    let cmcf = get_conf::<CoreMainConf>(&ctx, ConfLevel::Main, core::ctx_index());
-    let nvars = cmcf.borrow().variables.len();
-    let now = ngx_core::times::cached();
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
     let r = Rc::new(Request {
         connection: c.clone(),
         http_connection: hc.clone(),
-        ctx: RefCell::new(vec![None; http_max_module()]),
+        ctx: RefCell::new(RequestCtx::new()),
         main_conf: RefCell::new(ctx.main.clone().unwrap()),
         srv_conf: RefCell::new(ctx.srv.clone().unwrap()),
         loc_conf: RefCell::new(ctx.loc.clone().unwrap()),
@@ -759,8 +925,8 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         headers_out: RefCell::new(HeadersOut::new()),
         request_body: RefCell::new(None),
         lingering_time: Cell::new(0),
-        start_sec: Cell::new(now.sec),
-        start_msec: Cell::new(now.msec),
+        start_sec: Cell::new(sec),
+        start_msec: Cell::new(msec),
         method: Cell::new(NGX_HTTP_UNKNOWN),
         http_version: Cell::new(NGX_HTTP_VERSION_10),
         request_line: RefCell::new(Vec::new()),
@@ -779,7 +945,9 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         phase_handler: Cell::new(0),
         content_handler: RefCell::new(None),
         access_code: Cell::new(0),
-        variables: RefCell::new(vec![VariableValue::default(); nvars]),
+        // r->variables: sized on the first access to a variable (the
+        // accessors resize it to cmcf->variables)
+        variables: RefCell::new(Vec::new()),
         ncaptures: Cell::new(0),
         captures: RefCell::new(Vec::new()),
         captures_data: RefCell::new(Vec::new()),
@@ -872,6 +1040,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         postponed: RefCell::new(std::collections::VecDeque::new()),
         post_subrequest_async: RefCell::new(None),
         posted_subrequests: RefCell::new(None),
+        core_conf: CoreConfs::new(),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is
@@ -919,4 +1088,84 @@ macro_rules! http_debug {
 pub(crate) fn _silence(log: &Log) {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "{}", B(b""));
     ngx_log_error!(NGX_LOG_DEBUG, log, None, "{}", NGX_OK);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_conf_follows_the_slots() {
+        let slots = |v: u32| -> Rc<ConfSlots> { Rc::new(RefCell::new(vec![Some(make_slot(v))])) };
+        let (a, b) = (slots(1), slots(2));
+        let cur = RefCell::new(a.clone());
+        let cache: CoreConf<u32> = CoreConf::new();
+        let first = cache.get_at(&cur, || 0);
+        assert_eq!(*first.borrow(), 1);
+        // the same conf while the slots stay
+        assert!(Rc::ptr_eq(&first, &cache.get_at(&cur, || 0)));
+        // the slots set by someone else (find_config): taken again
+        *cur.borrow_mut() = b.clone();
+        assert_eq!(*cache.get_at(&cur, || 0).borrow(), 2);
+        *cur.borrow_mut() = a;
+        assert!(Rc::ptr_eq(&first, &cache.get_at(&cur, || 0)));
+    }
+
+    #[test]
+    fn table_elt_owned_keeps_its_parts() {
+        let key = b"X-Foo".to_vec();
+        let value = b"bar".to_vec();
+        let (kp, vp) = (key.as_ptr(), value.as_ptr());
+        let h = TableElt::owned(key, value, 42, b"x-foo".to_vec());
+        // moved in, not copied
+        assert_eq!(h.key.as_ptr(), kp);
+        assert_eq!(h.value.borrow().as_ptr(), vp);
+        assert_eq!(h.hash.get(), 42);
+        assert_eq!(h.lowcase_key, b"x-foo");
+        assert!(!h.null.get());
+    }
+
+    #[test]
+    fn request_ctx_slots() {
+        let mut ctx = RequestCtx::new();
+        assert!(ctx.get(3).is_none());
+        assert!(ctx[70].is_none());
+        // more contexts than are kept inline
+        for i in 0..7 {
+            ctx[i * 10] = Some(Rc::new(RefCell::new(i)) as Rc<dyn Any>);
+        }
+        for i in 0..7 {
+            let v = ctx.get(i * 10).unwrap().clone().downcast::<RefCell<usize>>().unwrap();
+            assert_eq!(*v.borrow(), i);
+        }
+        assert!(ctx.get(5).is_none());
+        assert_eq!(ctx.iter_mut().count(), 7);
+        // ngx_memzero(r->ctx)
+        for c in ctx.iter_mut() {
+            *c = None;
+        }
+        assert!((0..7).all(|i| ctx.get(i * 10).is_none()));
+        // the slots reset are reused
+        ctx[33] = Some(Rc::new(RefCell::new(33usize)) as Rc<dyn Any>);
+        assert!(ctx.get(33).is_some());
+        assert_eq!(ctx.more.len(), 3);
+        ctx[33] = None;
+        assert!(ctx.get(33).is_none());
+    }
+
+    #[test]
+    fn generated_headers_are_found_by_name() {
+        let mut ho = HeadersOut::new();
+        let value = b"\"abc\"".to_vec();
+        let vp = value.as_ptr();
+        let h = ho.add_generated(b"ETag", value);
+        assert_eq!(h.hash.get(), 1);
+        assert_eq!(h.value.borrow().as_ptr(), vp);
+        assert!(h.lowcase_key.is_empty());
+        ho.add(b"Content-Range", b"bytes 0-1/2");
+        assert!(Rc::ptr_eq(ho.find(b"etag").unwrap(), &h));
+        assert_eq!(ho.find(b"content-range").unwrap().value(), b"bytes 0-1/2");
+        h.hash.set(0);
+        assert!(ho.find(b"etag").is_none());
+    }
 }
