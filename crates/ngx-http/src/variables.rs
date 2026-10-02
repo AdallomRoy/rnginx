@@ -823,7 +823,7 @@ fn var_hostname(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
 }
 
 fn var_pid(_r: &R, v: &mut VariableValue, _d: usize) -> i64 {
-    set_str(v, ngx_core::os::getpid().to_string().as_bytes());
+    set_str(v, ngx_core::log::pid().to_string().as_bytes());
     NGX_OK
 }
 

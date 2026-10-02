@@ -560,7 +560,7 @@ fn variable_hostname(_s: &Session, v: &mut VariableValue, _data: usize) -> i64 {
 }
 
 fn variable_pid(_s: &Session, v: &mut VariableValue, _data: usize) -> i64 {
-    set_value(v, ngx_core::os::getpid().to_string().as_bytes());
+    set_value(v, ngx_core::log::pid().to_string().as_bytes());
     NGX_OK
 }
 
