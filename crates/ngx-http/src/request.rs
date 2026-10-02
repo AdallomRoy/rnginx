@@ -739,9 +739,7 @@ impl Request {
 /// Allocate a new main request on a connection (ngx_http_alloc_request + create_request).
 pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<HttpLogCtx>) -> R {
     let ctx = hc.conf_ctx.borrow().clone();
-    let cmcf = get_conf::<CoreMainConf>(&ctx, ConfLevel::Main, core::ctx_index());
-    let nvars = cmcf.borrow().variables.len();
-    let now = ngx_core::times::cached();
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
     let r = Rc::new(Request {
         connection: c.clone(),
         http_connection: hc.clone(),
@@ -759,8 +757,8 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         headers_out: RefCell::new(HeadersOut::new()),
         request_body: RefCell::new(None),
         lingering_time: Cell::new(0),
-        start_sec: Cell::new(now.sec),
-        start_msec: Cell::new(now.msec),
+        start_sec: Cell::new(sec),
+        start_msec: Cell::new(msec),
         method: Cell::new(NGX_HTTP_UNKNOWN),
         http_version: Cell::new(NGX_HTTP_VERSION_10),
         request_line: RefCell::new(Vec::new()),
@@ -779,7 +777,9 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         phase_handler: Cell::new(0),
         content_handler: RefCell::new(None),
         access_code: Cell::new(0),
-        variables: RefCell::new(vec![VariableValue::default(); nvars]),
+        // r->variables: sized on the first access to a variable (the
+        // accessors resize it to cmcf->variables)
+        variables: RefCell::new(Vec::new()),
         ncaptures: Cell::new(0),
         captures: RefCell::new(Vec::new()),
         captures_data: RefCell::new(Vec::new()),

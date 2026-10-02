@@ -257,7 +257,9 @@ async fn connection_close(c: &Connection) {
 
 /// ngx_http_close_connection
 pub fn close_connection(c: &Rc<Connection>) {
-    http_debug_c(c, &format!("close http connection: {}", c.fd.get()));
+    if c.log.debug_enabled(NGX_LOG_DEBUG_HTTP) {
+        c.log.error(NGX_LOG_DEBUG, None, format_args!("close http connection: {}", c.fd.get()));
+    }
     if c.is_quic_stream() {
         // ngx_ssl_shutdown() does nothing for a QUIC stream
         crate::v3::request::reset_stream(c);
@@ -574,7 +576,7 @@ async fn run_request(r: &R) -> End {
                 r.http_version.set(p.http_version);
                 *r.request_line.borrow_mut() = line;
             }
-            if process_request_uri(r).await.is_err() {
+            if process_request_uri(r).is_err() {
                 return finalize_and_end(r, NGX_HTTP_BAD_REQUEST).await;
             }
             let (schema, host) = {
@@ -711,11 +713,11 @@ async fn run_request(r: &R) -> End {
                 ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent too many header lines");
                 return finalize_and_end(r, NGX_HTTP_REQUEST_HEADER_TOO_LARGE).await;
             }
-            let h = TableElt::with_hash(&key, &value, hash, lowcase.clone());
+            let h = TableElt::with_hash(&key, &value, hash, lowcase);
             r.headers_in.borrow_mut().headers.push(h.clone());
             let handler = {
                 let m = cmcf.borrow();
-                m.headers_in_hash.as_ref().and_then(|hh| hh.find(hash, &lowcase).copied())
+                m.headers_in_hash.as_ref().and_then(|hh| hh.find(hash, &h.lowcase_key).copied())
             };
             if let Some(f) = handler {
                 if f(r, h.clone()) != NGX_OK {
@@ -761,41 +763,24 @@ async fn run_request(r: &R) -> End {
     }
 }
 
-/// ngx_http_process_request_uri for the HTTP/1 request line.
-async fn process_request_uri(r: &R) -> Result<(), ()> {
-    let data = {
-        let b = r.http_connection.buffer.borrow();
-        b.data[..b.last].to_vec()
-    };
-    process_request_uri_data(r, &data)
+/// ngx_http_process_request_uri for the HTTP/1 request line, over the
+/// header buffer (borrowed: nothing it calls writes the buffer)
+fn process_request_uri(r: &R) -> Result<(), ()> {
+    let b = r.http_connection.buffer.borrow();
+    process_request_uri_data(r, &b.data[..b.last])
 }
 
 /// ngx_http_process_request_uri over `data`, the buffer r.parse's offsets
 /// refer to (the request line, or an HTTP/2 :path value).
 pub fn process_request_uri_data(r: &R, data: &[u8]) -> Result<(), ()> {
-    let (uri, unparsed, exten, args, complex, merge_slashes) = {
+    let (us, ue, complex) = {
         let p = r.parse.borrow();
         let us = p.uri_start.unwrap_or(0);
-        let ue = p.uri_end.unwrap_or(us);
-        let uri_len = match p.args_start {
-            Some(a) => a - 1 - us,
-            None => ue - us,
-        };
-        let unparsed = data[us..ue].to_vec();
-        let exten = p.uri_ext.map(|x| match p.args_start {
-            Some(a) => data[x..a - 1].to_vec(),
-            None => data[x..ue].to_vec(),
-        });
-        let args = match p.args_start {
-            Some(a) if ue > a => data[a..ue].to_vec(),
-            _ => Vec::new(),
-        };
-        let complex = p.complex_uri || p.quoted_uri || p.empty_path_in_uri;
-        let cscf = r.cscf();
-        let ms = *cscf.borrow().merge_slashes;
-        (data[us..us + uri_len].to_vec(), unparsed, exten, args, complex, ms)
+        (us, p.uri_end.unwrap_or(us), p.complex_uri || p.quoted_uri || p.empty_path_in_uri)
     };
+    let unparsed = data[us..ue].to_vec();
     if complex {
+        let merge_slashes = *r.cscf().borrow().merge_slashes;
         let res = {
             let p = r.parse.borrow();
             parse::parse_complex_uri(&p, data, merge_slashes)
@@ -813,8 +798,24 @@ pub fn process_request_uri_data(r: &R, data: &[u8]) -> Result<(), ()> {
             }
         }
     } else {
+        let (uri, exten, args) = {
+            let p = r.parse.borrow();
+            let uri_end = match p.args_start {
+                Some(a) => a - 1,
+                None => ue,
+            };
+            let exten = match p.uri_ext {
+                Some(x) => data[x..uri_end].to_vec(),
+                None => Vec::new(),
+            };
+            let args = match p.args_start {
+                Some(a) if ue > a => data[a..ue].to_vec(),
+                _ => Vec::new(),
+            };
+            (data[us..uri_end].to_vec(), exten, args)
+        };
         *r.uri.borrow_mut() = uri;
-        *r.exten.borrow_mut() = exten.unwrap_or_default();
+        *r.exten.borrow_mut() = exten;
         *r.args.borrow_mut() = args;
     }
     let p = r.parse.borrow();
@@ -1593,9 +1594,9 @@ pub async fn subrequest(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps: 
     sr.main_filter_need_in_memory.set(r.main_filter_need_in_memory.get());
     sr.uri_changes.set(NGX_HTTP_MAX_URI_CHANGES + 1);
     sr.subrequests.set(r.subrequests.get() - 1);
-    let now = ngx_core::times::cached();
-    sr.start_sec.set(now.sec);
-    sr.start_msec.set(now.msec);
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
+    sr.start_sec.set(sec);
+    sr.start_msec.set(msec);
     if flags & NGX_HTTP_SUBREQUEST_CLONE != 0 {
         sr.method.set(r.method.get());
         *sr.method_name.borrow_mut() = r.method_name.borrow().clone();
@@ -1730,9 +1731,9 @@ pub fn subrequest_posted(r: &R, uri: &[u8], args: Option<&[u8]>, flags: u32, ps:
     sr.main_filter_need_in_memory.set(r.main_filter_need_in_memory.get());
     sr.uri_changes.set(NGX_HTTP_MAX_URI_CHANGES + 1);
     sr.subrequests.set(r.subrequests.get() - 1);
-    let now = ngx_core::times::cached();
-    sr.start_sec.set(now.sec);
-    sr.start_msec.set(now.msec);
+    let (sec, msec) = ngx_core::times::with_cached(|t| (t.sec, t.msec));
+    sr.start_sec.set(sec);
+    sr.start_msec.set(msec);
     if flags & NGX_HTTP_SUBREQUEST_CLONE != 0 {
         sr.method.set(r.method.get());
         *sr.method_name.borrow_mut() = r.method_name.borrow().clone();
