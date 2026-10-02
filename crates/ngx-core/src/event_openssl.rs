@@ -2671,7 +2671,7 @@ impl Drop for SslBuf {
 }
 
 /// The most free c->ssl->buf memory a worker keeps.
-const SSL_BUFS_MAX: usize = 32;
+const SSL_BUFS_MAX: usize = 16;
 
 thread_local! {
     /// The free c->ssl->buf memory of the worker, empty Vecs with their

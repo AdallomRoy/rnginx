@@ -593,7 +593,7 @@ impl H2Connection {
 
 /// The most frame buffers a worker keeps for reuse, and the largest kept.
 const FRAME_BUFS_MAX: usize = 64;
-const FRAME_BUF_MAX_SIZE: usize = 64 * 1024;
+const FRAME_BUF_MAX_SIZE: usize = 16 * 1024 + 64;
 
 thread_local! {
     /// The buffers of frames written out, for the next frames: C reuses

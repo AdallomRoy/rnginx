@@ -89,7 +89,7 @@ pub struct QuicBuffer {
 }
 
 /// The most blocks no buffer uses that a worker keeps for reuse.
-const NGX_QUIC_FREE_BLOCKS_KEPT: usize = 256;
+const NGX_QUIC_FREE_BLOCKS_KEPT: usize = 128;
 
 /// The most frames a connection keeps on its free list.
 pub const NGX_QUIC_FREE_FRAMES_KEPT: usize = 256;
