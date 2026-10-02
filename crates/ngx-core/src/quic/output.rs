@@ -968,8 +968,8 @@ pub fn ngx_quic_send_ack(c: &Connection, qc: &QuicConnection, ctx: &mut QuicSend
         None => return NGX_ERROR,
     };
 
-    let mut data = QChain::default();
-    let mut range = Vec::new();
+    // the chain of the frame, which keeps its room from the free list
+    let mut data = std::mem::take(&mut frame.data);
 
     for i in 0..ctx.nranges {
         let len = ngx_quic_create_ack_range_len(ctx.ranges[i].gap, ctx.ranges[i].range);
@@ -980,12 +980,10 @@ pub fn ngx_quic_send_ack(c: &Connection, qc: &QuicConnection, ctx: &mut QuicSend
             data.0.push_back(ngx_quic_alloc_chain(c));
         }
 
-        range.clear();
-        ngx_quic_create_ack_range(&mut range, ctx.ranges[i].gap, ctx.ranges[i].range);
-
         if let Some(b) = data.0.back_mut() {
-            b.block.borrow_mut()[b.last..b.last + range.len()].copy_from_slice(&range);
-            b.last += range.len();
+            let last = b.last;
+            let n = ngx_quic_create_ack_range_into(&mut b.block.borrow_mut()[last..], ctx.ranges[i].gap, ctx.ranges[i].range);
+            b.last += n;
         }
 
         frame.u.ack.ranges_length += len as u64;

@@ -1412,6 +1412,16 @@ pub fn ngx_quic_create_ack_range(out: &mut Vec<u8>, gap: u64, range: u64) -> usi
     out.len() - start
 }
 
+/// ngx_quic_create_ack_range written at the start of `out`: its length
+pub fn ngx_quic_create_ack_range_into(out: &mut [u8], gap: u64, range: u64) -> usize {
+    let mut w = SliceWriter { buf: out, pos: 0 };
+
+    w.varint(gap);
+    w.varint(range);
+
+    w.pos
+}
+
 pub fn ngx_quic_create_ack_range_len(gap: u64, range: u64) -> usize {
     ngx_quic_varint_len(gap) + ngx_quic_varint_len(range)
 }

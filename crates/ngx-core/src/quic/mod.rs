@@ -525,6 +525,9 @@ pub struct QuicConnection {
     pub nframes: Cell<usize>,
     pub free_frames: Cell<usize>,
     pub max_frames: Cell<usize>,
+    /// qc->free_frames itself: the frames freed, reset, for reuse (at most
+    /// frames::NGX_QUIC_FREE_FRAMES_KEPT of them; the counters go on)
+    pub frames_free: RefCell<Vec<Box<QuicFrame>>>,
 
     pub compat: RefCell<Option<openssl_compat::QuicCompat>>,
 
@@ -762,15 +765,17 @@ pub fn ngx_quic_run(c: &Rc<Connection>, conf: &Rc<QuicConf>) {
     });
 }
 
-/// ngx_quic_new_connection
-fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHeader<'_>) -> Option<Rc<QuicConnection>> {
-    let posted = Rc::new(RefCell::new(VecDeque::new()));
-    let wake = Rc::new(tokio::sync::Notify::new());
+impl QuicConnection {
+    /// The ngx_quic_connection_t of ngx_quic_new_connection(), as
+    /// ngx_pcalloc() makes it.
+    fn alloc(version: u32, conf: &Rc<QuicConf>) -> QuicConnection {
+        let posted = Rc::new(RefCell::new(VecDeque::new()));
+        let wake = Rc::new(tokio::sync::Notify::new());
 
-    let ev = |kind: QEventKind| Rc::new(QEvent { timer: Cell::new(None), posted: Cell::new(false), timedout: Cell::new(false), kind, wake: wake.clone(), queue: Rc::downgrade(&posted) });
+        let ev = |kind: QEventKind| Rc::new(QEvent { timer: Cell::new(None), posted: Cell::new(false), timedout: Cell::new(false), kind, wake: wake.clone(), queue: Rc::downgrade(&posted) });
 
-    let qc = Rc::new(QuicConnection {
-        version: Cell::new(pkt.version),
+        QuicConnection {
+        version: Cell::new(version),
         path: RefCell::new(None),
         sockets: RefCell::new(Vec::new()),
         paths: RefCell::new(Vec::new()),
@@ -803,6 +808,7 @@ fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHe
         nframes: Cell::new(0),
         free_frames: Cell::new(0),
         max_frames: Cell::new(0),
+        frames_free: RefCell::new(Vec::new()),
         compat: RefCell::new(None),
         streams: QuicStreams::default(),
         congestion: QuicCongestion::default(),
@@ -827,7 +833,19 @@ fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHe
         posted,
         wake,
         app_events: RefCell::new(Vec::new()),
-    });
+        }
+    }
+
+    /// A connection for the unit tests of the frames.
+    #[cfg(test)]
+    pub fn new_for_tests(_c: &Connection) -> QuicConnection {
+        QuicConnection::alloc(1, &Rc::new(QuicConf::default()))
+    }
+}
+
+/// ngx_quic_new_connection
+fn ngx_quic_new_connection(c: &Rc<Connection>, conf: &Rc<QuicConf>, pkt: &QuicHeader<'_>) -> Option<Rc<QuicConnection>> {
+    let qc = Rc::new(QuicConnection::alloc(pkt.version, conf));
 
     qc.init_rtt();
 

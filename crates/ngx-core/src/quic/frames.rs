@@ -88,9 +88,48 @@ pub struct QuicBuffer {
     pub chain: QChain,
 }
 
-/// ngx_quic_alloc_buf
+/// The most blocks no buffer uses that a worker keeps for reuse.
+const NGX_QUIC_FREE_BLOCKS_KEPT: usize = 256;
+
+/// The most frames a connection keeps on its free list.
+pub const NGX_QUIC_FREE_FRAMES_KEPT: usize = 256;
+
+type QBlock = Rc<RefCell<Box<[u8]>>>;
+
+thread_local! {
+    /// The blocks of the buffers no buffer uses any more, for the next
+    /// ngx_quic_alloc_buf() of the worker (C keeps them per connection,
+    /// qc->free_bufs). Their bytes are not cleared: a new buffer is empty,
+    /// or a hole, until written.
+    static FREE_BLOCKS: RefCell<Vec<QBlock>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Drop for QBuf {
+    /// ngx_quic_free_buf: the last buffer of a block gives it back.
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.block) != 1 || Rc::weak_count(&self.block) != 0 {
+            return;
+        }
+
+        let block = &self.block;
+
+        let _ = FREE_BLOCKS.try_with(|free| {
+            if let Ok(mut free) = free.try_borrow_mut() {
+                if free.len() < NGX_QUIC_FREE_BLOCKS_KEPT {
+                    free.push(block.clone());
+                }
+            }
+        });
+    }
+}
+
+/// ngx_quic_alloc_buf: an empty buffer of a block no buffer uses
 fn ngx_quic_alloc_buf() -> QBuf {
-    QBuf { block: Rc::new(RefCell::new(vec![0u8; NGX_QUIC_BUFFER_SIZE].into_boxed_slice())), pos: 0, last: 0, sync: false }
+    let block = FREE_BLOCKS.try_with(|free| free.try_borrow_mut().ok()?.pop()).ok().flatten();
+
+    let block = block.unwrap_or_else(|| Rc::new(RefCell::new(vec![0u8; NGX_QUIC_BUFFER_SIZE].into_boxed_slice())));
+
+    QBuf { block, pos: 0, last: 0, sync: false }
 }
 
 /// ngx_quic_split_chain: the buffer at `i` ends at `offset` into it, a
@@ -120,16 +159,32 @@ pub fn ngx_quic_alloc_frame(c: &Connection) -> Option<Box<QuicFrame>> {
         return None;
     }
 
-    Some(Box::default())
+    let frame = qc.frames_free.borrow_mut().pop();
+
+    Some(frame.unwrap_or_default())
 }
 
-/// ngx_quic_free_frame
-pub fn ngx_quic_free_frame(c: &Connection, frame: Box<QuicFrame>) {
-    if let Some(qc) = ngx_quic_get_connection(c) {
-        qc.free_frames.set(qc.free_frames.get() + 1);
-    }
+/// ngx_quic_free_frame: the frame, reset (its data given up, the chain
+/// keeping its room), to the free list of the connection
+pub fn ngx_quic_free_frame(c: &Connection, mut frame: Box<QuicFrame>) {
+    let qc = match ngx_quic_get_connection(c) {
+        Some(qc) => qc,
+        None => return,
+    };
 
-    drop(frame);
+    qc.free_frames.set(qc.free_frames.get() + 1);
+
+    let mut data = std::mem::take(&mut frame.data);
+
+    data.0.clear();
+
+    *frame = QuicFrame { data, ..Default::default() };
+
+    let mut free = qc.frames_free.borrow_mut();
+
+    if free.len() < NGX_QUIC_FREE_FRAMES_KEPT {
+        free.push(frame);
+    }
 }
 
 /// ngx_quic_free_chain
@@ -190,16 +245,31 @@ pub fn ngx_quic_split_frame(c: &Connection, frames: &mut VecDeque<Box<QuicFrame>
 
     let mut qb = QuicBuffer { chain: std::mem::take(&mut f.data), ..Default::default() };
 
-    f.data = ngx_quic_read_buffer(c, &mut qb, f.u.ord.length);
-
     let mut nf = match ngx_quic_alloc_frame(c) {
         Some(nf) => nf,
-        None => return NGX_ERROR,
+        None => {
+            frames[i].data = qb.chain;
+            return NGX_ERROR;
+        }
     };
 
     let f = &mut frames[i];
 
-    *nf = QuicFrame { data: QChain::default(), ..(**f).clone() };
+    // the first part into the chain of the new frame, which keeps its
+    // room, then the chains swapped
+    let mut head = std::mem::take(&mut nf.data);
+
+    ngx_quic_read_buffer_into(c, &mut qb, f.u.ord.length, &mut head);
+
+    f.data = head;
+
+    // the new frame: a copy of the frame but for its data
+    let data = std::mem::take(&mut f.data);
+
+    *nf = (**f).clone();
+
+    f.data = data;
+
     nf.u.ord.offset += f.u.ord.length;
     nf.u.ord.length = shrink as u64;
     nf.len = ngx_quic_frame_len(&mut nf);
@@ -231,9 +301,17 @@ pub fn ngx_quic_copy_buffer(c: &Connection, data: &[u8]) -> QChain {
 
 /// ngx_quic_read_buffer: the data of the buffer from its offset, up to
 /// `limit` bytes or a hole
-pub fn ngx_quic_read_buffer(_c: &Connection, qb: &mut QuicBuffer, mut limit: u64) -> QChain {
+pub fn ngx_quic_read_buffer(c: &Connection, qb: &mut QuicBuffer, limit: u64) -> QChain {
     let mut out = QChain::default();
 
+    ngx_quic_read_buffer_into(c, qb, limit, &mut out);
+
+    out
+}
+
+/// ngx_quic_read_buffer, the buffers moved to the end of `out` (a chain
+/// with room for them, as C links them to the chain it returns)
+pub fn ngx_quic_read_buffer_into(_c: &Connection, qb: &mut QuicBuffer, mut limit: u64, out: &mut QChain) {
     while let Some(b) = qb.chain.0.front() {
         if b.sync {
             /* hole */
@@ -259,8 +337,56 @@ pub fn ngx_quic_read_buffer(_c: &Connection, qb: &mut QuicBuffer, mut limit: u64
             out.0.push_back(b);
         }
     }
+}
 
-    out
+/// The bytes ngx_quic_read_buffer() takes: up to `limit`, the data from
+/// the offset of the buffer to its first hole.
+pub fn ngx_quic_buffer_readable(qb: &QuicBuffer, limit: u64) -> u64 {
+    let mut n = 0u64;
+
+    for b in qb.chain.iter() {
+        if b.sync || n >= limit {
+            break;
+        }
+
+        n += b.len() as u64;
+    }
+
+    n.min(limit)
+}
+
+/// ngx_quic_read_buffer() of up to `buf.len()` bytes copied to `buf` (the
+/// buffers read freed, as ngx_quic_stream_recv() does): their number.
+pub fn ngx_quic_read_buffer_copy(_c: &Connection, qb: &mut QuicBuffer, buf: &mut [u8]) -> usize {
+    let mut len = 0usize;
+
+    while let Some(b) = qb.chain.0.front_mut() {
+        if b.sync {
+            /* hole */
+            break;
+        }
+
+        if len == buf.len() {
+            break;
+        }
+
+        let n = b.len().min(buf.len() - len);
+
+        buf[len..len + n].copy_from_slice(&b.block.borrow()[b.pos..b.pos + n]);
+
+        len += n;
+        qb.offset += n as u64;
+
+        if n < b.len() {
+            // the rest of it stays (a clone of it split off in C)
+            b.pos += n;
+            break;
+        }
+
+        qb.chain.0.pop_front();
+    }
+
+    len
 }
 
 /// ngx_quic_skip_buffer
@@ -545,6 +671,113 @@ mod tests {
 
     fn data(qc: &QChain) -> Vec<u8> {
         qc.to_vec()
+    }
+
+    #[test]
+    fn blocks_reused_by_the_last_buffer() {
+        FREE_BLOCKS.with(|f| f.borrow_mut().clear());
+
+        let b = ngx_quic_alloc_buf();
+        let p = b.block.borrow().as_ptr();
+
+        // a clone shares the block: given back with the last of them
+        let clone = b.clone();
+        drop(b);
+        assert_eq!(FREE_BLOCKS.with(|f| f.borrow().len()), 0);
+        drop(clone);
+        assert_eq!(FREE_BLOCKS.with(|f| f.borrow().len()), 1);
+
+        // reused as it is (not cleared), empty
+        clone_write(p);
+
+        let b = ngx_quic_alloc_buf();
+        assert_eq!(b.block.borrow().as_ptr(), p);
+        assert_eq!((b.pos, b.last, b.sync), (0, 0, false));
+        assert_eq!(FREE_BLOCKS.with(|f| f.borrow().len()), 0);
+    }
+
+    fn clone_write(p: *const u8) {
+        FREE_BLOCKS.with(|f| {
+            let f = f.borrow();
+            let block = f.last().unwrap();
+            assert_eq!(block.borrow().as_ptr(), p);
+            block.borrow_mut()[0] = 9;
+        });
+    }
+
+    #[test]
+    fn readable_and_copied() {
+        let log = crate::log::Log::stderr(0);
+        crate::connection::set_connection_n(16);
+        let c = crate::connection::Connection::get(-1, &log).expect("connection");
+
+        let d: Vec<u8> = (0..200u8).collect();
+
+        // [0, 50) and [60, 200): a hole between
+        let mut qb = QuicBuffer::default();
+        let mut input = [&d[0..50]];
+        ngx_quic_write_buffer(&c, &mut qb, &mut input, 50, 0);
+        let mut input = [&d[60..200]];
+        ngx_quic_write_buffer(&c, &mut qb, &mut input, 140, 60);
+
+        assert_eq!(ngx_quic_buffer_readable(&qb, 1000), 50);
+        assert_eq!(ngx_quic_buffer_readable(&qb, 20), 20);
+
+        let mut buf = [0u8; 20];
+        assert_eq!(ngx_quic_read_buffer_copy(&c, &mut qb, &mut buf), 20);
+        assert_eq!(&buf[..], &d[0..20]);
+        assert_eq!(qb.offset, 20);
+
+        let mut buf = [0u8; 100];
+        assert_eq!(ngx_quic_read_buffer_copy(&c, &mut qb, &mut buf), 30);
+        assert_eq!(&buf[..30], &d[20..50]);
+        assert_eq!(qb.offset, 50);
+        assert_eq!(ngx_quic_buffer_readable(&qb, 1000), 0);
+
+        // the hole filled: the rest, read into a chain with room
+        let mut input = [&d[50..60]];
+        ngx_quic_write_buffer(&c, &mut qb, &mut input, 10, 50);
+        assert_eq!(ngx_quic_buffer_readable(&qb, 1000), 150);
+
+        let mut out = QChain(VecDeque::with_capacity(8));
+        ngx_quic_read_buffer_into(&c, &mut qb, 1000, &mut out);
+        assert_eq!(data(&out), &d[50..200]);
+        assert_eq!(qb.offset, 200);
+    }
+
+    #[test]
+    fn frames_from_the_free_list() {
+        let log = crate::log::Log::stderr(0);
+        crate::connection::set_connection_n(16);
+        let c = crate::connection::Connection::get(-1, &log).expect("connection");
+
+        let qc = Rc::new(crate::quic::QuicConnection::new_for_tests(&c));
+        qc.max_frames.set(2);
+        *c.quic_conn.borrow_mut() = Some(qc.clone());
+
+        let mut f = ngx_quic_alloc_frame(&c).expect("frame");
+        f.ty = NGX_QUIC_FT_STREAM;
+        f.data.0.push_back(ngx_quic_alloc_buf());
+        let p = &*f as *const QuicFrame;
+
+        let g = ngx_quic_alloc_frame(&c).expect("frame");
+
+        // the flood limit, as C counts
+        assert!(ngx_quic_alloc_frame(&c).is_none());
+
+        ngx_quic_free_frame(&c, f);
+        assert_eq!(qc.free_frames.get(), 1);
+
+        // the same frame, reset, its chain empty with its room
+        let f = ngx_quic_alloc_frame(&c).expect("frame");
+        assert_eq!(&*f as *const QuicFrame, p);
+        assert_eq!(f.ty, 0);
+        assert!(f.data.is_empty() && f.data.0.capacity() > 0);
+        assert_eq!(qc.free_frames.get(), 0);
+
+        ngx_quic_free_frame(&c, f);
+        ngx_quic_free_frame(&c, g);
+        assert_eq!((qc.free_frames.get(), qc.nframes.get()), (2, 2));
     }
 
     #[test]
