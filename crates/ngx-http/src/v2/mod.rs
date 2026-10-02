@@ -27,7 +27,7 @@ use std::rc::{Rc, Weak};
 
 use ngx_core::connection::Connection;
 
-use crate::request::{HttpConnection, R};
+use crate::request::{HttpConnection, HttpLogCtx, R};
 
 pub const NGX_HTTP_V2_ALPN_PROTO: &[u8] = b"\x02h2";
 
@@ -355,6 +355,38 @@ pub struct H2Stream {
     /// The main request's upstream as its read event handler: the fake
     /// connection's read event goes to it.
     pub upstream_watch: RefCell<Option<Weak<StreamWatch>>>,
+    /// The log context of the fake connection (fc->log->data), kept with
+    /// it for reuse.
+    pub log_ctx: Rc<HttpLogCtx>,
+}
+
+/// The most fake connections an HTTP/2 connection keeps for its next
+/// streams.
+pub const NGX_HTTP_V2_FREE_FAKE_KEPT: usize = 64;
+
+impl Drop for H2Stream {
+    /// ngx_http_v2_close_stream: the fake connection, and its log context,
+    /// to h2c->free_fake_connections, unless something else still refers
+    /// to them (then they go as they are).
+    fn drop(&mut self) {
+        let fc = &self.fc;
+
+        let free = Rc::strong_count(fc) == 1
+            && Rc::weak_count(fc) <= 1
+            && Rc::strong_count(&fc.log.inner) == 1
+            && Rc::strong_count(&self.log_ctx) <= 2
+            && fc.cleanups.borrow().is_empty();
+
+        if !free {
+            return;
+        }
+
+        if let Ok(mut list) = self.connection.free_fake_connections.try_borrow_mut() {
+            if list.len() < NGX_HTTP_V2_FREE_FAKE_KEPT {
+                list.push((fc.clone(), self.log_ctx.clone()));
+            }
+        }
+    }
 }
 
 /// The read event handler of a request that its upstream sets
@@ -493,6 +525,9 @@ pub struct H2Connection {
     /// The connection's read timer (client_header_timeout, then
     /// keepalive_timeout while idle); streams delete it when created.
     pub read_timer: Cell<Option<tokio::time::Instant>>,
+    /// h2c->free_fake_connections: the fake connections of the streams
+    /// that went, with their log contexts (released while idle)
+    pub free_fake_connections: RefCell<Vec<(Rc<Connection>, Rc<HttpLogCtx>)>>,
 }
 
 /// An effect of a state handler that C performs by calling into a stream
@@ -567,9 +602,16 @@ thread_local! {
 }
 
 /// An empty buffer for a frame of `size` bytes, one written out before if
-/// there is one.
+/// there is one: the last one freed which holds the frame, else the last
+/// one freed (grown).
 pub fn frame_buf(size: usize) -> Vec<u8> {
-    let mut v = FRAME_BUFS.try_with(|bufs| bufs.try_borrow_mut().ok()?.pop()).ok().flatten().unwrap_or_default();
+    let v = FRAME_BUFS.try_with(|bufs| {
+        let mut bufs = bufs.try_borrow_mut().ok()?;
+        let i = bufs.iter().rposition(|b| b.capacity() >= size).or_else(|| bufs.len().checked_sub(1))?;
+        Some(bufs.swap_remove(i))
+    });
+
+    let mut v = v.ok().flatten().unwrap_or_default();
 
     v.reserve(size);
 
@@ -678,6 +720,119 @@ mod tests {
 
     fn header(s: &State) -> (Vec<u8>, Vec<u8>) {
         (s.header_name.borrow().clone(), s.header_value.borrow().clone())
+    }
+
+    /// The fields of a fake connection a new stream sees.
+    fn fake_state(fc: &Connection) -> String {
+        format!(
+            "fd:{} sock:{:?} addr:{:?} orig:{:?}/{:?} local:{:?} pp:{} ssl:{} buf:{:?} sent:{} req:{} st:{}/{} to:{} err:{} destr:{} idle:{} close:{} shared:{} nodelay:{:?} nopush:{:?} last:{} flush:{} sf:{} udp:{} data:{} reus:{} ch:{} pipe:{} rd:{} wd:{} wdu:{:?} ueof:{} wr:{} reof:{} rpe:{} le:{} cln:{} pl:{} quic:{}/{}/{} log:{}/{}/{:?}/{}",
+            fc.fd.get(),
+            fc.sockaddr.borrow(),
+            fc.addr_text.borrow(),
+            fc.original_sockaddr.borrow(),
+            fc.original_addr_text.borrow(),
+            fc.local_sockaddr.borrow(),
+            fc.proxy_protocol.borrow().is_some(),
+            fc.ssl.borrow().is_some(),
+            fc.buffer.borrow(),
+            fc.sent.get(),
+            fc.requests.get(),
+            fc.start_time.get(),
+            fc.start_msec.get(),
+            fc.timedout.get(),
+            fc.error.get(),
+            fc.destroyed.get(),
+            fc.idle.get(),
+            fc.close.get(),
+            fc.shared.get(),
+            fc.tcp_nodelay.get(),
+            fc.tcp_nopush.get(),
+            fc.need_last_buf.get(),
+            fc.need_flush_buf.get(),
+            fc.sendfile.get(),
+            fc.udp.get(),
+            fc.data.borrow().is_some(),
+            fc.reusable.get(),
+            fc.close_handler.borrow().is_some(),
+            fc.pipeline.get(),
+            fc.read_delayed.get(),
+            fc.write_delayed.get(),
+            fc.write_delay_until.get(),
+            fc.unexpected_eof.get(),
+            fc.write_ready.get(),
+            fc.read_eof.get(),
+            fc.read_pending_eof.get(),
+            fc.log_error.get(),
+            fc.cleanups.borrow().len(),
+            fc.passed_listening.borrow().is_some(),
+            fc.quic_conn.borrow().is_some(),
+            fc.quic_sock.borrow().is_some(),
+            fc.quic_stream.borrow().is_some(),
+            fc.log.level(),
+            fc.log.connection(),
+            fc.log.action(),
+            fc.log.context().is_some(),
+        )
+    }
+
+    #[test]
+    fn fake_connection_made_again() {
+        let log = ngx_core::log::Log::stderr(ngx_core::log::NGX_LOG_WARN);
+        ngx_core::connection::set_connection_n(16);
+
+        let c = Connection::get(-1, &log).expect("connection");
+        *c.addr_text.borrow_mut() = b"127.0.0.1".to_vec();
+        c.requests.set(7);
+        c.sendfile.set(true);
+
+        let fresh = Connection::new_fake(&c);
+
+        // a stream's request ran on it
+        let fc = Connection::new_fake(&c);
+
+        fc.sent.set(1000);
+        fc.requests.set(9);
+        fc.timedout.set(true);
+        fc.error.set(true);
+        fc.destroyed.set(true);
+        fc.close.set(true);
+        fc.idle.set(true);
+        fc.need_last_buf.set(true);
+        fc.need_flush_buf.set(true);
+        fc.read_eof.set(true);
+        fc.write_delay_until.set(Some(std::time::Instant::now()));
+        fc.addr_text.borrow_mut().extend_from_slice(b":changed");
+        fc.buffer.borrow_mut().extend_from_slice(b"data");
+        *fc.data.borrow_mut() = Some(Rc::new(5u32));
+        *fc.proxy_protocol.borrow_mut() = Some(Rc::new(1u8));
+        *fc.close_handler.borrow_mut() = Some(Rc::new(|_c: &Rc<Connection>| {}));
+        fc.add_cleanup(ngx_core::connection::PoolCleanup { tag: "test", data: None, handler: None });
+        fc.log.set_action(Some("sending to client"));
+        fc.log.set_level(ngx_core::log::NGX_LOG_DEBUG);
+        fc.log.set_connection(99);
+
+        struct Ctx;
+        impl ngx_core::log::LogContext for Ctx {
+            fn write_context(&self, _buf: &mut Vec<u8>) {}
+        }
+        fc.log.set_context(Some(Rc::new(Ctx)));
+
+        // a notify_one() nothing waited for
+        fc.close_notify.notify_one();
+
+        assert_ne!(fake_state(&fc), fake_state(&fresh));
+
+        fc.reset_fake(&c);
+
+        assert_eq!(fake_state(&fc), fake_state(&fresh));
+
+        // no permit left over
+        let notified = fc.close_notify.notified();
+        assert!(!std::pin::pin!(notified).enable());
+
+        // still not counted as a connection, the same number
+        assert!(fc.fake);
+        assert_eq!(fc.number, c.number);
     }
 
     #[test]

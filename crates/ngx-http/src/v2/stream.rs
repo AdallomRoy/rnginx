@@ -313,13 +313,39 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
     let c = &h2c.connection;
     let hc = &h2c.http_connection;
 
-    let fc = Connection::new_fake(c);
+    // h2c->free_fake_connections: the fake connection and the log context
+    // of a stream that went, made again (if nothing else holds the log
+    // context), or new ones
+    let reused = h2c.free_fake_connections.borrow_mut().pop();
 
-    let log_ctx = Rc::new(HttpLogCtx {
-        connection: Rc::downgrade(&fc),
-        request: RefCell::new(None),
-        current_request: RefCell::new(None),
+    let reused = reused.and_then(|(fc, log_ctx)| {
+        fc.reset_fake(c);
+
+        if Rc::strong_count(&log_ctx) != 1 {
+            return None;
+        }
+
+        *log_ctx.request.borrow_mut() = None;
+        *log_ctx.current_request.borrow_mut() = None;
+
+        Some((fc, log_ctx))
     });
+
+    let (fc, log_ctx) = match reused {
+        Some(r) => r,
+        None => {
+            let fc = Connection::new_fake(c);
+
+            let log_ctx = Rc::new(HttpLogCtx {
+                connection: Rc::downgrade(&fc),
+                request: RefCell::new(None),
+                current_request: RefCell::new(None),
+            });
+
+            (fc, log_ctx)
+        }
+    };
+
     fc.log.set_context(Some(log_ctx.clone()));
     fc.log.set_action(Some("reading client request headers"));
 
@@ -368,6 +394,7 @@ pub fn create_stream(h2c: &Rc<H2Connection>, node: &Rc<H2Node>) -> Rc<H2Stream> 
         authority: RefCell::new(None),
         test_reading: RefCell::new(None),
         upstream_watch: RefCell::new(None),
+        log_ctx: log_ctx.clone(),
     });
 
     let any: Rc<dyn std::any::Any> = stream.clone();
@@ -773,8 +800,8 @@ fn construct_cookie_header(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R)
 }
 
 /// ngx_http_v2_construct_host_header: Host from :authority, for $http_host.
-fn construct_host_header(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R, host: &[u8]) -> Result<(), ()> {
-    process_header_line(h2c, stream, r, b"host", host)
+fn construct_host_header(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R, host: Vec<u8>) -> Result<(), ()> {
+    process_header_line_owned(h2c, stream, r, b"host", host)
 }
 
 // ---------------------------------------------------------------------------
@@ -880,21 +907,22 @@ fn run_request_checks(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R) -> C
         }
     }
 
-    let authority = stream.authority.borrow().clone();
+    // the :authority value, no longer needed by the stream (pseudo-headers
+    // after the request line are refused): moved into the Host header
+    let authority = stream.authority.borrow_mut().take();
 
     if let Some(host) = authority {
-        let host_header = r.headers_in.borrow().host.as_ref().map(|h| h.value.borrow().clone());
+        let differs = r.headers_in.borrow().host.as_ref().map(|h| *h.value.borrow() != host);
 
-        match host_header {
-            Some(h) => {
-                if h != host {
-                    ngx_log_error!(NGX_LOG_INFO, fc.log, None, "client sent \":authority\" and \"Host\" headers with different values");
-                    return Checked::Finalize(NGX_HTTP_BAD_REQUEST);
-                }
+        match differs {
+            Some(true) => {
+                ngx_log_error!(NGX_LOG_INFO, fc.log, None, "client sent \":authority\" and \"Host\" headers with different values");
+                return Checked::Finalize(NGX_HTTP_BAD_REQUEST);
             }
+            Some(false) => {}
             None => {
                 // compatibility for $http_host
-                if construct_host_header(h2c, stream, r, &host).is_err() {
+                if construct_host_header(h2c, stream, r, host).is_err() {
                     return Checked::Done;
                 }
             }
