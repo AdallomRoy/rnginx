@@ -379,7 +379,7 @@ impl LogContext for HttpLogCtx {
 
 /// ngx_http_log_error_handler
 pub fn log_error_handler(r: &R, sr: &R, buf: &mut Vec<u8>) {
-    let cscf = r.srv_conf::<CoreSrvConf>(core::ctx_index());
+    let cscf = r.cscf();
     buf.extend_from_slice(b", server: ");
     buf.extend_from_slice(&cscf.borrow().server_name);
     let rl = r.request_line.borrow();
@@ -678,6 +678,52 @@ pub struct Request {
     /// subrequests (c->data, r->main->count of theirs): not a module
     /// context, which an internal redirect clears.
     pub posted_subrequests: RefCell<Option<Rc<dyn Any>>>,
+    /// the core module's confs of main_conf, srv_conf and loc_conf
+    pub(crate) core_conf: CoreConfs,
+}
+
+/// A core module conf of the request (ngx_http_get_module_loc_conf(r,
+/// ngx_http_core_module) and the like), kept with the conf slots it was
+/// taken from: r.clcf() and the like give it without a lookup and a
+/// downcast while the slots stay the same, and take it again from the
+/// slots set since (find_config, an internal redirect or a server switch
+/// set r.loc_conf / r.srv_conf).
+pub(crate) struct CoreConf<T>(RefCell<Option<(Rc<ConfSlots>, Rc<RefCell<T>>)>>);
+
+impl<T: 'static> CoreConf<T> {
+    fn new() -> CoreConf<T> {
+        CoreConf(RefCell::new(None))
+    }
+
+    fn get(&self, slots: &RefCell<Rc<ConfSlots>>) -> Rc<RefCell<T>> {
+        self.get_at(slots, core::ctx_index)
+    }
+
+    /// The conf of slot index(), the core module's.
+    fn get_at(&self, slots: &RefCell<Rc<ConfSlots>>, index: fn() -> usize) -> Rc<RefCell<T>> {
+        let slots = slots.borrow();
+        if let Some((from, conf)) = &*self.0.borrow() {
+            if Rc::ptr_eq(from, &slots) {
+                return conf.clone();
+            }
+        }
+        let conf = slot_of::<T>(&slots, index());
+        *self.0.borrow_mut() = Some((slots.clone(), conf.clone()));
+        conf
+    }
+}
+
+/// The cached core module confs of a request.
+pub(crate) struct CoreConfs {
+    main: CoreConf<CoreMainConf>,
+    srv: CoreConf<CoreSrvConf>,
+    loc: CoreConf<CoreLocConf>,
+}
+
+impl CoreConfs {
+    fn new() -> CoreConfs {
+        CoreConfs { main: CoreConf::new(), srv: CoreConf::new(), loc: CoreConf::new() }
+    }
 }
 
 impl Request {
@@ -717,15 +763,15 @@ impl Request {
     }
 
     pub fn clcf(&self) -> Rc<RefCell<CoreLocConf>> {
-        self.loc_conf::<CoreLocConf>(core::ctx_index())
+        self.core_conf.loc.get(&self.loc_conf)
     }
 
     pub fn cscf(&self) -> Rc<RefCell<CoreSrvConf>> {
-        self.srv_conf::<CoreSrvConf>(core::ctx_index())
+        self.core_conf.srv.get(&self.srv_conf)
     }
 
     pub fn cmcf(&self) -> Rc<RefCell<CoreMainConf>> {
-        self.main_conf::<CoreMainConf>(core::ctx_index())
+        self.core_conf.main.get(&self.main_conf)
     }
 
     pub fn get_ctx<T: 'static>(&self, idx: usize) -> Option<Rc<RefCell<T>>> {
@@ -994,6 +1040,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
         postponed: RefCell::new(std::collections::VecDeque::new()),
         post_subrequest_async: RefCell::new(None),
         posted_subrequests: RefCell::new(None),
+        core_conf: CoreConfs::new(),
     });
     *r.weak_self.borrow_mut() = Rc::downgrade(&r);
     // c->ssl && !c->ssl->sendfile: without kernel TLS the file data is
@@ -1046,6 +1093,23 @@ pub(crate) fn _silence(log: &Log) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_conf_follows_the_slots() {
+        let slots = |v: u32| -> Rc<ConfSlots> { Rc::new(RefCell::new(vec![Some(make_slot(v))])) };
+        let (a, b) = (slots(1), slots(2));
+        let cur = RefCell::new(a.clone());
+        let cache: CoreConf<u32> = CoreConf::new();
+        let first = cache.get_at(&cur, || 0);
+        assert_eq!(*first.borrow(), 1);
+        // the same conf while the slots stay
+        assert!(Rc::ptr_eq(&first, &cache.get_at(&cur, || 0)));
+        // the slots set by someone else (find_config): taken again
+        *cur.borrow_mut() = b.clone();
+        assert_eq!(*cache.get_at(&cur, || 0).borrow(), 2);
+        *cur.borrow_mut() = a;
+        assert!(Rc::ptr_eq(&first, &cache.get_at(&cur, || 0)));
+    }
 
     #[test]
     fn table_elt_owned_keeps_its_parts() {
