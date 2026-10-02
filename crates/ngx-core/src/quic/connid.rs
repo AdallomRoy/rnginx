@@ -365,3 +365,51 @@ pub fn ngx_quic_free_client_id(c: &Connection, cid: &Rc<QuicClientId>) -> i64 {
 
     NGX_OK
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+
+    use super::*;
+    use crate::inet::SockAddr;
+
+    fn conn(fd: i32) -> Rc<Connection> {
+        crate::connection::set_connection_n(16);
+        Connection::peer(fd, libc::SOCK_DGRAM, SockAddr::v4(std::net::Ipv4Addr::LOCALHOST, 0), &Log::stderr(0)).expect("connection")
+    }
+
+    /// The socket's cookie in the first 8 bytes of a server id, for the BPF
+    /// program to route the packets with (ngx_quic_bpf_attach_id)
+    #[test]
+    fn server_id_with_socket_cookie() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cookie = rustix::net::sockopt::socket_cookie(&sock).unwrap();
+        let fd = crate::fd::register(OwnedFd::from(sock));
+
+        let c = conn(fd);
+        let mut id = [0u8; NGX_QUIC_SERVER_CID_LEN];
+        let mut other = [0u8; NGX_QUIC_SERVER_CID_LEN];
+
+        assert_eq!(ngx_quic_create_server_id(&c, &mut id), NGX_OK);
+        assert_eq!(ngx_quic_create_server_id(&c, &mut other), NGX_OK);
+
+        assert_eq!(id[..8], cookie.to_be_bytes());
+        assert_eq!(other[..8], cookie.to_be_bytes());
+        assert_ne!(id[8..], other[8..], "random");
+
+        c.fd.set(-1);
+        crate::fd::close(fd).unwrap();
+    }
+
+    /// getsockopt(SO_COOKIE) failing is logged, and the id stays random
+    #[test]
+    fn server_id_without_socket() {
+        let c = conn(-1);
+        let mut id = [0u8; NGX_QUIC_SERVER_CID_LEN];
+        let mut other = [0u8; NGX_QUIC_SERVER_CID_LEN];
+
+        assert_eq!(ngx_quic_create_server_id(&c, &mut id), NGX_OK);
+        assert_eq!(ngx_quic_create_server_id(&c, &mut other), NGX_OK);
+        assert_ne!(id, other);
+    }
+}
