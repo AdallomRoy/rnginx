@@ -190,6 +190,7 @@ Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six P
 - `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`; nothing relies on unwinding, and a panicking worker then exits like a crashed C worker.
 - `#[global_allocator]`: mimalloc or jemalloc via the safe crates, chosen by measurement.
 - Measured on master: +14 to +29% from LTO plus jemalloc (report §10).
+- Measured again on the Phase 1 build (`results/alloc-preload-20261002.jsonl`: the distro's allocators by LD_PRELOAD, 3 interleaved reps). jemalloc 5.2: +6% `h1-return`, +12% `h2-tls-1k`, +3% `h3-1k`, +6% `proxy-1k-keepalive`; idle memory per HTTP/1.1 connection unchanged (2.33 KB, glibc 2.37). mimalloc 2.0: −10 to −17%, and 3.02 KB per idle connection. Part of that may be the preload itself (a shared library's thread-local storage is slower), and the crate ships mimalloc 3: builds that link each allocator decide.
 
 **4. Re-baseline:** the full benchmark of the merged branch against C.
 

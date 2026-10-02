@@ -52,10 +52,16 @@ BINS["rust-lto"] = f"{B}/bin/nginx-rust-lto"           # master 7f01d41, fat LTO
 BINS["rust-jemalloc"] = BINS["rust"]
 BINS["rust-mimalloc"] = BINS["rust"]
 BINS["rust-lto-jemalloc"] = BINS["rust-lto"]
+# the Phase 1 build on the distro's jemalloc 5.2 and mimalloc 2.0
+BINS["rust-p1-jemalloc"] = BINS["rust-p1"]
+BINS["rust-p1-mimalloc"] = BINS["rust-p1"]
 JEMALLOC = "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+MIMALLOC = "/usr/lib/x86_64-linux-gnu/libmimalloc.so.2"
 ENVS = {"rust-jemalloc": {"LD_PRELOAD": JEMALLOC},
-        "rust-mimalloc": {"LD_PRELOAD": "/usr/lib/x86_64-linux-gnu/libmimalloc.so.2"},
-        "rust-lto-jemalloc": {"LD_PRELOAD": JEMALLOC}}
+        "rust-mimalloc": {"LD_PRELOAD": MIMALLOC},
+        "rust-lto-jemalloc": {"LD_PRELOAD": JEMALLOC},
+        "rust-p1-jemalloc": {"LD_PRELOAD": JEMALLOC},
+        "rust-p1-mimalloc": {"LD_PRELOAD": MIMALLOC}}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")
