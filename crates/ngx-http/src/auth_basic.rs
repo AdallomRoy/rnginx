@@ -392,11 +392,11 @@ fn auth_basic_set_realm(r: &R, realm: &[u8]) -> i64 {
     let mut ho = r.headers_out.borrow_mut();
 
     if r.is_proxy_auth() {
-        let h = ho.add(b"Proxy-Authenticate", &basic);
+        let h = ho.add_generated(b"Proxy-Authenticate", basic);
         ho.proxy_authenticate = vec![h];
         NGX_HTTP_PROXY_AUTH_REQUIRED
     } else {
-        let h = ho.add(b"WWW-Authenticate", &basic);
+        let h = ho.add_generated(b"WWW-Authenticate", basic);
         ho.www_authenticate = vec![h];
         NGX_HTTP_UNAUTHORIZED
     }

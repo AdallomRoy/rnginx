@@ -262,7 +262,7 @@ async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
 
     r.set_ctx(ctx_index(), ctx);
 
-    let h = TableElt::new(b"Content-Encoding", b"gzip");
+    let h = TableElt::generated(b"Content-Encoding", b"gzip".to_vec());
 
     {
         let mut ho = r.headers_out.borrow_mut();

@@ -185,7 +185,7 @@ fn range_header_filter(r: R, next: &HeaderFilter) -> Step {
 
     {
         let mut ho = r.headers_out.borrow_mut();
-        let h = ho.add(b"Accept-Ranges", b"bytes");
+        let h = ho.add_generated(b"Accept-Ranges", b"bytes".to_vec());
         ho.accept_ranges = Some(h);
     }
 
@@ -379,7 +379,7 @@ fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: &Heade
         value.push(b"/");
         value.push(int_digits(ho.content_length_n, &mut [0u8; 21]));
 
-        let content_range = ho.add(b"Content-Range", value.as_slice());
+        let content_range = ho.add_generated(b"Content-Range", value.as_slice().to_vec());
         ho.content_range = Some(content_range);
 
         ho.content_length_n = end - start;
@@ -487,7 +487,7 @@ fn range_not_satisfiable(r: &R) -> i64 {
         value.push(b"bytes */");
         value.push(int_digits(ho.content_length_n, &mut [0u8; 21]));
 
-        let content_range = ho.add(b"Content-Range", value.as_slice());
+        let content_range = ho.add_generated(b"Content-Range", value.as_slice().to_vec());
         ho.content_range = Some(content_range);
     }
 

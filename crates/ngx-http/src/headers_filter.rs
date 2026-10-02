@@ -147,7 +147,7 @@ fn headers_filter(r: R, next: &HeaderFilter) -> Step {
                 Err(_) => return Step::Ready(NGX_ERROR),
             };
 
-            set_header(&r, hv, &value);
+            set_header(&r, hv, value);
         }
     }
 
@@ -192,7 +192,7 @@ fn trailers_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
         };
 
         if !value.is_empty() {
-            r.headers_out.borrow_mut().trailers.push(TableElt::new(&hv.key, &value));
+            r.headers_out.borrow_mut().trailers.push(TableElt::generated(&hv.key, value));
         }
     }
 
@@ -224,7 +224,7 @@ fn set_expires(r: &R, conf: &HeadersConf) -> i64 {
     let e = match ho.expires.clone() {
         Some(e) => e,
         None => {
-            let e = ho.add(b"Expires", b"");
+            let e = ho.add_generated(b"Expires", Vec::new());
             ho.expires = Some(e.clone());
             e
         }
@@ -242,7 +242,7 @@ fn set_expires(r: &R, conf: &HeadersConf) -> i64 {
             cc
         }
         None => {
-            let cc = ho.add(b"Cache-Control", b"");
+            let cc = ho.add_generated(b"Cache-Control", Vec::new());
             ho.cache_control.push(cc.clone());
             cc
         }
@@ -344,15 +344,15 @@ fn parse_expires(value: &[u8], expires: &mut Expires, expires_time: &mut i64) ->
     Ok(())
 }
 
-/// The handler of an add_header with its value
-fn set_header(r: &R, hv: &HeaderVal, value: &[u8]) {
+/// The handler of an add_header with its value, which the header takes
+fn set_header(r: &R, hv: &HeaderVal, value: Vec<u8>) {
     let mut ho = r.headers_out.borrow_mut();
 
     match hv.handler {
         SetHeader::Add => {
             // ngx_http_add_header
             if !value.is_empty() {
-                ho.add(&hv.key, value);
+                ho.add_generated(&hv.key, value);
             }
         }
 
@@ -362,7 +362,7 @@ fn set_header(r: &R, hv: &HeaderVal, value: &[u8]) {
                 return;
             }
 
-            let h = ho.add(&hv.key, value);
+            let h = ho.add_generated(&hv.key, value);
 
             if hv.handler == SetHeader::CacheControl {
                 ho.cache_control.push(h);
@@ -373,10 +373,12 @@ fn set_header(r: &R, hv: &HeaderVal, value: &[u8]) {
 
         SetHeader::LastModified => {
             // ngx_http_set_last_modified
+            let time = if value.is_empty() { -1 } else { ngx_core::parse::parse_http_time(&value).unwrap_or(-1) };
+
             let slot = ho.last_modified.take();
             ho.last_modified = set_response_header(&mut ho, slot, hv, value);
 
-            ho.last_modified_time = if value.is_empty() { -1 } else { ngx_core::parse::parse_http_time(value).unwrap_or(-1) };
+            ho.last_modified_time = time;
         }
 
         SetHeader::ETag => {
@@ -389,7 +391,7 @@ fn set_header(r: &R, hv: &HeaderVal, value: &[u8]) {
 /// ngx_http_set_response_header: the header of the slot gets the key and
 /// value in its place in the list (or a new one), or is removed for an
 /// empty value; the new slot
-fn set_response_header(ho: &mut HeadersOut, old: Option<Header>, hv: &HeaderVal, value: &[u8]) -> Option<Header> {
+fn set_response_header(ho: &mut HeadersOut, old: Option<Header>, hv: &HeaderVal, value: Vec<u8>) -> Option<Header> {
     if value.is_empty() {
         if let Some(old) = old {
             old.hash.set(0);
@@ -398,7 +400,7 @@ fn set_response_header(ho: &mut HeadersOut, old: Option<Header>, hv: &HeaderVal,
         return None;
     }
 
-    let h = TableElt::new(&hv.key, value);
+    let h = TableElt::generated(&hv.key, value);
 
     match old.and_then(|old| ho.headers.iter().position(|x| Rc::ptr_eq(x, &old))) {
         Some(i) => ho.headers[i] = h.clone(),

@@ -108,7 +108,7 @@ pub fn static_handler(r: R) -> Step {
             location.push(b'?');
             location.extend_from_slice(&r.args.borrow());
         }
-        let h = r.headers_out.borrow_mut().add(b"Location", &location);
+        let h = r.headers_out.borrow_mut().add_generated(b"Location", location);
         r.headers_out.borrow_mut().location = Some(h);
         return Step::Ready(NGX_HTTP_MOVED_PERMANENTLY);
     }

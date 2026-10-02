@@ -379,9 +379,9 @@ fn userid_set_uid(r: &R, ctx: &Rc<std::cell::RefCell<UserIdCtx>>, conf: &UserIdC
 
     let mut ho = r.headers_out.borrow_mut();
 
-    ho.add(b"Set-Cookie", &cookie);
-
     http_debug!(r, "uid cookie: \"{}\"", B(&cookie));
+
+    ho.add_generated(b"Set-Cookie", cookie);
 
     if conf.p3p.is_empty() {
         return NGX_OK;

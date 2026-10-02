@@ -254,7 +254,7 @@ fn find_config_phase(r: &R) -> Next {
             v
         };
         r.clear_location();
-        let h = r.headers_out.borrow_mut().add(b"Location", &value);
+        let h = r.headers_out.borrow_mut().add_generated(b"Location", value);
         r.headers_out.borrow_mut().location = Some(h);
         return Next::Finalize(NGX_HTTP_MOVED_PERMANENTLY);
     }
@@ -632,14 +632,18 @@ pub fn set_etag(r: &R) -> i64 {
         return NGX_OK;
     }
     let mut ho = r.headers_out.borrow_mut();
-    // "\"%xT-%xO\"", on the stack: the header copies it
-    let mut value = crate::header_filter::StackBuf::<40>::new();
-    value.push(b"\"");
-    value.push(crate::header_filter::hex_digits(ho.last_modified_time, &mut [0u8; 16]));
-    value.push(b"-");
-    value.push(crate::header_filter::hex_digits(ho.content_length_n, &mut [0u8; 16]));
-    value.push(b"\"");
-    let h = ho.add(b"ETag", value.as_slice());
+    // "\"%xT-%xO\"", in a value of its size, which the header takes
+    let mut lm = [0u8; 16];
+    let lm = crate::header_filter::hex_digits(ho.last_modified_time, &mut lm);
+    let mut cl = [0u8; 16];
+    let cl = crate::header_filter::hex_digits(ho.content_length_n, &mut cl);
+    let mut value = Vec::with_capacity(lm.len() + cl.len() + 3);
+    value.push(b'"');
+    value.extend_from_slice(lm);
+    value.push(b'-');
+    value.extend_from_slice(cl);
+    value.push(b'"');
+    let h = ho.add_generated(b"ETag", value);
     ho.etag = Some(h);
     NGX_OK
 }
@@ -899,7 +903,7 @@ fn send_response_discarded(r: &R, rc: i64, status: i64, ct: Option<&[u8]>, cv: &
     };
     if status == NGX_HTTP_MOVED_PERMANENTLY || status == NGX_HTTP_MOVED_TEMPORARILY || status == NGX_HTTP_SEE_OTHER || status == NGX_HTTP_TEMPORARY_REDIRECT || status == NGX_HTTP_PERMANENT_REDIRECT {
         r.clear_location();
-        let h = r.headers_out.borrow_mut().add(b"Location", &val);
+        let h = r.headers_out.borrow_mut().add_generated(b"Location", val);
         r.headers_out.borrow_mut().location = Some(h);
         return Step::Ready(status);
     }
