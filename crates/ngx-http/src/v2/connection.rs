@@ -45,6 +45,9 @@ pub struct Driver {
     /// OpenSSL requires after SSL_ERROR_WANT_WRITE).
     wbuf: RefCell<Vec<u8>>,
     wpos: Cell<usize>,
+    /// The frames fill_wbuf() copied out, whose handlers it runs (kept for
+    /// its capacity).
+    done: RefCell<Vec<OutFrame>>,
 }
 
 const WBUF_SIZE: usize = 64 * 1024;
@@ -119,6 +122,7 @@ impl Driver {
             write_timer: Cell::new(None),
             wbuf: RefCell::new(Vec::new()),
             wpos: Cell::new(0),
+            done: RefCell::new(Vec::new()),
         }
     }
 
@@ -190,7 +194,7 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
         hpack: RefCell::new(table::Hpack::new()),
         streams_index: RefCell::new(vec![Vec::new(); streams_index_mask + 1]),
         streams_index_mask,
-        last_out: RefCell::new(Vec::new()),
+        last_out: RefCell::new(VecDeque::new()),
         dependencies: RefCell::new(Vec::new()),
         closed: RefCell::new(VecDeque::new()),
         closed_nodes: Cell::new(0),
@@ -606,7 +610,8 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         return;
     }
 
-    let mut done: Vec<OutFrame> = Vec::new();
+    // the list of the frames copied out, lent by the driver
+    let mut done = std::mem::take(&mut *d.done.borrow_mut());
     {
         let mut wbuf = d.wbuf.borrow_mut();
         wbuf.clear();
@@ -620,7 +625,7 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
             wbuf.reserve_exact(queued.min(WBUF_SIZE));
         }
 
-        while let Some(f) = out.last_mut() {
+        while let Some(f) = out.back_mut() {
             let room = WBUF_SIZE.saturating_sub(wbuf.len());
             if room == 0 {
                 break;
@@ -632,11 +637,12 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
                 f.blocked = true;
                 break;
             }
-            done.push(out.pop().unwrap());
+            done.extend(out.pop_back());
         }
     }
 
     if done.is_empty() {
+        *d.done.borrow_mut() = done;
         return;
     }
 
@@ -646,7 +652,7 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         c.error.set(true);
     }
 
-    for frame in done {
+    for frame in done.drain(..) {
         ngx_log_debug!(
             NGX_LOG_DEBUG_HTTP,
             c.log,
@@ -656,6 +662,8 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
         );
         frame_sent(h2c, frame);
     }
+
+    *d.done.borrow_mut() = done;
 }
 
 /// Write the write buffer out, waiting for writability. Cancel safe: the
@@ -850,6 +858,7 @@ fn handle_connection(h2c: &Rc<H2Connection>, d: &Driver) {
     // connection keeps no output buffers
     *d.wbuf.borrow_mut() = Vec::new();
     d.wpos.set(0);
+    *d.done.borrow_mut() = Vec::new();
     ngx_core::event_openssl::ngx_ssl_free_buffer(c);
 
     c.destroyed.set(true);
@@ -1052,7 +1061,7 @@ fn send_settings(h2c: &Rc<H2Connection>) -> Result<(), ()> {
         (s.concurrent_streams, s.preread_size)
     };
 
-    let mut data = Vec::with_capacity(NGX_HTTP_V2_FRAME_HEADER_SIZE + len);
+    let mut data = frame_buf(NGX_HTTP_V2_FRAME_HEADER_SIZE + len);
     write_frame_head(&mut data, len, NGX_HTTP_V2_SETTINGS_FRAME, NGX_HTTP_V2_NO_FLAG, 0);
 
     write_uint16(&mut data, NGX_HTTP_V2_MAX_STREAMS_SETTING);
@@ -1134,7 +1143,7 @@ pub fn get_frame(h2c: &Rc<H2Connection>, length: usize, ty: u8, flags: u8, sid: 
         return None;
     }
 
-    let mut data = Vec::with_capacity(NGX_HTTP_V2_FRAME_BUFFER_SIZE);
+    let mut data = frame_buf(NGX_HTTP_V2_FRAME_BUFFER_SIZE);
     write_frame_head(&mut data, length, ty, flags, sid);
 
     Some(OutFrame { data, sent: 0, handler: FrameHandler::Control, stream: None, length, blocked: false, fin: false })

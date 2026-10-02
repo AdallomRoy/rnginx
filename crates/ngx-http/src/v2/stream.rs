@@ -715,25 +715,36 @@ fn construct_request_line(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R) 
         return Ok(());
     }
 
-    let (method, schema, uri) = (r.method_name.borrow().clone(), r.schema.borrow().clone(), r.unparsed_uri.borrow().clone());
+    let line = {
+        let (method, schema, uri) = (r.method_name.borrow(), r.schema.borrow(), r.unparsed_uri.borrow());
 
-    if method.is_empty() || schema.is_empty() || uri.is_empty() {
-        if method.is_empty() {
-            ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :method header");
-        } else if schema.is_empty() {
-            ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :scheme header");
+        if method.is_empty() || schema.is_empty() || uri.is_empty() {
+            None
         } else {
-            ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :path header");
+            let mut line = Vec::with_capacity(method.len() + 1 + uri.len() + b" HTTP/2.0".len());
+            line.extend_from_slice(&method);
+            line.push(b' ');
+            line.extend_from_slice(&uri);
+            line.extend_from_slice(b" HTTP/2.0");
+            Some(line)
         }
+    };
 
-        finalize(h2c, stream, NGX_HTTP_BAD_REQUEST);
-        return Err(());
-    }
+    let line = match line {
+        Some(line) => line,
+        None => {
+            if r.method_name.borrow().is_empty() {
+                ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :method header");
+            } else if r.schema.borrow().is_empty() {
+                ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :scheme header");
+            } else {
+                ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no :path header");
+            }
 
-    let mut line = method;
-    line.push(b' ');
-    line.extend_from_slice(&uri);
-    line.extend_from_slice(b" HTTP/2.0");
+            finalize(h2c, stream, NGX_HTTP_BAD_REQUEST);
+            return Err(());
+        }
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http2 request line: \"{}\"", B(&line));
 

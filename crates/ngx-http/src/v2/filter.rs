@@ -99,7 +99,7 @@ async fn early_hints_filter(r: &R) -> i64 {
 
     let h2c = stream.connection.clone();
 
-    let mut pos: Vec<u8> = Vec::with_capacity(256);
+    let mut pos = frame_buf_with_head(256);
 
     if h2c.table_update.get() {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 table size update: 0");
@@ -123,7 +123,7 @@ async fn early_hints_filter(r: &R) -> i64 {
         write_value(&mut pos, value);
     }
 
-    let frame = create_headers_frame(&stream, &pos, false);
+    let frame = create_headers_frame(&stream, pos, false);
 
     h2c.queue_blocked_frame(frame);
 
@@ -217,7 +217,7 @@ async fn header_filter(r: &R) -> i64 {
         }
     }
 
-    let mut pos: Vec<u8> = Vec::with_capacity(256);
+    let mut pos = frame_buf_with_head(256);
 
     if h2c.table_update.get() {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 table size update: 0");
@@ -395,9 +395,7 @@ async fn header_filter(r: &R) -> i64 {
 
     // the headers of the list, in their order: the typed slots (an
     // upstream's Server and Date, ETag, Content-Encoding, ...) are in it
-    let headers: Vec<Header> = r.headers_out.borrow().headers.clone();
-
-    for h in headers.iter() {
+    for h in r.headers_out.borrow().headers.iter() {
         if h.hash.get() == 0 {
             continue;
         }
@@ -431,7 +429,7 @@ async fn header_filter(r: &R) -> i64 {
 
     let fin = r.header_only.get() || (r.headers_out.borrow().content_length_n == 0 && !r.expect_trailers.get());
 
-    let frame = create_headers_frame(&stream, &pos, fin);
+    let frame = create_headers_frame(&stream, pos, fin);
 
     h2c.queue_blocked_frame(frame);
 
@@ -461,8 +459,37 @@ fn init_stream(_r: &R, stream: &Rc<H2Stream>) {
 
 /// ngx_http_v2_create_headers_frame: a HEADERS frame and as many
 /// CONTINUATION frames as the peer's frame size requires, as one output
-/// frame.
-fn create_headers_frame(stream: &Rc<H2Stream>, block: &[u8], fin: bool) -> OutFrame {
+/// frame. `buf` holds the header block behind the room left for a frame
+/// header (frame_buf_with_head()): a block that fits one frame goes out in
+/// it, a longer one is copied into the frames.
+fn create_headers_frame(stream: &Rc<H2Stream>, mut buf: Vec<u8>, fin: bool) -> OutFrame {
+    let block_len = buf.len() - NGX_HTTP_V2_FRAME_HEADER_SIZE;
+
+    let flags = if fin { NGX_HTTP_V2_END_STREAM_FLAG } else { NGX_HTTP_V2_NO_FLAG };
+
+    if block_len <= stream.connection.frame_size.get() {
+        let id = stream.node.borrow().id.get();
+
+        set_frame_head(&mut buf, block_len, NGX_HTTP_V2_HEADERS_FRAME, flags | NGX_HTTP_V2_END_HEADERS_FLAG, id);
+
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, stream.fc.log, "http2:{} create HEADERS frame: len:{} fin:{}", id, block_len, fin as u32);
+
+        return OutFrame {
+            data: buf,
+            sent: 0,
+            handler: FrameHandler::Headers,
+            stream: Some(stream.clone()),
+            length: block_len,
+            blocked: true,
+            fin,
+        };
+    }
+
+    create_headers_frames(stream, &buf[NGX_HTTP_V2_FRAME_HEADER_SIZE..], fin)
+}
+
+/// create_headers_frame() of a block longer than a frame.
+fn create_headers_frames(stream: &Rc<H2Stream>, block: &[u8], fin: bool) -> OutFrame {
     let mut rest = block.len();
     let mut length = rest;
 
@@ -471,7 +498,7 @@ fn create_headers_frame(stream: &Rc<H2Stream>, block: &[u8], fin: bool) -> OutFr
     let mut frame_size = stream.connection.frame_size.get();
     let id = stream.node.borrow().id.get();
 
-    let mut data = Vec::with_capacity(block.len() + NGX_HTTP_V2_FRAME_HEADER_SIZE * 2);
+    let mut data = frame_buf(block.len() + NGX_HTTP_V2_FRAME_HEADER_SIZE * 2);
     let mut pos = 0;
 
     loop {
@@ -515,7 +542,7 @@ fn create_trailers_frame(r: &R, stream: &Rc<H2Stream>) -> Result<Option<OutFrame
     let fc = &stream.fc;
     let trailers: Vec<Header> = r.headers_out.borrow().trailers.clone();
 
-    let mut block = Vec::new();
+    let mut block = frame_buf_with_head(0);
 
     for h in trailers.iter() {
         if h.hash.get() == 0 {
@@ -547,11 +574,11 @@ fn create_trailers_frame(r: &R, stream: &Rc<H2Stream>) -> Result<Option<OutFrame
         write_value(&mut block, &value);
     }
 
-    if block.is_empty() {
+    if block.len() == NGX_HTTP_V2_FRAME_HEADER_SIZE {
         return Ok(None);
     }
 
-    Ok(Some(create_headers_frame(stream, &block, true)))
+    Ok(Some(create_headers_frame(stream, block, true)))
 }
 
 /// ngx_http_v2_send_chain, the stream's output: DATA frames of at most
@@ -721,7 +748,8 @@ fn send_chain_once(r: &R, stream: &Rc<H2Stream>, chain: &mut Chain, limit: i64) 
             frame_size = limit as usize;
         }
 
-        let mut payload = Vec::with_capacity(frame_size);
+        // the frame: its header, then the payload read behind it
+        let mut payload = frame_buf_with_head(frame_size);
         let mut rest = frame_size;
         let mut last_buf = false;
         let mut chain_done = false;
@@ -785,6 +813,8 @@ fn send_chain_once(r: &R, stream: &Rc<H2Stream>, chain: &mut Chain, limit: i64) 
             stream.queued_bytes.set(stream.queued_bytes.get() + frame_size);
 
             queued_total += frame_size as i64;
+        } else {
+            free_frame_buf(payload);
         }
 
         if chain_done {
@@ -812,8 +842,9 @@ fn send_chain_once(r: &R, stream: &Rc<H2Stream>, chain: &mut Chain, limit: i64) 
     Ok(queued_total)
 }
 
-/// ngx_http_v2_filter_get_data_frame
-fn get_data_frame(stream: &Rc<H2Stream>, payload: Vec<u8>, last_buf: bool) -> Result<OutFrame, ()> {
+/// ngx_http_v2_filter_get_data_frame: `data` holds the payload behind the
+/// room left for the frame header
+fn get_data_frame(stream: &Rc<H2Stream>, mut data: Vec<u8>, last_buf: bool) -> Result<OutFrame, ()> {
     let h2c = &stream.connection;
 
     if stream.free_frames.get() > 0 {
@@ -828,14 +859,12 @@ fn get_data_frame(stream: &Rc<H2Stream>, payload: Vec<u8>, last_buf: bool) -> Re
     }
 
     let flags = if last_buf { NGX_HTTP_V2_END_STREAM_FLAG } else { 0 };
-    let len = payload.len();
+    let len = data.len() - NGX_HTTP_V2_FRAME_HEADER_SIZE;
     let id = stream.node.borrow().id.get();
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, stream.fc.log, "http2:{} create DATA frame: len:{} flags:{}", id, len, flags);
 
-    let mut data = Vec::with_capacity(NGX_HTTP_V2_FRAME_HEADER_SIZE + len);
-    write_frame_head(&mut data, len, NGX_HTTP_V2_DATA_FRAME, flags, id);
-    data.extend_from_slice(&payload);
+    set_frame_head(&mut data, len, NGX_HTTP_V2_DATA_FRAME, flags, id);
 
     Ok(OutFrame {
         data,
@@ -1027,7 +1056,7 @@ pub fn filter_cleanup(stream: &Rc<H2Stream>) {
         while i < out.len() {
             let mine = out[i].stream.as_ref().map(|s| Rc::ptr_eq(s, stream)).unwrap_or(false);
             if mine && !out[i].blocked {
-                let f = out.remove(i);
+                let f = out.remove(i).expect("queued frame");
                 if f.handler == FrameHandler::Data {
                     window += f.length;
                     stream.queued_bytes.set(stream.queued_bytes.get().saturating_sub(f.length));

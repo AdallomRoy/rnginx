@@ -458,8 +458,8 @@ pub struct H2Connection {
     pub streams_index_mask: usize,
 
     /// The output queue; index 0 is C's last_out and each next element is
-    /// its ->next, so frames go out in reverse order.
-    pub last_out: RefCell<Vec<OutFrame>>,
+    /// its ->next, so frames go out in reverse order (from the back).
+    pub last_out: RefCell<VecDeque<OutFrame>>,
 
     /// Root nodes of the priority tree (ngx_queue_t dependencies).
     pub dependencies: RefCell<Vec<Rc<H2Node>>>,
@@ -552,7 +552,50 @@ impl H2Connection {
 
     /// ngx_http_v2_queue_ordered_frame
     pub fn queue_ordered_frame(&self, frame: OutFrame) {
-        self.last_out.borrow_mut().insert(0, frame);
+        self.last_out.borrow_mut().push_front(frame);
+    }
+}
+
+/// The most frame buffers a worker keeps for reuse, and the largest kept.
+const FRAME_BUFS_MAX: usize = 64;
+const FRAME_BUF_MAX_SIZE: usize = 64 * 1024;
+
+thread_local! {
+    /// The buffers of frames written out, for the next frames: C reuses
+    /// the frames of the connection and of its streams (free_frames).
+    static FRAME_BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An empty buffer for a frame of `size` bytes, one written out before if
+/// there is one.
+pub fn frame_buf(size: usize) -> Vec<u8> {
+    let mut v = FRAME_BUFS.try_with(|bufs| bufs.try_borrow_mut().ok()?.pop()).ok().flatten().unwrap_or_default();
+
+    v.reserve(size);
+
+    v
+}
+
+/// The buffer of a frame written out (or dropped), for frame_buf().
+pub fn free_frame_buf(mut v: Vec<u8>) {
+    if v.capacity() == 0 || v.capacity() > FRAME_BUF_MAX_SIZE {
+        return;
+    }
+
+    v.clear();
+
+    let _ = FRAME_BUFS.try_with(|bufs| {
+        if let Ok(mut bufs) = bufs.try_borrow_mut() {
+            if bufs.len() < FRAME_BUFS_MAX {
+                bufs.push(v);
+            }
+        }
+    });
+}
+
+impl Drop for OutFrame {
+    fn drop(&mut self) {
+        free_frame_buf(std::mem::take(&mut self.data));
     }
 }
 
@@ -600,6 +643,21 @@ pub fn write_frame_head(dst: &mut Vec<u8>, len: usize, ty: u8, flags: u8, sid: u
     write_len_and_type(dst, len, ty);
     dst.push(flags);
     write_uint32(dst, sid);
+}
+
+/// The frame header over the first NGX_HTTP_V2_FRAME_HEADER_SIZE bytes of
+/// `dst`, the room left for it in front of the payload.
+pub fn set_frame_head(dst: &mut [u8], len: usize, ty: u8, flags: u8, sid: u32) {
+    dst[..4].copy_from_slice(&(((len as u32) << 8) | ty as u32).to_be_bytes());
+    dst[4] = flags;
+    dst[5..9].copy_from_slice(&sid.to_be_bytes());
+}
+
+/// A buffer for a frame: room for its header, the payload to follow.
+pub fn frame_buf_with_head(payload: usize) -> Vec<u8> {
+    let mut v = frame_buf(NGX_HTTP_V2_FRAME_HEADER_SIZE + payload);
+    v.resize(NGX_HTTP_V2_FRAME_HEADER_SIZE, 0);
+    v
 }
 
 #[cfg(test)]
