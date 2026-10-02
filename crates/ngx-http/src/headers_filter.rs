@@ -69,8 +69,11 @@ pub struct HeadersConf {
     pub expires: Expires,
     pub expires_time: i64,
     pub expires_value: Option<ComplexValue>,
-    pub headers: Option<Vec<HeaderVal>>,
-    pub trailers: Option<Vec<HeaderVal>>,
+    /// the add_header list, shared by the requests (and the locations that
+    /// inherit it as it is)
+    pub headers: Option<Rc<[HeaderVal]>>,
+    /// the add_trailer list
+    pub trailers: Option<Rc<[HeaderVal]>>,
     pub headers_inherit: Val<u32>,
     pub trailers_inherit: Val<u32>,
 }
@@ -446,7 +449,7 @@ fn merge_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) -> Conf
 }
 
 /// The parent's headers (trailers) as add_header_inherit says
-fn inherit(headers: &mut Option<Vec<HeaderVal>>, prev: Option<&Vec<HeaderVal>>, mode: u32) {
+fn inherit(headers: &mut Option<Rc<[HeaderVal]>>, prev: Option<&Rc<[HeaderVal]>>, mode: u32) {
     let prev = match prev {
         Some(p) if mode != NGX_HTTP_HEADERS_INHERIT_OFF => p,
         _ => return,
@@ -454,7 +457,7 @@ fn inherit(headers: &mut Option<Vec<HeaderVal>>, prev: Option<&Vec<HeaderVal>>, 
 
     match headers {
         None => *headers = Some(prev.clone()),
-        Some(h) if mode == NGX_HTTP_HEADERS_INHERIT_MERGE => h.extend(prev.iter().cloned()),
+        Some(h) if mode == NGX_HTTP_HEADERS_INHERIT_MERGE => *h = h.iter().chain(prev.iter()).cloned().collect(),
         Some(_) => {}
     }
 }
@@ -547,7 +550,9 @@ fn headers_add(cf: &mut Conf, conf: Option<Rc<dyn Any>>, trailer: bool) -> ConfR
 
     let headers = if trailer { &mut hcf.trailers } else { &mut hcf.headers };
 
-    headers.get_or_insert_with(Vec::new).push(hv);
+    let mut list = headers.as_deref().map(|h| h.to_vec()).unwrap_or_default();
+    list.push(hv);
+    *headers = Some(list.into());
 
     Ok(())
 }
@@ -605,13 +610,15 @@ mod tests {
 
     #[test]
     fn test_inherit() {
-        let parent = vec![hv(b"X-A", SetHeader::Add)];
+        let parent: Rc<[HeaderVal]> = vec![hv(b"X-A", SetHeader::Add)].into();
 
         let mut none = None;
         inherit(&mut none, Some(&parent), NGX_HTTP_HEADERS_INHERIT_ON);
         assert_eq!(none.as_ref().map(|h| h.len()), Some(1));
+        // shared, not copied
+        assert!(Rc::ptr_eq(none.as_ref().unwrap(), &parent));
 
-        let mut own = Some(vec![hv(b"X-B", SetHeader::Add)]);
+        let mut own: Option<Rc<[HeaderVal]>> = Some(vec![hv(b"X-B", SetHeader::Add)].into());
         inherit(&mut own, Some(&parent), NGX_HTTP_HEADERS_INHERIT_ON);
         assert_eq!(own.as_ref().unwrap().iter().map(|h| h.key.clone()).collect::<Vec<_>>(), vec![b"X-B".to_vec()]);
 
