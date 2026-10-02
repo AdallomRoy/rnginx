@@ -7,9 +7,11 @@ and port it; do not "improve" behaviour.
 
 ## Layout
 - `crates/ngx-core`  : core (string utils, conf parser, log, cycle, process model, connection
-                       layer on tokio AsyncFd, inet, shm/slab, regex, syslog, ssl).
+                       layer on tokio AsyncFd, inet, shm/shmem, regex, syslog, ssl).
 - `crates/ngx-http`  : http core + all http modules.
 - `crates/ngx-stream`, `crates/ngx-mail`, `crates/nginx` (binary).
+- `crates/ngx-sys`   : the only crate with `unsafe`: the few system and OpenSSL calls no safe
+                       crate provides, behind safe functions (see docs/SAFETY.md).
 - Tests: `/home/ubuntu/rnginx/nginx-tests` (Perl). Run one file:
   `cd /home/ubuntu/rnginx/nginx-tests && TEST_NGINX_BINARY=/home/ubuntu/rnginx/target/debug/nginx prove -v foo.t`
 
@@ -35,9 +37,15 @@ and port it; do not "improve" behaviour.
   `RefCell` borrow across an `.await`.
 - Async I/O: `ngx_core::connection::Connection` (`recv/send/writev/sendfile` async fns, all
   cancel-safe). Timeouts via `tokio::time::timeout`.
-- Shared memory: zones are `ngx_core::shm::ShmZone`; data inside zones is plain `#[repr(C)]`
-  memory with raw pointers (mapped at the same address in every process).
-- Keep unsafe minimal and local; comment why it is sound.
+- Shared memory: zones are `ngx_core::shm::ShmZone`; their memory is a `ngx_core::shmem::ShmMem`
+  (atomic words), structures in it are declared with `shm_struct!` (C layout) and link each
+  other by offsets, not pointers; slab pool, rbtree and queue in `ngx_core::shmem`.
+- Descriptors are numbers owned by the process's table (`ngx_core::fd`): whatever opens one
+  registers the `OwnedFd`, `fd::get(n)` lends it to nix/rustix, `fd::close(n)` closes it.
+- No `unsafe`: ngx-core, ngx-http, ngx-stream, ngx-mail and nginx are `#![forbid(unsafe_code)]`.
+  Use std, nix, rustix, socket2, openssl (safe API); what none of them provides goes to
+  `crates/ngx-sys` as a small safe function with a `// SAFETY:` comment (docs/SAFETY.md).
 - Each new file gets `#[cfg(test)] mod tests` with unit tests for the tricky paths.
-- Do not add crate dependencies without need; allowed: libc, nix, tokio, openssl(-sys), pcre2,
-  flate2, md-5, sha1, crc32fast, memchr, bytes.
+- Do not add crate dependencies without need; allowed: libc, nix, rustix, socket2, tokio,
+  signal-hook, openssl (openssl-sys and foreign-types in ngx-sys only), pcre2, flate2, md-5,
+  sha1, crc32fast, memchr, bytes, vm-memory, mmap-rs, zerocopy, pwhash, blowfish.

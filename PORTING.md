@@ -82,5 +82,6 @@ reference material only if they help; correctness against the C source and the t
   `discard_request_body`).
 - Connections/sockets: `crates/ngx-core/src/connection.rs` (async `recv/send/writev/sendfile`),
   `ngx_core::inet` (addresses, `parse_url`), `ngx_core::resolver`.
-- Shared memory zones: `ngx_core::shm` + `ngx_core::slab` + `ngx_core::rbtree`.
+- Shared memory zones: `ngx_core::shm` + `ngx_core::shmem` (ShmMem, `shm_struct!`, slab, rbtree,
+  queue; offsets instead of pointers, see docs/SAFETY.md).
 - Time formats: `ngx_core::times`. Hash tables: `ngx_core::hash`. Regex: `ngx_core::regex`.
