@@ -1,10 +1,8 @@
 //! ngx_stream_geoip_module.c: variables with the country, organization and
 //! city of the client address, looked up in the databases of the legacy
-//! MaxMind GeoIP library (see ngx_core::geoip for the library binding).
+//! MaxMind GeoIP library (see ngx_core::geoip for the port of the library).
 
 use std::any::Any;
-use std::ffi::c_ulong;
-use std::mem::offset_of;
 use std::net::Ipv6Addr;
 use std::rc::Rc;
 
@@ -25,7 +23,7 @@ const NGX_GEOIP_COUNTRY_CODE: usize = 0;
 const NGX_GEOIP_COUNTRY_CODE3: usize = 1;
 const NGX_GEOIP_COUNTRY_NAME: usize = 2;
 
-const INADDR_NONE: c_ulong = 0xffffffff;
+const INADDR_NONE: u32 = 0xffffffff;
 
 /// ngx_stream_geoip_conf_t
 #[derive(Default)]
@@ -43,33 +41,33 @@ static GEOIP_VARS: &[VarDef] = &[
     VarDef { name: "geoip_country_code3", set: None, get: Some(geoip_country_variable), data: NGX_GEOIP_COUNTRY_CODE3, flags: 0 },
     VarDef { name: "geoip_country_name", set: None, get: Some(geoip_country_variable), data: NGX_GEOIP_COUNTRY_NAME, flags: 0 },
     VarDef { name: "geoip_org", set: None, get: Some(geoip_org_variable), data: 0, flags: 0 },
-    VarDef { name: "geoip_city_continent_code", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, continent_code), flags: 0 },
-    VarDef { name: "geoip_city_country_code", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, country_code), flags: 0 },
-    VarDef { name: "geoip_city_country_code3", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, country_code3), flags: 0 },
-    VarDef { name: "geoip_city_country_name", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, country_name), flags: 0 },
-    VarDef { name: "geoip_region", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, region), flags: 0 },
+    VarDef { name: "geoip_city_continent_code", set: None, get: Some(geoip_city_variable), data: record_member::CONTINENT_CODE, flags: 0 },
+    VarDef { name: "geoip_city_country_code", set: None, get: Some(geoip_city_variable), data: record_member::COUNTRY_CODE, flags: 0 },
+    VarDef { name: "geoip_city_country_code3", set: None, get: Some(geoip_city_variable), data: record_member::COUNTRY_CODE3, flags: 0 },
+    VarDef { name: "geoip_city_country_name", set: None, get: Some(geoip_city_variable), data: record_member::COUNTRY_NAME, flags: 0 },
+    VarDef { name: "geoip_region", set: None, get: Some(geoip_city_variable), data: record_member::REGION, flags: 0 },
     VarDef { name: "geoip_region_name", set: None, get: Some(geoip_region_name_variable), data: 0, flags: 0 },
-    VarDef { name: "geoip_city", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, city), flags: 0 },
-    VarDef { name: "geoip_postal_code", set: None, get: Some(geoip_city_variable), data: offset_of!(GeoIPRecord, postal_code), flags: 0 },
-    VarDef { name: "geoip_latitude", set: None, get: Some(geoip_city_float_variable), data: offset_of!(GeoIPRecord, latitude), flags: 0 },
-    VarDef { name: "geoip_longitude", set: None, get: Some(geoip_city_float_variable), data: offset_of!(GeoIPRecord, longitude), flags: 0 },
-    VarDef { name: "geoip_dma_code", set: None, get: Some(geoip_city_int_variable), data: offset_of!(GeoIPRecord, dma_code), flags: 0 },
-    VarDef { name: "geoip_area_code", set: None, get: Some(geoip_city_int_variable), data: offset_of!(GeoIPRecord, area_code), flags: 0 },
+    VarDef { name: "geoip_city", set: None, get: Some(geoip_city_variable), data: record_member::CITY, flags: 0 },
+    VarDef { name: "geoip_postal_code", set: None, get: Some(geoip_city_variable), data: record_member::POSTAL_CODE, flags: 0 },
+    VarDef { name: "geoip_latitude", set: None, get: Some(geoip_city_float_variable), data: record_member::LATITUDE, flags: 0 },
+    VarDef { name: "geoip_longitude", set: None, get: Some(geoip_city_float_variable), data: record_member::LONGITUDE, flags: 0 },
+    VarDef { name: "geoip_dma_code", set: None, get: Some(geoip_city_int_variable), data: record_member::DMA_CODE, flags: 0 },
+    VarDef { name: "geoip_area_code", set: None, get: Some(geoip_city_int_variable), data: record_member::AREA_CODE, flags: 0 },
 ];
 
 /// ngx_stream_geoip_addr
-fn geoip_addr(s: &Session, _gcf: &GeoipConf) -> c_ulong {
+fn geoip_addr(s: &Session, _gcf: &GeoipConf) -> u32 {
     let addr = s.connection.sockaddr.borrow().clone();
     /* addr.name = s->connection->addr_text; */
 
     if let SockAddr::V6(sin6) = &addr {
         if let Some(inaddr) = sin6.ip().to_ipv4_mapped() {
-            return u32::from(inaddr) as c_ulong;
+            return u32::from(inaddr);
         }
     }
 
     match &addr {
-        SockAddr::V4(sin) => u32::from(*sin.ip()) as c_ulong,
+        SockAddr::V4(sin) => u32::from(*sin.ip()),
         _ => INADDR_NONE,
     }
 }
@@ -86,7 +84,7 @@ fn geoip_addr_v6(s: &Session, _gcf: &GeoipConf) -> GeoIPv6 {
         _ => Ipv6Addr::UNSPECIFIED,
     };
 
-    GeoIPv6 { s6_addr: addr6.octets() }
+    addr6.octets()
 }
 
 /// ngx_stream_geoip_country_variable
@@ -111,7 +109,7 @@ fn geoip_country_variable(s: &Session, v: &mut VariableValue, data: usize) -> i6
         }
 
         Some(val) => {
-            v.data = val;
+            v.data = val.to_vec();
             v.valid = true;
             v.no_cacheable = false;
             v.not_found = false;
@@ -200,7 +198,7 @@ fn geoip_region_name_variable(s: &Session, v: &mut VariableValue, _data: usize) 
         }
 
         Some(val) => {
-            v.data = val;
+            v.data = val.to_vec();
             v.valid = true;
             v.no_cacheable = false;
             v.not_found = false;
@@ -252,7 +250,7 @@ fn geoip_city_int_variable(s: &Session, v: &mut VariableValue, data: usize) -> i
 }
 
 /// ngx_stream_geoip_get_city_record
-fn geoip_get_city_record(s: &Session) -> Option<GeoIPRecordPtr> {
+fn geoip_get_city_record(s: &Session) -> Option<GeoIPRecord> {
     let gcf = s.main_conf::<GeoipConf>(ctx_index());
     let gcf = gcf.borrow();
 

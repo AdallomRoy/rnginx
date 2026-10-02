@@ -26,8 +26,8 @@ pub struct MapConf {
     pub hash_max_size: Val<i64>,
     pub hash_bucket_size: Val<i64>,
 
-    /// The maps of the "map" blocks: the variables' data point to them
-    /// (the configuration pool in C).
+    /// The maps of the "map" blocks (the configuration pool in C): the
+    /// variables' data is the index of their map.
     pub maps: Vec<Rc<MapCtx>>,
 }
 
@@ -64,9 +64,8 @@ struct MapConfCtx {
 
 /// ngx_stream_map_variable
 fn map_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
-    // data is Rc::as_ptr() of a MapCtx kept alive by the MapConf of the
-    // configuration the session uses (s->main_conf holds it)
-    let map = unsafe { &*(data as *const MapCtx) };
+    // data: the index of the map in the module's main conf
+    let map = s.main_conf::<MapConf>(ctx_index()).borrow().maps[data].clone();
 
     ngx_log_debug!(NGX_LOG_DEBUG_STREAM, s.connection.log, "stream map started");
 
@@ -211,9 +210,11 @@ fn map_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
         hostnames: ctx.hostnames,
     });
 
-    var.data.set(Rc::as_ptr(&map) as usize);
+    let mut m = mcf.borrow_mut();
 
-    mcf.borrow_mut().maps.push(map);
+    var.data.set(m.maps.len());
+
+    m.maps.push(map);
 
     Ok(())
 }

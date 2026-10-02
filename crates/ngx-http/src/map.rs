@@ -23,12 +23,16 @@ crate::http_module_index!("ngx_http_map_module");
 pub struct MapMainConf {
     pub hash_max_size: Val<u32>,
     pub hash_bucket_size: Val<u32>,
+    /// The maps of the "map" blocks (the configuration pool in C): the
+    /// variables' data is the index of their map.
+    pub maps: Vec<Rc<MapCtx>>,
 }
 
 fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(MapMainConf {
         hash_max_size: Val::unset(),
         hash_bucket_size: Val::unset(),
+        maps: Vec::new(),
     })
 }
 
@@ -116,7 +120,8 @@ fn wildcard_match(pattern: &[u8], key: &[u8]) -> bool {
 }
 
 fn map_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
-    let ctx = unsafe { &*(data as *const MapCtx) };
+    // data: the index of the map in the module's main conf
+    let ctx = r.main_conf::<MapMainConf>(ctx_index()).borrow().maps[data].clone();
 
     v.valid = true;
     v.not_found = false;
@@ -315,9 +320,8 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
 
     let key = &args[0];
 
-    let ctx_ptr = *conf.downcast_ref::<usize>()
-        .ok_or_else(|| msg("invalid conf"))?;
-    let ctx = unsafe { &*(ctx_ptr as *const MapCtx) };
+    let ctx = conf.downcast::<MapCtx>().map_err(|_| msg("invalid conf"))?;
+    let ctx = &*ctx;
 
     // Single argument: flags (hostnames / volatile inside the block).
     // C ngx_http_map_block does the same recognition inside the block body.
@@ -387,7 +391,7 @@ fn map_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
     }
 }
 
-fn map_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn map_block_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
     if args.len() < 3 {
         return Err(msg("requires at least 2 arguments"));
@@ -420,22 +424,29 @@ fn map_block_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) 
 
     let var = add_variable(cf, &var_name[1..], var_flags)?;
 
-    let ctx = Box::leak(Box::new(MapCtx {
+    let ctx = Rc::new(MapCtx {
         cv,
         default: RefCell::new(None),
         entries: RefCell::new(Vec::new()),
         regexes: RefCell::new(Vec::new()),
         volatile: std::cell::Cell::new(volatile),
         hostnames: std::cell::Cell::new(hostnames),
-    }));
+    });
+
+    let index = {
+        let mcf = conf_rc::<MapMainConf>(conf.as_ref().ok_or_else(|| msg("no conf"))?);
+        let mut m = mcf.borrow_mut();
+        m.maps.push(ctx.clone());
+        m.maps.len() - 1
+    };
 
     var.get_handler.set(Some(map_variable));
-    var.data.set(ctx as *const _ as usize);
+    var.data.set(index);
 
     let saved_h = cf.handler.take();
     let saved_hc = cf.handler_conf.take();
     cf.handler = Some(map_item_handler);
-    cf.handler_conf = Some(Rc::new(ctx as *const _ as usize));
+    cf.handler_conf = Some(ctx as Rc<dyn Any>);
 
     cf.parse_block()?;
 

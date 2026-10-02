@@ -468,13 +468,12 @@ fn http_block(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> Conf
     rv
 }
 
-fn http_modules(modules: &Rc<Vec<Module>>) -> Vec<(usize, &'static HttpModuleDef)> {
-    // SAFETY: modules live for the whole process (Rc held by cycle); we hand out
-    // references tied to the Rc by leaking a clone once.
+/// The http modules and their contexts, borrowed from the module table
+/// (a clone of the cycle's Rc, alive while the block is parsed).
+fn http_modules(modules: &[Module]) -> Vec<(usize, &HttpModuleDef)> {
     let mut v = Vec::new();
     for m in modules.iter().filter(|m| m.def.ty == NGX_HTTP_MODULE) {
         if let Some(d) = m.ctx::<HttpModuleDef>() {
-            let d: &'static HttpModuleDef = unsafe { &*(d as *const HttpModuleDef) };
             v.push((m.ctx_index, d));
         }
     }

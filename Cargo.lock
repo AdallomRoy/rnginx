@@ -480,6 +480,7 @@ dependencies = [
 name = "ngx-core"
 version = "1.31.7"
 dependencies = [
+ "blowfish",
  "bytes",
  "chrono",
  "crc32fast",
@@ -511,7 +512,6 @@ dependencies = [
  "flate2",
  "foreign-types",
  "libc",
- "libz-sys",
  "md-5 0.10.6",
  "memchr",
  "ngx-core",
@@ -544,9 +544,9 @@ name = "ngx-stream"
 version = "1.31.7"
 dependencies = [
  "crc32fast",
+ "flate2",
  "foreign-types",
  "libc",
- "libz-sys",
  "ngx-core",
  "ngx-sys",
  "nix 0.29.0",
