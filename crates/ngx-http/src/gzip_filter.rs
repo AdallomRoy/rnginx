@@ -1,24 +1,32 @@
 //! ngx_http_gzip_filter_module
 //!
-//! zlib (libz-sys, the system zlib as in the C build) writes the gzip
-//! header and trailer itself (deflateInit2() with windowBits + 16).
+//! zlib (through flate2's safe API, the system zlib as in the C build)
+//! writes the gzip header and trailer itself (deflateInit2() with
+//! windowBits + 16).  flate2 has no memLevel parameter: its
+//! deflateInit2() uses memLevel 8, whatever ngx_http_gzip_filter_memory()
+//! computes from gzip_hash and the response length, so the compressed
+//! bytes can differ from C where C uses another memLevel (small responses
+//! of known length, gzip_hash other than 64k).  zlib allocates its memory
+//! itself (flate2's allocator): there is no preallocated memory, hence
+//! no "gzip alloc" debug lines and no "gzip filter failed to use
+//! preallocated memory" alert.
+//!
 //! The buffers own their data here: the output buffers a buffer of
 //! ctx->free stands for are allocated again when it is taken, and those
 //! passed on are free once the next filter returns, as the write filter
 //! has sent them by then (C keeps the ones not sent yet in ctx->busy).
 
 use std::any::Any;
-use std::cell::Cell;
 use std::rc::Rc;
 
-use libz_sys as z;
+use flate2::{Compress, Compression, FlushCompress, Status};
 
 use ngx_core::buf::{Buf, BufData, Chain};
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;
-use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error};
+use ngx_core::{cmd, cmd_fn, ngx_log_error};
 
 use crate::http_types::*;
 use crate::request::*;
@@ -30,6 +38,17 @@ crate::http_module_index!("ngx_http_gzip_filter_module");
 const MAX_WBITS: usize = 15;
 /// MAX_MEM_LEVEL of zconf.h
 const MAX_MEM_LEVEL: usize = 9;
+
+// the flush values and the return codes of zlib.h, as nginx logs them
+
+const Z_NO_FLUSH: i32 = 0;
+const Z_SYNC_FLUSH: i32 = 2;
+const Z_FINISH: i32 = 4;
+
+const Z_OK: i32 = 0;
+const Z_STREAM_END: i32 = 1;
+const Z_STREAM_ERROR: i32 = -2;
+const Z_BUF_ERROR: i32 = -5;
 
 /// ngx_http_gzip_conf_t
 pub struct GzipConf {
@@ -49,21 +68,6 @@ pub struct GzipConf {
     types_keys: Option<HttpTypesKeys>,
 }
 
-/// The memory ngx_http_gzip_filter_alloc() gives zlib: ctx->preallocated,
-/// ctx->free_mem and ctx->allocated, and the allocations from the request
-/// pool when the preallocated memory does not suffice. It is reached
-/// through zstream.opaque during the zlib calls.
-struct GzipAlloc {
-    preallocated: Vec<u64>,
-    /// ctx->free_mem: the offset of the free memory in preallocated
-    free_mem: usize,
-    allocated: usize,
-    zlib_ng: bool,
-    state_allocated: bool,
-    pool: Vec<Vec<u64>>,
-    log: Log,
-}
-
 /// ngx_http_gzip_ctx_t
 pub struct GzipCtx {
     in_: Chain,
@@ -76,13 +80,12 @@ pub struct GzipCtx {
     out_buf: Option<Buf>,
     bufs: usize,
 
-    /// ctx->preallocated != NULL: ngx_http_gzip_filter_deflate_start()
-    /// was called
-    preallocated: bool,
-    alloc: *mut GzipAlloc,
+    /// the deflate stream: ctx->preallocated != NULL, the zlib stream
+    /// ngx_http_gzip_filter_deflate_start() initialized, until
+    /// deflateEnd()
+    zstream: Option<Compress>,
 
     wbits: i32,
-    memlevel: i32,
 
     flush: i32,
     redo: bool,
@@ -93,30 +96,17 @@ pub struct GzipCtx {
     zin: usize,
     zout: usize,
 
-    zstream: Box<z::z_stream>,
-}
-
-impl Drop for GzipCtx {
-    fn drop(&mut self) {
-        // SAFETY: alloc comes from Box::into_raw() in GzipCtx::new() and is
-        // freed only here; zlib does not use the memory any more (its zfree
-        // is a no-op, as the pool frees the memory in C).
-        unsafe { drop(Box::from_raw(self.alloc)) };
-    }
+    /// zstream.next_in != NULL: the unprocessed input starts at
+    /// in_buf.pos
+    next_in: bool,
+    /// zstream.avail_in
+    avail_in: usize,
+    /// zstream.avail_out: the free space of out_buf, from out_buf.last
+    avail_out: usize,
 }
 
 impl GzipCtx {
-    fn new(log: Log) -> GzipCtx {
-        let alloc = Box::into_raw(Box::new(GzipAlloc {
-            preallocated: Vec::new(),
-            free_mem: 0,
-            allocated: 0,
-            zlib_ng: false,
-            state_allocated: false,
-            pool: Vec::new(),
-            log,
-        }));
-
+    fn new() -> GzipCtx {
         GzipCtx {
             in_: Chain::new(),
             free: Vec::new(),
@@ -124,33 +114,18 @@ impl GzipCtx {
             in_buf: None,
             out_buf: None,
             bufs: 0,
-            preallocated: false,
-            alloc,
+            zstream: None,
             wbits: 0,
-            memlevel: 0,
-            flush: z::Z_NO_FLUSH,
+            flush: Z_NO_FLUSH,
             redo: false,
             done: false,
             nomem: false,
             buffering: false,
             zin: 0,
             zout: 0,
-            zstream: Box::new(z::z_stream {
-                next_in: std::ptr::null_mut(),
-                avail_in: 0,
-                total_in: 0,
-                next_out: std::ptr::null_mut(),
-                avail_out: 0,
-                total_out: 0,
-                msg: std::ptr::null_mut(),
-                state: std::ptr::null_mut(),
-                zalloc: gzip_filter_alloc,
-                zfree: gzip_filter_free,
-                opaque: alloc as *mut libc::c_void,
-                data_type: 0,
-                adler: 0,
-                reserved: 0,
-            }),
+            next_in: false,
+            avail_in: 0,
+            avail_out: 0,
         }
     }
 
@@ -164,13 +139,22 @@ impl GzipCtx {
     }
 
     fn in_buf_pos(&self) -> usize {
-        self.in_buf.as_ref().map_or(0, |b| buf_data_ptr(b) as usize + b.pos)
+        self.in_buf.as_ref().map_or(0, |b| buf_data_addr(b) + b.pos)
     }
-}
 
-thread_local! {
-    /// ngx_http_gzip_assume_zlib_ng
-    static GZIP_ASSUME_ZLIB_NG: Cell<bool> = const { Cell::new(false) };
+    /// zstream.next_in for "%p"
+    fn next_in_ptr(&self) -> usize {
+        if self.next_in {
+            self.in_buf_pos()
+        } else {
+            0
+        }
+    }
+
+    /// zstream.next_out for "%p": the end of the data of out_buf
+    fn next_out_ptr(&self) -> usize {
+        self.out_buf.as_ref().map_or(0, |b| buf_data_addr(b) + b.last)
+    }
 }
 
 /// The tag of the buffers of the module, (ngx_buf_tag_t)
@@ -180,29 +164,22 @@ fn gzip_tag() -> usize {
     &TAG as *const u8 as usize
 }
 
-/// The start of the data of a buffer in memory (buf->start), NULL for
-/// the others (pos and last of these are NULL in C)
-fn buf_data_ptr(b: &Buf) -> *const u8 {
+/// The address of the data of a buffer in memory (buf->start) for the
+/// "%p" of the debug log, 0 (NULL) for the others (pos and last of these
+/// are NULL in C)
+fn buf_data_addr(b: &Buf) -> usize {
     match &b.data {
-        BufData::Memory(v) => v.as_ptr(),
-        _ => std::ptr::null(),
-    }
-}
-
-fn buf_data_mut_ptr(b: &mut Buf) -> *mut u8 {
-    match &mut b.data {
-        BufData::Memory(v) => v.as_mut_ptr(),
-        _ => std::ptr::null_mut(),
+        BufData::Memory(v) => v.as_ptr() as usize,
+        _ => 0,
     }
 }
 
 /// buf->last - buf->pos
 fn buf_mem_size(b: &Buf) -> usize {
-    if buf_data_ptr(b).is_null() {
-        return 0;
+    match &b.data {
+        BufData::Memory(_) => b.last - b.pos,
+        _ => 0,
     }
-
-    b.last - b.pos
 }
 
 /// A buffer sent, as ngx_chain_update_chains() moves it to ctx->free:
@@ -272,7 +249,7 @@ async fn gzip_header_filter(r: R, next: HeaderFilter) -> i64 {
         return next(r).await;
     }
 
-    let mut ctx = GzipCtx::new(r.connection.log.clone());
+    let mut ctx = GzipCtx::new();
 
     ctx.buffering = *conf.borrow().postpone_gzipping != 0;
 
@@ -334,7 +311,7 @@ async fn gzip_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
         }
     }
 
-    if !ctx.borrow().preallocated && gzip_filter_deflate_start(&r, &mut ctx.borrow_mut()) != NGX_OK {
+    if ctx.borrow().zstream.is_none() && gzip_filter_deflate_start(&r, &mut ctx.borrow_mut()) != NGX_OK {
         return gzip_filter_failed(&ctx);
     }
 
@@ -438,24 +415,10 @@ fn gzip_filter_failed(ctx: &Rc<std::cell::RefCell<GzipCtx>>) -> i64 {
 
     ctx.done = true;
 
-    if ctx.preallocated {
-        // SAFETY: the stream was initialized by deflateInit2_(); deflateEnd()
-        // of an ended one returns Z_STREAM_ERROR without using its state.
-        unsafe { z::deflateEnd(&mut *ctx.zstream) };
-
-        free_preallocated(&mut ctx);
-    }
+    // deflateEnd() and ngx_pfree(r->pool, ctx->preallocated)
+    ctx.zstream = None;
 
     NGX_ERROR
-}
-
-/// ngx_pfree(r->pool, ctx->preallocated)
-fn free_preallocated(ctx: &mut GzipCtx) {
-    // SAFETY: alloc is valid for the life of the ctx, and zlib is not
-    // running.
-    let alloc = unsafe { &mut *ctx.alloc };
-
-    alloc.preallocated = Vec::new();
 }
 
 /// ngx_http_gzip_filter_memory
@@ -464,7 +427,6 @@ fn gzip_filter_memory(r: &R, ctx: &mut GzipCtx) {
     let c = conf.borrow();
 
     let mut wbits = *c.wbits as i32;
-    let mut memlevel = *c.memlevel as i32;
 
     let content_length_n = r.headers_out.borrow().content_length_n;
 
@@ -473,52 +435,14 @@ fn gzip_filter_memory(r: &R, ctx: &mut GzipCtx) {
 
         while content_length_n < ((1i64 << (wbits - 1)) - 262) {
             wbits -= 1;
-            memlevel -= 1;
-        }
-
-        if memlevel < 1 {
-            memlevel = 1;
         }
     }
+
+    // C lowers the memory level with the window bits (down to 1) and
+    // preallocates zlib's memory (ctx->allocated) from both; flate2 takes
+    // no memory level and zlib allocates its memory itself.
 
     ctx.wbits = wbits;
-    ctx.memlevel = memlevel;
-
-    // We preallocate a memory for zlib in one buffer (200K-400K), this
-    // decreases a number of malloc() and free() calls and also probably
-    // decreases a number of syscalls (sbrk()/mmap() and so on).
-    // Besides we free the memory as soon as a gzipping will complete
-    // and do not wait while a whole response will be sent to a client.
-    //
-    // 8K is for zlib deflate_state, it takes
-    //  *) 5816 bytes on i386 and sparc64 (32-bit mode)
-    //  *) 5920 bytes on amd64 and sparc64
-    //
-    // A zlib variant from Intel (https://github.com/jtkukunas/zlib)
-    // uses additional 16-byte padding in one of window-sized buffers.
-
-    // SAFETY: alloc is valid for the life of the ctx, and zlib is not
-    // running.
-    let alloc = unsafe { &mut *ctx.alloc };
-
-    if !GZIP_ASSUME_ZLIB_NG.with(|g| g.get()) {
-        alloc.allocated = 8192 + 16 + (1 << (wbits + 2)) + (1 << (memlevel + 9));
-    } else {
-        // Another zlib variant, https://github.com/zlib-ng/zlib-ng.
-        // It used to force window bits to 13 for fast compression level,
-        // used (64 + sizeof(void*)) additional space on all allocations
-        // for alignment and 16-byte padding in one of window-sized buffers,
-        // uses a single allocation with up to 200 bytes for alignment and
-        // internal pointers, 5/4 times more memory for the pending buffer,
-        // and 128K hash.
-
-        if *c.level == 1 {
-            wbits = wbits.max(13);
-        }
-
-        alloc.allocated = 8192 + 16 + (1 << (wbits + 2)) + 131072 + (5 << (memlevel + 6)) + 4 * (64 + std::mem::size_of::<*const u8>());
-        alloc.zlib_ng = true;
-    }
 }
 
 /// ngx_http_gzip_filter_buffer
@@ -565,49 +489,19 @@ fn gzip_filter_buffer(r: &R, ctx: &mut GzipCtx, input: Chain) -> i64 {
 fn gzip_filter_deflate_start(r: &R, ctx: &mut GzipCtx) -> i64 {
     let level = *r.loc_conf::<GzipConf>(ctx_index()).borrow().level;
 
-    {
-        // SAFETY: alloc is valid for the life of the ctx, and zlib is not
-        // running.
-        let alloc = unsafe { &mut *ctx.alloc };
+    // deflateInit2(level, Z_DEFLATED, wbits + 16, memLevel 8,
+    // Z_DEFAULT_STRATEGY); with valid parameters it fails only when out of
+    // memory, which flate2 does not survive ("deflateInit2() failed")
+    ctx.zstream = Some(Compress::new_gzip(Compression::new(level as u32), ctx.wbits as u8));
 
-        alloc.preallocated = vec![0u64; alloc.allocated.div_ceil(8)];
-        alloc.free_mem = 0;
-    }
-
-    ctx.preallocated = true;
-
-    ctx.zstream.zalloc = gzip_filter_alloc;
-    ctx.zstream.zfree = gzip_filter_free;
-    ctx.zstream.opaque = ctx.alloc as *mut libc::c_void;
-
-    // SAFETY: the stream is boxed (zlib keeps a pointer to it in its state)
-    // and its allocator is the one of the ctx, which outlives it.
-    let rc = unsafe {
-        z::deflateInit2_(
-            &mut *ctx.zstream,
-            level as i32,
-            z::Z_DEFLATED,
-            ctx.wbits + 16,
-            ctx.memlevel,
-            z::Z_DEFAULT_STRATEGY,
-            z::zlibVersion(),
-            std::mem::size_of::<z::z_stream>() as i32,
-        )
-    };
-
-    if rc != z::Z_OK {
-        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "deflateInit2() failed: {}", rc);
-        return NGX_ERROR;
-    }
-
-    ctx.flush = z::Z_NO_FLUSH;
+    ctx.flush = Z_NO_FLUSH;
 
     NGX_OK
 }
 
 /// ngx_http_gzip_filter_add_data
 fn gzip_filter_add_data(r: &R, ctx: &mut GzipCtx) -> i64 {
-    if ctx.zstream.avail_in != 0 || ctx.flush != z::Z_NO_FLUSH || ctx.redo {
+    if ctx.avail_in != 0 || ctx.flush != Z_NO_FLUSH || ctx.redo {
         return NGX_OK;
     }
 
@@ -625,20 +519,19 @@ fn gzip_filter_add_data(r: &R, ctx: &mut GzipCtx) -> i64 {
 
     let in_buf = ctx.in_buf.as_ref().expect("in_buf");
 
-    let start = buf_data_ptr(in_buf);
+    // zstream.next_in = in_buf->pos, NULL for the buffers without memory
+    ctx.next_in = matches!(in_buf.data, BufData::Memory(_));
+    ctx.avail_in = buf_mem_size(in_buf);
 
-    ctx.zstream.next_in = if start.is_null() { std::ptr::null_mut() } else { start.wrapping_add(in_buf.pos) as *mut u8 };
-    ctx.zstream.avail_in = buf_mem_size(in_buf) as z::uInt;
-
-    http_debug!(r, "gzip in_buf:{:016X} ni:{:016X} ai:{}", ctx.in_buf_ptr(), ctx.zstream.next_in as usize, ctx.zstream.avail_in);
+    http_debug!(r, "gzip in_buf:{:016X} ni:{:016X} ai:{}", ctx.in_buf_ptr(), ctx.next_in_ptr(), ctx.avail_in);
 
     let in_buf = ctx.in_buf.as_ref().expect("in_buf");
 
     if in_buf.last_buf {
-        ctx.flush = z::Z_FINISH;
+        ctx.flush = Z_FINISH;
     } else if in_buf.flush {
-        ctx.flush = z::Z_SYNC_FLUSH;
-    } else if ctx.zstream.avail_in == 0 {
+        ctx.flush = Z_SYNC_FLUSH;
+    } else if ctx.avail_in == 0 {
         // ctx->flush == Z_NO_FLUSH
         return NGX_AGAIN;
     }
@@ -648,7 +541,7 @@ fn gzip_filter_add_data(r: &R, ctx: &mut GzipCtx) -> i64 {
 
 /// ngx_http_gzip_filter_get_buf
 fn gzip_filter_get_buf(r: &R, ctx: &mut GzipCtx) -> i64 {
-    if ctx.zstream.avail_out != 0 {
+    if ctx.avail_out != 0 {
         return NGX_OK;
     }
 
@@ -674,66 +567,90 @@ fn gzip_filter_get_buf(r: &R, ctx: &mut GzipCtx) -> i64 {
         return NGX_DECLINED;
     }
 
-    let out_buf = ctx.out_buf.as_mut().expect("out_buf");
-    let pos = out_buf.pos;
-
-    ctx.zstream.next_out = buf_data_mut_ptr(out_buf).wrapping_add(pos);
-    ctx.zstream.avail_out = bufs.size as z::uInt;
+    // zstream.next_out = ctx->out_buf->pos, the buffer is empty
+    ctx.avail_out = bufs.size;
 
     NGX_OK
 }
 
 /// ngx_http_gzip_filter_deflate
+/// deflate(&ctx->zstream, ctx->flush): the zlib return code; the input
+/// consumed advances in_buf.pos (the C does it after the call from
+/// zstream.next_in), the output is appended to out_buf.
+fn deflate(ctx: &mut GzipCtx) -> i32 {
+    let flush = match ctx.flush {
+        Z_SYNC_FLUSH => FlushCompress::Sync,
+        Z_FINISH => FlushCompress::Finish,
+        _ => FlushCompress::None,
+    };
+
+    let GzipCtx { zstream, in_buf, out_buf, next_in, avail_in, avail_out, .. } = ctx;
+
+    let z = zstream.as_mut().expect("deflate stream");
+
+    let input: &[u8] = match (in_buf.as_ref(), *next_in) {
+        (Some(b), true) => match &b.data {
+            BufData::Memory(v) => &v[b.pos..b.pos + *avail_in],
+            _ => &[],
+        },
+        _ => &[],
+    };
+
+    let out_buf = out_buf.as_mut().expect("out_buf");
+    let last = out_buf.last;
+
+    let output: &mut [u8] = match &mut out_buf.data {
+        BufData::Memory(v) => &mut v[last..last + *avail_out],
+        _ => &mut [],
+    };
+
+    let (total_in, total_out) = (z.total_in(), z.total_out());
+
+    let rc = match z.compress(input, output, flush) {
+        Ok(Status::Ok) => Z_OK,
+        Ok(Status::StreamEnd) => Z_STREAM_END,
+        Ok(Status::BufError) => Z_BUF_ERROR,
+        Err(_) => Z_STREAM_ERROR,
+    };
+
+    let consumed = (z.total_in() - total_in) as usize;
+    let produced = (z.total_out() - total_out) as usize;
+
+    if consumed != 0 {
+        if let Some(b) = in_buf.as_mut() {
+            b.pos += consumed;
+        }
+    }
+
+    *avail_in -= consumed;
+
+    out_buf.last += produced;
+    *avail_out -= produced;
+
+    rc
+}
+
+/// ngx_http_gzip_filter_deflate
 fn gzip_filter_deflate(r: &R, ctx: &mut GzipCtx) -> i64 {
-    http_debug!(
-        r,
-        "deflate in: ni:{:016X} no:{:016X} ai:{} ao:{} fl:{} redo:{}",
-        ctx.zstream.next_in as usize,
-        ctx.zstream.next_out as usize,
-        ctx.zstream.avail_in,
-        ctx.zstream.avail_out,
-        ctx.flush,
-        ctx.redo as i32
-    );
+    http_debug!(r, "deflate in: ni:{:016X} no:{:016X} ai:{} ao:{} fl:{} redo:{}", ctx.next_in_ptr(), ctx.next_out_ptr(), ctx.avail_in, ctx.avail_out, ctx.flush, ctx.redo as i32);
 
-    // SAFETY: next_in points into ctx->in_buf and next_out into
-    // ctx->out_buf, both owned by the ctx with the lengths avail_in and
-    // avail_out; the stream was initialized by deflateInit2_().
-    let rc = unsafe { z::deflate(&mut *ctx.zstream, ctx.flush) };
+    let rc = deflate(ctx);
 
-    if rc != z::Z_OK && rc != z::Z_STREAM_END && rc != z::Z_BUF_ERROR {
+    if rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "deflate() failed: {}, {}", ctx.flush, rc);
         return NGX_ERROR;
     }
 
-    http_debug!(
-        r,
-        "deflate out: ni:{:016X} no:{:016X} ai:{} ao:{} rc:{}",
-        ctx.zstream.next_in as usize,
-        ctx.zstream.next_out as usize,
-        ctx.zstream.avail_in,
-        ctx.zstream.avail_out,
-        rc
-    );
+    http_debug!(r, "deflate out: ni:{:016X} no:{:016X} ai:{} ao:{} rc:{}", ctx.next_in_ptr(), ctx.next_out_ptr(), ctx.avail_in, ctx.avail_out, rc);
 
     http_debug!(r, "gzip in_buf:{:016X} pos:{:016X}", ctx.in_buf_ptr(), ctx.in_buf_pos());
 
-    if !ctx.zstream.next_in.is_null() {
-        if let Some(in_buf) = ctx.in_buf.as_mut() {
-            in_buf.pos = ctx.zstream.next_in as usize - buf_data_ptr(in_buf) as usize;
-        }
-
-        if ctx.zstream.avail_in == 0 {
-            ctx.zstream.next_in = std::ptr::null_mut();
-        }
+    // in_buf->pos = zstream.next_in (done by deflate()), and
+    if ctx.next_in && ctx.avail_in == 0 {
+        ctx.next_in = false;
     }
 
-    {
-        let out_buf = ctx.out_buf.as_mut().expect("out_buf");
-        out_buf.last = ctx.zstream.next_out as usize - buf_data_mut_ptr(out_buf) as usize;
-    }
-
-    if ctx.zstream.avail_out == 0 && rc != z::Z_STREAM_END {
+    if ctx.avail_out == 0 && rc != Z_STREAM_END {
         // zlib wants to output some more gzipped data
 
         let b = ctx.out_buf.take().expect("out_buf");
@@ -746,14 +663,14 @@ fn gzip_filter_deflate(r: &R, ctx: &mut GzipCtx) -> i64 {
 
     ctx.redo = false;
 
-    if ctx.flush == z::Z_SYNC_FLUSH {
-        ctx.flush = z::Z_NO_FLUSH;
+    if ctx.flush == Z_SYNC_FLUSH {
+        ctx.flush = Z_NO_FLUSH;
 
         let mut b = if ctx.out_buf.as_ref().expect("out_buf").buf_size() == 0 {
             // ngx_calloc_buf()
             Buf::default()
         } else {
-            ctx.zstream.avail_out = 0;
+            ctx.avail_out = 0;
             ctx.out_buf.take().expect("out_buf")
         };
 
@@ -766,7 +683,7 @@ fn gzip_filter_deflate(r: &R, ctx: &mut GzipCtx) -> i64 {
         return NGX_OK;
     }
 
-    if rc == z::Z_STREAM_END {
+    if rc == Z_STREAM_END {
         if gzip_filter_deflate_end(r, ctx) != NGX_OK {
             return NGX_ERROR;
         }
@@ -802,18 +719,14 @@ fn gzip_filter_deflate(r: &R, ctx: &mut GzipCtx) -> i64 {
 
 /// ngx_http_gzip_filter_deflate_end
 fn gzip_filter_deflate_end(r: &R, ctx: &mut GzipCtx) -> i64 {
-    ctx.zin = ctx.zstream.total_in as usize;
-    ctx.zout = ctx.zstream.total_out as usize;
+    let z = ctx.zstream.take().expect("deflate stream");
 
-    // SAFETY: the stream was initialized by deflateInit2_().
-    let rc = unsafe { z::deflateEnd(&mut *ctx.zstream) };
+    ctx.zin = z.total_in() as usize;
+    ctx.zout = z.total_out() as usize;
 
-    if rc != z::Z_OK {
-        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "deflateEnd() failed: {}", rc);
-        return NGX_ERROR;
-    }
-
-    free_preallocated(ctx);
+    // deflateEnd() (Z_OK after Z_STREAM_END: the "deflateEnd() failed"
+    // alert cannot happen) and ngx_pfree(r->pool, ctx->preallocated)
+    drop(z);
 
     let mut b = ctx.out_buf.take().expect("out_buf");
 
@@ -825,8 +738,8 @@ fn gzip_filter_deflate_end(r: &R, ctx: &mut GzipCtx) -> i64 {
 
     ctx.out.push_back(b);
 
-    ctx.zstream.avail_in = 0;
-    ctx.zstream.avail_out = 0;
+    ctx.avail_in = 0;
+    ctx.avail_out = 0;
 
     ctx.done = true;
 
@@ -834,51 +747,6 @@ fn gzip_filter_deflate_end(r: &R, ctx: &mut GzipCtx) -> i64 {
 
     NGX_OK
 }
-
-/// ngx_http_gzip_filter_alloc
-unsafe extern "C" fn gzip_filter_alloc(opaque: *mut libc::c_void, items: z::uInt, size: z::uInt) -> *mut libc::c_void {
-    // SAFETY: opaque is the GzipAlloc of the ctx, alive during the zlib
-    // calls, and nothing else refers to it meanwhile.
-    let ctx = &mut *(opaque as *mut GzipAlloc);
-
-    let mut alloc = items as usize * size as usize;
-
-    if items == 1 && alloc % 512 != 0 && alloc < 8192 && !ctx.state_allocated {
-        // The zlib deflate_state allocation, it takes about 6K,
-        // we allocate 8K.  Other allocations are divisible by 512.
-
-        ctx.state_allocated = true;
-
-        alloc = 8192;
-    }
-
-    if alloc <= ctx.allocated {
-        let p = (ctx.preallocated.as_mut_ptr() as *mut u8).add(ctx.free_mem);
-        ctx.free_mem += alloc;
-        ctx.allocated -= alloc;
-
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, ctx.log, "gzip alloc: n:{} s:{} a:{} p:{:016X}", items, size, alloc, p as usize);
-
-        return p as *mut libc::c_void;
-    }
-
-    if ctx.zlib_ng {
-        ngx_log_error!(NGX_LOG_ALERT, ctx.log, None, "gzip filter failed to use preallocated memory: {} of {}", items.wrapping_mul(size), ctx.allocated);
-    } else {
-        GZIP_ASSUME_ZLIB_NG.with(|g| g.set(true));
-    }
-
-    // ngx_palloc(ctx->request->pool, items * size)
-    let mut v = vec![0u64; (items as usize * size as usize).div_ceil(8)];
-    let p = v.as_mut_ptr() as *mut libc::c_void;
-
-    ctx.pool.push(v);
-
-    p
-}
-
-/// ngx_http_gzip_filter_free
-unsafe extern "C" fn gzip_filter_free(_opaque: *mut libc::c_void, _address: *mut libc::c_void) {}
 
 /// ngx_http_gzip_add_variables
 fn gzip_add_variables(cf: &mut Conf) -> ConfResult {
@@ -1102,34 +970,67 @@ mod tests {
     /// XFL 4 at level 1 in the first output
     #[test]
     fn gzip_header_by_zlib() {
-        let mut ctx = GzipCtx::new(Log::new(ngx_core::log::LogChain::new()));
-
-        // SAFETY: the test owns the ctx
-        unsafe {
-            (*ctx.alloc).allocated = 8192 + 16 + (1 << (9 + 2)) + (1 << (2 + 9));
-            (*ctx.alloc).preallocated = vec![0u64; (*ctx.alloc).allocated.div_ceil(8)];
-        }
-
-        let rc = unsafe {
-            z::deflateInit2_(&mut *ctx.zstream, 1, z::Z_DEFLATED, 9 + 16, 2, z::Z_DEFAULT_STRATEGY, z::zlibVersion(), std::mem::size_of::<z::z_stream>() as i32)
-        };
-        assert_eq!(rc, z::Z_OK);
+        let mut z = Compress::new_gzip(Compression::new(1), 9);
 
         let input = b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".to_vec();
         let mut out = vec![0u8; 4096];
 
-        ctx.zstream.next_in = input.as_ptr() as *mut u8;
-        ctx.zstream.avail_in = input.len() as z::uInt;
-        ctx.zstream.next_out = out.as_mut_ptr();
-        ctx.zstream.avail_out = out.len() as z::uInt;
+        assert!(matches!(z.compress(&input, &mut out, FlushCompress::Finish), Ok(Status::StreamEnd)));
 
-        let rc = unsafe { z::deflate(&mut *ctx.zstream, z::Z_FINISH) };
-        assert_eq!(rc, z::Z_STREAM_END);
-
-        let n = out.len() - ctx.zstream.avail_out as usize;
+        let n = z.total_out() as usize;
         assert_eq!(&out[..10], &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0x04, 0x03]);
         assert_eq!(n, 24);
+        assert_eq!(z.total_in() as usize, input.len());
+    }
 
-        assert_eq!(unsafe { z::deflateEnd(&mut *ctx.zstream) }, z::Z_OK);
+    /// The bookkeeping of deflate(): the input consumed from in_buf, the
+    /// output appended to out_buf.
+    #[test]
+    fn deflate_buffers() {
+        let mut ctx = GzipCtx::new();
+        ctx.zstream = Some(Compress::new_gzip(Compression::new(1), 15));
+
+        let data = b"0123456789".repeat(100);
+        ctx.in_buf = Some(Buf::from_vec(data.clone()));
+        ctx.next_in = true;
+        ctx.avail_in = data.len();
+
+        ctx.out_buf = Some(create_temp_buf(16));
+        ctx.avail_out = 16;
+
+        // the first output fills the 16 bytes of out_buf
+        ctx.flush = Z_FINISH;
+        assert_eq!(deflate(&mut ctx), Z_OK);
+        assert_eq!(ctx.avail_out, 0);
+        assert_eq!(ctx.out_buf.as_ref().unwrap().last, 16);
+        assert_eq!(ctx.avail_in + ctx.in_buf.as_ref().unwrap().pos, data.len());
+
+        let out_data = |b: &Buf| match &b.data {
+            BufData::Memory(v) => v[b.pos..b.last].to_vec(),
+            _ => Vec::new(),
+        };
+
+        let mut gz = out_data(ctx.out_buf.as_ref().unwrap());
+
+        loop {
+            ctx.out_buf = Some(create_temp_buf(16));
+            ctx.avail_out = 16;
+
+            let rc = deflate(&mut ctx);
+            gz.extend_from_slice(&out_data(ctx.out_buf.as_ref().unwrap()));
+
+            if rc == Z_STREAM_END {
+                break;
+            }
+
+            assert_eq!(rc, Z_OK);
+        }
+
+        assert_eq!(ctx.avail_in, 0);
+        assert_eq!(ctx.zstream.as_ref().unwrap().total_out() as usize, gz.len());
+
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut out).unwrap();
+        assert_eq!(out, data);
     }
 }
