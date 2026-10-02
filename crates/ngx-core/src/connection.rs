@@ -709,6 +709,17 @@ impl Connection {
         }
     }
 
+    /// c->read->ready: a read event came since a read last found the socket
+    /// drained (see read_drained()), tested without touching the socket. A
+    /// pending EOF keeps it, as rev->pending_eof keeps rev->ready in
+    /// ngx_unix_recv. False for a socket never waited for.
+    pub fn read_ready(&self) -> bool {
+        match self.afd.borrow().as_ref() {
+            Some(afd) => afd.try_io(Interest::READABLE, |_| Ok(())).is_ok(),
+            None => false,
+        }
+    }
+
     /// Wait for a read event (data or the end of the stream) and return
     /// what it reports, leaving the readiness to the connection's readers:
     /// a handler that only looks at the event, as
