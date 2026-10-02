@@ -109,9 +109,13 @@ fn uri_is_collection(r: &R) -> bool {
     r.uri.borrow().last() == Some(&b'/')
 }
 
-/// dav_handler declines at once: not one of the dav_methods
+/// dav_handler declines at once: not one of the dav_methods, or a method
+/// it does not handle (its switch declines the others, GET and HEAD
+/// included, which the default dav_methods bitmask lets through)
 fn dav_idle(r: &R) -> bool {
-    r.method.get() & r.loc_conf::<DavLocConf>(ctx_index()).borrow().methods == 0
+    let method = r.method.get();
+
+    method & r.loc_conf::<DavLocConf>(ctx_index()).borrow().methods == 0 || method & (NGX_HTTP_PUT | NGX_HTTP_DELETE | NGX_HTTP_MKCOL | NGX_HTTP_COPY | NGX_HTTP_MOVE) == 0
 }
 
 async fn dav_handler(r: R) -> i64 {
