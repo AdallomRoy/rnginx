@@ -3020,7 +3020,6 @@ mod tests {
     use super::*;
     use ngx_core::buf::BufData;
     use std::cell::RefCell;
-    use std::os::unix::io::AsRawFd;
 
     fn capture() -> (Log, Rc<RefCell<Vec<u8>>>) {
         let logged: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3109,11 +3108,12 @@ mod tests {
     fn run(name: &str, file: &[u8], start: usize, length: usize, start_key_frame: bool, buffer_size: usize) -> Run {
         let path = std::env::temp_dir().join(format!("rnginx-mp4-{}-{}", std::process::id(), name));
         std::fs::write(&path, file).unwrap();
-        let f = std::fs::File::open(&path).unwrap();
+        // the descriptor in the process's table, as the static handler opens it
+        let fd = ngx_core::fd::register(std::os::fd::OwnedFd::from(std::fs::File::open(&path).unwrap()));
 
         let (log, logged) = capture();
         let conf = Mp4Conf { buffer_size: Val::set(buffer_size), max_buffer_size: Val::set(300), start_key_frame: Val::set(start_key_frame) };
-        let mut mp4 = Mp4File::new(f.as_raw_fd(), name.as_bytes().to_vec(), log, file.len() as i64, start, length, &conf, true);
+        let mut mp4 = Mp4File::new(fd, name.as_bytes().to_vec(), log, file.len() as i64, start, length, &conf, true);
 
         let rc = mp4.process();
         let mut body = Vec::new();
@@ -3128,7 +3128,7 @@ mod tests {
             }
         }
 
-        drop(f);
+        ngx_core::fd::close(fd).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let logged = String::from_utf8_lossy(&logged.borrow()).into_owned();
