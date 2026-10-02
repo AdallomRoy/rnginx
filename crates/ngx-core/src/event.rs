@@ -1301,7 +1301,7 @@ pub fn add_pending_work() {
 
 pub fn remove_pending_work() {
     PENDING_WORK.with(|p| p.set(p.get().saturating_sub(1)));
-    close_notify().notify_waiters();
+    crate::connection::wake_exiting_cycle();
 }
 
 pub fn no_pending_work() -> bool {

@@ -241,7 +241,8 @@ fn drain_connections() {
     }
 }
 
-/// Notified whenever a connection is closed (used by graceful shutdown).
+/// Notified, while the worker is exiting, whenever a connection or other
+/// pending work is gone (graceful shutdown waits for the last one).
 pub fn close_notify() -> Rc<tokio::sync::Notify> {
     CLOSE_NOTIFY.with(|n| n.clone())
 }
@@ -1410,6 +1411,16 @@ impl Drop for Connection {
         self.free_connection();
         ACTIVE.with(|a| a.set(a.get().saturating_sub(1)));
         CONNECTIONS.with(|m| m.borrow_mut().remove(&self.number));
+        wake_exiting_cycle();
+    }
+}
+
+/// A connection or other work is gone: an exiting worker cycle is woken to
+/// check whether it is the last (C checks ngx_exiting once per iteration of
+/// the cycle). A worker not exiting waits for no connection to go: it is
+/// not woken, which would make it re-arm its waits for nothing.
+pub(crate) fn wake_exiting_cycle() {
+    if crate::event::is_exiting() {
         CLOSE_NOTIFY.with(|n| n.notify_waiters());
     }
 }
