@@ -3471,6 +3471,17 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
 
     let mut do_write = do_write || u.length == 0;
 
+    // the read timer, and the client's close watched, along the response:
+    // one Sleep (ReadTimer) and one future, not one of each per read
+    let read_sleep: Option<tokio::time::Sleep> = None;
+    tokio::pin!(read_sleep);
+    let mut read_timer = ReadTimer::new();
+
+    let watch = u.watch.clone();
+    let closed = client_closed(watch.as_deref());
+    tokio::pin!(closed);
+    let mut watching = watch.is_some();
+
     loop {
         if do_write {
             if !u.out_bufs.is_empty() {
@@ -3498,15 +3509,23 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
             }
         }
 
-        let watch = u.watch.clone();
+        read_timer.arm(read_sleep.as_mut(), Instant::now() + Duration::from_millis(read_timeout));
 
         let res = {
             let sock = u.sock.as_mut().expect("connection");
-            let read = tokio::time::timeout(Duration::from_millis(read_timeout), sock.read(&mut chunk));
+            let (timer, mut sleep) = (&mut read_timer, read_sleep.as_mut());
+
+            let read = std::future::poll_fn(|cx| {
+                timer.poll(sleep.as_mut(), cx, |cx| {
+                    let mut rb = tokio::io::ReadBuf::new(&mut chunk);
+
+                    tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut *sock), cx, &mut rb).map_ok(|()| rb.filled().len())
+                })
+            });
 
             tokio::select! {
                 res = read => Some(res),
-                err = client_closed(watch.as_deref()) => {
+                err = &mut closed, if watching => {
                     let _ = err;
                     None
                 }
@@ -3520,6 +3539,7 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
                 }
 
                 u.watch = None;
+                watching = false;
                 continue;
             }
 
@@ -3611,6 +3631,57 @@ async fn sleep_until_opt(t: Option<Instant>) {
     match t {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
+    }
+}
+
+/// The read timer of a loop reading the upstream (ngx_add_timer(c->read,
+/// ...)): one Sleep pinned by the loop, registered with the timer wheel
+/// when a read first waits and then moved to each new deadline (moving it
+/// later takes no lock there), instead of a timeout registered and
+/// cancelled at each wait.
+struct ReadTimer {
+    /// the deadline the Sleep is set for
+    armed: Option<Instant>,
+    /// whether it was polled, so registered: then moved, else made anew
+    polled: bool,
+}
+
+impl ReadTimer {
+    fn new() -> ReadTimer {
+        ReadTimer { armed: None, polled: false }
+    }
+
+    /// Set the timer, `sleep`, for `deadline`.
+    fn arm(&mut self, mut sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>, deadline: Instant) {
+        if self.armed == Some(deadline) {
+            return;
+        }
+
+        self.armed = Some(deadline);
+
+        match sleep.as_mut().as_pin_mut() {
+            Some(s) if self.polled => s.reset(deadline),
+            _ => sleep.set(Some(tokio::time::sleep_until(deadline))),
+        }
+    }
+
+    /// A read under the timer, as tokio::time::timeout polls it: the read
+    /// first, the timer only while the read waits. Err(()) when the timer
+    /// expires.
+    fn poll<T>(&mut self, sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>, cx: &mut std::task::Context<'_>, read: impl FnOnce(&mut std::task::Context<'_>) -> std::task::Poll<T>) -> std::task::Poll<Result<T, ()>> {
+        use std::future::Future;
+
+        if let std::task::Poll::Ready(v) = read(cx) {
+            return std::task::Poll::Ready(Ok(v));
+        }
+
+        match sleep.as_pin_mut() {
+            Some(s) => {
+                self.polled = true;
+                s.poll(cx).map(|()| Err(()))
+            }
+            None => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -4533,14 +4604,26 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
     // u->conf->preserve_output: the rest of the request and the module's
     // output go on while the response is read (the upstream's write handler
     // stays ngx_http_upstream_send_request_handler), and the upstream's read
-    // timer is the pipe's, not re-armed by those events
+    // timer is the pipe's, not re-armed by those events; otherwise each wait
+    // for the upstream arms it anew
     let duplex = u.conf.preserve_output;
-    let mut read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+    let mut read_deadline = duplex.then(|| Instant::now() + Duration::from_millis(p.read_timeout));
     let mut body_timer = None;
 
     if duplex {
         body_timer_after_read(r, &mut body_timer);
     }
+
+    // the read timer, and the client's close watched, along the pipe: one
+    // Sleep (ReadTimer) and one future, not one of each per wait
+    let read_sleep: Option<tokio::time::Sleep> = None;
+    tokio::pin!(read_sleep);
+    let mut read_timer = ReadTimer::new();
+
+    let watch = u.watch.clone();
+    let closed = client_closed(watch.as_deref());
+    tokio::pin!(closed);
+    let mut watching = watch.is_some();
 
     loop {
         if duplex && u.post_write {
@@ -4570,7 +4653,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 return (PipeEnd::Finalize(rc), None);
             }
 
-            read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+            read_deadline = Some(Instant::now() + Duration::from_millis(p.read_timeout));
         }
 
         // ngx_event_pipe_write_to_downstream: what can be written now
@@ -4618,15 +4701,25 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
             }
         }
 
-        let watch = u.watch.clone();
-
         enum Ev {
             Written(i64),
-            Read(Option<Result<std::io::Result<(usize, usize)>, tokio::time::error::Elapsed>>),
+            /// a read, or Err(()) when the read timer expired
+            Read(Option<Result<std::io::Result<(usize, usize)>, ()>>),
             Delayed,
             ClientClosed(i32),
             /// u->conf->preserve_output: the events of the request's output
             Duplex(DuplexEvent),
+        }
+
+        let reading = !chain.is_empty();
+
+        if reading {
+            let deadline = match read_deadline {
+                Some(d) => d,
+                None => Instant::now() + Duration::from_millis(p.read_timeout),
+            };
+
+            read_timer.arm(read_sleep.as_mut(), deadline);
         }
 
         let ev = if duplex {
@@ -4640,9 +4733,9 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
             let upstream_writer = &mut u.writer;
             let reading_body = r.reading_body.get();
             let send_timer = u.send_timer;
-            let reading = !chain.is_empty();
             let downstream = writer.is_some();
             let read_chain = &mut chain;
+            let (timer, mut sleep) = (&mut read_timer, read_sleep.as_mut());
 
             tokio::select! {
                 biased;
@@ -4654,7 +4747,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                     }
                 }, if downstream => Ev::Written(rc),
 
-                res = tokio::time::timeout_at(read_deadline, std::future::poll_fn(|cx| poll_pipe_recv_conn(pc, cx, read_chain, limit))), if reading => Ev::Read(Some(res)),
+                res = std::future::poll_fn(|cx| timer.poll(sleep.as_mut(), cx, |cx| poll_pipe_recv_conn(pc, cx, read_chain, limit))), if reading => Ev::Read(Some(res)),
 
                 _ = sleep_until_opt(delayed), if delayed.is_some() => Ev::Delayed,
 
@@ -4670,17 +4763,16 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
                 _ = sleep_until_opt(body_timer), if reading_body && body_timer.is_some() => Ev::Duplex(DuplexEvent::BodyTimeout),
 
-                err = client_closed(watch.as_deref()), if !reading_body => Ev::ClientClosed(err),
+                err = &mut closed, if watching && !reading_body => Ev::ClientClosed(err),
             }
         } else {
             let sock = u.sock.as_mut().expect("connection");
-            let read_timeout = p.read_timeout;
-            let reading = !chain.is_empty();
             let read_chain = &mut chain;
+            let (timer, mut sleep) = (&mut read_timer, read_sleep.as_mut());
 
             let read = async {
                 if reading {
-                    Ev::Read(Some(tokio::time::timeout(Duration::from_millis(read_timeout), std::future::poll_fn(|cx| poll_pipe_recv(sock, cx, read_chain, limit))).await))
+                    Ev::Read(Some(std::future::poll_fn(|cx| timer.poll(sleep.as_mut(), cx, |cx| poll_pipe_recv(sock, cx, read_chain, limit))).await))
                 } else {
                     std::future::pending().await
                 }
@@ -4707,7 +4799,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 ev = write => ev,
                 ev = read => ev,
                 ev = delay => ev,
-                err = client_closed(watch.as_deref()) => Ev::ClientClosed(err),
+                err = &mut closed, if watching => Ev::ClientClosed(err),
             }
         };
 
@@ -4730,7 +4822,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 }
 
                 if duplex {
-                    read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+                    read_deadline = Some(Instant::now() + Duration::from_millis(p.read_timeout));
                 }
             }
 
@@ -4742,6 +4834,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 }
 
                 u.watch = None;
+                watching = false;
             }
 
             Ev::Duplex(DuplexEvent::Written(Ok(()))) => {
@@ -4791,7 +4884,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 r.connection.log.set_action(Some("reading upstream"));
 
                 if duplex {
-                    read_deadline = Instant::now() + Duration::from_millis(p.read_timeout);
+                    read_deadline = Some(Instant::now() + Duration::from_millis(p.read_timeout));
                 }
 
                 match res {
