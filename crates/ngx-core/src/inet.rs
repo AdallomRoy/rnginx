@@ -1,8 +1,63 @@
 //! Address parsing and formatting, ported from ngx_inet.c.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+
+use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage, UnixAddr};
 
 use crate::string::{atoi, starts_with_ignore_case, B};
+
+/// sizeof(sun_path)
+const SUN_PATH_LEN: usize = 108;
+
+/// offsetof(struct sockaddr_un, sun_path)
+const SUN_PATH_OFFSET: usize = std::mem::size_of::<libc::sa_family_t>();
+
+/// The address as the socket calls of nix take it (bind, connect, sendmsg):
+/// the sockaddr of SockAddr::to_libc(), its unix path given up to where the
+/// kernel reads it.
+pub enum NixSockAddr {
+    V4(SockaddrIn),
+    V6(SockaddrIn6),
+    Unix(UnixAddr),
+}
+
+impl NixSockAddr {
+    /// For nix's bind() and connect().
+    pub fn as_dyn(&self) -> &dyn SockaddrLike {
+        match self {
+            NixSockAddr::V4(a) => a,
+            NixSockAddr::V6(a) => a,
+            NixSockAddr::Unix(a) => a,
+        }
+    }
+}
+
+/// The sockaddr_un of to_libc(): the first 107 bytes of the path, NUL
+/// terminated in the 108 of sun_path, with the length of the whole
+/// structure. The kernel reads a path up to its NUL, and a name starting
+/// with a NUL (none: an empty path) as an abstract name taking all of
+/// sun_path: the same address is given here with the length it is read
+/// with.
+fn unix_addr(path: &[u8]) -> UnixAddr {
+    let p = &path[..path.len().min(SUN_PATH_LEN - 1)];
+
+    match p.first() {
+        Some(&c) if c != 0 => {
+            let end = memchr::memchr(0, p).unwrap_or(p.len());
+            UnixAddr::new(&p[..end]).expect("a unix path shorter than sun_path, without NUL")
+        }
+
+        _ => {
+            let mut name = [0u8; SUN_PATH_LEN - 1];
+
+            if p.len() > 1 {
+                name[..p.len() - 1].copy_from_slice(&p[1..]);
+            }
+
+            UnixAddr::new_abstract(&name).expect("an abstract name shorter than sun_path")
+        }
+    }
+}
 
 /// ngx_cmp_sockaddr: NGX_OK for the same address (and port, if asked),
 /// else NGX_DECLINED
@@ -171,6 +226,91 @@ impl SockAddr {
             }
             _ => None,
         }
+    }
+
+    /// The address for the socket calls of nix (to_libc() made safe).
+    pub fn to_nix(&self) -> NixSockAddr {
+        match self {
+            SockAddr::V4(a) => NixSockAddr::V4(SockaddrIn::from(*a)),
+            SockAddr::V6(a) => NixSockAddr::V6(SockaddrIn6::from(*a)),
+            SockAddr::Unix(p) => NixSockAddr::Unix(unix_addr(p)),
+        }
+    }
+
+    /// The address nix returned (getsockname(), recvmsg()), as from_libc()
+    /// reads the sockaddr: None for a family other than AF_INET, AF_INET6
+    /// and AF_UNIX.
+    pub fn from_nix(ss: &SockaddrStorage) -> Option<SockAddr> {
+        if let Some(sin) = ss.as_sockaddr_in() {
+            return Some(SockAddr::V4(SocketAddrV4::from(*sin)));
+        }
+
+        if let Some(sin6) = ss.as_sockaddr_in6() {
+            return Some(SockAddr::V6(SocketAddrV6::from(*sin6)));
+        }
+
+        if let Some(sun) = ss.as_unix_addr() {
+            return Some(SockAddr::from_unix_addr(sun));
+        }
+
+        if ss.family() == Some(nix::sys::socket::AddressFamily::Unix) {
+            // shorter than the family: no path
+            return Some(SockAddr::Unix(Vec::new()));
+        }
+
+        None
+    }
+
+    /// A unix address nix returned, as from_libc() reads it: the path up to
+    /// its first NUL within the address length (an abstract or unnamed
+    /// address has none).
+    pub fn from_unix_addr(sun: &UnixAddr) -> SockAddr {
+        let len = sun.len() as usize;
+
+        if len <= SUN_PATH_OFFSET {
+            return SockAddr::Unix(Vec::new());
+        }
+
+        let raw: &libc::sockaddr_un = sun.as_ref();
+        let max = (len - SUN_PATH_OFFSET).min(raw.sun_path.len());
+
+        SockAddr::Unix(raw.sun_path[..max].iter().map(|&c| c as u8).take_while(|&c| c != 0).collect())
+    }
+
+    /// The bytes of the sockaddr to_libc() makes, as long as the length it
+    /// returns (ngx_quic_address_hash hashes c->sockaddr).
+    pub fn raw_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(SUN_PATH_OFFSET + SUN_PATH_LEN);
+
+        match self {
+            SockAddr::V4(a) => {
+                // struct sockaddr_in
+                v.extend_from_slice(&(libc::AF_INET as libc::sa_family_t).to_ne_bytes());
+                v.extend_from_slice(&a.port().to_be_bytes());
+                v.extend_from_slice(&a.ip().octets());
+                v.extend_from_slice(&[0u8; 8]);
+            }
+
+            SockAddr::V6(a) => {
+                // struct sockaddr_in6
+                v.extend_from_slice(&(libc::AF_INET6 as libc::sa_family_t).to_ne_bytes());
+                v.extend_from_slice(&a.port().to_be_bytes());
+                v.extend_from_slice(&a.flowinfo().to_ne_bytes());
+                v.extend_from_slice(&a.ip().octets());
+                v.extend_from_slice(&a.scope_id().to_ne_bytes());
+            }
+
+            SockAddr::Unix(p) => {
+                // struct sockaddr_un
+                v.extend_from_slice(&(libc::AF_UNIX as libc::sa_family_t).to_ne_bytes());
+                let mut path = [0u8; SUN_PATH_LEN];
+                let n = p.len().min(SUN_PATH_LEN - 1);
+                path[..n].copy_from_slice(&p[..n]);
+                v.extend_from_slice(&path);
+            }
+        }
+
+        v
     }
 
     /// ngx_cmp_sockaddr
@@ -883,32 +1023,36 @@ fn parse_inet6_url(u: &mut Url, url: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-/// ngx_inet_resolve_host via getaddrinfo.
+/// ngx_inet_resolve_host via getaddrinfo: the lookup of std, which calls
+/// getaddrinfo() with the same hints (AF_UNSPEC, SOCK_STREAM, no flags)
+/// and returns its AF_INET and AF_INET6 addresses in order (a host that is
+/// an address text is returned as is, as getaddrinfo() does).
 pub fn inet_resolve_host(u: &mut Url) -> Result<(), ()> {
     let host = crate::os::cstr(&u.host);
-    let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
-    hints.ai_family = libc::AF_UNSPEC;
-    hints.ai_socktype = libc::SOCK_STREAM;
-    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
-    let rc = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut res) };
-    if rc != 0 {
-        u.err = Some("host not found");
-        return Err(());
-    }
-    let mut addrs = Vec::new();
-    let mut rp = res;
-    while !rp.is_null() {
-        let ai = unsafe { &*rp };
-        if let Some(mut sa) = SockAddr::from_libc(ai.ai_addr, ai.ai_addrlen) {
-            if matches!(sa, SockAddr::V4(_) | SockAddr::V6(_)) {
-                sa.set_port(u.port);
-                let name = sa.to_text(true);
-                addrs.push(Addr { sockaddr: sa, name });
-            }
+
+    // getaddrinfo() of a name that is not UTF-8 finds no host
+    let found = match host.to_str() {
+        Ok(name) => (name, u.port).to_socket_addrs().ok(),
+        Err(_) => None,
+    };
+
+    let found = match found {
+        Some(f) => f,
+        None => {
+            u.err = Some("host not found");
+            return Err(());
         }
-        rp = ai.ai_next;
+    };
+
+    let mut addrs = Vec::new();
+    for a in found {
+        let sa = match a {
+            std::net::SocketAddr::V4(a) => SockAddr::V4(a),
+            std::net::SocketAddr::V6(a) => SockAddr::V6(a),
+        };
+        let name = sa.to_text(true);
+        addrs.push(Addr { sockaddr: sa, name });
     }
-    unsafe { libc::freeaddrinfo(res) };
     if addrs.is_empty() {
         u.err = Some("host not found");
         return Err(());
@@ -1039,6 +1183,111 @@ mod tests {
         assert!(!cidr(b"10.0.0.0/8").matches(&SockAddr::Unix(b"/tmp/x".to_vec())));
         assert!(Cidr::Unix.matches(&SockAddr::Unix(b"/tmp/x".to_vec())));
         assert!(!Cidr::Unix.matches(&v4("10.0.0.1")));
+    }
+
+    #[test]
+    fn sockaddr_bytes() {
+        let v4 = SockAddr::v4(Ipv4Addr::new(192, 0, 2, 1), 8080);
+        let b = v4.raw_bytes();
+        assert_eq!(b.len(), std::mem::size_of::<libc::sockaddr_in>());
+        assert_eq!(&b[..2], &(libc::AF_INET as u16).to_ne_bytes());
+        assert_eq!(&b[2..8], &[0x1f, 0x90, 192, 0, 2, 1]);
+        assert!(b[8..].iter().all(|&c| c == 0));
+
+        let v6 = SockAddr::V6(SocketAddrV6::new("2001:db8::1".parse().unwrap(), 443, 7, 3));
+        let b = v6.raw_bytes();
+        assert_eq!(b.len(), std::mem::size_of::<libc::sockaddr_in6>());
+        assert_eq!(&b[..2], &(libc::AF_INET6 as u16).to_ne_bytes());
+        assert_eq!(&b[2..4], &[0x01, 0xbb]);
+        assert_eq!(&b[4..8], &7u32.to_ne_bytes());
+        assert_eq!(&b[8..24], &"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(&b[24..], &3u32.to_ne_bytes());
+
+        let un = SockAddr::Unix(b"/tmp/x".to_vec());
+        let b = un.raw_bytes();
+        assert_eq!(b.len(), std::mem::size_of::<libc::sockaddr_un>());
+        assert_eq!(&b[2..8], b"/tmp/x");
+        assert!(b[8..].iter().all(|&c| c == 0));
+
+        // the path is cut to 107 bytes, NUL-terminated in sun_path
+        let long = SockAddr::Unix(vec![b'a'; 120]);
+        let b = long.raw_bytes();
+        assert_eq!(b.len(), std::mem::size_of::<libc::sockaddr_un>());
+        assert_eq!(b[2 + 106], b'a');
+        assert_eq!(b[2 + 107], 0);
+    }
+
+    #[test]
+    fn nix_addresses() {
+        let v4 = SockAddr::v4(Ipv4Addr::new(127, 0, 0, 1), 80);
+        assert_eq!(v4.to_nix().as_dyn().len() as usize, std::mem::size_of::<libc::sockaddr_in>());
+        let v6 = SockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 5, 1));
+        match v6.to_nix() {
+            NixSockAddr::V6(a) => {
+                assert_eq!(SocketAddrV6::from(a), SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 5, 1));
+            }
+            _ => panic!("v6"),
+        }
+
+        // a path up to where the kernel reads it
+        match SockAddr::Unix(b"/tmp/sock".to_vec()).to_nix() {
+            NixSockAddr::Unix(u) => assert_eq!(u.path(), Some(std::path::Path::new("/tmp/sock"))),
+            _ => panic!("unix"),
+        }
+        match SockAddr::Unix(vec![b'p'; 200]).to_nix() {
+            NixSockAddr::Unix(u) => assert_eq!(u.path().unwrap().as_os_str().len(), 107),
+            _ => panic!("unix"),
+        }
+
+        // no path: the all-zero sun_path of to_libc(), an abstract name
+        match SockAddr::Unix(Vec::new()).to_nix() {
+            NixSockAddr::Unix(u) => {
+                assert_eq!(u.len() as usize, std::mem::size_of::<libc::sockaddr_un>());
+                assert_eq!(u.as_abstract(), Some(&[0u8; 107][..]));
+            }
+            _ => panic!("unix"),
+        }
+
+        // getsockname() results
+        use std::os::fd::AsRawFd;
+
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ss: SockaddrStorage = nix::sys::socket::getsockname(s.as_raw_fd()).unwrap();
+        let std::net::SocketAddr::V4(local) = s.local_addr().unwrap() else { panic!("v4") };
+        assert_eq!(SockAddr::from_nix(&ss), Some(SockAddr::V4(local)));
+
+        let path = std::env::temp_dir().join(format!("ngx-inet-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let ss: SockaddrStorage = nix::sys::socket::getsockname(l.as_raw_fd()).unwrap();
+        assert_eq!(SockAddr::from_nix(&ss), Some(SockAddr::Unix(path.to_str().unwrap().as_bytes().to_vec())));
+        let _ = std::fs::remove_file(&path);
+
+        // an unbound unix socket has no path
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ss: SockaddrStorage = nix::sys::socket::getsockname(a.as_raw_fd()).unwrap();
+        assert_eq!(SockAddr::from_nix(&ss), Some(SockAddr::Unix(Vec::new())));
+    }
+
+    #[test]
+    fn resolve_host() {
+        let mut u = Url { host: b"127.0.0.1".to_vec(), port: 8080, ..Default::default() };
+        inet_resolve_host(&mut u).unwrap();
+        assert_eq!(u.addrs.len(), 1);
+        assert_eq!(u.addrs[0].sockaddr, SockAddr::v4(Ipv4Addr::LOCALHOST, 8080));
+        assert_eq!(u.addrs[0].name, b"127.0.0.1:8080".to_vec());
+
+        let mut u = Url { host: b"localhost".to_vec(), port: 80, ..Default::default() };
+        inet_resolve_host(&mut u).unwrap();
+        assert!(u.addrs.iter().all(|a| a.sockaddr.port() == 80 && !a.sockaddr.is_unix()));
+
+        let mut u = Url { host: Vec::new(), ..Default::default() };
+        assert!(inet_resolve_host(&mut u).is_err());
+        assert_eq!(u.err, Some("host not found"));
+
+        let mut u = Url { host: vec![0xff, b'x'], ..Default::default() };
+        assert!(inet_resolve_host(&mut u).is_err());
+        assert_eq!(u.err, Some("host not found"));
     }
 
     #[test]
