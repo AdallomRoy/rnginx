@@ -271,8 +271,8 @@ async fn header_filter(r: &R) -> i64 {
         }
 
         if ho.last_modified.is_none() && ho.last_modified_time != -1 {
-            let mut tb = [0u8; 32];
-            let t = crate::v2::encode::http_time(&mut tb, ho.last_modified_time);
+            let tb = ngx_core::times::http_time_bytes(ho.last_modified_time);
+            let t = &tb[..];
 
             ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 output header: \"last-modified: {}\"", B(t));
 

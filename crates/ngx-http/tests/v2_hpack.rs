@@ -281,11 +281,3 @@ fn hpack_indexed_into_buffers() {
     // the buffers were filled in place
     assert_eq!((name.as_ptr(), value.as_ptr()), (np, vp));
 }
-
-#[test]
-fn http_time_without_string() {
-    for t in [0i64, 1, 59, 86399, 86400, 951782400, 1700000000, 4102444800, 253402300799, 999999999999, -5] {
-        let mut b = [0u8; 32];
-        assert_eq!(ngx_http::v2::encode::http_time(&mut b, t), ngx_core::times::http_time(t).as_bytes(), "{}", t);
-    }
-}

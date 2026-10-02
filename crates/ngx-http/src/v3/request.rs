@@ -1141,7 +1141,7 @@ fn construct_cookie_header(r: &R) -> Result<(), Fin> {
     let value = cookies.join(&b"; "[..]);
 
     let hash = ngx_core::hash::hash_key(b"cookie");
-    let h = TableElt::with_hash(b"cookie", &value, hash, b"cookie".to_vec());
+    let h = TableElt::owned(b"cookie".to_vec(), value, hash, b"cookie".to_vec());
 
     r.headers_in.borrow_mut().headers.push(h.clone());
 

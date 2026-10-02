@@ -484,8 +484,14 @@ pub fn header_request(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, name: &[u8]
 
 /// Add a header to headers_in and run its headers_in_hash handler.
 fn process_header_line(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R, name: &[u8], value: &[u8]) -> Result<(), ()> {
+    process_header_line_owned(h2c, stream, r, name, value.to_vec())
+}
+
+/// process_header_line() of a value made for it (moved into the header):
+/// the key and lowcase key of HTTP/2's lowercase names are copies of it.
+fn process_header_line_owned(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R, name: &[u8], value: Vec<u8>) -> Result<(), ()> {
     let hash = ngx_core::hash::hash_key(name);
-    let h = TableElt::with_hash(name, value, hash, name.to_vec());
+    let h = TableElt::owned(name.to_vec(), value, hash, name.to_vec());
 
     r.headers_in.borrow_mut().headers.push(h.clone());
 
@@ -763,7 +769,7 @@ fn construct_cookie_header(h2c: &Rc<H2Connection>, stream: &Rc<H2Stream>, r: &R)
 
     let value = cookies.join(&b"; "[..]);
 
-    process_header_line(h2c, stream, r, b"cookie", &value)
+    process_header_line_owned(h2c, stream, r, b"cookie", value)
 }
 
 /// ngx_http_v2_construct_host_header: Host from :authority, for $http_host.

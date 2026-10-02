@@ -75,21 +75,6 @@ pub fn string_encode(dst: &mut Vec<u8>, src: &[u8], lower: bool) {
     }
 }
 
-/// ngx_http_time() into `buf`: the bytes of ngx_core::times::http_time()
-/// ("Wed, 31 Dec 1986 18:00:00 GMT"), without a String.
-pub fn http_time(buf: &mut [u8; 32], t: i64) -> &[u8] {
-    use ngx_core::times::{gmtime, MONTHS, WEEK};
-    use std::io::Write;
-
-    let tm = gmtime(t);
-
-    let mut w = &mut buf[..];
-    let _ = write!(w, "{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT", WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec);
-    let n = 32 - w.len();
-
-    &buf[..n]
-}
-
 /// ngx_http_v2_write_name
 pub fn write_name(dst: &mut Vec<u8>, src: &[u8]) {
     string_encode(dst, src, true);
