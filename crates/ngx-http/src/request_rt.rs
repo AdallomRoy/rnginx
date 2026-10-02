@@ -179,7 +179,11 @@ async fn connection_task(c: Rc<Connection>) {
                     let preread = {
                         let mut b = hc.buffer.borrow_mut();
                         let v = b.unread().to_vec();
-                        b.pos = b.last;
+                        b.pos = 0;
+                        b.last = 0;
+                        let data = std::mem::take(&mut b.data);
+                        drop(b);
+                        free_header_buffer(data);
                         v
                     };
                     Box::pin(crate::v2::connection::init(c.clone(), hc.clone(), preread)).await;
@@ -190,36 +194,46 @@ async fn connection_task(c: Rc<Connection>) {
         }
         c.log.set_action(Some("reading client request line"));
         c.set_reusable(false);
-        let r = create_request(&c, &hc, &log_ctx);
-        let end = tokio::select! {
-            end = run_request(&r) => end,
-            _ = connection_close(&c) => {
-                // ngx_http_request_handler: c->close (the shutdown timer)
-                // terminates the request
-                terminate_request(&r, 0);
-                End::Close
-            }
-        };
-        match end {
-            End::Keepalive => {
-                if keepalive(&r, &hc).await.is_err() {
+        let keepalive = {
+            let r = create_request(&c, &hc, &log_ctx);
+            let end = tokio::select! {
+                end = run_request(&r) => end,
+                _ = connection_close(&c) => {
+                    // ngx_http_request_handler: c->close (the shutdown timer)
+                    // terminates the request
+                    terminate_request(&r, 0);
+                    End::Close
+                }
+            };
+            match end {
+                End::Keepalive => match set_keepalive(&r, &hc) {
+                    Ok(k) => k,
+                    Err(()) => {
+                        close_connection(&c);
+                        return;
+                    }
+                },
+                End::Lingering => {
+                    lingering_close(&r).await;
+                    close_request_final(&r);
                     close_connection(&c);
                     return;
                 }
-                // next request: either pipelined data or freshly read data is in the buffer
+                End::Close => {
+                    close_request_final(&r);
+                    close_connection(&c);
+                    return;
+                }
             }
-            End::Lingering => {
-                lingering_close(&r).await;
-                close_request_final(&r);
-                close_connection(&c);
-                return;
-            }
-            End::Close => {
-                close_request_final(&r);
+            // the request object goes here, before the wait
+        };
+        if let Keepalive::Wait(min_to, ka_to) = keepalive {
+            if keepalive_wait(&c, &hc, min_to, ka_to).await.is_err() {
                 close_connection(&c);
                 return;
             }
         }
+        // next request: either pipelined data or freshly read data is in the buffer
     }
 }
 
@@ -295,44 +309,29 @@ async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<Wai
     let size = *cscf.borrow().client_header_buffer_size;
     loop {
         http_debug_c(c, "http wait request handler");
-        {
-            let mut b = hc.buffer.borrow_mut();
-            if b.data.len() < size {
-                b.data.resize(size, 0);
-            }
-            b.cap = size;
-        }
+        hc.buffer.borrow_mut().cap = size;
         c.set_reusable(true);
-        let n = {
-            let last = hc.buffer.borrow().last;
-            let mut buf = vec![0u8; size - last];
-            let res = tokio::select! {
-                r = tokio::time::timeout(Duration::from_millis(timeout), c.recv(&mut buf)) => r,
-                _ = c.close_notify.notified() => {
-                    close_connection(c);
-                    return Err(());
-                }
-            };
-            match res {
-                Err(_) => {
-                    ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
-                    return Err(());
-                }
-                Ok(Err(_)) => return Err(()),
-                Ok(Ok(0)) => {
-                    ngx_log_error!(NGX_LOG_INFO, c.log, None, "client closed connection");
-                    return Err(());
-                }
-                Ok(Ok(n)) => {
-                    let mut b = hc.buffer.borrow_mut();
-                    let last = b.last;
-                    b.data[last..last + n].copy_from_slice(&buf[..n]);
-                    b.last += n;
-                    n
-                }
+        // c->recv() into c->buffer, which an empty connection gives back
+        // while it waits
+        let res = tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(timeout), read_header_buffer(c, hc, true, false)) => r,
+            _ = c.close_notify.notified() => {
+                close_connection(c);
+                return Err(());
             }
         };
-        let _ = n;
+        match res {
+            Err(_) => {
+                ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
+                return Err(());
+            }
+            Ok(Err(_)) => return Err(()),
+            Ok(Ok(0)) => {
+                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client closed connection");
+                return Err(());
+            }
+            Ok(Ok(_)) => {}
+        }
         if c.close.get() {
             return Err(());
         }
@@ -393,16 +392,21 @@ async fn read_request_header(r: &R, deadline: &mut Option<tokio::time::Instant>)
             return Ok(false);
         }
     }
-    let cscf = r.cscf();
-    let timeout = *cscf.borrow().client_header_timeout;
-    if deadline.is_none() {
-        *deadline = Some(tokio::time::Instant::now() + Duration::from_millis(timeout));
-    }
-    let dl = deadline.unwrap();
-    let cap = hc.buffer.borrow().cap;
-    let last = hc.buffer.borrow().last;
-    let mut tmp = vec![0u8; cap - last];
-    let res = tokio::time::timeout_at(dl, c.recv(&mut tmp)).await;
+    let dl = match *deadline {
+        Some(dl) => dl,
+        None => {
+            let timeout = *r.cscf().borrow().client_header_timeout;
+            let dl = tokio::time::Instant::now() + Duration::from_millis(timeout);
+            *deadline = Some(dl);
+            dl
+        }
+    };
+    // the log handler reads a request line not parsed yet out of the
+    // buffer (ngx_http_log_error_handler): a read borrowing the buffer
+    // could log meanwhile (SSL_read() does), so then the read goes through
+    // another buffer of the pool
+    let copy = r.request_line.borrow().is_empty() && r.parse.borrow().request_start_set;
+    let res = tokio::time::timeout_at(dl, read_header_buffer(c, hc, false, copy)).await;
     match res {
         Err(_) => {
             ngx_log_error!(NGX_LOG_INFO, c.log, Some(libc::ETIMEDOUT), "client timed out");
@@ -420,13 +424,111 @@ async fn read_request_header(r: &R, deadline: &mut Option<tokio::time::Instant>)
             c.log.set_action(Some("reading client request headers"));
             Err(NGX_HTTP_BAD_REQUEST)
         }
-        Ok(Ok(n)) => {
+        Ok(Ok(_)) => Ok(true),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the header buffer
+
+/// The header buffers a worker keeps for reuse.
+const HEADER_BUFFERS_KEPT: usize = 8;
+
+thread_local! {
+    /// The memory of c->buffer while connections wait: C frees it
+    /// (ngx_pfree) when a read finds nothing, so that an idle connection
+    /// holds no buffer, and allocates it again on the next read event.
+    /// The buffers freed are kept here for the next reads, with their size
+    /// (client_header_buffer_size, or that of a large header buffer).
+    static HEADER_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A header buffer of `size` bytes from the worker's pool, else a new one.
+fn take_header_buffer(size: usize) -> Vec<u8> {
+    let pooled = HEADER_BUFFERS.with(|p| {
+        let mut p = p.borrow_mut();
+        let i = p.iter().rposition(|b| b.len() == size)?;
+        Some(p.swap_remove(i))
+    });
+    pooled.unwrap_or_else(|| vec![0u8; size])
+}
+
+/// ngx_pfree() of a header buffer: kept in the worker's pool.
+pub(crate) fn free_header_buffer(b: Vec<u8>) {
+    if b.is_empty() {
+        return;
+    }
+    // (not while the thread exits)
+    let _ = HEADER_BUFFERS.try_with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() >= HEADER_BUFFERS_KEPT {
+            p.remove(0);
+        }
+        p.push(b);
+    });
+}
+
+/// c->recv() into the header buffer, after b->last, waiting for the read
+/// event while there is nothing to read; Ok(0) is the end of the stream.
+/// A buffer is taken from the worker's pool if there is none. `release`:
+/// when nothing was read and the buffer holds nothing, it goes back to
+/// the pool while the connection waits (ngx_http_wait_request_handler,
+/// ngx_http_keepalive_handler). `copy`: the read goes through another
+/// buffer of the pool, so that the header buffer is not borrowed while
+/// the read runs (see read_request_header); else nothing the read calls
+/// may borrow it.
+async fn read_header_buffer(c: &Connection, hc: &HttpConnection, release: bool, copy: bool) -> std::io::Result<usize> {
+    loop {
+        let res = if copy {
+            let (last, cap) = {
+                let b = hc.buffer.borrow();
+                (b.last, b.cap)
+            };
+            let mut tmp = take_header_buffer(cap);
+            let res = c.try_recv(&mut tmp[..cap - last]);
+            if let Ok(n) = res {
+                let mut b = hc.buffer.borrow_mut();
+                if b.data.len() < cap {
+                    b.data.resize(cap, 0);
+                }
+                b.data[last..last + n].copy_from_slice(&tmp[..n]);
+                b.last += n;
+            }
+            free_header_buffer(tmp);
+            res
+        } else {
             let mut b = hc.buffer.borrow_mut();
-            let last = b.last;
-            b.data[last..last + n].copy_from_slice(&tmp[..n]);
-            b.last += n;
-            r.request_length.set(r.request_length.get());
-            Ok(true)
+            let (last, cap) = (b.last, b.cap);
+            if b.data.len() < cap {
+                if b.data.is_empty() {
+                    b.data = take_header_buffer(cap);
+                } else {
+                    b.data.resize(cap, 0);
+                }
+            }
+            let res = c.try_recv(&mut b.data[last..cap]);
+            match res {
+                Ok(n) => b.last += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock && release && b.pos == b.last => {
+                    let data = std::mem::take(&mut b.data);
+                    drop(b);
+                    free_header_buffer(data);
+                }
+                Err(_) => {}
+            }
+            res
+        };
+        match res {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // NGX_AGAIN: the read event, or the write event when
+                // SSL_read() has to write
+                if !c.is_quic_stream() && c.ssl_want_write() {
+                    c.writable().await?;
+                } else {
+                    c.readable().await?;
+                }
+            }
+            res => return res,
         }
     }
 }
@@ -454,7 +556,8 @@ fn alloc_large_header_buffer(r: &R, request_line: bool) -> i64 {
     b.nbusy += 1;
     if p.state == 0 {
         // new empty large buffer
-        b.data = vec![0u8; large.size];
+        let old = std::mem::replace(&mut b.data, take_header_buffer(large.size));
+        free_header_buffer(old);
         b.cap = large.size;
         b.pos = 0;
         b.last = 0;
@@ -466,10 +569,10 @@ fn alloc_large_header_buffer(r: &R, request_line: bool) -> i64 {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "too large header to copy");
         return NGX_ERROR;
     }
-    let mut nd = vec![0u8; large.size];
+    let mut nd = take_header_buffer(large.size);
     nd[..len].copy_from_slice(&b.data[old..b.last]);
     let newpos = b.pos - old;
-    b.data = nd;
+    free_header_buffer(std::mem::replace(&mut b.data, nd));
     b.cap = large.size;
     b.pos = newpos;
     b.last = len;
@@ -1305,9 +1408,21 @@ pub fn log_request(r: &R) {
     }
 }
 
-/// ngx_http_set_keepalive + ngx_http_keepalive_handler: wait for the next request.
-async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
-    let c = r.connection.clone();
+/// What ngx_http_set_keepalive leaves to do once the request is freed.
+enum Keepalive {
+    /// A pipelined request is in the buffer.
+    Pipelined,
+    /// Wait for the next request (ngx_http_keepalive_handler), with the
+    /// keepalive_min_timeout and keepalive_timeout of the location.
+    Wait(u64, u64),
+}
+
+/// ngx_http_set_keepalive: the request is freed and the connection kept
+/// for the next one; an idle connection holds no buffer (ngx_pfree of
+/// c->buffer and of the large header buffers). The caller drops the
+/// request object before it waits, as C frees the request's pool.
+fn set_keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<Keepalive, ()> {
+    let c = &r.connection;
     let clcf = r.clcf();
     http_debug!(r, "set http keepalive handler");
     c.log.set_action(Some("closing request"));
@@ -1326,7 +1441,7 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
             let mut b = hc.buffer.borrow_mut();
             b.compact();
             b.nbusy = 0;
-            return Ok(());
+            return Ok(Keepalive::Pipelined);
         }
     }
     {
@@ -1336,10 +1451,12 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
         b.nbusy = 0;
         let cscf = srv_conf_from_ctx(&hc.conf_ctx.borrow());
         b.cap = *cscf.borrow().client_header_buffer_size;
-        b.data.clear();
+        let data = std::mem::take(&mut b.data);
+        drop(b);
+        free_header_buffer(data);
     }
     if c.ssl.borrow().is_some() {
-        ngx_core::event_openssl::ngx_ssl_free_buffer(&c);
+        ngx_core::event_openssl::ngx_ssl_free_buffer(c);
     }
     c.log.set_action(Some("keepalive"));
     let tcp_nodelay = if c.tcp_nopush.get() == TcpNopush::Set {
@@ -1353,27 +1470,29 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
     } else {
         true
     };
-    if tcp_nodelay && *clcf.borrow().tcp_nodelay && !c.set_tcp_nodelay() {
+    let cl = clcf.borrow();
+    if tcp_nodelay && *cl.tcp_nodelay && !c.set_tcp_nodelay() {
         return Err(());
     }
-    let (min_to, ka_to) = {
-        let cl = clcf.borrow();
-        (*cl.keepalive_min_timeout, *cl.keepalive_timeout)
-    };
-    let (first, rest) = if min_to > 0 && ka_to > min_to { (min_to, ka_to - min_to) } else { (ka_to, 0) };
+    let (min_to, ka_to) = (*cl.keepalive_min_timeout, *cl.keepalive_timeout);
     if min_to == 0 {
         c.idle.set(true);
         c.set_reusable(true);
     }
-    let size = hc.buffer.borrow().cap;
-    let mut buf = vec![0u8; size];
-    let mut n: usize;
+    Ok(Keepalive::Wait(min_to, ka_to))
+}
+
+/// ngx_http_keepalive_handler: wait for the next request. The buffer is
+/// taken from the worker's pool when the socket has data, and given back
+/// if the read finds nothing.
+async fn keepalive_wait(c: &Rc<Connection>, hc: &Rc<HttpConnection>, min_to: u64, ka_to: u64) -> Result<(), ()> {
+    let (first, rest) = if min_to > 0 && ka_to > min_to { (min_to, ka_to - min_to) } else { (ka_to, 0) };
     let mut idle_phase = min_to == 0;
     let mut remaining = first;
     loop {
-        http_debug!(r, "http keepalive handler");
+        http_debug_c(c, "http keepalive handler");
         let res = tokio::select! {
-            r = tokio::time::timeout(Duration::from_millis(remaining), c.recv(&mut buf)) => Some(r),
+            r = tokio::time::timeout(Duration::from_millis(remaining), read_header_buffer(c, hc, true, false)) => Some(r),
             _ = c.close_notify.notified(), if idle_phase => None,
         };
         match res {
@@ -1397,21 +1516,8 @@ async fn keepalive(r: &R, hc: &Rc<HttpConnection>) -> Result<(), ()> {
                 ngx_log_error!(NGX_LOG_INFO, c.log, None, "client {} closed keepalive connection", B(&c.addr_text.borrow()));
                 return Err(());
             }
-            Some(Ok(Ok(m))) => {
-                n = m;
-                break;
-            }
+            Some(Ok(Ok(_))) => break,
         }
-    }
-    if c.close.get() {
-        return Err(());
-    }
-    {
-        let mut b = hc.buffer.borrow_mut();
-        b.data = vec![0u8; size];
-        b.data[..n].copy_from_slice(&buf[..n]);
-        b.pos = 0;
-        b.last = n;
     }
     c.idle.set(false);
     c.set_reusable(false);

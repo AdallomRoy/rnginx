@@ -307,6 +307,13 @@ pub struct HttpConnection {
     pub v3_session: RefCell<Option<Rc<crate::v3::H3Session>>>,
 }
 
+impl Drop for HttpConnection {
+    fn drop(&mut self) {
+        // c->buffer goes with the connection's pool: the worker keeps it
+        crate::request_rt::free_header_buffer(std::mem::take(&mut self.buffer.get_mut().data));
+    }
+}
+
 /// In-memory header buffer: data[pos..last] unread.
 #[derive(Default)]
 pub struct HeaderBuf {
@@ -689,10 +696,13 @@ impl Request {
     pub fn partial_request_line(&self) -> Option<Vec<u8>> {
         let p = self.parse.borrow();
         if p.request_start_set {
-            let hb = self.http_connection.buffer.borrow();
-            let start = p.request_start.min(hb.last);
+            // (a read into the buffer does not log while it borrows it, see
+            // request_rt::read_header_buffer; nothing to show if it did)
+            let hb = self.http_connection.buffer.try_borrow().ok()?;
+            let last = hb.last.min(hb.data.len());
+            let start = p.request_start.min(last);
             let mut end = start;
-            while end < hb.last && hb.data[end] != b'\r' && hb.data[end] != b'\n' {
+            while end < last && hb.data[end] != b'\r' && hb.data[end] != b'\n' {
                 end += 1;
             }
             return Some(hb.data[start..end].to_vec());
