@@ -245,17 +245,17 @@ fn add_variables(cf: &mut Conf) -> ConfResult {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_POST_READ_PHASE, crate::core::phase_handler(realip_idle, realip_handler));
-    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler(realip_idle, realip_handler));
+    add_phase_handler(cf, NGX_HTTP_POST_READ_PHASE, crate::core::phase_handler_fn(realip_handler));
+    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler_fn(realip_handler));
     Ok(())
 }
 
-/// realip_handler declines at once: no set_real_ip_from
-fn realip_idle(r: &R) -> bool {
-    r.loc_conf::<RealipLocConf>(ctx_index()).borrow().from.is_empty()
+/// ngx_http_realip_handler
+fn realip_handler(r: R) -> Step {
+    Step::Ready(realip(&r))
 }
 
-async fn realip_handler(r: R) -> i64 {
+fn realip(r: &R) -> i64 {
     let idx = ctx_index();
 
     let rlcf = r.loc_conf::<RealipLocConf>(idx);
@@ -315,7 +315,7 @@ async fn realip_handler(r: R) -> i64 {
             };
             (headers, None)
         }
-        NGX_HTTP_REALIP_PROXY => match proxy_protocol(&r) {
+        NGX_HTTP_REALIP_PROXY => match proxy_protocol(r) {
             Some(pp) => (Vec::new(), Some(pp.src_addr.clone())),
             None => return NGX_DECLINED,
         },
@@ -356,20 +356,20 @@ async fn realip_handler(r: R) -> i64 {
     let proxies = c.from.clone();
     drop(c);
 
-    let (rc, mut new_addr) = get_forwarded_addr(&r, &current_addr, &headers_vec, value_opt.as_deref().unwrap_or(&[]), &proxies, recursive);
+    let (rc, mut new_addr) = get_forwarded_addr(r, &current_addr, &headers_vec, value_opt.as_deref().unwrap_or(&[]), &proxies, recursive);
 
     if rc == NGX_DECLINED {
         return NGX_DECLINED;
     }
 
     if header_type == NGX_HTTP_REALIP_PROXY {
-        if let Some(pp) = proxy_protocol(&r) {
+        if let Some(pp) = proxy_protocol(r) {
             new_addr.set_port(pp.src_port);
         }
     }
 
     // Set the new address
-    set_real_addr(&r, new_addr).await
+    set_real_addr(r, new_addr)
 }
 
 /// The PROXY protocol header read for this connection (c->proxy_protocol).
@@ -378,7 +378,7 @@ fn proxy_protocol(r: &R) -> Option<Rc<ngx_core::proxy_protocol::ProxyProtocol>> 
     pp.downcast::<ngx_core::proxy_protocol::ProxyProtocol>().ok()
 }
 
-async fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
+fn set_real_addr(r: &R, new_addr: SockAddr) -> i64 {
     let idx = ctx_index();
 
     // Save original address on the connection (survives internal_redirect,

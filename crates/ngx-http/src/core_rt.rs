@@ -15,7 +15,7 @@ use crate::script::*;
 use crate::*;
 
 /// ngx_http_handler: entry point running the phases for a (main or internal) request.
-pub async fn handler(r: R) -> i64 {
+pub fn handler(r: R) -> Phases {
     r.connection.log.set_action(None);
     if !r.internal.get() {
         if r.method.get() != NGX_HTTP_CONNECT {
@@ -40,82 +40,185 @@ pub async fn handler(r: R) -> i64 {
     r.gzip_tested.set(false);
     r.gzip_ok.set(false);
     r.gzip_vary.set(false);
-    run_phases(r).await
+    run_phases(r)
 }
 
-/// ngx_http_core_run_phases: returns the rc to pass to finalize_request.
-pub async fn run_phases(r: R) -> i64 {
-    let cmcf = r.cmcf();
-    loop {
-        let ph = {
-            let m = cmcf.borrow();
-            let idx = r.phase_handler.get();
-            match m.phase_engine.handlers.get(idx) {
-                Some(p) => p.clone(),
-                None => return NGX_DONE,
+/// ngx_http_core_run_phases: the future of the rc to pass to
+/// finalize_request.
+pub fn run_phases(r: R) -> Phases {
+    Phases { r, engine: None, wait: None }
+}
+
+/// The phases of a request, run as C runs them: the checkers and the
+/// handlers that do not wait are plain calls in a loop; a handler that
+/// returns a pending step (or a checker that waits) is awaited, and the
+/// loop goes on with its result. Not boxed: awaited by the request.
+pub struct Phases {
+    r: R,
+    /// the phase handlers, taken from the main conf once per run
+    engine: Option<Rc<[PhaseHandler]>>,
+    /// what the phases wait for, and what its result is
+    wait: Option<(BoxFut<i64>, After)>,
+}
+
+/// What the result of what the phases wait for is
+#[derive(Clone, Copy)]
+enum After {
+    /// that of the phase handler at this index of the engine, for its
+    /// checker
+    Handler(usize),
+    /// the result of the phases
+    Finalize,
+}
+
+/// What a checker comes to
+enum Next {
+    /// the phase handler of r->phase_handler next
+    Continue,
+    /// the end of the phases, with the rc to finalize the request with
+    Finalize(i64),
+    /// waiting
+    Wait(BoxFut<i64>, After),
+}
+
+impl std::future::Future for Phases {
+    type Output = i64;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        let this = self.get_mut();
+        let r = &this.r;
+        let engine = this.engine.get_or_insert_with(|| r.cmcf().borrow().phase_engine.handlers.clone()).clone();
+
+        loop {
+            let next = match &mut this.wait {
+                Some((fut, after)) => {
+                    let rc = match fut.as_mut().poll(cx) {
+                        std::task::Poll::Ready(rc) => rc,
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    };
+                    let after = *after;
+                    this.wait = None;
+                    match after {
+                        After::Finalize => Next::Finalize(rc),
+                        After::Handler(idx) => handler_rc(&this.r, &engine, idx, rc),
+                    }
+                }
+                None => run(&this.r, &engine),
+            };
+
+            match next {
+                Next::Continue => {}
+                Next::Finalize(rc) => return std::task::Poll::Ready(rc),
+                Next::Wait(fut, after) => this.wait = Some((fut, after)),
             }
-        };
-        let step = match ph.checker {
-            Checker::Generic => generic_phase(&r, &ph).await,
-            Checker::Rewrite => rewrite_phase(&r, &ph).await,
-            Checker::FindConfig => find_config_phase(&r, &ph).await,
-            Checker::PostRewrite => post_rewrite_phase(&r, &ph),
-            Checker::Access => access_phase(&r, &ph).await,
-            Checker::PostAccess => post_access_phase(&r, &ph).await,
-            Checker::Content => content_phase(&r, &ph).await,
-        };
-        match step {
-            PhaseStep::Continue => continue,
-            PhaseStep::Finalize(rc) => return rc,
         }
     }
 }
 
-pub enum PhaseStep {
-    Continue,
-    Finalize(i64),
+/// The loop of ngx_http_core_run_phases until a checker finalizes the
+/// request or waits
+fn run(r: &R, engine: &[PhaseHandler]) -> Next {
+    loop {
+        let idx = r.phase_handler.get();
+        let ph = match engine.get(idx) {
+            Some(p) => p,
+            None => return Next::Finalize(NGX_DONE),
+        };
+        let next = match ph.checker {
+            Checker::Generic => {
+                http_debug!(r, "generic phase: {}", idx);
+                call(r, engine, ph, idx)
+            }
+            Checker::Rewrite => {
+                http_debug!(r, "rewrite phase: {}", idx);
+                call(r, engine, ph, idx)
+            }
+            Checker::FindConfig => find_config_phase(r),
+            Checker::PostRewrite => post_rewrite_phase(r, ph),
+            Checker::Access => {
+                if !r.is_main() {
+                    r.phase_handler.set(ph.next);
+                    continue;
+                }
+                http_debug!(r, "access phase: {}", idx);
+                call(r, engine, ph, idx)
+            }
+            Checker::PostAccess => post_access_phase(r),
+            Checker::Content => {
+                let ch = r.content_handler.borrow().clone();
+                if let Some(h) = ch {
+                    return Next::Wait(h(r.clone()), After::Finalize);
+                }
+                http_debug!(r, "content phase: {}", idx);
+                call(r, engine, ph, idx)
+            }
+        };
+        match next {
+            Next::Continue => continue,
+            next => return next,
+        }
+    }
 }
 
-async fn generic_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
-    http_debug!(r, "generic phase: {}", r.phase_handler.get());
-    let rc = (ph.handler.as_ref().unwrap())(r.clone()).await;
+/// The phase handler at `idx` called, its result to its checker
+fn call(r: &R, engine: &[PhaseHandler], ph: &PhaseHandler, idx: usize) -> Next {
+    match (ph.handler.as_ref().unwrap())(r.clone()) {
+        Step::Ready(rc) => handler_rc(r, engine, idx, rc),
+        Step::Pending(fut) => Next::Wait(fut, After::Handler(idx)),
+    }
+}
+
+/// What the checker of the phase handler at `idx` does with its result
+fn handler_rc(r: &R, engine: &[PhaseHandler], idx: usize, rc: i64) -> Next {
+    let ph = &engine[idx];
+    match ph.checker {
+        Checker::Generic => generic_phase_rc(r, ph, rc),
+        Checker::Rewrite => rewrite_phase_rc(r, rc),
+        Checker::Access => access_phase_rc(r, ph, rc),
+        Checker::Content => content_phase_rc(r, engine, rc),
+        Checker::FindConfig | Checker::PostRewrite | Checker::PostAccess => unreachable!("a checker without handler"),
+    }
+}
+
+/// ngx_http_core_generic_phase, after the handler
+fn generic_phase_rc(r: &R, ph: &PhaseHandler, rc: i64) -> Next {
     if rc == NGX_OK {
         r.phase_handler.set(ph.next);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
     if rc == NGX_DECLINED {
         r.phase_handler.set(r.phase_handler.get() + 1);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
     if rc == NGX_AGAIN || rc == NGX_DONE {
-        return PhaseStep::Finalize(NGX_DONE);
+        return Next::Finalize(NGX_DONE);
     }
-    PhaseStep::Finalize(rc)
+    Next::Finalize(rc)
 }
 
-async fn rewrite_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
-    http_debug!(r, "rewrite phase: {}", r.phase_handler.get());
-    let rc = (ph.handler.as_ref().unwrap())(r.clone()).await;
+/// ngx_http_core_rewrite_phase, after the handler
+fn rewrite_phase_rc(r: &R, rc: i64) -> Next {
     if rc == NGX_DECLINED {
         r.phase_handler.set(r.phase_handler.get() + 1);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
     if rc == NGX_DONE {
-        return PhaseStep::Finalize(NGX_DONE);
+        return Next::Finalize(NGX_DONE);
     }
-    PhaseStep::Finalize(rc)
+    Next::Finalize(rc)
 }
 
-async fn find_config_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
+/// ngx_http_core_find_config_phase
+fn find_config_phase(r: &R) -> Next {
     *r.content_handler.borrow_mut() = None;
     r.uri_changed.set(false);
     let rc = find_location(r);
     if rc == NGX_ERROR {
-        return PhaseStep::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return Next::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
     let clcf = r.clcf();
     if !r.internal.get() && *clcf.borrow().internal {
-        return PhaseStep::Finalize(NGX_HTTP_NOT_FOUND);
+        return Next::Finalize(NGX_HTTP_NOT_FOUND);
     }
     {
         let c = clcf.borrow();
@@ -129,68 +232,71 @@ async fn find_config_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
     if cl != -1 && !r.discard_body.get() && max_body != 0 && max_body < cl {
         ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "client intended to send too large body: {} bytes", cl);
         r.expect_tested.set(true);
-        let _ = crate::request_body::discard_request_body(r).await;
-        return PhaseStep::Finalize(NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        let r = r.clone();
+        return Next::Wait(
+            Box::pin(async move {
+                let _ = crate::request_body::discard_request_body(&r).await;
+                NGX_HTTP_REQUEST_ENTITY_TOO_LARGE
+            }),
+            After::Finalize,
+        );
     }
     if rc == NGX_DONE {
-        let name = clcf.borrow().escaped_name.clone();
-        r.clear_location();
-        let args = r.args.borrow().clone();
-        let value = if args.is_empty() {
-            name
-        } else {
-            let mut v = name;
-            v.push(b'?');
-            v.extend_from_slice(&args);
+        let value = {
+            let c = clcf.borrow();
+            let args = r.args.borrow();
+            let mut v = Vec::with_capacity(c.escaped_name.len() + if args.is_empty() { 0 } else { 1 + args.len() });
+            v.extend_from_slice(&c.escaped_name);
+            if !args.is_empty() {
+                v.push(b'?');
+                v.extend_from_slice(&args);
+            }
             v
         };
+        r.clear_location();
         let h = r.headers_out.borrow_mut().add(b"Location", &value);
         r.headers_out.borrow_mut().location = Some(h);
-        return PhaseStep::Finalize(NGX_HTTP_MOVED_PERMANENTLY);
+        return Next::Finalize(NGX_HTTP_MOVED_PERMANENTLY);
     }
     r.phase_handler.set(r.phase_handler.get() + 1);
-    PhaseStep::Continue
+    Next::Continue
 }
 
-fn post_rewrite_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
+/// ngx_http_core_post_rewrite_phase
+fn post_rewrite_phase(r: &R, ph: &PhaseHandler) -> Next {
     http_debug!(r, "post rewrite phase: {}", r.phase_handler.get());
     if !r.uri_changed.get() {
         r.phase_handler.set(r.phase_handler.get() + 1);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
     http_debug!(r, "uri changes: {}", r.uri_changes.get());
     r.uri_changes.set(r.uri_changes.get() - 1);
     if r.uri_changes.get() == 0 {
         ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "rewrite or internal redirection cycle while processing \"{}\"", B(&r.uri.borrow()));
-        return PhaseStep::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return Next::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
     r.phase_handler.set(ph.next);
     let cscf = r.cscf();
     let loc = cscf.borrow().ctx.loc.clone().unwrap();
     *r.loc_conf.borrow_mut() = loc;
-    PhaseStep::Continue
+    Next::Continue
 }
 
-async fn access_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
-    if !r.is_main() {
-        r.phase_handler.set(ph.next);
-        return PhaseStep::Continue;
-    }
-    http_debug!(r, "access phase: {}", r.phase_handler.get());
-    let rc = (ph.handler.as_ref().unwrap())(r.clone()).await;
+/// ngx_http_core_access_phase, after the handler
+fn access_phase_rc(r: &R, ph: &PhaseHandler, rc: i64) -> Next {
     if rc == NGX_DECLINED {
         r.phase_handler.set(r.phase_handler.get() + 1);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
     if rc == NGX_AGAIN || rc == NGX_DONE {
-        return PhaseStep::Finalize(NGX_DONE);
+        return Next::Finalize(NGX_DONE);
     }
     let clcf = r.clcf();
     let satisfy = *clcf.borrow().satisfy;
     if satisfy == NGX_HTTP_SATISFY_ALL {
         if rc == NGX_OK {
             r.phase_handler.set(r.phase_handler.get() + 1);
-            return PhaseStep::Continue;
+            return Next::Continue;
         }
     } else {
         if rc == NGX_OK {
@@ -202,24 +308,25 @@ async fn access_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
             }
             drop(ho);
             r.phase_handler.set(ph.next);
-            return PhaseStep::Continue;
+            return Next::Continue;
         }
         if rc == NGX_HTTP_FORBIDDEN || rc == NGX_HTTP_UNAUTHORIZED || rc == NGX_HTTP_PROXY_AUTH_REQUIRED {
             if r.access_code.get() != NGX_HTTP_UNAUTHORIZED && r.access_code.get() != NGX_HTTP_PROXY_AUTH_REQUIRED {
                 r.access_code.set(rc);
             }
             r.phase_handler.set(r.phase_handler.get() + 1);
-            return PhaseStep::Continue;
+            return Next::Continue;
         }
     }
     if rc == NGX_HTTP_UNAUTHORIZED || rc == NGX_HTTP_PROXY_AUTH_REQUIRED {
         r.access_code.set(rc);
-        return PhaseStep::Finalize(auth_delay(r).await);
+        return auth_delay(r);
     }
-    PhaseStep::Finalize(rc)
+    Next::Finalize(rc)
 }
 
-async fn post_access_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
+/// ngx_http_core_post_access_phase
+fn post_access_phase(r: &R) -> Next {
     http_debug!(r, "post access phase: {}", r.phase_handler.get());
     let access_code = r.access_code.get();
     if access_code != 0 {
@@ -227,62 +334,57 @@ async fn post_access_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
             ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "access forbidden by rule");
         }
         if access_code == NGX_HTTP_UNAUTHORIZED || access_code == NGX_HTTP_PROXY_AUTH_REQUIRED {
-            return PhaseStep::Finalize(auth_delay(r).await);
+            return auth_delay(r);
         }
         r.access_code.set(0);
-        return PhaseStep::Finalize(access_code);
+        return Next::Finalize(access_code);
     }
     r.phase_handler.set(r.phase_handler.get() + 1);
-    PhaseStep::Continue
+    Next::Continue
 }
 
-/// ngx_http_core_auth_delay: returns the access code to finalize with after the delay.
-async fn auth_delay(r: &R) -> i64 {
+/// ngx_http_core_auth_delay: the access code to finalize with, after the
+/// delay if there is one.
+fn auth_delay(r: &R) -> Next {
     let clcf = r.clcf();
     let delay = *clcf.borrow().auth_delay;
     let access_code = r.access_code.get();
     r.access_code.set(0);
     if delay == 0 {
-        return access_code;
+        return Next::Finalize(access_code);
     }
     ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "delaying unauthorized request");
-    let closed = crate::request_rt::wait_delay_or_close(r, delay).await;
-    if closed {
-        return NGX_HTTP_CLIENT_CLOSED_REQUEST;
-    }
-    access_code
+    let r = r.clone();
+    Next::Wait(
+        Box::pin(async move {
+            let closed = crate::request_rt::wait_delay_or_close(&r, delay).await;
+            if closed {
+                return NGX_HTTP_CLIENT_CLOSED_REQUEST;
+            }
+            access_code
+        }),
+        After::Finalize,
+    )
 }
 
-async fn content_phase(r: &R, ph: &PhaseHandler) -> PhaseStep {
-    let ch = r.content_handler.borrow().clone();
-    if let Some(h) = ch {
-        let rc = h(r.clone()).await;
-        return PhaseStep::Finalize(rc);
-    }
-    http_debug!(r, "content phase: {}", r.phase_handler.get());
-    let rc = (ph.handler.as_ref().unwrap())(r.clone()).await;
+/// ngx_http_core_content_phase, after the handler
+fn content_phase_rc(r: &R, engine: &[PhaseHandler], rc: i64) -> Next {
     if rc != NGX_DECLINED {
-        return PhaseStep::Finalize(rc);
+        return Next::Finalize(rc);
     }
     // rc == NGX_DECLINED
-    let cmcf = r.cmcf();
-    let has_next = {
-        let m = cmcf.borrow();
-        m.phase_engine.handlers.get(r.phase_handler.get() + 1).is_some()
-    };
-    if has_next {
+    if engine.get(r.phase_handler.get() + 1).is_some() {
         r.phase_handler.set(r.phase_handler.get() + 1);
-        return PhaseStep::Continue;
+        return Next::Continue;
     }
-    let uri = r.uri.borrow().clone();
-    if uri.last() == Some(&b'/') {
+    if r.uri.borrow().last() == Some(&b'/') {
         if let Some((path, _root)) = map_uri_to_path(r, 0) {
             ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "directory index of \"{}\" is forbidden", B(&path));
         }
-        return PhaseStep::Finalize(NGX_HTTP_FORBIDDEN);
+        return Next::Finalize(NGX_HTTP_FORBIDDEN);
     }
     ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "no handler found");
-    PhaseStep::Finalize(NGX_HTTP_NOT_FOUND)
+    Next::Finalize(NGX_HTTP_NOT_FOUND)
 }
 
 /// ngx_http_update_location_config
@@ -353,16 +455,18 @@ pub fn find_location(r: &R) -> i64 {
     if rc == NGX_OK || rc == NGX_DONE || rc == NGX_ERROR {
         return rc;
     }
-    let regex_locations = pclcf.borrow().regex_locations.clone();
-    if !noregex && !regex_locations.is_empty() {
-        for clcf in regex_locations.iter() {
-            let (name, re) = {
+    // the parent's location conf is not changed while it is searched: its
+    // regex and predicate locations are borrowed
+    let p = pclcf.borrow();
+    if !noregex && !p.regex_locations.is_empty() {
+        for clcf in p.regex_locations.iter() {
+            let re = {
                 let c = clcf.borrow();
-                (c.name.clone(), c.regex.clone().unwrap())
+                http_debug!(r, "test location: ~ \"{}\"", B(&c.name));
+                c.regex.clone().unwrap()
             };
-            http_debug!(r, "test location: ~ \"{}\"", B(&name));
-            let uri = r.uri.borrow().clone();
-            let n = crate::variables::regex_exec(r, &re, &uri);
+            // regex_exec writes the captures, not r->uri
+            let n = crate::variables::regex_exec(r, &re, &r.uri.borrow());
             if n == NGX_OK {
                 *r.loc_conf.borrow_mut() = clcf.borrow().loc_conf.clone().unwrap();
                 let rc = find_location(r);
@@ -374,14 +478,13 @@ pub fn find_location(r: &R) -> i64 {
             return NGX_ERROR;
         }
     }
-    let preds = pclcf.borrow().predicate_locations.clone();
-    if !noregex && !preds.is_empty() {
-        for clcf in preds.iter() {
-            let (name, pidx) = {
+    if !noregex && !p.predicate_locations.is_empty() {
+        for clcf in p.predicate_locations.iter() {
+            let pidx = {
                 let c = clcf.borrow();
-                (c.name.clone(), c.predicate)
+                http_debug!(r, "test location: \"{}\"", B(&c.name));
+                c.predicate
             };
-            http_debug!(r, "test location: \"{}\"", B(&name));
             let vv = match crate::variables::get_flushed_variable(r, pidx - 1) {
                 Some(v) => v,
                 None => return NGX_ERROR,
@@ -614,6 +717,14 @@ pub struct OutputFilter {
 }
 
 impl OutputFilter {
+    /// The result, if the filters are done
+    pub fn done(&self) -> Option<i64> {
+        match (&self.step, &self.r) {
+            (Step::Ready(rc), None) => Some(*rc),
+            _ => None,
+        }
+    }
+
     /// The step of the call; one that is not done goes on in a new boxed
     /// future
     pub fn into_step(self) -> Step {
@@ -701,21 +812,22 @@ pub fn map_uri_to_path(r: &R, reserved: usize) -> Option<(Vec<u8>, usize)> {
     let clcf = r.clcf();
     let c = clcf.borrow();
     let mut alias = c.alias;
-    let uri = r.uri.borrow().clone();
+    let uri_len = r.uri.borrow().len();
     if alias != 0 && !r.valid_location.get() {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "\"alias\" cannot be used in location \"{}\" where URI was rewritten", B(&c.name));
         return None;
     }
-    if alias > uri.len() && alias != usize::MAX {
+    if alias > uri_len && alias != usize::MAX {
         ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "URI shorter than aliased URI part");
         return None;
     }
-    let _ = reserved;
     let mut path: Vec<u8>;
     let root_length;
     match &c.root_script {
         None => {
-            path = c.root.clone();
+            // the root, the URI and what the caller adds, as C reserves
+            path = Vec::with_capacity(c.root.len() + uri_len.saturating_sub(alias) + reserved);
+            path.extend_from_slice(&c.root);
             root_length = path.len();
         }
         Some(script) => {
@@ -738,26 +850,40 @@ pub fn map_uri_to_path(r: &R, reserved: usize) -> Option<(Vec<u8>, usize)> {
             }
         }
     }
-    path.extend_from_slice(&uri[alias..]);
+    path.extend_from_slice(&r.uri.borrow()[alias..]);
     Some((path, root_length))
 }
 
-/// ngx_http_send_response
-pub async fn send_response(r: &R, status: i64, ct: Option<&[u8]>, cv: &ComplexValue) -> i64 {
-    let rc = crate::request_body::discard_request_body(r).await;
+/// ngx_http_send_response: a plain call while nothing waits (the request
+/// body to discard, the client to take the output)
+pub fn send_response(r: &R, status: i64, ct: Option<&[u8]>, cv: &ComplexValue) -> Step {
+    match crate::request_body::discard_request_body_step(r) {
+        Step::Ready(rc) => send_response_discarded(r, rc, status, ct, cv),
+        Step::Pending(fut) => {
+            let (r, ct, cv) = (r.clone(), ct.map(|ct| ct.to_vec()), cv.clone());
+            Step::boxed(async move {
+                let rc = fut.await;
+                send_response_discarded(&r, rc, status, ct.as_deref(), &cv).await
+            })
+        }
+    }
+}
+
+/// ngx_http_send_response after the request body is discarded
+fn send_response_discarded(r: &R, rc: i64, status: i64, ct: Option<&[u8]>, cv: &ComplexValue) -> Step {
     if rc != NGX_OK {
-        return rc;
+        return Step::Ready(rc);
     }
     r.headers_out.borrow_mut().status = status;
     let val = match complex_value(r, cv) {
         Ok(v) => v,
-        Err(_) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+        Err(_) => return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR),
     };
     if status == NGX_HTTP_MOVED_PERMANENTLY || status == NGX_HTTP_MOVED_TEMPORARILY || status == NGX_HTTP_SEE_OTHER || status == NGX_HTTP_TEMPORARY_REDIRECT || status == NGX_HTTP_PERMANENT_REDIRECT {
         r.clear_location();
         let h = r.headers_out.borrow_mut().add(b"Location", &val);
         r.headers_out.borrow_mut().location = Some(h);
-        return status;
+        return Step::Ready(status);
     }
     r.headers_out.borrow_mut().content_length_n = val.len() as i64;
     match ct {
@@ -768,7 +894,7 @@ pub async fn send_response(r: &R, status: i64, ct: Option<&[u8]>, cv: &ComplexVa
         }
         None => {
             if set_content_type(r) != NGX_OK {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
         }
     }
@@ -777,13 +903,26 @@ pub async fn send_response(r: &R, status: i64, ct: Option<&[u8]>, cv: &ComplexVa
     b.last_buf = r.is_main();
     b.last_in_chain = true;
     b.sync = !(b.last_buf || b.memory);
-    let rc = send_header(r).await;
+    match send_header(r) {
+        Step::Ready(rc) => send_response_body(r, rc, b),
+        Step::Pending(fut) => {
+            let r = r.clone();
+            Step::boxed(async move {
+                let rc = fut.await;
+                send_response_body(&r, rc, b).await
+            })
+        }
+    }
+}
+
+/// ngx_http_send_response after the header
+fn send_response_body(r: &R, rc: i64, b: Buf) -> Step {
     if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
-        return rc;
+        return Step::Ready(rc);
     }
     let mut out = Chain::new();
     out.push_back(b);
-    output_filter(r, out).await
+    output_filter(r, out).into_step()
 }
 
 /// ngx_http_internal_redirect: runs the request again from the server rewrite phase.

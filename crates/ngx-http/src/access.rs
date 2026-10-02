@@ -130,29 +130,30 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_ACCESS_PHASE,
-        crate::core::phase_handler(access_idle, access_handler),
+        crate::core::phase_handler_fn(access_handler),
     );
     Ok(())
 }
 
 /// ngx_http_access_handler
-/// access_handler declines at once: no allow/deny rules for the location
-fn access_idle(r: &R) -> bool {
-    let conf = r.loc_conf::<AccessLocConf>(ctx_index());
-    let c = conf.borrow();
-    c.rules_v4.is_none() && c.rules_v6.is_none() && c.rules_unix.is_none()
+fn access_handler(r: R) -> Step {
+    Step::Ready(access(&r))
 }
 
-async fn access_handler(r: R) -> i64 {
+fn access(r: &R) -> i64 {
     let conf = r.loc_conf::<AccessLocConf>(ctx_index());
     let alcf = conf.borrow();
+
+    if alcf.rules_v4.is_none() && alcf.rules_v6.is_none() && alcf.rules_unix.is_none() {
+        return NGX_DECLINED;
+    }
 
     let sockaddr = r.connection.sockaddr.borrow().clone();
 
     match sockaddr {
         SockAddr::V4(sin) => {
             if let Some(rules) = &alcf.rules_v4 {
-                return access_inet(&r, rules, u32::from(*sin.ip()));
+                return access_inet(r, rules, u32::from(*sin.ip()));
             }
         }
 
@@ -161,18 +162,18 @@ async fn access_handler(r: R) -> i64 {
 
             if let Some(rules) = &alcf.rules_v4 {
                 if let Some(v4) = sin6.ip().to_ipv4_mapped() {
-                    return access_inet(&r, rules, u32::from(v4));
+                    return access_inet(r, rules, u32::from(v4));
                 }
             }
 
             if let Some(rules) = &alcf.rules_v6 {
-                return access_inet6(&r, rules, &p);
+                return access_inet6(r, rules, &p);
             }
         }
 
         SockAddr::Unix(_) => {
             if let Some(rules) = &alcf.rules_unix {
-                return access_unix(&r, rules);
+                return access_unix(r, rules);
             }
         }
     }

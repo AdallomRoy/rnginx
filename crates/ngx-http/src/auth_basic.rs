@@ -94,7 +94,7 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_ACCESS_PHASE,
-        crate::core::phase_handler(auth_basic_idle, auth_basic_handler),
+        crate::core::phase_handler_fn(auth_basic_handler),
     );
     Ok(())
 }
@@ -271,14 +271,12 @@ fn lookup_user(user: &[u8], mut read: impl FnMut(&mut [u8], i64) -> Result<usize
     result
 }
 
-/// auth_basic_handler declines at once: no auth_basic realm or user file
-fn auth_basic_idle(r: &R) -> bool {
-    let alcf = r.loc_conf::<AuthBasicLocConf>(ctx_index());
-    let c = alcf.borrow();
-    c.realm.is_none() || c.user_file.is_none()
+/// ngx_http_auth_basic_handler
+fn auth_basic_handler(r: R) -> Step {
+    Step::Ready(auth_basic(&r))
 }
 
-async fn auth_basic_handler(r: R) -> i64 {
+fn auth_basic(r: &R) -> i64 {
     let alcf = r.loc_conf::<AuthBasicLocConf>(ctx_index());
 
     let (realm_cv, user_file_cv) = {
@@ -289,7 +287,7 @@ async fn auth_basic_handler(r: R) -> i64 {
         }
     };
 
-    let realm = match complex_value(&r, &realm_cv) {
+    let realm = match complex_value(r, &realm_cv) {
         Ok(v) => v,
         Err(_) => return NGX_ERROR,
     };
@@ -298,19 +296,19 @@ async fn auth_basic_handler(r: R) -> i64 {
         return NGX_DECLINED;
     }
 
-    let rc = auth_basic_user(&r);
+    let rc = auth_basic_user(r);
 
     if rc == NGX_DECLINED {
         ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "no user/password was provided for basic authentication");
 
-        return auth_basic_set_realm(&r, &realm);
+        return auth_basic_set_realm(r, &realm);
     }
 
     if rc == NGX_ERROR {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    let user_file = match user_file_value(&r, &user_file_cv) {
+    let user_file = match user_file_value(r, &user_file_cv) {
         Ok(v) => v,
         Err(_) => return NGX_ERROR,
     };
@@ -339,11 +337,11 @@ async fn auth_basic_handler(r: R) -> i64 {
 
     let rc = match lookup {
         Lookup::ReadError => NGX_HTTP_INTERNAL_SERVER_ERROR,
-        Lookup::Found(pwd) => auth_basic_crypt_handler(&r, &pwd, &realm),
+        Lookup::Found(pwd) => auth_basic_crypt_handler(r, &pwd, &realm),
         Lookup::NotFound => {
             ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "user \"{}\" was not found in \"{}\"", B(&user), B(c_str(&user_file)));
 
-            auth_basic_set_realm(&r, &realm)
+            auth_basic_set_realm(r, &realm)
         }
     };
 

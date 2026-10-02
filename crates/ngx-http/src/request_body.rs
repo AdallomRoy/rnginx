@@ -722,6 +722,34 @@ pub async fn discard_request_body(r: &R) -> i64 {
     NGX_OK
 }
 
+/// discard_request_body() as a step: at once when there is nothing to
+/// answer or read (no "Expect: 100-continue" to send, no body), else its
+/// future
+pub fn discard_request_body_step(r: &R) -> crate::Step {
+    if !r.is_main() || r.discard_body.get() || r.request_body.borrow().is_some() {
+        return crate::Step::Ready(NGX_OK);
+    }
+    if let Some(stream) = crate::v2::stream::request_stream(r) {
+        stream.skip_data.set(true);
+        return crate::Step::Ready(NGX_OK);
+    }
+    if r.http_version.get() == NGX_HTTP_VERSION_30 {
+        return crate::Step::Ready(NGX_OK);
+    }
+    // what test_expect() would answer, and the body
+    let expect = !(r.expect_tested.get() || r.http_version.get() < NGX_HTTP_VERSION_11 || r.stream.borrow().is_some() || r.connection.is_quic_stream()) && r.headers_in.borrow().expect.is_some();
+    let body = {
+        let hin = r.headers_in.borrow();
+        hin.content_length_n > 0 || hin.chunked
+    };
+    if !expect && !body {
+        http_debug!(r, "http set discard body");
+        return crate::Step::Ready(NGX_OK);
+    }
+    let r = r.clone();
+    crate::Step::boxed(async move { discard_request_body(&r).await })
+}
+
 /// Reads and discards; `wait` = block for data (with lingering limits) or only drain what is ready.
 async fn read_discarded_request_body(r: &R, wait: bool) -> i64 {
     http_debug!(r, "http read discarded body");

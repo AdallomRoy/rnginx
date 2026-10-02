@@ -61,7 +61,8 @@ pub const NGX_OPEN_FILE_DIRECTIO_OFF: i64 = i64::MAX;
 pub const NGX_LISTEN_BACKLOG: i32 = 511;
 pub const NGX_CONF_BITMASK_SET: u32 = 1;
 
-pub type HandlerFn = Rc<dyn Fn(R) -> BoxFut<i64>>;
+/// A phase handler: its result at once, or the future of one that waits
+pub type HandlerFn = Rc<dyn Fn(R) -> Step>;
 pub type HeaderInFn = fn(&R, Header) -> i64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,7 +85,9 @@ pub struct PhaseHandler {
 
 #[derive(Default)]
 pub struct PhaseEngine {
-    pub handlers: Vec<PhaseHandler>,
+    /// cmcf->phase_engine.handlers: shared, a request's phases take them
+    /// once
+    pub handlers: Rc<[PhaseHandler]>,
     pub server_rewrite_index: usize,
     pub location_rewrite_index: usize,
 }
@@ -2156,12 +2159,12 @@ pub fn init_phases(_cf: &mut Conf, cmcf: &Rc<RefCell<CoreMainConf>>) -> ConfResu
     Ok(())
 }
 
-/// A phase handler that declines at once, without running, while `idle`
-/// says its module has nothing to do for the request (the location has no
-/// configuration of it, or the method or URI is not one it handles): the
-/// same result as the handler's own first test, without the boxed future of
-/// its async fn. `idle` repeats only tests the handler makes before it logs
-/// or changes anything.
+/// The phase handler of an async function: it declines at once, without
+/// running, while `idle` says its module has nothing to do for the request
+/// (the location has no configuration of it, or the method or URI is not
+/// one it handles): the same result as the handler's own first test,
+/// without the boxed future of its async fn. `idle` repeats only tests the
+/// handler makes before it logs or changes anything.
 pub fn phase_handler<F, Fut>(idle: fn(&R) -> bool, h: F) -> HandlerFn
 where
     F: Fn(R) -> Fut + 'static,
@@ -2169,23 +2172,17 @@ where
 {
     Rc::new(move |r| {
         if idle(&r) {
-            return Box::pin(Declined);
+            return Step::Ready(NGX_DECLINED);
         }
 
-        Box::pin(h(r))
+        Step::boxed(h(r))
     })
 }
 
-/// The future of a phase handler that declined at once: zero-sized, so the
-/// box allocates nothing
-struct Declined;
-
-impl std::future::Future for Declined {
-    type Output = i64;
-
-    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
-        std::task::Poll::Ready(NGX_DECLINED)
-    }
+/// The phase handler of a plain function, as C's are: it returns its step
+/// (a boxed future only where it has to wait)
+pub fn phase_handler_fn(h: fn(R) -> Step) -> HandlerFn {
+    Rc::new(h)
 }
 
 /// Add a phase handler (called by modules in postconfiguration).
@@ -2273,7 +2270,7 @@ pub fn init_phase_handlers(_cf: &mut Conf, cmcf: &Rc<RefCell<CoreMainConf>>) -> 
             ph.push(PhaseHandler { checker, handler: Some(h.clone()), next: n });
         }
     }
-    m.phase_engine = PhaseEngine { handlers: ph, server_rewrite_index, location_rewrite_index };
+    m.phase_engine = PhaseEngine { handlers: ph.into(), server_rewrite_index, location_rewrite_index };
     Ok(())
 }
 

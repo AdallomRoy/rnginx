@@ -18,7 +18,7 @@ use crate::*;
 crate::http_module_index!("ngx_http_try_files_module");
 
 pub struct TryFilesConf {
-    pub try_files: Option<Vec<TryFile>>,
+    pub try_files: Option<Rc<[TryFile]>>,
 }
 
 #[derive(Clone)]
@@ -110,7 +110,7 @@ fn try_files_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
         return Err(cf.emerg(format_args!("try_files has no files")));
     }
 
-    cell.borrow_mut().try_files = Some(files);
+    cell.borrow_mut().try_files = Some(files.into());
 
     Ok(())
 }
@@ -136,25 +136,21 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_PRECONTENT_PHASE,
-        crate::core::phase_handler(try_files_idle, try_files_handler),
+        crate::core::phase_handler_fn(try_files_handler),
     );
     Ok(())
 }
 
-/// ngx_http_try_files_handler
-/// try_files_handler declines at once: no try_files for the location
-fn try_files_idle(r: &R) -> bool {
-    r.loc_conf::<TryFilesConf>(ctx_index()).borrow().try_files.as_ref().is_none_or(|f| f.is_empty())
-}
-
-async fn try_files_handler(r: R) -> i64 {
+/// ngx_http_try_files_handler: a plain call up to the internal redirect
+/// of the last entry
+fn try_files_handler(r: R) -> Step {
     let conf = r.loc_conf::<TryFilesConf>(ctx_index());
     let files = match &conf.borrow().try_files {
         Some(f) => f.clone(),
-        None => return NGX_DECLINED,
+        None => return Step::Ready(NGX_DECLINED),
     };
     if files.is_empty() {
-        return NGX_DECLINED;
+        return Step::Ready(NGX_DECLINED);
     }
 
     http_debug!(r, "try files handler");
@@ -171,7 +167,7 @@ async fn try_files_handler(r: R) -> i64 {
         // The terminal entry with empty name may be a =code fallback.
         if is_last && tf.name.is_empty() {
             if tf.code > 0 {
-                return tf.code;
+                return Step::Ready(tf.code);
             }
         }
 
@@ -179,7 +175,7 @@ async fn try_files_handler(r: R) -> i64 {
         let expanded_name: Vec<u8> = if let Some(cv) = &tf.value {
             match crate::script::complex_value(&r, cv) {
                 Ok(v) => v,
-                Err(_) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+                Err(_) => return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR),
             }
         } else {
             tf.name.clone()
@@ -187,26 +183,26 @@ async fn try_files_handler(r: R) -> i64 {
 
         // Terminal entry with a name: internal redirect (either @name or /uri).
         if is_last {
-            let name = &expanded_name;
-            if name.first() == Some(&b'@') {
-                let rc = crate::core_rt::named_location(&r, name).await;
+            let name = expanded_name;
+            return Step::boxed(async move {
+                if name.first() == Some(&b'@') {
+                    let rc = crate::core_rt::named_location(&r, &name).await;
+                    if rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE {
+                        return rc;
+                    }
+                    return NGX_DONE;
+                }
+                // Split at '?' to detect args
+                let (uri_part, args_part): (&[u8], Option<&[u8]>) = match name.iter().position(|&b| b == b'?') {
+                    Some(q) => (&name[..q], Some(&name[q + 1..])),
+                    None => (&name[..], None),
+                };
+                let rc = crate::core_rt::internal_redirect(&r, uri_part, args_part).await;
                 if rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE {
                     return rc;
                 }
-                return NGX_DONE;
-            }
-            // Split at '?' to detect args
-            let (uri_part, args_part): (Vec<u8>, Option<Vec<u8>>) =
-                if let Some(q) = name.iter().position(|&b| b == b'?') {
-                    (name[..q].to_vec(), Some(name[q + 1..].to_vec()))
-                } else {
-                    (name.clone(), None)
-                };
-            let rc = crate::core_rt::internal_redirect(&r, &uri_part, args_part.as_deref()).await;
-            if rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE {
-                return rc;
-            }
-            return NGX_DONE;
+                NGX_DONE
+            });
         }
 
         // Middle entry: attempt to map to a filesystem path and stat it.
@@ -254,14 +250,14 @@ async fn try_files_handler(r: R) -> i64 {
         };
 
         if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
         }
 
         let cache = clcf.borrow().open_file_cache.get().clone();
 
         if ngx_core::open_file_cache::open_cached_file(cache.as_ref(), &path, &mut of, &r.connection.log).is_err() {
             if of.err == 0 {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
 
             if of.err != libc::ENOENT && of.err != libc::ENOTDIR && of.err != libc::ENAMETOOLONG {
@@ -302,10 +298,10 @@ async fn try_files_handler(r: R) -> i64 {
             *r.uri.borrow_mut() = new_uri;
         }
         crate::core_rt::set_exten(&r);
-        return NGX_DECLINED;
+        return Step::Ready(NGX_DECLINED);
     }
 
-    NGX_DECLINED
+    Step::Ready(NGX_DECLINED)
 }
 
 #[cfg(test)]

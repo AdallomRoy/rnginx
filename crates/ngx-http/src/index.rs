@@ -86,22 +86,35 @@ pub fn index_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(index_idle, index_handler));
+    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler_fn(index_handler));
     Ok(())
 }
 
-/// index_handler declines at once: not a directory URI, or a method it
-/// does not handle
-fn index_idle(r: &R) -> bool {
-    r.uri.borrow().last() != Some(&b'/') || r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_POST) == 0
+/// ngx_http_index_handler: a plain call up to the internal redirect to
+/// the index found
+fn index_handler(r: R) -> Step {
+    match index(&r) {
+        Index::Done(rc) => Step::Ready(rc),
+        Index::Redirect(uri) => Step::boxed(async move {
+            let args = r.args.borrow().clone();
+            internal_redirect(&r, &uri, Some(&args)).await
+        }),
+    }
 }
 
-async fn index_handler(r: R) -> i64 {
+/// What the index handler comes to
+enum Index {
+    Done(i64),
+    /// the internal redirect to this URI, with the request's arguments
+    Redirect(Vec<u8>),
+}
+
+fn index(r: &R) -> Index {
     if r.uri.borrow().last() != Some(&b'/') {
-        return NGX_DECLINED;
+        return Index::Done(NGX_DECLINED);
     }
     if r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_POST) == 0 {
-        return NGX_DECLINED;
+        return Index::Done(NGX_DECLINED);
     }
     let log = r.connection.log.clone();
     let conf = r.loc_conf::<IndexConf>(ctx_index());
@@ -113,39 +126,37 @@ async fn index_handler(r: R) -> i64 {
     for entry in indices.iter() {
         let name: Vec<u8>;
         if let Some(cv) = &entry.cv {
-            name = match complex_value(&r, cv) {
+            name = match complex_value(r, cv) {
                 Ok(v) => v,
-                Err(_) => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+                Err(_) => return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR),
             };
             if name.is_empty() {
                 continue;
             }
             if name[0] == b'/' {
-                let args = r.args.borrow().clone();
-                return internal_redirect(&r, &name, Some(&args)).await;
+                return Index::Redirect(name);
             }
-            match map_uri_to_path(&r, name.len() + 1) {
+            match map_uri_to_path(r, name.len() + 1) {
                 Some((p, rl)) => {
                     path = p;
                     root_len = rl;
                 }
-                None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+                None => return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR),
             }
         } else {
             name = entry.name.clone();
             // Absolute path: internal redirect (per C — only the last entry
             // is allowed to be absolute and it triggers redirect to that URI).
             if name.first() == Some(&b'/') {
-                let args = r.args.borrow().clone();
-                return internal_redirect(&r, &name, Some(&args)).await;
+                return Index::Redirect(name);
             }
             if path.is_empty() {
-                match map_uri_to_path(&r, 0) {
+                match map_uri_to_path(r, 0) {
                     Some((p, rl)) => {
                         path = p;
                         root_len = rl;
                     }
-                    None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+                    None => return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR),
                 }
             }
         }
@@ -155,11 +166,11 @@ async fn index_handler(r: R) -> i64 {
         http_debug!(r, "open index \"{}\"", B(&full));
         let mut of = {
             let c = clcf.borrow();
-            crate::static_module::open_file_info(&r, &c)
+            crate::static_module::open_file_info(r, &c)
         };
         of.test_only = true;
-        if crate::core_rt::set_disable_symlinks(&r, &clcf, &full, &mut of) != NGX_OK {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        if crate::core_rt::set_disable_symlinks(r, &clcf, &full, &mut of) != NGX_OK {
+            return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
         }
         let cache = clcf.borrow().open_file_cache.get().clone();
         match open_cached_file(cache.as_ref(), &full, &mut of, &log) {
@@ -172,29 +183,28 @@ async fn index_handler(r: R) -> i64 {
                 uri.extend_from_slice(&name);
                 let _ = dir_len;
                 let _ = root_len;
-                let args = r.args.borrow().clone();
-                return internal_redirect(&r, &uri, Some(&args)).await;
+                return Index::Redirect(uri);
             }
             Err(()) => {
                 http_debug!(r, "{} \"{}\" failed ({}: {})", of.failed, B(&full), of.err, ngx_core::log::strerror(of.err));
                 if of.err == 0 {
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
                 }
                 // NGX_HAVE_OPENAT
                 if of.err == libc::EMLINK || of.err == libc::ELOOP {
-                    return NGX_HTTP_FORBIDDEN;
+                    return Index::Done(NGX_HTTP_FORBIDDEN);
                 }
                 if of.err == libc::ENOTDIR
                     || of.err == libc::ENAMETOOLONG
                     || of.err == libc::EACCES
                 {
-                    return index_error(&r, &clcf, &full, of.err);
+                    return Index::Done(index_error(r, &clcf, &full, of.err));
                 }
                 if !dir_tested {
                     let _ = root_len;
-                    let rc = test_dir(&r, &clcf, &full, dir_len).await;
+                    let rc = test_dir(r, &clcf, &full, dir_len);
                     if rc != NGX_OK {
-                        return rc;
+                        return Index::Done(rc);
                     }
                     dir_tested = true;
                 }
@@ -202,11 +212,11 @@ async fn index_handler(r: R) -> i64 {
                     continue;
                 }
                 ngx_log_error!(NGX_LOG_CRIT, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&full));
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                return Index::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
         }
     }
-    NGX_DECLINED
+    Index::Done(NGX_DECLINED)
 }
 
 fn index_error(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, file: &[u8], err: i32) -> i64 {
@@ -227,7 +237,7 @@ fn index_error(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, file: &[u8], e
 /// name at `name`) exists. As in C, the "is not found" and "is not a
 /// directory" messages show `path`: the directory name is terminated in
 /// place, and the byte is restored before they are logged.
-async fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, path: &[u8], name: usize) -> i64 {
+fn test_dir(r: &R, clcf: &Rc<std::cell::RefCell<CoreLocConf>>, path: &[u8], name: usize) -> i64 {
     let log = r.connection.log.clone();
 
     // c = *last; if (c != '/' || path == last) { /* "alias" without

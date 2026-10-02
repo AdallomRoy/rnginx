@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use ngx_core::buf::{Buf, BufData, BufFile, Chain};
+use ngx_core::buf::{Buf, BufFile, Chain};
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
@@ -21,7 +21,7 @@ pub fn static_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(static_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, phase_handler_fn(static_handler));
     Ok(())
 }
 
@@ -38,17 +38,28 @@ pub fn open_file_info(r: &R, clcf: &CoreLocConf) -> OpenFileInfo {
     of
 }
 
-pub async fn static_handler(r: R) -> i64 {
+/// The file a response is sent from, open until the response is sent
+struct StaticFile {
+    path: Vec<u8>,
+    fd: i32,
+    size: i64,
+    directio: bool,
+    handle: Option<Rc<CachedFileHandle>>,
+}
+
+/// ngx_http_static_handler: a plain call while nothing waits (the request
+/// body to discard, the client to take the output)
+pub fn static_handler(r: R) -> Step {
     if r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_POST) == 0 {
-        return NGX_HTTP_NOT_ALLOWED;
+        return Step::Ready(NGX_HTTP_NOT_ALLOWED);
     }
     if r.uri.borrow().last() == Some(&b'/') {
-        return NGX_DECLINED;
+        return Step::Ready(NGX_DECLINED);
     }
-    let log = r.connection.log.clone();
-    let (path, root) = match map_uri_to_path(&r, 0) {
+    let log = &r.connection.log;
+    let (path, _root) = match map_uri_to_path(&r, 0) {
         Some(p) => p,
-        None => return NGX_HTTP_INTERNAL_SERVER_ERROR,
+        None => return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR),
     };
     http_debug!(r, "http filename: \"{}\"", B(&path));
     let clcf = r.clcf();
@@ -57,10 +68,10 @@ pub async fn static_handler(r: R) -> i64 {
         open_file_info(&r, &c)
     };
     if crate::core_rt::set_disable_symlinks(&r, &clcf, &path, &mut of) != NGX_OK {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
     let cache = clcf.borrow().open_file_cache.get().clone();
-    let handle = match open_cached_file(cache.as_ref(), &path, &mut of, &log) {
+    let handle = match open_cached_file(cache.as_ref(), &path, &mut of, log) {
         Ok(h) => h,
         Err(()) => {
             let level;
@@ -82,7 +93,7 @@ pub async fn static_handler(r: R) -> i64 {
             if rc != NGX_HTTP_NOT_FOUND || *clcf.borrow().log_not_found {
                 ngx_log_error!(level, log, Some(of.err), "{} \"{}\" failed", of.failed, B(&path));
             }
-            return rc;
+            return Step::Ready(rc);
         }
     };
     r.root_tested.set(!r.error_page.get());
@@ -90,15 +101,8 @@ pub async fn static_handler(r: R) -> i64 {
     if of.is_dir {
         http_debug!(r, "http dir");
         r.clear_location();
-        let mut location = r.uri.borrow().clone();
-        location.push(b'/');
-        if !r.args.borrow().is_empty() {
-            location.push(b'?');
-            location.extend_from_slice(&r.args.borrow());
-        }
         // ngx_http_static_handler: escape the URI when redirecting
-        let esc = ngx_core::string::escape_uri(&r.uri.borrow(), ngx_core::string::NGX_ESCAPE_URI);
-        let mut location = esc;
+        let mut location = ngx_core::string::escape_uri(&r.uri.borrow(), ngx_core::string::NGX_ESCAPE_URI);
         location.push(b'/');
         if !r.args.borrow().is_empty() {
             location.push(b'?');
@@ -106,49 +110,79 @@ pub async fn static_handler(r: R) -> i64 {
         }
         let h = r.headers_out.borrow_mut().add(b"Location", &location);
         r.headers_out.borrow_mut().location = Some(h);
-        return NGX_HTTP_MOVED_PERMANENTLY;
+        return Step::Ready(NGX_HTTP_MOVED_PERMANENTLY);
     }
     if !of.is_file {
         ngx_log_error!(NGX_LOG_CRIT, log, None, "\"{}\" is not a regular file", B(&path));
-        return NGX_HTTP_NOT_FOUND;
+        return Step::Ready(NGX_HTTP_NOT_FOUND);
     }
     if r.method.get() == NGX_HTTP_POST {
-        return NGX_HTTP_NOT_ALLOWED;
+        return Step::Ready(NGX_HTTP_NOT_ALLOWED);
     }
-    let rc = crate::request_body::discard_request_body(&r).await;
+    drop(clcf);
+    let mtime = of.mtime;
+    let file = StaticFile { path, fd: of.fd, size: of.size, directio: of.is_directio, handle };
+    match crate::request_body::discard_request_body_step(&r) {
+        Step::Ready(rc) => static_send(r, rc, mtime, file),
+        Step::Pending(fut) => Step::boxed(async move {
+            let rc = fut.await;
+            static_send(r, rc, mtime, file).await
+        }),
+    }
+}
+
+/// ngx_http_static_handler after the request body is discarded: the header
+fn static_send(r: R, rc: i64, mtime: i64, file: StaticFile) -> Step {
     if rc != NGX_OK {
-        return rc;
+        return Step::Ready(rc);
     }
-    log.set_action(Some("sending response to client"));
+    r.connection.log.set_action(Some("sending response to client"));
     {
         let mut ho = r.headers_out.borrow_mut();
         ho.status = NGX_HTTP_OK;
-        ho.content_length_n = of.size;
-        ho.last_modified_time = of.mtime;
+        ho.content_length_n = file.size;
+        ho.last_modified_time = mtime;
     }
     if set_etag(&r) != NGX_OK {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
     if set_content_type(&r) != NGX_OK {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
     r.allow_ranges.set(true);
-    let rc = send_header(&r).await;
-    if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
-        return rc;
+    match send_header(&r) {
+        Step::Ready(rc) => static_body(r, rc, file),
+        Step::Pending(fut) => Step::boxed(async move {
+            let rc = fut.await;
+            static_body(r, rc, file).await
+        }),
     }
-    let file = Rc::new(BufFile { fd: of.fd, name: path.clone(), directio: of.is_directio });
-    let mut b = Buf::file(file, 0, of.size);
+}
+
+/// ngx_http_static_handler after the header: the file, kept open until it
+/// is sent
+fn static_body(r: R, rc: i64, file: StaticFile) -> Step {
+    if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
+        return Step::Ready(rc);
+    }
+    let StaticFile { path, fd, size, directio, handle } = file;
+    let mut b = Buf::file(Rc::new(BufFile { fd, name: path, directio }), 0, size);
     b.in_file = b.file_last != 0;
     b.last_buf = r.is_main();
     b.last_in_chain = true;
     b.sync = !(b.last_buf || b.in_file);
     let mut chain = Chain::new();
     chain.push_back(b);
-    // keep the file handle alive until the body is sent
-    let rc = output_filter(&r, chain).await;
-    drop(handle);
-    let _ = root;
-    let _ = BufData::None;
-    rc
+    let out = output_filter(&r, chain);
+    match out.done() {
+        Some(rc) => {
+            drop(handle);
+            Step::Ready(rc)
+        }
+        None => Step::boxed(async move {
+            let rc = out.await;
+            drop(handle);
+            rc
+        }),
+    }
 }
