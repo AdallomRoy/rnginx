@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! The cycle: configuration lifecycle (ngx_cycle.c).
 
 use std::any::Any;

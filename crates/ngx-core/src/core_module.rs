@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! ngx_core_module and ngx_errlog_module (nginx.c / ngx_log.c directives).
 
 use std::any::Any;

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Configuration file parsing, ported from ngx_conf_file.c.
 
 use std::any::Any;

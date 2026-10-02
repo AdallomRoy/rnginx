@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! nginx entry point (nginx.c).
 
 use std::rc::Rc;

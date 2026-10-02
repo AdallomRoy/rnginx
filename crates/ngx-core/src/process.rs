@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Process management: master/worker cycle, signals, channels (ngx_process*.c).
 
 use std::cell::{Cell, RefCell};

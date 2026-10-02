@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Cached time and time formatting, ported from ngx_times.c.
 
 use std::cell::RefCell;
