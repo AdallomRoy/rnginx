@@ -211,36 +211,44 @@ async fn limit_req_handler(r: R) -> i64 {
 
         let ctx = zone_ctx(&limits[n]);
 
-        let key = match complex_value(&r, &ctx.key) {
-            Ok(k) => k,
+        // the key is looked up where it is (a variable's cached value):
+        // None for an empty or too long key
+        let looked_up = with_complex_value(&r, &ctx.key, |key| {
+            if key.is_empty() {
+                return None;
+            }
+
+            if key.len() > 65535 {
+                ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 65535 bytes: \"{}\"", B(&ctx.key.value), B(key));
+                return None;
+            }
+
+            let hash = crc32fast::hash(key);
+
+            let mem = ctx.mem();
+            let shpool = SlabPool::of(&mem);
+
+            shpool.lock();
+
+            // the zone's rbtree and queue are used under its mutex
+            let rc = limit_req_lookup(&limits[n], hash, key, &mut excess, n == limits.len() - 1);
+
+            shpool.unlock();
+
+            Some(rc)
+        });
+
+        rc = match looked_up {
+            Ok(Some(rc)) => rc,
+            Ok(None) => {
+                n += 1;
+                continue;
+            }
             Err(_) => {
                 limit_req_unlock(limits, n);
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
         };
-
-        if key.is_empty() {
-            n += 1;
-            continue;
-        }
-
-        if key.len() > 65535 {
-            ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the value of the \"{}\" key is more than 65535 bytes: \"{}\"", B(&ctx.key.value), B(&key));
-            n += 1;
-            continue;
-        }
-
-        let hash = crc32fast::hash(&key);
-
-        let mem = ctx.mem();
-        let shpool = SlabPool::of(&mem);
-
-        shpool.lock();
-
-        // the zone's rbtree and queue are used under its mutex
-        rc = limit_req_lookup(&limits[n], hash, &key, &mut excess, n == limits.len() - 1);
-
-        shpool.unlock();
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit_req[{}]: {} {}.{:03}", n, rc, excess / 1000, excess % 1000);
 

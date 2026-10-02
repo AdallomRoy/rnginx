@@ -178,13 +178,10 @@ fn log_handler(r: &R) -> i64 {
 
     for log in logs.iter() {
         if let Some(filter) = &log.filter {
-            let val = match complex_value(r, filter) {
-                Ok(v) => v,
+            match with_complex_value(r, filter, |val| val.is_empty() || (val.len() == 1 && val[0] == b'0')) {
+                Ok(true) => continue,
+                Ok(false) => {}
                 Err(_) => return NGX_ERROR,
-            };
-
-            if val.is_empty() || (val.len() == 1 && val[0] == b'0') {
-                continue;
             }
         }
 
@@ -793,43 +790,41 @@ fn log_variable_compile(cf: &mut Conf, value: &[u8], escape: usize) -> Result<Lo
 
 /// ngx_http_log_variable_getlen
 fn log_variable_getlen(r: &R, data: usize) -> usize {
-    let value = match get_indexed_variable(r, data) {
-        Some(v) if !v.not_found => v,
-        _ => return 1,
-    };
-
-    let len = log_escape_count(&value.data);
-
-    value.data.len() + len * 3
+    with_indexed_variable(r, data, |value| match value {
+        Some(v) if !v.not_found => v.data.len() + log_escape_count(&v.data) * 3,
+        _ => 1,
+    })
 }
 
 /// ngx_http_log_variable
 fn log_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
-    let value = match get_indexed_variable(r, op.data) {
-        Some(v) if !v.not_found => v,
-        _ => {
-            if !log_check_length(r, buf, end, 1) {
-                return false;
+    with_indexed_variable(r, op.data, |value| {
+        let value = match value {
+            Some(v) if !v.not_found => v,
+            _ => {
+                if !log_check_length(r, buf, end, 1) {
+                    return false;
+                }
+
+                buf.push(b'-');
+
+                return true;
             }
+        };
 
-            buf.push(b'-');
+        // value->escape is set by the getlen: the escaping of a value without
+        // the characters to escape is the value itself
 
-            return true;
+        let len = log_escape_count(&value.data);
+
+        if !log_check_length(r, buf, end, value.data.len() + len * 3) {
+            return false;
         }
-    };
 
-    // value->escape is set by the getlen: the escaping of a value without
-    // the characters to escape is the value itself
+        log_escape(buf, &value.data);
 
-    let len = log_escape_count(&value.data);
-
-    if !log_check_length(r, buf, end, value.data.len() + len * 3) {
-        return false;
-    }
-
-    log_escape(buf, &value.data);
-
-    true
+        true
+    })
 }
 
 /// The escape[] table of ngx_http_log_escape
@@ -893,54 +888,56 @@ fn escape_json_count(src: &[u8]) -> usize {
 
 /// ngx_http_log_json_variable_getlen
 fn log_json_variable_getlen(r: &R, data: usize) -> usize {
-    let value = match get_indexed_variable(r, data) {
-        Some(v) if !v.not_found => v,
-        _ => return 0,
-    };
-
-    value.data.len() + escape_json_count(&value.data)
+    with_indexed_variable(r, data, |value| match value {
+        Some(v) if !v.not_found => v.data.len() + escape_json_count(&v.data),
+        _ => 0,
+    })
 }
 
 /// ngx_http_log_json_variable
 fn log_json_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
-    let value = match get_indexed_variable(r, op.data) {
-        Some(v) if !v.not_found => v,
-        _ => return true,
-    };
+    with_indexed_variable(r, op.data, |value| {
+        let value = match value {
+            Some(v) if !v.not_found => v,
+            _ => return true,
+        };
 
-    let len = escape_json_count(&value.data);
+        let len = escape_json_count(&value.data);
 
-    if !log_check_length(r, buf, end, value.data.len() + len) {
-        return false;
-    }
+        if !log_check_length(r, buf, end, value.data.len() + len) {
+            return false;
+        }
 
-    escape_json_into(buf, &value.data);
+        escape_json_into(buf, &value.data);
 
-    true
+        true
+    })
 }
 
 /// ngx_http_log_unescaped_variable_getlen
 fn log_unescaped_variable_getlen(r: &R, data: usize) -> usize {
-    match get_indexed_variable(r, data) {
+    with_indexed_variable(r, data, |value| match value {
         Some(v) if !v.not_found => v.data.len(),
         _ => 0,
-    }
+    })
 }
 
 /// ngx_http_log_unescaped_variable
 fn log_unescaped_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
-    let value = match get_indexed_variable(r, op.data) {
-        Some(v) if !v.not_found => v,
-        _ => return true,
-    };
+    with_indexed_variable(r, op.data, |value| {
+        let value = match value {
+            Some(v) if !v.not_found => v,
+            _ => return true,
+        };
 
-    if !log_check_length(r, buf, end, value.data.len()) {
-        return false;
-    }
+        if !log_check_length(r, buf, end, value.data.len()) {
+            return false;
+        }
 
-    buf.extend_from_slice(&value.data);
+        buf.extend_from_slice(&value.data);
 
-    true
+        true
+    })
 }
 
 /// ngx_http_log_check_length
