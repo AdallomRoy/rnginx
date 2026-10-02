@@ -482,27 +482,27 @@ impl<'a> ShmRbtree<'a> {
         self.node(n).set(RbNode::data, data)
     }
 
-    /// ngx_str_rbtree_insert_value
+    /// ngx_str_rbtree_insert_value: by hash, then length, then bytes
     pub fn str_insert_value(&self, temp: usize, node: usize, sentinel: usize) {
         insert_by(self, temp, node, sentinel, |t, node, temp| {
             let (nk, tk) = (t.key(node), t.key(temp));
+
             if nk != tk {
                 return nk < tk;
             }
+
             let n = StrNode::at(t.mem, node);
             let m = StrNode::at(t.mem, temp);
-            t.str_cmp(n.get(StrNode::str_data), n.get(StrNode::str_len), m.get(StrNode::str_data), m.get(StrNode::str_len))
-                == std::cmp::Ordering::Less
-        });
-    }
+            let (nlen, tlen) = (n.get(StrNode::str_len), m.get(StrNode::str_len));
 
-    /// ngx_memn2cmp() of two strings of the zone
-    fn str_cmp(&self, a: usize, alen: usize, b: usize, blen: usize) -> std::cmp::Ordering {
-        let x = self.mem.bytes(a, alen.min(blen));
-        match self.mem.cmp_bytes(b, &x).reverse() {
-            std::cmp::Ordering::Equal => alen.cmp(&blen),
-            o => o,
-        }
+            if nlen != tlen {
+                return nlen < tlen;
+            }
+
+            // ngx_memcmp(n->str.data, t->str.data, n->str.len) < 0
+            let data = t.mem.bytes(n.get(StrNode::str_data), nlen);
+            t.mem.cmp_bytes(m.get(StrNode::str_data), &data) == std::cmp::Ordering::Greater
+        });
     }
 
     /// ngx_str_rbtree_lookup: the node of ngx_str_node_t with `name` and
@@ -521,18 +521,17 @@ impl<'a> ShmRbtree<'a> {
             }
 
             let len = n.get(StrNode::str_len);
-            let data = n.get(StrNode::str_data);
 
-            // ngx_memn2cmp(name->data, n->str.data, name->len, n->str.len)
-            let rc = match self.mem.cmp_bytes(data, &name[..name.len().min(len)]).reverse() {
-                std::cmp::Ordering::Equal => name.len().cmp(&len),
-                o => o,
-            };
+            if name.len() != len {
+                node = if name.len() < len { self.left(node) } else { self.right(node) };
+                continue;
+            }
 
-            match rc {
-                std::cmp::Ordering::Less => node = self.left(node),
-                std::cmp::Ordering::Greater => node = self.right(node),
-                std::cmp::Ordering::Equal => return node,
+            // ngx_memcmp(val->data, n->str.data, val->len)
+            match self.mem.cmp_bytes(n.get(StrNode::str_data), name) {
+                std::cmp::Ordering::Greater => node = self.left(node),
+                std::cmp::Ordering::Less => node = self.right(node),
+                std::cmp::Ordering::Equal => return n.off,
             }
         }
 
@@ -817,5 +816,15 @@ mod tests {
         }
         assert_eq!(tree.str_lookup(b"alph", 7), 0);
         assert_eq!(tree.str_lookup(b"alpha", 8), 0);
+
+        // C's order: the hash, then the length, then the bytes
+        let order: Vec<Vec<u8>> = walk(&tree)
+            .into_iter()
+            .map(|n| {
+                let s = StrNode::at(&mem, n);
+                mem.bytes(s.get(StrNode::str_data), s.get(StrNode::str_len))
+            })
+            .collect();
+        assert_eq!(order, vec![b"al".to_vec(), b"beta".to_vec(), b"alpha".to_vec(), b"gamma".to_vec()]);
     }
 }
