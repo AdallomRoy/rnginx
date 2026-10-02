@@ -24,6 +24,8 @@ use crate::request::*;
 use crate::variables::*;
 use crate::*;
 
+mod libc_time;
+
 crate::http_module_index!("ngx_http_ssi_filter_module");
 
 const NGX_HTTP_SSI_ERROR: i64 = 1;
@@ -2253,31 +2255,16 @@ fn ssi_date_gmt_local_variable(r: &R, v: &mut VariableValue, gmt: usize) -> i64 
     }
 
     // the format is a C string, as ngx_cpystrn() makes it
-    let mut fmt: Vec<u8> = timefmt.iter().copied().take_while(|&c| c != 0).collect();
-    fmt.push(0);
+    let fmt: Vec<u8> = timefmt.iter().copied().take_while(|&c| c != 0).collect();
 
-    // SAFETY: tm is plain data filled in by gmtime_r()/localtime_r() from
-    // a valid time_t; strftime() writes at most buf.len() bytes into buf
-    // and reads the NUL terminated format.
-    let len = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let t: libc::time_t = now as libc::time_t;
+    // ngx_libc_gmtime(), ngx_libc_localtime(): they ignore a failure,
+    // which needs a year beyond an int
+    let tm = if gmt != 0 { libc_time::gmtime(now) } else { libc_time::localtime(now) };
+    let tm = tm.unwrap_or_default();
 
-        if gmt != 0 {
-            libc::gmtime_r(&t, &mut tm);
-        } else {
-            libc::localtime_r(&t, &mut tm);
-        }
+    v.data = libc_time::strftime(NGX_HTTP_SSI_DATE_LEN, &fmt, &tm);
 
-        let mut buf = [0u8; NGX_HTTP_SSI_DATE_LEN];
-        let n = libc::strftime(buf.as_mut_ptr() as *mut libc::c_char, NGX_HTTP_SSI_DATE_LEN, fmt.as_ptr() as *const libc::c_char, &tm);
-
-        v.data = buf[..n].to_vec();
-
-        n
-    };
-
-    if len == 0 {
+    if v.data.is_empty() {
         return NGX_ERROR;
     }
 
