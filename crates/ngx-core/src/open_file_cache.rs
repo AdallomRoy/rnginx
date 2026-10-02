@@ -705,7 +705,7 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
                 of.fd = fd;
 
                 if of.read_ahead > 0 && st.st_size as usize > NGX_MIN_READ_AHEAD {
-                    let _ = posix_fadvise(fd, 0, st.st_size, libc::POSIX_FADV_SEQUENTIAL);
+                    let _ = nix::fcntl::posix_fadvise(fd, 0, st.st_size, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
                 }
 
                 if of.directio > 0 && st.st_size as usize >= of.directio {
@@ -740,63 +740,47 @@ const FILE_SEARCH: i32 = libc::O_PATH | libc::O_RDONLY | libc::O_DIRECTORY;
 /// NGX_DISABLE_SYMLINKS_NOTOWNER
 const DISABLE_SYMLINKS_NOTOWNER: u8 = 2;
 
-fn set_errno(err: i32) {
-    unsafe { *libc::__errno_location() = err };
-}
+/// ngx_openat_file: openat(at_fd, name, mode | create, access),
+/// close-on-exec; the registered descriptor or errno
+fn openat_file(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32) -> Result<i32, i32> {
+    if at_fd == libc::AT_FDCWD {
+        // openat(AT_FDCWD, ...)
+        return os::open(name, mode | create, access);
+    }
 
-/// ngx_openat_file: openat(at_fd, name, mode | create, access)
-fn openat_file(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32) -> i32 {
-    let cname = match std::ffi::CString::new(name) {
-        Ok(c) => c,
-        Err(_) => {
-            set_errno(libc::EINVAL);
-            return NGX_INVALID_FILE;
-        }
-    };
-
-    unsafe { libc::openat(at_fd, cname.as_ptr(), mode | create | libc::O_CLOEXEC, access as libc::c_uint) }
+    os::openat(at_fd, name, mode | create, access)
 }
 
 /// ngx_openat_file_owner: to allow symlinks with the same owner, openat()
 /// (followed by fstat()) and fstatat(AT_SYMLINK_NOFOLLOW), and the uids
 /// compared, even when fstatat() reports the component isn't a symlink
 /// (there is a race between openat() and fstatat()).
-fn openat_file_owner(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32, log: &Log) -> i32 {
-    let fd = openat_file(at_fd, name, mode, create, access);
-
-    if fd == NGX_INVALID_FILE {
-        return NGX_INVALID_FILE;
-    }
+fn openat_file_owner(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u32, log: &Log) -> Result<i32, i32> {
+    let fd = openat_file(at_fd, name, mode, create, access)?;
 
     let err = 'failed: {
-        let cname = std::ffi::CString::new(name).expect("name");
+        let atfi = match nix::sys::stat::fstatat(Some(at_fd), name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(e) => break 'failed e as i32,
+        };
 
-        let mut atfi: libc::stat = unsafe { std::mem::zeroed() };
-
-        if unsafe { libc::fstatat(at_fd, cname.as_ptr(), &mut atfi, libc::AT_SYMLINK_NOFOLLOW) } == -1 {
-            break 'failed os::errno();
-        }
-
-        let mut fi: libc::stat = unsafe { std::mem::zeroed() };
-
-        if file_o_path_info(fd, &mut fi, log).is_err() {
-            break 'failed os::errno();
-        }
+        let fi = match file_o_path_info(fd, log) {
+            Ok(st) => st,
+            Err(e) => break 'failed e,
+        };
 
         if fi.st_uid != atfi.st_uid {
             break 'failed libc::ELOOP;
         }
 
-        return fd;
+        return Ok(fd);
     };
 
     if let Err(e) = close_file(fd) {
         ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() \"{}\" failed", B(name));
     }
 
-    set_errno(err);
-
-    NGX_INVALID_FILE
+    Err(err)
 }
 
 thread_local! {
@@ -805,15 +789,13 @@ thread_local! {
 }
 
 /// ngx_file_o_path_info: fstat() of an O_PATH descriptor, or fstatat()
-/// with AT_EMPTY_PATH on kernels before 3.6
-fn file_o_path_info(fd: i32, fi: &mut libc::stat, log: &Log) -> Result<(), ()> {
+/// with AT_EMPTY_PATH on kernels before 3.6; Err(errno)
+fn file_o_path_info(fd: i32, log: &Log) -> Result<libc::stat, i32> {
     if USE_FSTAT.with(|u| u.get()) {
-        if unsafe { libc::fstat(fd, fi) } != -1 {
-            return Ok(());
-        }
-
-        if os::errno() != libc::EBADF {
-            return Err(());
+        match nix::sys::stat::fstat(fd) {
+            Ok(fi) => return Ok(fi),
+            Err(e) if e != nix::errno::Errno::EBADF => return Err(e as i32),
+            Err(_) => {}
         }
 
         ngx_log_error!(crate::log::NGX_LOG_NOTICE, log, None, "fstat(O_PATH) failed with EBADF, switching to fstatat(AT_EMPTY_PATH)");
@@ -821,11 +803,7 @@ fn file_o_path_info(fd: i32, fi: &mut libc::stat, log: &Log) -> Result<(), ()> {
         USE_FSTAT.with(|u| u.set(false));
     }
 
-    if unsafe { libc::fstatat(fd, b"\0".as_ptr() as *const libc::c_char, fi, libc::AT_EMPTY_PATH) } != -1 {
-        return Ok(());
-    }
-
-    Err(())
+    nix::sys::stat::fstatat(Some(fd), "", nix::fcntl::AtFlags::AT_EMPTY_PATH).map_err(|e| e as i32)
 }
 
 /// ngx_open_file_wrapper: without disable_symlinks, open(); with it, the
@@ -908,12 +886,15 @@ fn open_file_wrapper(name: &[u8], of: &mut OpenFileInfo, mode: i32, create: i32,
             openat_file(at_fd, &name[p..cp], FILE_SEARCH | libc::O_NONBLOCK | libc::O_NOFOLLOW, 0, 0)
         };
 
-        if fd == NGX_INVALID_FILE {
-            of.err = os::errno();
-            of.failed = "openat()";
-            close_at(at_fd, at_name_len);
-            return NGX_INVALID_FILE;
-        }
+        let fd = match fd {
+            Ok(fd) => fd,
+            Err(err) => {
+                of.err = err;
+                of.failed = "openat()";
+                close_at(at_fd, at_name_len);
+                return NGX_INVALID_FILE;
+            }
+        };
 
         close_at(at_fd, at_name_len);
 
@@ -936,10 +917,14 @@ fn open_file_wrapper(name: &[u8], of: &mut OpenFileInfo, mode: i32, create: i32,
         openat_file(at_fd, &name[p..end], mode | libc::O_NOFOLLOW, create, access)
     };
 
-    if fd == NGX_INVALID_FILE {
-        of.err = os::errno();
-        of.failed = "openat()";
-    }
+    let fd = match fd {
+        Ok(fd) => fd,
+        Err(err) => {
+            of.err = err;
+            of.failed = "openat()";
+            NGX_INVALID_FILE
+        }
+    };
 
     close_at(at_fd, at_name_len);
 
@@ -982,24 +967,16 @@ fn fill_info_from_stat(st: &libc::stat, of: &mut OpenFileInfo) -> Result<(), ()>
 
 /// ngx_close_file
 fn close_file(fd: i32) -> Result<(), i32> {
-    // SAFETY: closing a descriptor owned by the cache or the caller.
-    if unsafe { libc::close(fd) } == -1 {
-        Err(os::errno())
-    } else {
-        Ok(())
-    }
+    os::close_fd(fd)
 }
 
 fn stat_uniq(st: &libc::stat) -> u64 {
     (((st.st_dev as u64) << 32) ^ (st.st_ino as u64)) as u64
 }
 
+/// time(NULL): glibc reads the coarse realtime clock
 fn current_time() -> i64 {
-    unsafe { libc::time(std::ptr::null_mut()) as i64 }
-}
-
-fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32 {
-    unsafe { libc::posix_fadvise(fd, offset, len, advice) }
+    rustix::time::clock_gettime(rustix::time::ClockId::RealtimeCoarse).tv_sec
 }
 
 #[cfg(test)]
