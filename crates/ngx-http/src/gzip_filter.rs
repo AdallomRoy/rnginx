@@ -525,7 +525,11 @@ fn gzip_filter_add_data(r: &R, ctx: &mut GzipCtx) -> i64 {
     // the copies of postpone_gzipping own their data: nothing to free
     // later (ctx->copy_buf, ctx->copied)
 
-    ctx.in_buf = Some(buf);
+    // the buffer before is consumed: a copy buffer's memory is free for
+    // the next copies
+    if let Some(consumed) = ctx.in_buf.replace(buf) {
+        crate::copy_filter::recycle(consumed);
+    }
 
     let in_buf = ctx.in_buf.as_ref().expect("in_buf");
 
@@ -737,6 +741,11 @@ fn gzip_filter_deflate_end(r: &R, ctx: &mut GzipCtx) -> i64 {
     // deflateEnd() (Z_OK after Z_STREAM_END: the "deflateEnd() failed"
     // alert cannot happen) and ngx_pfree(r->pool, ctx->preallocated)
     drop(z);
+
+    // the last buffer is consumed
+    if let Some(consumed) = ctx.in_buf.take() {
+        crate::copy_filter::recycle(consumed);
+    }
 
     let mut b = ctx.out_buf.take().expect("out_buf");
 

@@ -419,7 +419,55 @@ fn get_buf(c: &CopyCtx, src: &Buf, bsize: i64) -> CopyBuf {
     CopyBuf { size, recycled }
 }
 
-/// ngx_output_chain_copy_buf: `size` bytes of src at most into a new
+/// buf->tag of the copy buffers (ngx_http_copy_filter_module in C): their
+/// memory goes back to the worker's free copy buffers once they are sent
+/// or consumed
+pub const COPY_BUF_TAG: usize = 0x6e67_785f_636f_7079;
+
+/// The free copy buffers kept, and the largest one kept
+const FREE_BUFS: usize = 16;
+const FREE_BUF_SIZE: usize = 1024 * 1024;
+
+thread_local! {
+    /// The memory of the copy buffers sent or consumed, as C's ctx->free
+    /// keeps the buffers of the request: reused for the next copies,
+    /// without allocating or zeroing them again. A buffer keeps its length,
+    /// the part of it that is initialized.
+    static FREE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The memory of a copy buffer of `size` bytes: a free one, or a new one
+/// with exactly that capacity and nothing initialized
+fn take_buf(size: usize) -> Vec<u8> {
+    let free = FREE.with(|f| {
+        let mut f = f.borrow_mut();
+        let i = f.iter().rposition(|v| v.capacity() >= size)?;
+        Some(f.swap_remove(i))
+    });
+
+    free.unwrap_or_else(|| Vec::with_capacity(size))
+}
+
+/// A buffer sent or consumed: a copy buffer's memory is free again
+/// (ngx_chain_update_chains() moves the copy filter's buffers to ctx->free)
+pub fn recycle(b: Buf) {
+    if b.tag != COPY_BUF_TAG {
+        return;
+    }
+
+    if let BufData::Memory(v) = b.data {
+        if v.capacity() <= FREE_BUF_SIZE {
+            FREE.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.len() < FREE_BUFS {
+                    f.push(v);
+                }
+            });
+        }
+    }
+}
+
+/// ngx_output_chain_copy_buf: `size` bytes of src at most into a copy
 /// buffer, aligned for directio (ngx_pmemalign), and src moved past them
 fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize, unaligned: bool, recycled: bool) -> Result<Buf, i64> {
     let log = &r.connection.log;
@@ -428,10 +476,12 @@ fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize,
     let mut dst;
 
     if src.in_memory() {
-        let data = match &src.data {
-            BufData::Memory(v) => v[src.pos..src.pos + size].to_vec(),
-            _ => Vec::new(),
-        };
+        let mut data = take_buf(size);
+        data.clear();
+
+        if let BufData::Memory(v) = &src.data {
+            data.extend_from_slice(&v[src.pos..src.pos + size]);
+        }
 
         src.pos += size;
 
@@ -443,40 +493,60 @@ fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize,
             dst.last_in_chain = src.last_in_chain;
         }
     } else {
-        let (fd, name) = match &src.data {
-            BufData::File(f) => (f.fd, f.name.clone()),
+        let file = match &src.data {
+            BufData::File(f) => f.clone(),
             _ => return Err(NGX_ERROR),
         };
+        let (fd, name) = (file.fd, &file.name);
 
         // with directio the buffer is aligned to a disk sector size
         let align = if directio && !unaligned { alignment.max(1) } else { 1 };
-        let mut v = vec![0u8; size + align - 1];
-        let start = v.as_ptr().align_offset(align).min(align - 1);
 
-        if unaligned && ngx_core::os::directio_off(fd) == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "{} \"{}\" failed", ngx_core::os::DIRECTIO_OFF_N, B(&name));
+        let mut v;
+        let start;
+
+        if align == 1 {
+            v = take_buf(size);
+            start = 0;
+        } else {
+            v = vec![0u8; size + align - 1];
+            start = v.as_ptr().align_offset(align).min(align - 1);
         }
 
-        let buf = &mut v[start..start + size];
+        if unaligned && ngx_core::os::directio_off(fd) == -1 {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "{} \"{}\" failed", ngx_core::os::DIRECTIO_OFF_N, B(name));
+        }
 
-        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "read: {}, {:p}, {}, {}", fd, buf.as_ptr(), size, src.file_pos);
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "read: {}, {:p}, {}, {}", fd, v.as_ptr().wrapping_add(start), size, src.file_pos);
 
-        let read = ngx_core::os::pread(fd, buf, src.file_pos);
+        let read = if align == 1 && v.is_empty() && v.capacity() == size {
+            // a new buffer: read into its memory not initialized
+            match ngx_core::fd::get(fd) {
+                Ok(f) => rustix::io::pread(&f, rustix::buffer::spare_capacity(&mut v), src.file_pos as u64).map_err(|e| e.raw_os_error()),
+                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EBADF)),
+            }
+        } else {
+            if align == 1 {
+                // a free buffer: only what it never had is zeroed
+                v.resize(size, 0);
+            }
+            ngx_core::os::pread(fd, &mut v[start..start + size], src.file_pos)
+        };
 
         if unaligned && ngx_core::os::directio_on(fd) == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "{} \"{}\" failed", ngx_core::os::DIRECTIO_ON_N, B(&name));
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "{} \"{}\" failed", ngx_core::os::DIRECTIO_ON_N, B(name));
         }
 
         let n = match read {
             Ok(n) => n as isize,
             Err(err) => {
-                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pread() \"{}\" failed", B(&name));
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pread() \"{}\" failed", B(name));
                 return Err(NGX_ERROR);
             }
         };
 
         if n as usize != size {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "pread() read only {} of {} from \"{}\"", n, size, B(&name));
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "pread() read only {} of {} from \"{}\"", n, size, B(name));
             return Err(NGX_ERROR);
         }
 
@@ -493,7 +563,51 @@ fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize,
         }
     }
 
+    dst.tag = COPY_BUF_TAG;
     dst.recycled = recycled;
 
     Ok(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_free_copy_buffers() {
+        // a new buffer: exactly the capacity asked, nothing initialized
+        let v = take_buf(100);
+        assert_eq!(v.capacity(), 100);
+        assert!(v.is_empty());
+
+        // a copy buffer sent: its memory is taken again, initialized, for a
+        // copy it holds
+        let mut b = Buf::from_vec(vec![7u8; 1000]);
+        b.tag = COPY_BUF_TAG;
+        let p = match &b.data {
+            BufData::Memory(v) => v.as_ptr(),
+            _ => unreachable!(),
+        };
+        recycle(b);
+
+        let v = take_buf(2000);
+        assert!(v.is_empty() && v.capacity() == 2000, "too small: a new one");
+
+        let v = take_buf(500);
+        assert_eq!(v.as_ptr(), p);
+        assert_eq!(v.len(), 1000);
+
+        // other buffers are not kept
+        recycle(Buf::from_vec(vec![1u8; 4096]));
+        let v = take_buf(10);
+        assert!(v.is_empty() && v.capacity() == 10);
+
+        // at most FREE_BUFS are kept
+        for _ in 0..FREE_BUFS + 4 {
+            let mut b = Buf::from_vec(vec![0u8; 64]);
+            b.tag = COPY_BUF_TAG;
+            recycle(b);
+        }
+        assert_eq!(FREE.with(|f| f.borrow().len()), FREE_BUFS);
+    }
 }

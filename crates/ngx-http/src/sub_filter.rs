@@ -343,6 +343,10 @@ async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
 
             ob.recycled = buf.recycled;
         }
+
+        // the buffer is consumed (its parts went on as copies): a copy
+        // buffer's memory is free for the next copies
+        crate::copy_filter::recycle(buf);
     }
 
     if ctx.borrow().out.is_empty() {
@@ -363,7 +367,8 @@ fn sub_copy_buf(buf: &Buf, start: usize, end: usize) -> Buf {
         last: len,
         file_pos: 0,
         file_last: 0,
-        tag: buf.tag,
+        // the copy has its own memory, not that of a copy buffer
+        tag: if buf.tag == crate::copy_filter::COPY_BUF_TAG { 0 } else { buf.tag },
         num: buf.num,
         data: BufData::Memory(data),
         temporary: buf.temporary,

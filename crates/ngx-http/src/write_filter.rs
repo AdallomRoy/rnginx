@@ -107,7 +107,7 @@ pub fn write_filter(r: R, mut input: Chain) -> Step {
     let pass_empty = (last && c.need_last_buf.get()) || (flush && c.need_flush_buf.get());
     if size == 0 && !flush && !sync && !pass_empty {
         if last || r.out.borrow().iter().any(|b| b.last_buf) {
-            r.out.borrow_mut().clear();
+            free_out(&r);
             r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
             r.response_sent.set(true);
             return Step::Ready(NGX_OK);
@@ -287,7 +287,7 @@ fn sent(r: &R, s: &Send, before: u64) -> Option<i64> {
     let remaining: i64 = r.out.borrow().iter().map(|b| b.buf_size()).sum();
     if remaining == 0 {
         // drop special (sync/flush/last) buffers as sent
-        r.out.borrow_mut().clear();
+        free_out(r);
         r.buffered.set(r.buffered.get() & !NGX_HTTP_WRITE_BUFFERED);
         if s.last {
             r.response_sent.set(true);
@@ -296,6 +296,14 @@ fn sent(r: &R, s: &Send, before: u64) -> Option<i64> {
     }
     // partial due to sendfile_max_chunk or limit_rate: the next iteration
     None
+}
+
+/// r->out sent: its buffers are free (the memory of copy buffers for the
+/// next copies)
+fn free_out(r: &R) {
+    for b in r.out.borrow_mut().drain(..) {
+        crate::copy_filter::recycle(b);
+    }
 }
 
 /// The send failed (ngx_writev() and others log the error)

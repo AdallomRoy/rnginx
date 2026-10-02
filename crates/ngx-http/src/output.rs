@@ -4,6 +4,8 @@ use std::io;
 use std::io::IoSlice;
 
 use ngx_core::buf::{BufData, Chain};
+
+use crate::copy_filter::recycle;
 use ngx_core::connection::{Connection, TcpNodelay, TcpNopush};
 use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf, SslChainFile};
 use ngx_core::log::*;
@@ -81,7 +83,7 @@ fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
         // drop empty non-special buffers at the front
         while let Some(b) = chain.front() {
             if b.buf_size() == 0 {
-                chain.pop_front();
+                recycle(chain.pop_front().unwrap());
             } else {
                 break;
             }
@@ -115,7 +117,7 @@ fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
             }
 
             *total += n as i64;
-            ngx_core::buf::chain_update_sent(chain, n as i64);
+            update_sent(chain, n as i64);
             continue;
         }
 
@@ -176,7 +178,7 @@ fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
         };
 
         *total += n as i64;
-        ngx_core::buf::chain_update_sent(chain, n as i64);
+        update_sent(chain, n as i64);
 
         // a partial write: the next attempt finds out whether the socket
         // takes more
@@ -343,7 +345,7 @@ async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
         ngx_ssl_send_chain_wait(c, &links, limit).await?
     };
 
-    ngx_core::buf::chain_update_sent(chain, n);
+    update_sent(chain, n);
 
     Ok(n)
 }
@@ -369,7 +371,7 @@ async fn quic_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::R
 fn quic_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
     while let Some(b) = chain.front() {
         if b.buf_size() == 0 {
-            chain.pop_front();
+            recycle(chain.pop_front().unwrap());
         } else {
             break;
         }
@@ -420,13 +422,56 @@ fn quic_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &m
 
     *total += n as i64;
 
-    ngx_core::buf::chain_update_sent(chain, n as i64);
+    update_sent(chain, n as i64);
 
     if left == 0 || (limit > 0 && *total >= limit) {
         return Ok(Pass::Done);
     }
 
     Ok(Pass::Again)
+}
+
+/// ngx_chain_update_sent: `sent` bytes of the chain are taken off it, and
+/// the special buffers after them; the memory of a copy buffer is free for
+/// the next copies (ngx_chain_update_chains() in C)
+fn update_sent(chain: &mut Chain, mut sent: i64) {
+    while let Some(buf) = chain.front_mut() {
+        if buf.special_buf() {
+            recycle(chain.pop_front().unwrap());
+            continue;
+        }
+
+        if sent == 0 {
+            break;
+        }
+
+        let size = buf.buf_size();
+
+        if sent >= size {
+            sent -= size;
+
+            if buf.in_memory() {
+                buf.pos = buf.last;
+            }
+
+            if buf.in_file {
+                buf.file_pos = buf.file_last;
+            }
+
+            recycle(chain.pop_front().unwrap());
+            continue;
+        }
+
+        if buf.in_memory() {
+            buf.pos += sent as usize;
+        }
+
+        if buf.in_file {
+            buf.file_pos += sent;
+        }
+
+        break;
+    }
 }
 
 /// Convenience: send a whole chain (awaiting writability) — used by simple paths.
