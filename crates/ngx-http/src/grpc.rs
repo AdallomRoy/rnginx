@@ -150,8 +150,9 @@ pub struct NgxHttpGrpcLocConf {
     pub headers: Option<Rc<GrpcHeaders>>,
     pub headers_source: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>>,
 
-    /// glcf->host: the :authority of grpc_pass without variables
-    pub host: Vec<u8>,
+    /// glcf->host: the :authority of grpc_pass without variables (shared
+    /// with the requests)
+    pub host: Rc<[u8]>,
     /// glcf->host_value: the value of "grpc_set_header Host"
     pub host_value: Option<Rc<ComplexValue>>,
 
@@ -224,7 +225,7 @@ fn new_loc_conf() -> NgxHttpGrpcLocConf {
         cache: UpstreamCacheConf::default(),
         headers: None,
         headers_source: Val::unset(),
-        host: Vec::new(),
+        host: Rc::from(&b""[..]),
         host_value: None,
         grpc_values: None,
         upstream_ssl: UpstreamSslConf::default(),
@@ -250,7 +251,7 @@ fn new_loc_conf() -> NgxHttpGrpcLocConf {
 struct GrpcModule {
     lcf: Rc<RefCell<NgxHttpGrpcLocConf>>,
     ctx: H2Ctx,
-    host: Vec<u8>,
+    host: Rc<[u8]>,
 }
 
 /// ngx_http_grpc_handler
@@ -269,16 +270,12 @@ async fn grpc_handler(r: R) -> i64 {
 
     // ngx_http_upstream_create
 
-    let mut u = Upstream::create(&r, conf, Rc::new(Vec::new()), b"grpc://");
+    let mut u = Upstream::create(&r, conf, crate::upstream_cache::no_caches(), b"grpc://");
 
     let ctx = H2Ctx::new("grpc", GRPC_TAG);
 
-    let mut authority_host = Vec::new();
-
-    match grpc_values {
+    let authority_host: Rc<[u8]> = match grpc_values {
         None => {
-            authority_host = host;
-
             u.ssl = ssl;
 
             if ssl {
@@ -286,14 +283,20 @@ async fn grpc_handler(r: R) -> i64 {
             } else {
                 u.set_schema(b"grpc://");
             }
+
+            host
         }
 
         Some(codes) => {
+            let mut authority_host = Vec::new();
+
             if grpc_eval(&r, &mut authority_host, &codes, &mut u) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
+
+            authority_host.into()
         }
-    }
+    };
 
     r.request_body_no_buffering.set(true);
 
@@ -683,7 +686,7 @@ fn create_request(r: &R, glcf: &NgxHttpGrpcLocConf, authority: &[u8], ssl: bool)
     };
 
     let method = r.method.get();
-    let method_name = r.method_name.borrow().clone();
+    let method_name = r.method_name.borrow();
 
     // :method header
 
@@ -711,31 +714,37 @@ fn create_request(r: &R, glcf: &NgxHttpGrpcLocConf, authority: &[u8], ssl: bool)
 
     // :authority header
 
-    let mut host: Vec<u8> = Vec::new();
+    let host_value = match &glcf.host_value {
+        Some(hv) => Some(crate::script::complex_value_cow(r, hv).map_err(|_| ())?),
+        None => None,
+    };
 
-    if let Some(hv) = &glcf.host_value {
-        host = crate::script::complex_value(r, hv).map_err(|_| ())?;
-    }
-
-    if host.is_empty() {
-        host = authority.to_vec();
-    }
+    let host: &[u8] = match host_value.as_deref() {
+        Some(h) if !h.is_empty() => h,
+        _ => authority,
+    };
 
     if host.len() > NGX_HTTP_V2_MAX_FIELD {
-        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "too long http2 host: \"{}\"", B(&host));
+        ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "too long http2 host: \"{}\"", B(host));
         return Err(());
     }
 
-    // other headers
+    // other headers: their lengths first, the values are written into the
+    // frame after (the two passes of C, without a copy of each)
 
     crate::script::script_flush_no_cacheable_variables(r, Some(&headers.flushes));
 
-    let mut lines: Vec<(&[u8], Vec<u8>)> = Vec::new();
+    // an HPACK literal: the zero octet, the name and the value with their
+    // lengths (at most 5 octets each)
+    let field = |name: usize, value: usize| 1 + 5 + name + 5 + value;
+
+    let mut len = 0;
+    let mut longest = 0;
 
     for (key, codes) in headers.lines.iter() {
-        let value = crate::proxy::run_codes(r, codes);
+        let value_len = crate::proxy::codes_len(r, codes);
 
-        if value.is_empty() {
+        if value_len == 0 {
             continue;
         }
 
@@ -744,22 +753,22 @@ fn create_request(r: &R, glcf: &NgxHttpGrpcLocConf, authority: &[u8], ssl: bool)
             return Err(());
         }
 
-        if value.len() > NGX_HTTP_V2_MAX_FIELD {
+        if value_len > NGX_HTTP_V2_MAX_FIELD {
             ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "too long http2 header value");
             return Err(());
         }
 
-        lines.push((key, value));
+        len += field(key.len(), value_len);
+        longest = longest.max(value_len);
     }
 
-    let mut request_headers: Vec<Header> = Vec::new();
+    let pass_request_headers = glcf.upstream_conf.as_ref().map(|c| c.pass_request_headers).unwrap_or(true);
 
-    if glcf.upstream_conf.as_ref().map(|c| c.pass_request_headers).unwrap_or(true) {
-        for h in r.headers_in.borrow().headers.iter() {
-            if headers.hash.find(hash_key(&h.lowcase_key), &h.lowcase_key).is_some() {
-                continue;
-            }
+    // the client's headers not set by grpc_set_header
+    let passed = |h: &Header| !headers.hash.find(hash_key(&h.lowcase_key), &h.lowcase_key).is_some();
 
+    if pass_request_headers {
+        for h in r.headers_in.borrow().headers.iter().filter(|h| passed(h)) {
             let value = h.value.borrow();
 
             if h.key.len() > NGX_HTTP_V2_MAX_FIELD {
@@ -772,11 +781,11 @@ fn create_request(r: &R, glcf: &NgxHttpGrpcLocConf, authority: &[u8], ssl: bool)
                 return Err(());
             }
 
-            request_headers.push(h.clone());
+            len += field(h.key.len(), value.len());
         }
     }
 
-    let mut b: Vec<u8> = Vec::with_capacity(CONNECTION_START.len() + FRAME_SIZE + uri_len + host.len() + 256);
+    let mut b: Vec<u8> = Vec::with_capacity(CONNECTION_START.len() + FRAME_SIZE + 1 + field(0, method_name.len()) + 1 + field(0, uri_len) + field(0, host.len()) + len);
 
     // connection preface
 
@@ -855,28 +864,42 @@ fn create_request(r: &R, glcf: &NgxHttpGrpcLocConf, authority: &[u8], ssl: bool)
     }
 
     b.push(inc_indexed(NGX_HTTP_V2_AUTHORITY_INDEX));
-    write_value(&mut b, &host);
+    write_value(&mut b, host);
 
-    http_debug!(r, "grpc header: \":authority: {}\"", B(&host));
+    http_debug!(r, "grpc header: \":authority: {}\"", B(host));
 
-    for (key, value) in lines.iter() {
-        b.push(0);
+    if longest > 0 {
+        // the values of the lines, each made in one buffer for them all
+        let mut value = Vec::with_capacity(longest);
 
-        write_name(&mut b, key);
-        write_value(&mut b, value);
+        for (key, codes) in headers.lines.iter() {
+            value.clear();
+            crate::proxy::append_codes(r, codes, &mut value);
 
-        http_debug!(r, "grpc header: \"{}: {}\"", B(&key.to_ascii_lowercase()), B(value));
+            if value.is_empty() {
+                continue;
+            }
+
+            b.push(0);
+
+            write_name(&mut b, key);
+            write_value(&mut b, &value);
+
+            http_debug!(r, "grpc header: \"{}: {}\"", B(&key.to_ascii_lowercase()), B(&value));
+        }
     }
 
-    for h in request_headers.iter() {
-        let value = h.value.borrow();
+    if pass_request_headers {
+        for h in r.headers_in.borrow().headers.iter().filter(|h| passed(h)) {
+            let value = h.value.borrow();
 
-        b.push(0);
+            b.push(0);
 
-        write_name(&mut b, &h.key);
-        write_value(&mut b, &value);
+            write_name(&mut b, &h.key);
+            write_value(&mut b, &value);
 
-        http_debug!(r, "grpc header: \"{}: {}\"", B(&h.key.to_ascii_lowercase()), B(&value));
+            http_debug!(r, "grpc header: \"{}: {}\"", B(&h.key.to_ascii_lowercase()), B(&value));
+        }
     }
 
     header_frames(&mut b, headers_frame);
@@ -1119,9 +1142,10 @@ impl GrpcModule {
                         return NGX_HTTP_UPSTREAM_INVALID_HEADER;
                     }
 
-                    let h = TableElt::with_hash(&name, &value, hash_key(&name), name.clone());
+                    let hash = hash_key(&name);
+                    let h = crate::upstream_rt::upstream_header(name.clone(), value, hash, name);
 
-                    u.resp.headers.push(h.clone());
+                    u.resp.push_header(h.clone());
 
                     if u.resp.status_n == NGX_HTTP_EARLY_HINTS {
                         continue;
@@ -1455,7 +1479,8 @@ impl GrpcModule {
                             return NGX_ERROR;
                         }
 
-                        let h = TableElt::with_hash(&name, &value, hash_key(&name), name.clone());
+                        let hash = hash_key(&name);
+                        let h = crate::upstream_rt::upstream_header(name.clone(), value, hash, name);
 
                         u.resp.trailers.push(h);
 
@@ -2183,7 +2208,7 @@ fn grpc_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
 
     glcf.upstream = Some(uscf);
 
-    glcf.host = authority(&u);
+    glcf.host = authority(&u).into();
 
     Ok(())
 }

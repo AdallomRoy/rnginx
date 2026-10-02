@@ -235,7 +235,7 @@ fn get_random_peer(pc: &mut PeerConnection, rp: &mut RandomPeerData) -> i64 {
         p.set(RrPeer::checked, now);
     }
 
-    connect_peer(pc, mem, peer);
+    connect_rr_peer(pc, &rp.rrp, peer);
 
     p.set(RrPeer::conns, p.get(RrPeer::conns) + 1);
 
@@ -330,7 +330,7 @@ fn get_random2_peer(pc: &mut PeerConnection, rp: &mut RandomPeerData) -> i64 {
         pp.set(RrPeer::checked, now);
     }
 
-    connect_peer(pc, mem, peer);
+    connect_rr_peer(pc, &rp.rrp, peer);
 
     pp.set(RrPeer::conns, pp.get(RrPeer::conns) + 1);
 

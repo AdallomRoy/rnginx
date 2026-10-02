@@ -50,9 +50,9 @@ pub struct ProxyHeaders {
 }
 
 /// ngx_http_proxy_ctx_t
-#[derive(Default)]
 pub struct ProxyCtx {
-    pub vars: ProxyVars,
+    /// ctx->vars: those of the location, or of a proxy_pass with variables
+    pub vars: Rc<ProxyVars>,
     pub internal_body_length: i64,
     /// the request sent is a HEAD one
     pub head: bool,
@@ -61,14 +61,31 @@ pub struct ProxyCtx {
     pub header_sent: bool,
 }
 
+impl ProxyCtx {
+    /// The context of a request with these vars.
+    pub fn new(vars: Rc<ProxyVars>) -> ProxyCtx {
+        ProxyCtx { vars, internal_body_length: 0, head: false, internal_chunked: false, header_sent: false }
+    }
+}
+
+/// Empty vars, shared: those of the context before ngx_http_proxy_eval
+/// sets them (ngx_pcalloc).
+pub fn no_vars() -> Rc<ProxyVars> {
+    thread_local! {
+        static NONE: Rc<ProxyVars> = Rc::new(ProxyVars::default());
+    }
+
+    NONE.with(|v| v.clone())
+}
+
 /// Proxy location configuration
 pub struct NgxHttpProxyLocConf {
     /// plcf->url: the URL of proxy_pass without variables
     pub url: Vec<u8>,
     /// plcf->location
     pub location: Vec<u8>,
-    /// plcf->vars
-    pub vars: ProxyVars,
+    /// plcf->vars (shared with the contexts of the requests)
+    pub vars: Rc<ProxyVars>,
     /// plcf->proxy_lengths / proxy_values: the codes of a proxy_pass URL
     /// with variables (ngx_http_proxy_eval)
     pub proxy_values: Option<Rc<Vec<crate::script::Part>>>,
@@ -301,7 +318,7 @@ impl Default for NgxHttpProxyLocConf {
         NgxHttpProxyLocConf {
             url: Vec::new(),
             location: Vec::new(),
-            vars: ProxyVars::default(),
+            vars: Rc::new(ProxyVars::default()),
             proxy_values: None,
             method: Val::unset(),
             body_source: None,
@@ -1202,10 +1219,11 @@ fn proxy_pass_handler(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) 
 
     plcf.upstream = Some(uscf);
 
-    plcf.vars.schema = url[..add].to_vec();
-    plcf.vars.key_start = plcf.vars.schema.clone();
+    let mut vars = ProxyVars { schema: url[..add].to_vec(), key_start: url[..add].to_vec(), ..Default::default() };
 
-    set_vars(&u, &mut plcf.vars, &url);
+    set_vars(&u, &mut vars, &url);
+
+    plcf.vars = Rc::new(vars);
 
     let lc = clcf.borrow();
 
@@ -1581,30 +1599,33 @@ async fn proxy_handler(r: R) -> i64 {
     let caches = {
         let pmcf = r.main_conf::<crate::upstream_cache::UpstreamCacheMainConf>(ctx_index());
         let caches = pmcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     // ngx_http_upstream_create; u->conf and u->caches
 
     let mut u = crate::upstream_rt::Upstream::create(&r, conf, caches, b"");
 
-    let ctx = r.set_ctx(ctx_index(), ProxyCtx::default());
-
     let proxy_values = lcf.borrow().proxy_values.clone();
 
-    match proxy_values {
+    let ctx = match proxy_values {
         None => {
             let plcf = lcf.borrow();
-            ctx.borrow_mut().vars = plcf.vars.clone();
+            let ctx = r.set_ctx(ctx_index(), ProxyCtx::new(plcf.vars.clone()));
             u.set_schema(&plcf.vars.schema);
             u.ssl = plcf.ssl;
+            ctx
         }
         Some(codes) => {
+            let ctx = r.set_ctx(ctx_index(), ProxyCtx::new(no_vars()));
+
             if proxy_eval(&r, &ctx, &codes, &mut u) != NGX_OK {
                 return crate::NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
+
+            ctx
         }
-    }
+    };
 
     {
         let plcf = lcf.borrow();
@@ -1667,12 +1688,12 @@ pub(crate) fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::scr
     }
 
     {
-        let mut c = ctx.borrow_mut();
-
         // ctx->vars.key_start = u->schema
-        c.vars.key_start = proxy[..add].to_vec();
+        let mut vars = ProxyVars { key_start: proxy[..add].to_vec(), schema: ctx.borrow().vars.schema.clone(), ..Default::default() };
 
-        set_vars(&url, &mut c.vars, &proxy);
+        set_vars(&url, &mut vars, &proxy);
+
+        ctx.borrow_mut().vars = Rc::new(vars);
     }
 
     // u->schema
@@ -1688,83 +1709,117 @@ pub(crate) fn proxy_eval(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, codes: &[crate::scr
 /// ngx_http_get_indexed_variable() (e.flushed = 1), the no cacheable ones
 /// having been flushed.
 pub(crate) fn run_codes(r: &R, codes: &[crate::script::Part]) -> Vec<u8> {
-    let mut value = Vec::new();
+    let mut value = Vec::with_capacity(codes_len(r, codes));
 
-    for code in codes {
-        match code {
-            crate::script::Part::Literal(data) => value.extend_from_slice(data),
+    append_codes(r, codes, &mut value);
 
-            crate::script::Part::Var(index) => {
-                if let Some(v) = crate::variables::get_indexed_variable(r, *index) {
-                    if !v.not_found {
-                        value.extend_from_slice(&v.data);
-                    }
-                }
-            }
+    value
+}
 
-            crate::script::Part::Capture(n) => {
-                let n = *n;
+/// The bytes of a variable for the codes of ngx_http_proxy_create_request
+/// and of the params (e->flushed: the value cached in r->variables, else
+/// evaluated and cached by ngx_http_get_indexed_variable()), lent to `f`;
+/// empty if not found. `f` must not evaluate variables.
+fn with_var<T>(r: &R, index: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+    crate::variables::with_indexed_variable(r, index, |v| match v {
+        Some(v) if !v.not_found => f(&v.data),
+        _ => f(&[]),
+    })
+}
 
-                if n < r.ncaptures.get() {
-                    let cap = r.captures.borrow();
+/// A regex capture of the codes, lent to `f` (empty if not set).
+fn with_capture<T>(r: &R, n: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+    if n < r.ncaptures.get() {
+        let cap = r.captures.borrow();
 
-                    if n + 1 < cap.len() {
-                        let (a, b) = (cap[n], cap[n + 1]);
+        if n + 1 < cap.len() {
+            let (a, b) = (cap[n], cap[n + 1]);
 
-                        if a >= 0 && b >= a {
-                            let data = r.captures_data.borrow();
+            if a >= 0 && b >= a {
+                let data = r.captures_data.borrow();
 
-                            if (b as usize) <= data.len() {
-                                value.extend_from_slice(&data[a as usize..b as usize]);
-                            }
-                        }
-                    }
+                if (b as usize) <= data.len() {
+                    return f(&data[a as usize..b as usize]);
                 }
             }
         }
     }
 
-    value
+    f(&[])
+}
+
+/// The length of the value of codes (the lengths codes of C).
+pub(crate) fn codes_len(r: &R, codes: &[crate::script::Part]) -> usize {
+    codes
+        .iter()
+        .map(|code| match code {
+            crate::script::Part::Literal(data) => data.len(),
+            crate::script::Part::Var(index) => with_var(r, *index, |v| v.len()),
+            crate::script::Part::Capture(n) => with_capture(r, *n, |c| c.len()),
+        })
+        .sum()
+}
+
+/// The value of codes appended to `out` (the values codes of C).
+pub(crate) fn append_codes(r: &R, codes: &[crate::script::Part], out: &mut Vec<u8>) {
+    for code in codes {
+        match code {
+            crate::script::Part::Literal(data) => out.extend_from_slice(data),
+            crate::script::Part::Var(index) => with_var(r, *index, |v| out.extend_from_slice(v)),
+            crate::script::Part::Capture(n) => with_capture(r, *n, |c| out.extend_from_slice(c)),
+        }
+    }
 }
 
 /// ngx_http_proxy_create_request: the request line, the Host header, the
 /// headers of proxy_set_header and the defaults with a value, the client's
-/// headers not among them, and the body of proxy_set_body. Returns the
-/// header buffer and u->uri.
+/// headers not among them, and the body of proxy_set_body, in one buffer of
+/// the length computed first. Returns the buffer and u->uri.
 fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>, cacheable: bool, u_method: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), ()> {
-    let headers = if cacheable { plcf.headers_cache.clone() } else { plcf.headers.clone() };
-
-    let headers = match headers {
+    let headers = match if cacheable { plcf.headers_cache.as_ref() } else { plcf.headers.as_ref() } {
         Some(h) => h,
         None => return Err(()),
     };
 
-    let method: Vec<u8> = if let Some(m) = u_method {
-        // HEAD was changed to GET to cache response
-        m.to_vec()
-    } else if let Some(Some(cv)) = plcf.method.as_option() {
-        crate::script::complex_value(r, cv).map_err(|_| ())?
-    } else {
-        r.method_name.borrow().clone()
+    // u->method (HEAD was changed to GET to cache response), proxy_method,
+    // or r->method_name
+    let method_value = match (u_method, plcf.method.as_option()) {
+        (None, Some(Some(cv))) => Some(crate::script::complex_value_cow(r, cv).map_err(|_| ())?),
+        _ => None,
+    };
+
+    let method_name;
+
+    let method: &[u8] = match (u_method, &method_value) {
+        (Some(m), _) => m,
+        (None, Some(m)) => m,
+        (None, None) => {
+            method_name = r.method_name.borrow();
+            &method_name
+        }
     };
 
     let http_version = plcf.http_version.get_or(crate::NGX_HTTP_VERSION_11);
 
-    let mut host: Vec<u8> = Vec::new();
+    let vars = ctx.borrow().vars.clone();
 
-    if let Some(hv) = &plcf.host_value {
-        host = crate::script::complex_value(r, hv).map_err(|_| ())?;
-    }
+    let host_value = match &plcf.host_value {
+        Some(hv) => Some(crate::script::complex_value_cow(r, hv).map_err(|_| ())?),
+        None => None,
+    };
 
-    if plcf.host_value.is_none() || (host.is_empty() && http_version == crate::NGX_HTTP_VERSION_11) {
-        host = ctx.borrow().vars.host_header.clone();
-    }
+    let host: &[u8] = match &host_value {
+        Some(h) if !(h.is_empty() && http_version == crate::NGX_HTTP_VERSION_11) => h,
+        _ => &vars.host_header,
+    };
 
     if method.len() == 4 && method.eq_ignore_ascii_case(b"HEAD") {
         ctx.borrow_mut().head = true;
     }
 
-    let vars_uri = ctx.borrow().vars.uri.clone();
+    let vars_uri = &vars.uri;
+
+    let mut len = method.len() + " ".len() + " HTTP/1.0\r\n".len() + "\r\n".len();
 
     let mut escape = false;
     let mut loc_len = 0;
@@ -1795,15 +1850,18 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
         return Err(());
     }
 
+    len += uri_len;
+
     crate::script::script_flush_no_cacheable_variables(r, Some(&plcf.body_flushes));
     crate::script::script_flush_no_cacheable_variables(r, Some(&headers.flushes));
 
-    let mut body: Option<Vec<u8>> = None;
+    // the lengths: of the body, the Host header, the headers with a value
+    // and the client's headers passed
 
     if let Some(codes) = &plcf.body_values {
-        let b = run_codes(r, codes);
-        ctx.borrow_mut().internal_body_length = b.len() as i64;
-        body = Some(b);
+        let body_len = codes_len(r, codes);
+        ctx.borrow_mut().internal_body_length = body_len as i64;
+        len += body_len;
     } else if r.headers_in.borrow().chunked && r.reading_body.get() {
         let mut c = ctx.borrow_mut();
         c.internal_body_length = -1;
@@ -1812,22 +1870,50 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
         ctx.borrow_mut().internal_body_length = r.headers_in.borrow().content_length_n;
     }
 
-    let mut b: Vec<u8> = Vec::with_capacity(method.len() + uri_len + 256);
+    if !host.is_empty() {
+        len += "Host: ".len() + host.len() + "\r\n".len();
+    }
+
+    for (key, codes) in headers.lines.iter() {
+        let val_len = codes_len(r, codes);
+
+        if val_len == 0 {
+            continue;
+        }
+
+        len += key.len() + ": ".len() + val_len + "\r\n".len();
+    }
+
+    let pass_request_headers = plcf.pass_request_headers.get_or(true);
+
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
+
+        for h in hin.headers.iter() {
+            if headers.hash.find(ngx_core::hash::hash_key(&h.lowcase_key), &h.lowcase_key).is_some() {
+                continue;
+            }
+
+            len += h.key.len() + ": ".len() + h.value.borrow().len() + "\r\n".len();
+        }
+    }
+
+    let mut b: Vec<u8> = Vec::with_capacity(len);
 
     // the request line
 
-    b.extend_from_slice(&method);
+    b.extend_from_slice(method);
     b.push(b' ');
 
     let uri_start = b.len();
 
     if plcf.proxy_values.is_some() && !vars_uri.is_empty() {
-        b.extend_from_slice(&vars_uri);
+        b.extend_from_slice(vars_uri);
     } else if unparsed_uri {
         b.extend_from_slice(&r.unparsed_uri.borrow());
     } else {
         if r.valid_location.get() {
-            b.extend_from_slice(&vars_uri);
+            b.extend_from_slice(vars_uri);
         }
 
         let r_uri = r.uri.borrow();
@@ -1856,24 +1942,23 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
 
     if !host.is_empty() {
         b.extend_from_slice(b"Host: ");
-        b.extend_from_slice(&host);
+        b.extend_from_slice(host);
         b.extend_from_slice(b"\r\n");
     }
 
+    // the values (e.flushed: those the lengths evaluated)
     for (key, codes) in headers.lines.iter() {
-        let value = run_codes(r, codes);
-
-        if value.is_empty() {
+        if codes_len(r, codes) == 0 {
             continue;
         }
 
         b.extend_from_slice(key);
         b.extend_from_slice(b": ");
-        b.extend_from_slice(&value);
+        append_codes(r, codes, &mut b);
         b.extend_from_slice(b"\r\n");
     }
 
-    if plcf.pass_request_headers.get_or(true) {
+    if pass_request_headers {
         let hin = r.headers_in.borrow();
 
         for h in hin.headers.iter() {
@@ -1895,8 +1980,8 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
     // add "\r\n" at the header end
     b.extend_from_slice(b"\r\n");
 
-    if let Some(body) = body {
-        b.extend_from_slice(&body);
+    if let Some(codes) = &plcf.body_values {
+        append_codes(r, codes, &mut b);
     }
 
     ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header:\n\"{}\"", ngx_core::string::B(&b));
@@ -1908,6 +1993,17 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
 /// (ctx->vars.key_start) and the URI of the request as the upstream
 /// request has it.
 pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+    let mut k = crate::file_cache::CacheKeys::new();
+
+    let rc = create_keys(r, &mut k);
+
+    keys.extend(k.iter().map(|part| part.to_vec()));
+
+    rc
+}
+
+/// create_key() into c->keys, the parts written in place.
+pub(crate) fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let plcf = lcf.borrow();
 
@@ -1916,37 +2012,39 @@ pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         None => return NGX_ERROR,
     };
 
-    let ctx = ctx.borrow();
+    let vars = ctx.borrow().vars.clone();
 
     if let Some(cv) = &plcf.cache.cache_key {
-        match crate::script::complex_value(r, cv) {
-            Ok(k) => keys.push(k),
-            Err(_) => return NGX_ERROR,
-        }
-
-        return NGX_OK;
+        return crate::upstream_cache::push_key_value(r, cv, keys);
     }
 
-    keys.push(ctx.vars.key_start.clone());
+    // room for the URL and the URI (escaped, at most 3 bytes a byte)
+    let room = vars.key_start.len() + vars.uri.len() + (3 * r.uri.borrow().len()).max(r.unparsed_uri.borrow().len()) + "?".len() + r.args.borrow().len();
 
-    if plcf.proxy_values.is_some() && !ctx.vars.uri.is_empty() {
-        keys.push(ctx.vars.uri.clone());
+    keys.data_mut().reserve(room);
+
+    keys.push(&vars.key_start);
+
+    if plcf.proxy_values.is_some() && !vars.uri.is_empty() {
+        keys.push(&vars.uri);
 
         return NGX_OK;
-    } else if ctx.vars.uri.is_empty() && r.valid_unparsed_uri.get() {
-        keys.push(r.unparsed_uri.borrow().clone());
+    } else if vars.uri.is_empty() && r.valid_unparsed_uri.get() {
+        keys.push(&r.unparsed_uri.borrow());
 
         return NGX_OK;
     }
 
     let uri = r.uri.borrow();
 
-    let loc_len = if r.valid_location.get() && !ctx.vars.uri.is_empty() { plcf.location.len().min(uri.len()) } else { 0 };
+    let loc_len = if r.valid_location.get() && !vars.uri.is_empty() { plcf.location.len().min(uri.len()) } else { 0 };
 
-    let mut key = ctx.vars.uri.clone();
+    let key = keys.data_mut();
+
+    key.extend_from_slice(&vars.uri);
 
     if r.quoted_uri.get() || r.internal.get() {
-        ngx_core::string::escape_uri_into(&mut key, &uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
+        ngx_core::string::escape_uri_into(key, &uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
     } else {
         key.extend_from_slice(&uri[loc_len..]);
     }
@@ -1958,7 +2056,7 @@ pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         key.extend_from_slice(&args);
     }
 
-    keys.push(key);
+    keys.end();
 
     NGX_OK
 }
@@ -1987,6 +2085,10 @@ impl crate::upstream_rt::UpstreamModule for ProxyModule {
         create_key(r, keys)
     }
 
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        create_keys(r, keys)
+    }
+
     /// ngx_http_proxy_create_request: the request (with the body of
     /// proxy_set_body), then the buffers of a buffered body; an unbuffered
     /// one is sent after it by ngx_http_upstream_send_request_body, through
@@ -2001,7 +2103,7 @@ impl crate::upstream_rt::UpstreamModule for ProxyModule {
             Err(()) => return NGX_ERROR,
         };
 
-        u.set_uri(&uri);
+        u.set_uri_owned(uri);
 
         let mut b = ngx_core::buf::Buf::from_vec(header);
         b.flush = true;
@@ -2009,9 +2111,8 @@ impl crate::upstream_rt::UpstreamModule for ProxyModule {
         let mut bufs = ngx_core::buf::Chain::new();
         bufs.push_back(b);
 
-        if !r.request_body_no_buffering.get() && plcf.body_values.is_none() && plcf.pass_request_body.get_or(true) {
-            bufs.extend(crate::upstream_rt::request_body_bufs(r));
-        }
+        // the buffers of the body follow, linked
+        u.request_body_link = !r.request_body_no_buffering.get() && plcf.body_values.is_none() && plcf.pass_request_body.get_or(true);
 
         u.request_bufs = bufs;
 
@@ -2138,14 +2239,14 @@ impl ProxyModule {
     fn chunked_filter(&mut self, r: &R, u: &mut crate::upstream_rt::Upstream, p: &mut crate::event_pipe::EventPipe, buf: crate::event_pipe::RawBuf) -> i64 {
         use ngx_core::log::*;
 
-        if buf.data.is_empty() {
-            p.release_raw(buf.slot);
+        if buf.is_empty() {
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
         if p.upstream_done {
             ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy data after close");
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -2155,15 +2256,15 @@ impl ProxyModule {
             u.keepalive = false;
             p.upstream_done = true;
 
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
         let (pass_trailers, buffer_size) = (u.conf.pass_trailers, u.conf.buffer_size);
 
         let slot = buf.slot;
-        let data = buf.data;
-        let mut pos = 0usize;
+        let mut pos = buf.pos;
+        let data = &buf.data[..buf.last];
         let mut produced = false;
 
         if self.trailers.is_some() {
@@ -2243,9 +2344,13 @@ impl ProxyModule {
 
         ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy chunked state {}, length {}", self.chunked.state, p.length);
 
+        // the data of the chunks was copied: the memory of the raw buffer
+        // is kept for its next use
         if !produced {
             // there is no data record in the buf, add it to free chain
-            p.release_raw(slot);
+            p.release_raw_buf(buf);
+        } else {
+            p.recycle(buf);
         }
 
         NGX_OK
@@ -2464,9 +2569,9 @@ fn process_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, up: &mut crate::upstream_r
 
             ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
 
-            let h = crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase);
+            let h = crate::upstream_rt::upstream_header(key, value, pr.header_hash, lowcase);
 
-            up.resp.headers.push(h.clone());
+            up.resp.push_header(h.clone());
 
             if up.resp.status_n == crate::NGX_HTTP_EARLY_HINTS {
                 continue;
@@ -2496,13 +2601,13 @@ fn process_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, up: &mut crate::upstream_r
             // special empty headers
 
             if !up.resp.server {
-                let h = crate::request::TableElt::with_hash(b"Server", b"", ngx_core::hash::hash_key(b"server"), b"server".to_vec());
+                let h = crate::upstream_rt::upstream_header(b"Server".to_vec(), Vec::new(), ngx_core::hash::hash_key(b"server"), b"server".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }
 
             if !up.resp.date {
-                let h = crate::request::TableElt::with_hash(b"Date", b"", ngx_core::hash::hash_key(b"date"), b"date".to_vec());
+                let h = crate::upstream_rt::upstream_header(b"Date".to_vec(), Vec::new(), ngx_core::hash::hash_key(b"date"), b"date".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }
@@ -2590,7 +2695,7 @@ fn process_trailer(
 
             ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy trailer: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
 
-            trailers.push(crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase));
+            trailers.push(crate::upstream_rt::upstream_header(key, value, pr.header_hash, lowcase));
 
             continue;
         }

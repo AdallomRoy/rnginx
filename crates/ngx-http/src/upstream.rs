@@ -705,7 +705,9 @@ pub struct UpstreamConn {
 /// ngx_peer_connection_t: the balancer's view of an upstream connection.
 pub struct PeerConnection {
     pub sockaddr: Option<SockAddr>,
-    pub name: Vec<u8>,
+    /// pc->name: the peer's (shared with the memory of the peers, the
+    /// upstream state and the error log), or the upstream's
+    pub name: Rc<[u8]>,
     pub tries: u32,
     pub start_time: u64,
     pub cached: bool,
@@ -713,7 +715,7 @@ pub struct PeerConnection {
     pub connection: Option<UpstreamConn>,
     /// sticky: the session id the client wants, and the chosen peer's
     pub hint: Option<Vec<u8>>,
-    pub sid: Option<Vec<u8>>,
+    pub sid: Option<Rc<[u8]>>,
     pub log: Log,
     /// u->keepalive and u->request_body_sent, for the keepalive cache
     pub keepalive: bool,
@@ -741,25 +743,53 @@ pub trait PeerBalancer {
     }
 }
 
+/// peer.data with its methods: the request's own, or, for an https
+/// upstream, shared with c->data of its connections
+/// (ngx_http_upstream_ssl_save_session)
+pub enum Balancer {
+    Owned(RefCell<Box<dyn PeerBalancer>>),
+    Shared(Rc<RefCell<Box<dyn PeerBalancer>>>),
+}
+
+impl Balancer {
+    pub fn cell(&self) -> &RefCell<Box<dyn PeerBalancer>> {
+        match self {
+            Balancer::Owned(b) => b,
+            Balancer::Shared(b) => b,
+        }
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Box<dyn PeerBalancer>> {
+        self.cell().borrow_mut()
+    }
+}
+
 /// The peer side of a request's upstream (ngx_http_upstream_t: peer,
 /// the next upstream settings, request_sent).
 pub struct UpstreamPeer {
     pub pc: PeerConnection,
-    /// peer.data with its methods; shared with c->data of the upstream
-    /// connection (ngx_http_upstream_ssl_save_session)
-    pub balancer: Rc<RefCell<Box<dyn PeerBalancer>>>,
+    /// peer.data with its methods
+    pub balancer: Balancer,
     pub next_upstream: u32,
     pub next_upstream_timeout: u64,
     pub request_sent: bool,
     /// ngx_current_msec at the start of the current try (u->start_time)
     pub start_time: u64,
     /// u->ssl_name: the host of the upstream (uscf->host, or
-    /// u->resolved->host), the name ngx_http_upstream_ssl_name found
+    /// u->resolved->host), the name ngx_http_upstream_ssl_name found; see
+    /// ssl_name_init()
     pub ssl_name: Vec<u8>,
+    /// the upstream whose host ssl_name is, until a new connection needs it
+    ssl_host: Option<Rc<UpstreamSrvConf>>,
 }
 
 impl UpstreamPeer {
-    fn new(r: &R, balancer: Box<dyn PeerBalancer>, ssl_name: &[u8], next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+    fn new(r: &R, balancer: Box<dyn PeerBalancer>, ssl_name: Option<&[u8]>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+        UpstreamPeer::with_ssl(r, balancer, ssl_name.is_some(), ssl_name.map(|n| n.to_vec()).unwrap_or_default(), None, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_ssl(r: &R, balancer: Box<dyn PeerBalancer>, ssl: bool, ssl_name: Vec<u8>, ssl_host: Option<Rc<UpstreamSrvConf>>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
         let mut tries = balancer.tries();
 
         // ngx_http_upstream_init_request
@@ -767,12 +797,12 @@ impl UpstreamPeer {
             tries = next_upstream_tries;
         }
 
-        let now = ngx_core::times::current_msec();
+        let now = ngx_core::times::event_msec();
 
         UpstreamPeer {
             pc: PeerConnection {
                 sockaddr: None,
-                name: Vec::new(),
+                name: crate::upstream_round_robin::no_name(),
                 tries,
                 start_time: now,
                 cached: false,
@@ -784,26 +814,38 @@ impl UpstreamPeer {
                 request_body_sent: false,
                 tag,
             },
-            balancer: Rc::new(RefCell::new(balancer)),
+            // only the connections of an https upstream refer to it
+            balancer: if ssl { Balancer::Shared(Rc::new(RefCell::new(balancer))) } else { Balancer::Owned(RefCell::new(balancer)) },
             next_upstream,
             next_upstream_timeout,
             request_sent: false,
             start_time: now,
-            ssl_name: ssl_name.to_vec(),
+            ssl_name,
+            ssl_host,
         }
     }
 
     /// uscf->peer.init for the request's upstream.
-    pub fn init(r: &R, uscf: &Rc<UpstreamSrvConf>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> Result<UpstreamPeer, i64> {
+    pub fn init(r: &R, uscf: &Rc<UpstreamSrvConf>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize, ssl: bool) -> Result<UpstreamPeer, i64> {
         let balancer = uscf.init_peer(r).map_err(|_| crate::NGX_HTTP_INTERNAL_SERVER_ERROR)?;
-        Ok(UpstreamPeer::new(r, balancer, &uscf.host, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+
+        // u->ssl_name = uscf->host: copied when a new connection needs it
+        Ok(UpstreamPeer::with_ssl(r, balancer, ssl, Vec::new(), ssl.then(|| uscf.clone()), next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+    }
+
+    /// u->ssl_name for ngx_http_upstream_ssl_init_connection: the upstream's
+    /// host, if not made yet.
+    pub fn ssl_name_init(&mut self) {
+        if let Some(uscf) = self.ssl_host.take() {
+            self.ssl_name = uscf.host.clone();
+        }
     }
 
     /// ngx_http_upstream_create_round_robin_peer for addresses resolved for
     /// this request.
-    pub fn resolved(r: &R, host: &[u8], addrs: Vec<Addr>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+    pub fn resolved(r: &R, host: &[u8], addrs: Vec<Addr>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize, ssl: bool) -> UpstreamPeer {
         let balancer = Box::new(crate::upstream_round_robin::create_round_robin_peer(host, addrs));
-        UpstreamPeer::new(r, balancer, host, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
+        UpstreamPeer::new(r, balancer, ssl.then_some(host), next_upstream, next_upstream_tries, next_upstream_timeout, tag)
     }
 
     /// The start of ngx_http_upstream_connect: a new state, and the peer
@@ -812,7 +854,7 @@ impl UpstreamPeer {
     /// "no live upstreams" with pc.name, the upstream's name, in the log
     /// context, and goes to next() with FT_NOLIVE).
     pub fn connect(&mut self, r: &R) -> i64 {
-        let now = ngx_core::times::current_msec();
+        let now = ngx_core::times::event_msec();
 
         {
             let mut states = r.upstream_states.borrow_mut();
@@ -842,10 +884,21 @@ impl UpstreamPeer {
         }
 
         if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
-            last.peer = self.pc.name.clone();
+            last.peer = Some(self.pc.name.clone());
         }
 
         rc
+    }
+
+    /// The balancer's call with u->state, lent (an empty state when there is
+    /// none).
+    fn with_state<T>(r: &R, f: impl FnOnce(&UpstreamState) -> T) -> T {
+        let states = r.upstream_states.borrow();
+
+        match states.last() {
+            Some(us) => f(us),
+            None => f(&UpstreamState::default()),
+        }
     }
 
     /// peer.set_session: the session to resume with the peer
@@ -856,21 +909,32 @@ impl UpstreamPeer {
     /// c->data = r (ngx_http_upstream_connect): the request's upstream
     /// uses the connection (its new TLS sessions go to peer.save_session).
     pub fn attach(&self, c: &ngx_core::connection::Connection) {
-        let data = crate::upstream_ssl::UpstreamConnData { balancer: Rc::downgrade(&self.balancer) };
+        // the balancer of an https upstream is shared (a connection with
+        // c->ssl is one of those)
+        let balancer = match &self.balancer {
+            Balancer::Shared(b) => Rc::downgrade(b),
+            Balancer::Owned(_) => std::rc::Weak::new(),
+        };
+
+        let data = crate::upstream_ssl::UpstreamConnData { balancer };
         *c.data.borrow_mut() = Some(Rc::new(data));
     }
 
-    /// attach() for the connection of a socket.
+    /// attach() for the connection of a socket, if it is an SSL one (only
+    /// its sessions use c->data).
     pub fn attach_sock(&self, sock: &UpstreamSock) {
         if let UpstreamSock::Conn(c) = sock {
-            self.attach(&c.c);
+            if c.c.ssl.borrow().is_some() {
+                self.attach(&c.c);
+            }
         }
     }
 
     /// peer.notify
     pub fn notify(&mut self, r: &R, typ: u32) {
-        let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
-        self.balancer.borrow_mut().notify(&mut self.pc, typ, &us);
+        let (balancer, pc) = (&self.balancer, &mut self.pc);
+
+        UpstreamPeer::with_state(r, |us| balancer.borrow_mut().notify(pc, typ, us));
     }
 
     /// ngx_http_upstream_next: free the peer (NGX_PEER_NEXT for 403 and
@@ -893,9 +957,12 @@ impl UpstreamPeer {
                 NGX_PEER_FAILED
             };
 
-            let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
             self.pc.connection = None;
-            self.balancer.borrow_mut().free(&mut self.pc, state, &us);
+
+            let (balancer, pc) = (&self.balancer, &mut self.pc);
+
+            UpstreamPeer::with_state(r, |us| balancer.borrow_mut().free(pc, state, us));
+
             self.pc.sockaddr = None;
             self.pc.sid = None;
         }
@@ -938,7 +1005,7 @@ impl UpstreamPeer {
         if self.pc.tries == 0
             || self.next_upstream & ft != ft
             || (self.request_sent && r.request_body_no_buffering.get())
-            || (timeout != 0 && ngx_core::times::current_msec().saturating_sub(self.pc.start_time) >= timeout)
+            || (timeout != 0 && ngx_core::times::event_msec().saturating_sub(self.pc.start_time) >= timeout)
         {
             return Err(status);
         }
@@ -952,7 +1019,7 @@ impl UpstreamPeer {
     pub fn finalize(&mut self, r: &R, conn: Option<UpstreamConn>, keepalive: bool, request_body_sent: bool) {
         if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
             if last.response_time == u64::MAX {
-                last.response_time = ngx_core::times::current_msec().saturating_sub(self.start_time);
+                last.response_time = ngx_core::times::event_msec().saturating_sub(self.start_time);
             }
         }
 
@@ -964,8 +1031,9 @@ impl UpstreamPeer {
         self.pc.keepalive = keepalive;
         self.pc.request_body_sent = request_body_sent;
 
-        let us = r.upstream_states.borrow().last().cloned().unwrap_or_default();
-        self.balancer.borrow_mut().free(&mut self.pc, 0, &us);
+        let (balancer, pc) = (&self.balancer, &mut self.pc);
+
+        UpstreamPeer::with_state(r, |us| balancer.borrow_mut().free(pc, 0, us));
 
         self.pc.sockaddr = None;
         self.pc.sid = None;
@@ -980,9 +1048,9 @@ impl UpstreamPeer {
     /// ngx_http_upstream_init_request): the upstream it names, its address
     /// if it is one, or the addresses the resolver finds
     /// (ngx_http_upstream_resolve_handler).
-    pub async fn resolve(r: &R, u: &Url, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> Result<UpstreamPeer, i64> {
+    pub async fn resolve(r: &R, u: &Url, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize, ssl: bool) -> Result<UpstreamPeer, i64> {
         if let Some(uscf) = find_upstream(r, &u.host, u.port, u.no_port) {
-            return UpstreamPeer::init(r, &uscf, next_upstream, next_upstream_tries, next_upstream_timeout, tag);
+            return UpstreamPeer::init(r, &uscf, next_upstream, next_upstream_tries, next_upstream_timeout, tag, ssl);
         }
 
         if !u.addrs.is_empty() {
@@ -991,7 +1059,7 @@ impl UpstreamPeer {
                 return Err(crate::NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
             let addrs = vec![u.addrs[0].clone()];
-            return Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag));
+            return Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag, ssl));
         }
 
         if u.port == 0 {
@@ -1050,7 +1118,7 @@ impl UpstreamPeer {
             })
             .collect();
 
-        Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+        Ok(UpstreamPeer::resolved(r, &u.host, addrs, next_upstream, next_upstream_tries, next_upstream_timeout, tag, ssl))
     }
 }
 
@@ -1102,7 +1170,7 @@ fn join_states(states: &[crate::request::UpstreamState], value: &dyn Fn(&crate::
             break;
         }
 
-        if !states[i].peer.is_empty() {
+        if states[i].peer.as_ref().is_some_and(|p| !p.is_empty()) {
             out.extend_from_slice(b", ");
         } else {
             out.extend_from_slice(b" : ");
@@ -1138,7 +1206,7 @@ fn states_variable(r: &R, v: &mut crate::request::VariableValue, value: &dyn Fn(
 
 /// ngx_http_upstream_addr_variable
 fn upstream_addr_variable(r: &R, v: &mut crate::request::VariableValue, _data: usize) -> i64 {
-    states_variable(r, v, &|s| s.peer.clone())
+    states_variable(r, v, &|s| s.peer.as_deref().unwrap_or(&[]).to_vec())
 }
 
 /// ngx_http_upstream_status_variable
@@ -1380,7 +1448,7 @@ pub fn upstream_module() -> ModuleDef {
 pub fn upstream_log_info(r: &Request) -> Option<Vec<u8>> {
     if let Some(state) = r.upstream_states.borrow().last() {
         if state.status > 0 {
-            let peer = B(&state.peer).to_string();
+            let peer = B(state.peer.as_deref().unwrap_or(&[])).to_string();
             let status = state.status;
             return Some(format!("upstream: {}, status: {}", peer, status).into_bytes());
         }
@@ -1397,12 +1465,12 @@ mod tests {
     use super::*;
 
     fn state(peer: &[u8], status: i64) -> crate::request::UpstreamState {
-        crate::request::UpstreamState { peer: peer.to_vec(), status, ..Default::default() }
+        crate::request::UpstreamState { peer: if peer.is_empty() { None } else { Some(peer.into()) }, status, ..Default::default() }
     }
 
     #[test]
     fn test_join_states() {
-        let addr = |s: &crate::request::UpstreamState| s.peer.clone();
+        let addr = |s: &crate::request::UpstreamState| s.peer.as_deref().unwrap_or(&[]).to_vec();
         let status = |s: &crate::request::UpstreamState| if s.status != 0 { s.status.to_string().into_bytes() } else { b"-".to_vec() };
 
         // the tries of an upstream

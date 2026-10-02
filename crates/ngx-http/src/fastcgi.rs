@@ -484,9 +484,9 @@ impl FastcgiModule {
 
         lowcase_key = if key.len() == self.pr.lowcase_index { self.pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
 
-        let h = TableElt::with_hash(&key, &value, hash, lowcase_key);
+        let h = crate::upstream_rt::upstream_header(key, value, hash, lowcase_key);
 
-        u.resp.headers.push(h.clone());
+        u.resp.push_header(h.clone());
 
         // hh->handler(r, h, hh->offset)
         if crate::upstream_rt::process_header_line(r, u, &h).is_err() {
@@ -559,7 +559,7 @@ async fn fastcgi_handler(r: R) -> i64 {
     let caches = {
         let fmcf = r.main_conf::<UpstreamCacheMainConf>(ctx_index());
         let caches = fmcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     let mut u = Upstream::create(&r, conf, caches, b"fastcgi://");
@@ -621,7 +621,14 @@ fn fastcgi_eval(r: &R, codes: &[Part], u: &mut Upstream) -> i64 {
 
 impl UpstreamModule for FastcgiModule {
     fn create_key(&self, r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
-        create_key(r, keys)
+        let mut k = crate::file_cache::CacheKeys::new();
+        let rc = create_keys(r, &mut k);
+        keys.extend(k.iter().map(|part| part.to_vec()));
+        rc
+    }
+
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        create_keys(r, keys)
     }
 
     fn create_request(&mut self, r: &R, u: &mut Upstream) -> i64 {
@@ -1046,8 +1053,8 @@ impl UpstreamModule for FastcgiModule {
     /// buffer to p->in, as its shadows; the end of the request, and with
     /// fastcgi_keep_conn, p->length for the rest of the record.
     fn pipe_input_filter(&mut self, r: &R, u: &mut Upstream, p: &mut EventPipe, buf: RawBuf) -> i64 {
-        if buf.data.is_empty() {
-            p.release_raw(buf.slot);
+        if buf.is_empty() {
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
@@ -1056,11 +1063,11 @@ impl UpstreamModule for FastcgiModule {
 
             http_debug!(r, "http fastcgi data after close");
 
-            p.release_raw(buf.slot);
+            p.release_raw_buf(buf);
             return NGX_OK;
         }
 
-        let data = &buf.data;
+        let data = buf.bytes();
         let last = data.len();
 
         // f->pos, and the last shadow made (b)
@@ -1253,13 +1260,16 @@ impl UpstreamModule for FastcgiModule {
             };
         }
 
+        // the data of the records was copied: the memory of the raw buffer
+        // is kept for its next use
         if let Some((b_pos, b_last)) = shadow {
             http_debug!(r, "input buf {} {}", b_pos, b_last - b_pos);
+            p.recycle(buf);
             return NGX_OK;
         }
 
         // there is no data record in the buf, add it to free chain
-        p.release_raw(buf.slot);
+        p.release_raw_buf(buf);
 
         NGX_OK
     }
@@ -1280,22 +1290,18 @@ impl UpstreamModule for FastcgiModule {
 }
 
 /// ngx_http_fastcgi_create_key: fastcgi_cache_key
-fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
     let lcf = r.loc_conf::<NgxHttpFastcgiLocConf>(ctx_index());
 
     let cv = lcf.borrow().cache.cache_key.clone();
 
-    let key = match cv {
-        Some(cv) => match crate::script::complex_value(r, &cv) {
-            Ok(k) => k,
-            Err(_) => return NGX_ERROR,
-        },
-        None => Vec::new(),
-    };
-
-    keys.push(key);
-
-    NGX_OK
+    match cv {
+        Some(cv) => crate::upstream_cache::push_key_value(r, &cv, keys),
+        None => {
+            keys.push(b"");
+            NGX_OK
+        }
+    }
 }
 
 /// A record header (ngx_http_fastcgi_header_t) of the request, request id 1.
@@ -1327,7 +1333,8 @@ fn push_nv_len(out: &mut Vec<u8>, len: usize) {
 }
 
 /// A param: the length of the name, the length of the value, the name, the
-/// value.
+/// value (create_request writes the value in place).
+#[cfg(test)]
 fn push_param(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     push_nv_len(out, key.len());
     push_nv_len(out, value.len());
@@ -1428,41 +1435,36 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     let params = if cacheable { flcf.params_cache.as_ref() } else { flcf.params.as_ref() };
 
     let params = match params {
-        Some(p) => p.clone(),
+        Some(p) => p,
         None => return Err(()),
     };
 
     let mut len: usize = 0;
 
-    // the lengths of the params
+    // the lengths of the params (e.flushed: the values are evaluated once,
+    // the values pass reads them)
 
     crate::script::script_flush_no_cacheable_variables(r, Some(&params.flushes));
 
-    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(params.params.len());
-
     for p in params.params.iter() {
-        let value = crate::proxy::run_codes(r, &p.codes);
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        if p.skip_empty && value.is_empty() {
-            values.push(None);
+        if p.skip_empty && val_len == 0 {
             continue;
         }
 
-        len += nv_len_size(p.key.len()) + p.key.len() + nv_len_size(value.len()) + value.len();
-
-        values.push(Some(value));
+        len += nv_len_size(p.key.len()) + p.key.len() + nv_len_size(val_len) + val_len;
     }
 
-    let header_params = if *flcf.pass_request_headers {
-        let headers = r.headers_in.borrow().headers.clone();
+    let pass_request_headers = *flcf.pass_request_headers;
+    let hides = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        crate::upstream_rt::header_params(&headers, &|lowcase_key: &[u8]| params.hides(lowcase_key))
-    } else {
-        Vec::new()
-    };
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
 
-    for (key, value) in header_params.iter() {
-        len += nv_len_size(key.len()) + key.len() + nv_len_size(value.len()) + value.len();
+        crate::upstream_rt::for_each_header_param(&hin.headers, &hides, |_, key_len, val_len| {
+            len += nv_len_size(key_len) + key_len + nv_len_size(val_len) + val_len;
+        });
     }
 
     if len > 65535 {
@@ -1484,21 +1486,42 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     // the values of the params (the lengths were those of these values:
     // "fastcgi request length mismatch" cannot happen)
 
-    for (p, value) in params.params.iter().zip(values.iter()) {
-        let value = match value {
-            Some(v) => v,
-            None => continue,
-        };
+    for p in params.params.iter() {
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        push_param(&mut b, &p.key, value);
+        if p.skip_empty && val_len == 0 {
+            continue;
+        }
 
-        http_debug!(r, "fastcgi param: \"{}: {}\"", B(&p.key), B(value));
+        push_nv_len(&mut b, p.key.len());
+        push_nv_len(&mut b, val_len);
+        b.extend_from_slice(&p.key);
+
+        let value = b.len();
+
+        crate::proxy::append_codes(r, &p.codes, &mut b);
+
+        http_debug!(r, "fastcgi param: \"{}: {}\"", B(&p.key), B(&b[value..]));
     }
 
-    for (key, value) in header_params.iter() {
-        push_param(&mut b, key, value);
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
+        let headers = &hin.headers;
 
-        http_debug!(r, "fastcgi param: \"{}: {}\"", B(key), B(value));
+        crate::upstream_rt::for_each_header_param(headers, &hides, |i, key_len, val_len| {
+            push_nv_len(&mut b, key_len);
+            push_nv_len(&mut b, val_len);
+
+            let key = b.len();
+
+            crate::upstream_rt::push_header_param_key(&mut b, headers, i);
+
+            let value = b.len();
+
+            crate::upstream_rt::push_header_param_value(&mut b, headers, i);
+
+            http_debug!(r, "fastcgi param: \"{}: {}\"", B(&b[key..value]), B(&b[value..]));
+        });
     }
 
     b.resize(b.len() + padding, 0);
@@ -1518,13 +1541,15 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     let mut cl = b;
 
     if *flcf.pass_request_body {
-        for body in crate::upstream_rt::request_body_bufs(r).iter() {
-            if body.special_buf() {
-                continue;
-            }
+        crate::upstream_rt::with_request_body_bufs(r, |bodies| {
+            for body in bodies {
+                if body.special_buf() {
+                    continue;
+                }
 
-            stdin_records(&mut bufs, &mut cl, body);
-        }
+                stdin_records(&mut bufs, &mut cl, body);
+            }
+        });
     }
 
     record_header(&mut cl, NGX_HTTP_FASTCGI_STDIN, 0, 0);

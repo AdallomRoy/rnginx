@@ -13,6 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
@@ -213,9 +214,9 @@ impl RrPeer<'_> {
 }
 
 impl RrPeers<'_> {
-    /// *peers->name
-    pub fn name_bytes(&self) -> Vec<u8> {
-        NgxStr::at(self.mem, self.get(RrPeers::name)).bytes()
+    /// *peers->name (pc->name when no peer is available)
+    pub fn name_bytes(&self) -> Rc<[u8]> {
+        NgxStr::at(self.mem, self.get(RrPeers::name)).bytes().into()
     }
 }
 
@@ -237,12 +238,57 @@ pub struct PeerMem {
     /// The sessions saved with the peers of a memory of the process, by
     /// peer (C keeps the SSL_SESSION in peer->ssl_session).
     sessions: RefCell<HashMap<usize, openssl::ssl::SslSession>>,
+    /// The address, name and sid of the peers chosen, as the requests take
+    /// them (C points pc->sockaddr, pc->name and pc->sid at the peer), by
+    /// peer: valid while the peers of a zone do not change (*peers->config).
+    info: RefCell<HashMap<usize, PeerInfo, BuildHasherDefault<OffsetHasher>>>,
+}
+
+/// What connect_peer gives a request of a peer.
+#[derive(Clone)]
+pub struct PeerInfo {
+    /// peer->config and *peer->config when it was read (0 for a memory of
+    /// the process, whose peers do not change)
+    config: usize,
+    generation: usize,
+    pub sockaddr: SockAddr,
+    pub name: Rc<[u8]>,
+    pub sid: Rc<[u8]>,
+}
+
+/// The hasher of the peer offsets: a multiplicative mix (offsets are
+/// distinct, and not chosen by clients).
+#[derive(Default)]
+pub struct OffsetHasher(u64);
+
+impl std::hash::Hasher for OffsetHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
 }
 
 impl PeerMem {
+    fn new(mem: Rc<ShmMem>, next: usize) -> PeerMem {
+        PeerMem { mem, next: Cell::new(next), sessions: RefCell::new(HashMap::new()), info: RefCell::new(HashMap::default()) }
+    }
+
     /// The memory of a zone.
     pub fn zone(mem: Rc<ShmMem>) -> Rc<PeerMem> {
-        Rc::new(PeerMem { mem, next: Cell::new(0), sessions: RefCell::new(HashMap::new()) })
+        Rc::new(PeerMem::new(mem, 0))
     }
 
     /// A memory of the process with room for `size` bytes of peers.
@@ -250,8 +296,50 @@ impl PeerMem {
         let ps = ngx_core::os::pagesize();
         let mem = ShmMem::private((ALIGN + size).div_ceil(ps) * ps)?;
 
-        Ok(Rc::new(PeerMem { mem: Rc::new(mem), next: Cell::new(ALIGN), sessions: RefCell::new(HashMap::new()) }))
+        Ok(Rc::new(PeerMem::new(Rc::new(mem), ALIGN)))
     }
+
+    /// The address, name and sid of a peer of `peers`, read once for the
+    /// requests while the peers stay as they are: those of a memory of the
+    /// process do; those of a zone until its counter of the changes of the
+    /// peers moves on.
+    pub fn peer_info(&self, peers: usize, peer: usize) -> PeerInfo {
+        let mem = &*self.mem;
+
+        let config = RrPeers::at(mem, peers).get(RrPeers::config);
+        let generation = if config == 0 { 0 } else { mem.get(config) };
+
+        if let Some(info) = self.info.borrow().get(&peer) {
+            if info.config == config && info.generation == generation {
+                return info.clone();
+            }
+        }
+
+        let info = peer_info_of(mem, peer, config, generation);
+
+        self.info.borrow_mut().insert(peer, info.clone());
+
+        info
+    }
+}
+
+/// The address, name and sid of a peer, read from its memory.
+fn peer_info_of(mem: &ShmMem, peer: usize, config: usize, generation: usize) -> PeerInfo {
+    let p = RrPeer::at(mem, peer);
+
+    PeerInfo { config, generation, sockaddr: p.addr(), name: p.name().into(), sid: p.sid().into() }
+}
+
+/// An empty name, shared (pc->name before a peer is chosen).
+pub fn no_name() -> Rc<[u8]> {
+    thread_local! {
+        static NONE: Rc<[u8]> = Rc::from(&b""[..]);
+    }
+
+    NONE.with(|n| n.clone())
+}
+
+impl PeerMem {
 
     /// ngx_pcalloc() in a memory of the process: the offset of `size`
     /// bytes, zeroed as a new mapping is.
@@ -832,7 +920,7 @@ pub struct RrPeerData {
     pub peers: usize,
     /// the peer chosen, 0 before
     pub current: usize,
-    pub tried: Vec<usize>,
+    pub tried: Tried,
     /// the peers of addresses resolved for the request: they have no
     /// sessions (ngx_http_upstream_empty_set_session)
     pub resolved: bool,
@@ -840,9 +928,86 @@ pub struct RrPeerData {
 
 const UINTPTR_BITS: usize = usize::BITS as usize;
 
+/// rrp->tried: a bitmap of the peers tried, in rrp->data for up to 64 of
+/// them, allocated for more.
+#[derive(Clone, Debug)]
+pub struct Tried {
+    data: [usize; 1],
+    words: Vec<usize>,
+}
+
+impl Tried {
+    /// The bitmap of `n` peers.
+    pub fn new(n: usize) -> Tried {
+        if n <= UINTPTR_BITS {
+            Tried { data: [0], words: Vec::new() }
+        } else {
+            Tried { data: [0], words: vec![0; n.div_ceil(UINTPTR_BITS)] }
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        if self.words.is_empty() {
+            &self.data
+        } else {
+            &self.words
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        if self.words.is_empty() {
+            &mut self.data
+        } else {
+            &mut self.words
+        }
+    }
+
+    /// The words of the bitmap.
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn get(&self, i: usize) -> Option<&usize> {
+        self.as_slice().get(i)
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, usize> {
+        self.as_mut_slice().iter_mut()
+    }
+
+    /// The bitmap with room for `n` words.
+    fn grow(&mut self, n: usize) {
+        if n > self.len() {
+            if self.words.is_empty() {
+                self.words.push(self.data[0]);
+            }
+
+            self.words.resize(n, 0);
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Tried {
+    type Output = usize;
+
+    fn index(&self, i: usize) -> &usize {
+        &self.as_slice()[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Tried {
+    fn index_mut(&mut self, i: usize) -> &mut usize {
+        &mut self.as_mut_slice()[i]
+    }
+}
+
 impl RrPeerData {
-    fn tried_bitmap(n: usize) -> Vec<usize> {
-        vec![0; n.div_ceil(UINTPTR_BITS).max(1)]
+    fn tried_bitmap(n: usize) -> Tried {
+        Tried::new(n)
     }
 
     pub fn is_tried(&self, i: usize) -> bool {
@@ -852,7 +1017,7 @@ impl RrPeerData {
     pub fn set_tried(&mut self, i: usize) {
         let n = i / UINTPTR_BITS;
         if n >= self.tried.len() {
-            self.tried.resize(n + 1, 0);
+            self.tried.grow(n + 1);
         }
         self.tried[n] |= 1 << (i % UINTPTR_BITS);
     }
@@ -939,13 +1104,29 @@ pub fn peer_ptr(mem: &ShmMem, peer: usize) -> usize {
     mem.addr() + peer
 }
 
-/// pc->sockaddr, pc->name and pc->sid of a chosen peer.
+/// pc->sockaddr, pc->name and pc->sid of a chosen peer, read from its
+/// memory.
 pub fn connect_peer(pc: &mut PeerConnection, mem: &ShmMem, peer: usize) {
-    let p = RrPeer::at(mem, peer);
+    let info = peer_info_of(mem, peer, 0, 0);
 
-    pc.sockaddr = Some(p.addr());
-    pc.name = p.name();
-    pc.sid = Some(p.sid());
+    pc.sockaddr = Some(info.sockaddr);
+    pc.name = info.name;
+    pc.sid = Some(info.sid);
+}
+
+/// connect_peer() for the peer of the round robin data: what the memory
+/// of the peers keeps of it (those resolved for the request are read).
+pub fn connect_rr_peer(pc: &mut PeerConnection, rrp: &RrPeerData, peer: usize) {
+    if rrp.resolved {
+        connect_peer(pc, rrp.m(), peer);
+        return;
+    }
+
+    let info = rrp.mem.peer_info(rrp.peers, peer);
+
+    pc.sockaddr = Some(info.sockaddr);
+    pc.name = info.name;
+    pc.sid = Some(info.sid);
 }
 
 /// ngx_http_upstream_get_round_robin_peer
@@ -1015,7 +1196,7 @@ pub fn get_round_robin_peer(pc: &mut PeerConnection, rrp: &mut RrPeerData) -> i6
             peer
         };
 
-        connect_peer(pc, mem, peer);
+        connect_rr_peer(pc, rrp, peer);
 
         let p = RrPeer::at(mem, peer);
         p.set(RrPeer::conns, p.get(RrPeer::conns) + 1);
@@ -1487,7 +1668,7 @@ mod tests {
     fn pc() -> PeerConnection {
         PeerConnection {
             sockaddr: None,
-            name: Vec::new(),
+            name: no_name(),
             tries: 10,
             start_time: 0,
             cached: false,
@@ -1517,7 +1698,7 @@ mod tests {
         assert_eq!(ps.get(RrPeers::total_weight), 5);
         assert_eq!(ps.get(RrPeers::weighted), 1);
         assert_eq!(ps.get(RrPeers::shpool), 0);
-        assert_eq!(ps.name_bytes(), b"backend");
+        assert_eq!(&*ps.name_bytes(), b"backend");
 
         let mut names = Vec::new();
         let mut peer = ps.get(RrPeers::peer);
@@ -1691,7 +1872,7 @@ mod tests {
             pc.hint = Some(sid.clone());
             rrp.tried.iter_mut().for_each(|t| *t = 0);
             assert_eq!(get_round_robin_peer(&mut pc, &mut rrp), NGX_OK);
-            assert_eq!(pc.name, b"10.0.0.2:80");
+            assert_eq!(&*pc.name, b"10.0.0.2:80");
             assert_eq!(pc.sid.as_deref(), Some(&sid[..]));
             free_round_robin_peer(&mut pc, &mut rrp, 0);
         }
@@ -1711,11 +1892,78 @@ mod tests {
         let mut other = rrp_of(&pm, peers);
         let mut pc2 = pc();
         assert_eq!(get_round_robin_peer(&mut pc2, &mut other), NGX_BUSY);
-        assert_eq!(pc2.name, b"backend");
+        assert_eq!(&*pc2.name, b"backend");
 
         free_round_robin_peer(&mut pc1, &mut rrp, NGX_PEER_FAILED);
         assert_eq!(pc1.tries, 0);
         assert_eq!(get_round_robin_peer(&mut pc2, &mut other), NGX_OK);
+    }
+
+    #[test]
+    fn tried_bitmap() {
+        // up to 64 peers inline, as rrp->data
+        let mut t = Tried::new(64);
+        assert_eq!(t.len(), 1);
+        assert!(t.words.is_empty());
+
+        t[0] |= 1 << 63;
+        assert_eq!(t.get(0), Some(&(1 << 63)));
+
+        // more: allocated
+        let mut rrp = rrp_of(&peers_of(&[server("a", &[("10.0.0.1", 80)], 1)]).0, 0x10);
+        rrp.tried = Tried::new(130);
+        assert_eq!(rrp.tried.len(), 3);
+        rrp.set_tried(129);
+        assert!(rrp.is_tried(129) && !rrp.is_tried(128));
+
+        // an inline one grows keeping its bits
+        let mut rrp2 = RrPeerData { tried: Tried::new(1), ..rrp };
+        rrp2.set_tried(5);
+        rrp2.set_tried(70);
+        assert!(rrp2.is_tried(5) && rrp2.is_tried(70) && !rrp2.is_tried(6));
+        rrp2.tried.iter_mut().for_each(|t| *t = 0);
+        assert!(!rrp2.is_tried(5) && !rrp2.is_tried(70));
+    }
+
+    #[test]
+    fn peer_info_cached_per_config() {
+        let servers = [server("a", &[("10.0.0.1", 80)], 1), server("b", &[("10.0.0.2", 80)], 1)];
+        let (pm, peers) = peers_of(&servers);
+        let mem = &*pm.mem;
+
+        let first = RrPeers::at(mem, peers).get(RrPeers::peer);
+
+        // a memory of the process: read once
+        let a = pm.peer_info(peers, first);
+        let b = pm.peer_info(peers, first);
+        assert!(Rc::ptr_eq(&a.name, &b.name));
+        assert_eq!(&*a.name, b"10.0.0.1:80");
+        assert_eq!(a.sockaddr, SockAddr::v4(Ipv4Addr::new(10, 0, 0, 1), 80));
+
+        // as the peers of a zone: read again once the counter of the
+        // changes moves on
+        let config = pm.alloc(8);
+        RrPeers::at(mem, peers).set(RrPeers::config, config);
+
+        let c = pm.peer_info(peers, first);
+        assert!(!Rc::ptr_eq(&a.name, &c.name));
+        assert!(Rc::ptr_eq(&c.name, &pm.peer_info(peers, first).name));
+
+        let p = RrPeer::at(mem, first);
+        set_peer_sockaddr(&pm, first, &SockAddr::v4(Ipv4Addr::new(10, 0, 0, 9), 80));
+        p.set(RrPeer::name_data, pm.dup(b"10.0.0.9:80"));
+        config_inc(mem, config);
+
+        let d = pm.peer_info(peers, first);
+        assert_eq!(&*d.name, b"10.0.0.9:80");
+        assert_eq!(d.sockaddr, SockAddr::v4(Ipv4Addr::new(10, 0, 0, 9), 80));
+
+        // what connect_rr_peer gives the request
+        let rrp = rrp_of(&pm, peers);
+        let mut pc = pc();
+        connect_rr_peer(&mut pc, &rrp, first);
+        assert_eq!(&*pc.name, b"10.0.0.9:80");
+        assert_eq!(pc.sid.as_deref(), Some(&p.sid()[..]));
     }
 
     #[test]
@@ -1734,7 +1982,7 @@ mod tests {
 
         let mut pc = pc();
         assert_eq!(get_round_robin_peer(&mut pc, &mut rrp), NGX_OK);
-        assert_eq!(pc.name, b"127.0.0.1:1");
+        assert_eq!(&*pc.name, b"127.0.0.1:1");
         assert!(rrp.set_session().is_none());
     }
 }

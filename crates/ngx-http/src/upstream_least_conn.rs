@@ -196,7 +196,7 @@ fn get_least_conn_peer(pc: &mut PeerConnection, rrp: &mut RrPeerData) -> i64 {
             b.set(RrPeer::checked, now);
         }
 
-        connect_peer(pc, mem, best);
+        connect_rr_peer(pc, rrp, best);
 
         b.set(RrPeer::conns, b.get(RrPeer::conns) + 1);
 
