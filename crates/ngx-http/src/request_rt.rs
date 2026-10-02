@@ -304,10 +304,8 @@ async fn wait_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>) -> Result<Wai
         // while it waits
         let res = tokio::select! {
             r = tokio::time::timeout(Duration::from_millis(timeout), read_header_buffer(c, hc, true, false)) => r,
-            _ = c.close_notify.notified() => {
-                close_connection(c);
-                return Err(());
-            }
+            // c->close: the caller closes the connection (once, as C does)
+            _ = c.close_notify.notified() => return Err(()),
         };
         match res {
             Err(_) => {
