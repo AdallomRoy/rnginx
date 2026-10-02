@@ -36,27 +36,37 @@ pub fn early_hints_filter(r: R) -> Step {
         return Step::Ready(NGX_OK);
     }
 
-    let mut headers: Vec<u8> = Vec::new();
+    // ngx_http_early_hints_status_line
+    const STATUS_LINE: &[u8] = b"HTTP/1.1 103 Early Hints\r\n";
 
-    for h in r.headers_out.borrow().headers.iter() {
-        if h.hash.get() == 0 {
-            continue;
+    let out = {
+        let ho = r.headers_out.borrow();
+
+        let len: usize = ho.headers.iter().filter(|h| h.hash.get() != 0).map(|h| h.key.len() + 2 + h.value.borrow().len() + 2).sum();
+
+        if len == 0 {
+            return Step::Ready(NGX_OK);
         }
 
-        headers.extend_from_slice(&h.key);
-        headers.extend_from_slice(b": ");
-        headers.extend_from_slice(&h.value.borrow());
-        headers.extend_from_slice(b"\r\n");
-    }
+        let mut out = Vec::with_capacity(STATUS_LINE.len() + len + 2);
 
-    if headers.is_empty() {
-        return Step::Ready(NGX_OK);
-    }
+        out.extend_from_slice(STATUS_LINE);
 
-    // ngx_http_early_hints_status_line
-    let mut out = b"HTTP/1.1 103 Early Hints\r\n".to_vec();
+        for h in ho.headers.iter() {
+            if h.hash.get() == 0 {
+                continue;
+            }
 
-    out.extend_from_slice(&headers);
+            out.extend_from_slice(&h.key);
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(&h.value.borrow());
+            out.extend_from_slice(b"\r\n");
+        }
+
+        out
+    };
+
+    let mut out = out;
 
     http_debug!(r, "{}", B(&out));
 
@@ -124,7 +134,15 @@ pub fn status_line(status: i64) -> Option<&'static str> {
     STATUS_LINES.iter().find(|(s, _)| *s == status).map(|(_, l)| *l)
 }
 
-/// ngx_http_header_filter
+/// NGX_INT_T_LEN, NGX_OFF_T_LEN, NGX_TIME_T_LEN: the longest 64-bit
+/// decimal ("-9223372036854775808")
+const NGX_INT64_LEN: usize = 20;
+
+/// The length of "Mon, 28 Sep 1970 06:00:00 GMT"
+const HTTP_TIME_LEN: usize = 29;
+
+/// ngx_http_header_filter: the response header in one buffer, its size
+/// counted before it is written, as C allocates it
 pub fn header_filter(r: R) -> Step {
     if r.header_sent.get() {
         return Step::Ready(NGX_OK);
@@ -139,178 +157,7 @@ pub fn header_filter(r: R) -> Step {
     if r.method.get() == NGX_HTTP_HEAD {
         r.header_only.set(true);
     }
-    let clcf = r.clcf();
-    let mut out: Vec<u8> = Vec::with_capacity(512);
-    {
-        let mut ho = r.headers_out.borrow_mut();
-        // r->headers_out.last_modified = NULL: a header of the list stays
-        if ho.last_modified_time != -1 && ho.status != NGX_HTTP_OK && ho.status != NGX_HTTP_PARTIAL_CONTENT && ho.status != NGX_HTTP_NOT_MODIFIED {
-            ho.last_modified_time = -1;
-            ho.last_modified = None;
-        }
-        if ho.status == NGX_HTTP_NO_CONTENT {
-            r.header_only.set(true);
-            ho.content_type_len = 0;
-            ho.content_type.clear();
-            ho.content_length_n = -1;
-            if let Some(cl) = ho.content_length.take() {
-                cl.hash.set(0);
-            }
-            ho.last_modified = None;
-            ho.last_modified_time = -1;
-        }
-        if ho.status == NGX_HTTP_NOT_MODIFIED {
-            r.header_only.set(true);
-        }
-        out.extend_from_slice(b"HTTP/1.1 ");
-        let status = ho.status;
-        if !ho.status_line.is_empty() {
-            out.extend_from_slice(&ho.status_line);
-        } else if let Some(l) = status_line(status) {
-            out.extend_from_slice(l.as_bytes());
-        } else {
-            out.extend_from_slice(format!("{:03} ", status).as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
-    }
-    let mut content_type: Option<Vec<u8>> = None;
-    // ngx_http_header_filter: "Server", "Date", "Content-Length" and
-    // "Last-Modified" are written here only from the fields when there is
-    // no header for them; the headers of r->headers_out.headers (typed
-    // slots included) follow in their order after "Connection"
-    {
-        let ho = r.headers_out.borrow();
-        let cl = clcf.borrow();
-        if ho.server.is_none() {
-            match *cl.server_tokens {
-                NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
-                NGX_HTTP_SERVER_TOKENS_BUILD => out.extend_from_slice(SERVER_BUILD_STRING),
-                _ => out.extend_from_slice(SERVER_STRING),
-            }
-        }
-        if ho.date.is_none() {
-            out.extend_from_slice(b"Date: ");
-            out.extend_from_slice(ngx_core::times::cached_http_time().as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        if !ho.content_type.is_empty() {
-            out.extend_from_slice(b"Content-Type: ");
-            let p = out.len();
-            out.extend_from_slice(&ho.content_type);
-            if ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty() {
-                out.extend_from_slice(b"; charset=");
-                out.extend_from_slice(&ho.charset);
-                // update r->headers_out.content_type for possible logging
-                content_type = Some(out[p..].to_vec());
-            }
-            out.extend_from_slice(b"\r\n");
-        }
-        if ho.content_length.is_none() && ho.content_length_n >= 0 {
-            out.extend_from_slice(format!("Content-Length: {}\r\n", ho.content_length_n).as_bytes());
-        }
-        if ho.last_modified.is_none() && ho.last_modified_time != -1 {
-            out.extend_from_slice(b"Last-Modified: ");
-            out.extend_from_slice(ngx_core::times::http_time(ho.last_modified_time).as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
-    if let Some(ct) = content_type {
-        r.headers_out.borrow_mut().content_type = ct;
-    }
-    // Location: a relative one made absolute (absolute_redirect), its
-    // header not written again from the list; any other stays in the list
-    {
-        let ho = r.headers_out.borrow();
-        let cl = clcf.borrow();
-        if let Some(loc) = &ho.location {
-            let v = loc.value.borrow().clone();
-            if !v.is_empty() && v[0] == b'/' && *cl.absolute_redirect {
-                loc.hash.set(0);
-                let p = out.len() + b"Location: ".len();
-                out.extend_from_slice(b"Location: ");
-                out.extend_from_slice(if r.connection.ssl.borrow().is_some() { b"https://" } else { b"http://" });
-                // server_name_in_redirect on: the server name; else the
-                // client's Host; else the local address
-                let host: Vec<u8> = if *cl.server_name_in_redirect {
-                    let cscf = r.cscf();
-                    let n = cscf.borrow().server_name.clone();
-                    n
-                } else {
-                    let hin_server = r.headers_in.borrow().server.clone();
-                    if !hin_server.is_empty() {
-                        hin_server
-                    } else if let Some(local) = r.connection.local_sockaddr() {
-                        match local {
-                            ngx_core::inet::SockAddr::V4(a) => a.ip().to_string().into_bytes(),
-                            ngx_core::inet::SockAddr::V6(a) => a.ip().to_string().into_bytes(),
-                            ngx_core::inet::SockAddr::Unix(_) => Vec::new(),
-                        }
-                    } else {
-                        let cscf = r.cscf();
-                        let n = cscf.borrow().server_name.clone();
-                        n
-                    }
-                };
-                out.extend_from_slice(&host);
-                if *cl.port_in_redirect {
-                    if let Some(local) = r.connection.local_sockaddr() {
-                        let port = local.port();
-                        let is_ssl = r.connection.ssl.borrow().is_some();
-                        if port != 0 && port != if is_ssl { 443 } else { 80 } {
-                            out.extend_from_slice(format!(":{}", port).as_bytes());
-                        }
-                    }
-                }
-                out.extend_from_slice(&v);
-                // update r->headers_out.location->value for possible logging
-                *loc.value.borrow_mut() = out[p..].to_vec();
-                out.extend_from_slice(b"\r\n");
-            }
-        }
-    }
-    let _ = ();
-    {
-        let ho = r.headers_out.borrow();
-        let cl = clcf.borrow();
-        if r.chunked.get() {
-            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        }
-        // Suppress keep-alive during graceful shutdown so this response
-        // signals to the client that no further requests should follow —
-        // matches C's ngx_http_header_filter check of ngx_terminate /
-        // ngx_exiting.
-        let terminating = ngx_core::process::SIG_TERMINATE
-            .load(std::sync::atomic::Ordering::SeqCst)
-            || ngx_core::event::is_exiting();
-        if ho.status == NGX_HTTP_SWITCHING_PROTOCOLS {
-            out.extend_from_slice(b"Connection: upgrade\r\n");
-        } else if r.keepalive.get() && !terminating {
-            out.extend_from_slice(b"Connection: keep-alive\r\n");
-            if *cl.keepalive_header > 0 {
-                out.extend_from_slice(format!("Keep-Alive: timeout={}\r\n", *cl.keepalive_header).as_bytes());
-            }
-        } else {
-            out.extend_from_slice(b"Connection: close\r\n");
-        }
-        // NGX_HTTP_GZIP
-        if r.gzip_vary.get() {
-            if *cl.gzip_vary {
-                out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
-            } else {
-                r.gzip_vary.set(false);
-            }
-        }
-        for h in ho.headers.iter() {
-            if h.hash.get() == 0 {
-                continue;
-            }
-            out.extend_from_slice(&h.key);
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(&h.value.borrow());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
-    out.extend_from_slice(b"\r\n");
+    let out = build_header(&r);
     http_debug!(r, "{}", B(&out).to_string().trim_end_matches("\r\n").replace("\r\n", "\n"));
     r.header_size.set(out.len());
     let mut b = Buf::from_vec(out);
@@ -320,4 +167,407 @@ pub fn header_filter(r: R) -> Step {
     chain.push_back(b);
     // Header bytes go directly to the write filter (they bypass body filters like range/gzip/sub).
     crate::write_filter::write_filter(r, chain)
+}
+
+/// The header of ngx_http_header_filter, in a buffer of the size counted
+/// first
+fn build_header(r: &R) -> Vec<u8> {
+    let clcf = r.clcf();
+    let cl = clcf.borrow();
+    let mut ho = r.headers_out.borrow_mut();
+
+    // r->headers_out.last_modified = NULL: a header of the list stays
+    if ho.last_modified_time != -1 && ho.status != NGX_HTTP_OK && ho.status != NGX_HTTP_PARTIAL_CONTENT && ho.status != NGX_HTTP_NOT_MODIFIED {
+        ho.last_modified_time = -1;
+        ho.last_modified = None;
+    }
+    if ho.status == NGX_HTTP_NO_CONTENT {
+        r.header_only.set(true);
+        ho.content_type_len = 0;
+        ho.content_type.clear();
+        ho.content_length_n = -1;
+        if let Some(cl) = ho.content_length.take() {
+            cl.hash.set(0);
+        }
+        ho.last_modified = None;
+        ho.last_modified_time = -1;
+    }
+    if ho.status == NGX_HTTP_NOT_MODIFIED {
+        r.header_only.set(true);
+    }
+
+    let status = ho.status;
+    let known_line = if ho.status_line.is_empty() { status_line(status) } else { None };
+
+    // Suppress keep-alive during graceful shutdown so this response
+    // signals to the client that no further requests should follow —
+    // matches C's ngx_http_header_filter check of ngx_terminate /
+    // ngx_exiting.
+    let terminating = ngx_core::process::SIG_TERMINATE.load(std::sync::atomic::Ordering::SeqCst) || ngx_core::event::is_exiting();
+
+    // Location: a relative one made absolute (absolute_redirect), its
+    // header not written again from the list; any other stays in the list
+    let location = match &ho.location {
+        Some(loc) if *cl.absolute_redirect && loc.value.borrow().first() == Some(&b'/') => Some(loc.clone()),
+        _ => None,
+    };
+    let cscf;
+    let hin;
+    // server_name_in_redirect on: the server name; else the client's
+    // Host; else the local address
+    let host: std::borrow::Cow<[u8]> = if location.is_none() {
+        std::borrow::Cow::Borrowed(&[])
+    } else if *cl.server_name_in_redirect {
+        cscf = r.cscf();
+        std::borrow::Cow::Owned(cscf.borrow().server_name.clone())
+    } else if {
+        hin = r.headers_in.borrow();
+        !hin.server.is_empty()
+    } {
+        std::borrow::Cow::Borrowed(&hin.server[..])
+    } else if let Some(local) = r.connection.local_sockaddr() {
+        std::borrow::Cow::Owned(match local {
+            ngx_core::inet::SockAddr::V4(a) => a.ip().to_string().into_bytes(),
+            ngx_core::inet::SockAddr::V6(a) => a.ip().to_string().into_bytes(),
+            ngx_core::inet::SockAddr::Unix(_) => Vec::new(),
+        })
+    } else {
+        std::borrow::Cow::Owned(r.cscf().borrow().server_name.clone())
+    };
+    let ssl = location.is_some() && r.connection.ssl.borrow().is_some();
+    let port = match &location {
+        Some(_) if *cl.port_in_redirect => match r.connection.local_sockaddr() {
+            Some(local) if local.port() != 0 && local.port() != if ssl { 443 } else { 80 } => local.port(),
+            _ => 0,
+        },
+        _ => 0,
+    };
+
+    // NGX_HTTP_GZIP
+    if r.gzip_vary.get() && !*cl.gzip_vary {
+        r.gzip_vary.set(false);
+    }
+
+    let charset = !ho.content_type.is_empty() && ho.content_type_len == ho.content_type.len() && !ho.charset.is_empty();
+
+    let mut len = "HTTP/1.x ".len() + 2 /* the end of the header */ + 2;
+
+    len += if !ho.status_line.is_empty() {
+        ho.status_line.len()
+    } else if let Some(l) = known_line {
+        l.len()
+    } else {
+        NGX_INT64_LEN + 1
+    };
+
+    if ho.server.is_none() {
+        len += match *cl.server_tokens {
+            NGX_HTTP_SERVER_TOKENS_ON => SERVER_FULL_STRING.len(),
+            NGX_HTTP_SERVER_TOKENS_BUILD => SERVER_BUILD_STRING.len(),
+            _ => SERVER_STRING.len(),
+        };
+    }
+    if ho.date.is_none() {
+        len += "Date: ".len() + HTTP_TIME_LEN + 2;
+    }
+    if !ho.content_type.is_empty() {
+        len += "Content-Type: ".len() + ho.content_type.len() + 2;
+        if charset {
+            len += "; charset=".len() + ho.charset.len();
+        }
+    }
+    if ho.content_length.is_none() && ho.content_length_n >= 0 {
+        len += "Content-Length: ".len() + NGX_INT64_LEN + 2;
+    }
+    if ho.last_modified.is_none() && ho.last_modified_time != -1 {
+        len += "Last-Modified: ".len() + HTTP_TIME_LEN + 2;
+    }
+    if let Some(loc) = &location {
+        len += "Location: https://".len() + host.len() + loc.value.borrow().len() + 2;
+        if port != 0 {
+            len += ":65535".len();
+        }
+    }
+    if r.chunked.get() {
+        len += "Transfer-Encoding: chunked\r\n".len();
+    }
+    if status == NGX_HTTP_SWITCHING_PROTOCOLS {
+        len += "Connection: upgrade\r\n".len();
+    } else if r.keepalive.get() && !terminating {
+        len += "Connection: keep-alive\r\n".len();
+        if *cl.keepalive_header > 0 {
+            len += "Keep-Alive: timeout=".len() + NGX_INT64_LEN + 2;
+        }
+    } else {
+        len += "Connection: close\r\n".len();
+    }
+    if r.gzip_vary.get() {
+        len += "Vary: Accept-Encoding\r\n".len();
+    }
+    for h in ho.headers.iter() {
+        if h.hash.get() == 0 {
+            continue;
+        }
+        if location.as_ref().is_some_and(|loc| Rc::ptr_eq(loc, h)) {
+            // the Location made absolute: its hash is cleared below
+            continue;
+        }
+        len += h.key.len() + 2 + h.value.borrow().len() + 2;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(len);
+
+    out.extend_from_slice(b"HTTP/1.1 ");
+    if !ho.status_line.is_empty() {
+        out.extend_from_slice(&ho.status_line);
+    } else if let Some(l) = known_line {
+        out.extend_from_slice(l.as_bytes());
+    } else {
+        // "%03ui " (as "{:03}" formats a number)
+        let mut digits = 1;
+        let mut v = status.unsigned_abs();
+        while v >= 10 {
+            v /= 10;
+            digits += 1;
+        }
+        if status < 0 {
+            out.push(b'-');
+            digits += 1;
+        }
+        for _ in digits..3 {
+            out.push(b'0');
+        }
+        write_dec(&mut out, status.unsigned_abs());
+        out.push(b' ');
+    }
+    out.extend_from_slice(b"\r\n");
+
+    // ngx_http_header_filter: "Server", "Date", "Content-Length" and
+    // "Last-Modified" are written here only from the fields when there is
+    // no header for them; the headers of r->headers_out.headers (typed
+    // slots included) follow in their order after "Connection"
+    if ho.server.is_none() {
+        match *cl.server_tokens {
+            NGX_HTTP_SERVER_TOKENS_ON => out.extend_from_slice(SERVER_FULL_STRING),
+            NGX_HTTP_SERVER_TOKENS_BUILD => out.extend_from_slice(SERVER_BUILD_STRING),
+            _ => out.extend_from_slice(SERVER_STRING),
+        }
+    }
+    if ho.date.is_none() {
+        out.extend_from_slice(b"Date: ");
+        ngx_core::times::with_cached(|t| out.extend_from_slice(t.http_time.as_bytes()));
+        out.extend_from_slice(b"\r\n");
+    }
+    if !ho.content_type.is_empty() {
+        out.extend_from_slice(b"Content-Type: ");
+        let p = out.len();
+        out.extend_from_slice(&ho.content_type);
+        if charset {
+            out.extend_from_slice(b"; charset=");
+            out.extend_from_slice(&ho.charset);
+            // update r->headers_out.content_type for possible logging
+            ho.content_type = out[p..].to_vec();
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    if ho.content_length.is_none() && ho.content_length_n >= 0 {
+        out.extend_from_slice(b"Content-Length: ");
+        write_int(&mut out, ho.content_length_n);
+        out.extend_from_slice(b"\r\n");
+    }
+    if ho.last_modified.is_none() && ho.last_modified_time != -1 {
+        out.extend_from_slice(b"Last-Modified: ");
+        write_http_time(&mut out, ho.last_modified_time);
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(loc) = &location {
+        loc.hash.set(0);
+        let p = out.len() + b"Location: ".len();
+        out.extend_from_slice(if ssl { b"Location: https://" } else { b"Location: http://" });
+        out.extend_from_slice(&host);
+        if port != 0 {
+            out.push(b':');
+            write_int(&mut out, port as i64);
+        }
+        out.extend_from_slice(&loc.value.borrow());
+        // update r->headers_out.location->value for possible logging
+        *loc.value.borrow_mut() = out[p..].to_vec();
+        out.extend_from_slice(b"\r\n");
+    }
+    if r.chunked.get() {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    if status == NGX_HTTP_SWITCHING_PROTOCOLS {
+        out.extend_from_slice(b"Connection: upgrade\r\n");
+    } else if r.keepalive.get() && !terminating {
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
+        if *cl.keepalive_header > 0 {
+            out.extend_from_slice(b"Keep-Alive: timeout=");
+            write_int(&mut out, *cl.keepalive_header);
+            out.extend_from_slice(b"\r\n");
+        }
+    } else {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    if r.gzip_vary.get() {
+        out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    }
+    for h in ho.headers.iter() {
+        if h.hash.get() == 0 {
+            continue;
+        }
+        out.extend_from_slice(&h.key);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(&h.value.borrow());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    debug_assert!(out.len() <= len, "header {} of {}", out.len(), len);
+    out
+}
+
+/// `v` in decimal ("%d" of ngx_sprintf)
+pub fn write_int(out: &mut Vec<u8>, v: i64) {
+    if v < 0 {
+        out.push(b'-');
+    }
+    write_dec(out, v.unsigned_abs());
+}
+
+/// `v` in decimal ("%ud")
+pub fn write_dec(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(dec_digits(v, &mut [0u8; 20]));
+}
+
+/// The decimal digits of `v`, in `buf`
+pub fn dec_digits(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[i..]
+}
+
+/// `v` in lowercase hexadecimal ("%xd"), a negative value as its two's
+/// complement
+pub fn write_hex(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(hex_digits(v, &mut [0u8; 16]));
+}
+
+/// The lowercase hexadecimal digits of `v` (a negative value as its
+/// two's complement), in `buf`
+pub fn hex_digits(v: i64, buf: &mut [u8; 16]) -> &[u8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut v = v as u64;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = HEX[(v & 0xf) as usize];
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[i..]
+}
+
+/// A short value written on the stack (a header value the header list
+/// copies)
+pub struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    pub fn new() -> StackBuf<N> {
+        StackBuf { buf: [0u8; N], len: 0 }
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+        self.len += data.len();
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> Default for StackBuf<N> {
+    fn default() -> StackBuf<N> {
+        StackBuf::new()
+    }
+}
+
+/// `v` in decimal ("%d")
+pub fn int_digits(v: i64, buf: &mut [u8; 21]) -> &[u8] {
+    let mut digits = [0u8; 20];
+    let d = dec_digits(v.unsigned_abs(), &mut digits);
+    let mut n = 0;
+    if v < 0 {
+        buf[0] = b'-';
+        n = 1;
+    }
+    buf[n..n + d.len()].copy_from_slice(d);
+    &buf[..n + d.len()]
+}
+
+/// ngx_http_time: "Sun, 06 Nov 1994 08:49:37 GMT"
+pub fn write_http_time(out: &mut Vec<u8>, t: i64) {
+    let tm = ngx_core::times::gmtime(t);
+    let two = |out: &mut Vec<u8>, v: u32| {
+        if v < 10 {
+            out.push(b'0');
+        }
+        write_dec(out, v as u64);
+    };
+    out.extend_from_slice(ngx_core::times::WEEK[tm.wday as usize].as_bytes());
+    out.extend_from_slice(b", ");
+    two(out, tm.mday);
+    out.push(b' ');
+    out.extend_from_slice(ngx_core::times::MONTHS[(tm.mon - 1) as usize].as_bytes());
+    out.push(b' ');
+    // "%4d"
+    for d in [1000, 100, 10] {
+        if tm.year < d {
+            out.push(b' ');
+        }
+    }
+    write_dec(out, tm.year as u64);
+    out.push(b' ');
+    two(out, tm.hour);
+    out.push(b':');
+    two(out, tm.min);
+    out.push(b':');
+    two(out, tm.sec);
+    out.extend_from_slice(b" GMT");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_writers() {
+        for v in [0i64, 7, 10, 99, 100, 12345, -1, -12345, i64::MAX, i64::MIN] {
+            let mut out = Vec::new();
+            write_int(&mut out, v);
+            assert_eq!(out, v.to_string().into_bytes());
+
+            let mut out = Vec::new();
+            write_hex(&mut out, v);
+            assert_eq!(out, format!("{:x}", v).into_bytes());
+        }
+
+        for t in [0i64, 1, 59, 86399, 86400, 784111777, 1_000_000_000, 1_790_000_000, 2_147_483_647, 4_102_444_800, 253_402_300_799, 300_000_000_000] {
+            let mut out = Vec::new();
+            write_http_time(&mut out, t);
+            assert_eq!(out, ngx_core::times::http_time(t).into_bytes(), "{}", t);
+        }
+    }
 }

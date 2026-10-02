@@ -573,13 +573,25 @@ pub fn set_content_type(r: &R) -> i64 {
         return NGX_OK;
     }
     let clcf = r.clcf();
-    let exten = r.exten.borrow().clone();
-    if !exten.is_empty() {
-        let lower = ngx_core::string::to_lower_vec(&exten);
-        let hash = ngx_core::hash::hash_key(&lower);
+    {
+        let exten = r.exten.borrow();
         let c = clcf.borrow();
-        if let Some(th) = &c.types_hash {
-            if let Some(t) = th.find(hash, &lower) {
+        if let (false, Some(th)) = (exten.is_empty(), &c.types_hash) {
+            // the extension lowercased (ngx_hash_strlow), on the stack
+            // unless it is long
+            let mut stack = [0u8; 32];
+            let heap;
+            let lower: &[u8] = if exten.len() <= stack.len() {
+                for (d, s) in stack.iter_mut().zip(exten.iter()) {
+                    *d = ngx_core::string::tolower(*s);
+                }
+                &stack[..exten.len()]
+            } else {
+                heap = ngx_core::string::to_lower_vec(&exten);
+                &heap
+            };
+            let hash = ngx_core::hash::hash_key(lower);
+            if let Some(t) = th.find(hash, lower) {
                 let mut ho = r.headers_out.borrow_mut();
                 ho.content_type_len = t.len();
                 ho.content_type = (**t).clone();
@@ -620,8 +632,14 @@ pub fn set_etag(r: &R) -> i64 {
         return NGX_OK;
     }
     let mut ho = r.headers_out.borrow_mut();
-    let value = format!("\"{:x}-{:x}\"", ho.last_modified_time, ho.content_length_n);
-    let h = ho.add(b"ETag", value.as_bytes());
+    // "\"%xT-%xO\"", on the stack: the header copies it
+    let mut value = crate::header_filter::StackBuf::<40>::new();
+    value.push(b"\"");
+    value.push(crate::header_filter::hex_digits(ho.last_modified_time, &mut [0u8; 16]));
+    value.push(b"-");
+    value.push(crate::header_filter::hex_digits(ho.content_length_n, &mut [0u8; 16]));
+    value.push(b"\"");
+    let h = ho.add(b"ETag", value.as_slice());
     ho.etag = Some(h);
     NGX_OK
 }

@@ -46,6 +46,7 @@ use ngx_core::ngx_log_error;
 use ngx_core::rc::*;
 use ngx_core::string::B;
 
+use crate::header_filter::{int_digits, StackBuf};
 use crate::request::*;
 use crate::*;
 
@@ -370,9 +371,15 @@ fn range_singlepart_header(r: R, ctx: &Rc<RefCell<RangeFilterCtx>>, next: &Heade
 
         /* "Content-Range: bytes SSSS-EEEE/TTTT" header */
 
-        let value = format!("bytes {}-{}/{}", start, end - 1, ho.content_length_n);
+        let mut value = StackBuf::<80>::new();
+        value.push(b"bytes ");
+        value.push(int_digits(start, &mut [0u8; 21]));
+        value.push(b"-");
+        value.push(int_digits(end - 1, &mut [0u8; 21]));
+        value.push(b"/");
+        value.push(int_digits(ho.content_length_n, &mut [0u8; 21]));
 
-        let content_range = ho.add(b"Content-Range", value.as_bytes());
+        let content_range = ho.add(b"Content-Range", value.as_slice());
         ho.content_range = Some(content_range);
 
         ho.content_length_n = end - start;
@@ -476,9 +483,11 @@ fn range_not_satisfiable(r: &R) -> i64 {
             h.hash.set(0);
         }
 
-        let value = format!("bytes */{}", ho.content_length_n);
+        let mut value = StackBuf::<32>::new();
+        value.push(b"bytes */");
+        value.push(int_digits(ho.content_length_n, &mut [0u8; 21]));
 
-        let content_range = ho.add(b"Content-Range", value.as_bytes());
+        let content_range = ho.add(b"Content-Range", value.as_slice());
         ho.content_range = Some(content_range);
     }
 
