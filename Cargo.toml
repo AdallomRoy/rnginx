@@ -37,7 +37,7 @@ ngx-sys = { path = "crates/ngx-sys" }
 rustix = { version = "1", features = ["fs", "net", "process", "pipe", "event", "time", "thread", "system", "param", "stdio"] }
 socket2 = { version = "0.6", features = ["all"] }
 mmap-rs = "0.7"
-zerocopy = "0.8"
+zerocopy = { version = "0.8", features = ["derive"] }
 signal-hook = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 pwhash = "1"

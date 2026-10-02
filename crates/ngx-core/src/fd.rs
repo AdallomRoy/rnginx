@@ -113,8 +113,9 @@ pub fn get(fd: RawFd) -> io::Result<Fd> {
     }
 }
 
-/// An owned duplicate of the open descriptor `fd` of the process.
-fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
+/// An owned duplicate of the open descriptor `fd` of the process (one it
+/// does not own, e.g. the reactor's epoll instance).
+pub fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
     let pidfd = rustix::process::pidfd_open(rustix::process::getpid(), rustix::process::PidfdFlags::empty())?;
 
     match rustix::process::pidfd_getfd(&pidfd, fd, rustix::process::PidfdGetfdFlags::empty()) {

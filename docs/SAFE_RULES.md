@@ -59,6 +59,8 @@ a typed field), no `transmute`, no `from_raw_parts`, no `get_unchecked`, no
   `getpid`, `getppid`, `geteuid`, `getpwnam`, `getgrnam`, `glob`, `Dir`,
   `strerror` (glibc's text of an errno), `pagesize`, `ncpu`. Errors are errno
   values (`Result<_, i32>`).
+- `ngx_core::random::random()`: glibc's random() (same sequence) for the
+  `extern "C" { fn random(); }` calls (ngx_random).
 
 ## Descriptors: crates/ngx-core/src/fd.rs
 The port passes descriptors around as numbers. The safe wrappers want a
@@ -73,6 +75,8 @@ table of owned descriptors.
 - `fd::take(n)` gives the `OwnedFd` back (to make a `File`, `UdpSocket`, ...).
 - `fd::adopt(n)` takes a descriptor inherited across exec() (binary upgrade
   listening sockets) or received some way that gives only a number.
+- `fd::duplicate(n)` makes an owned duplicate of a descriptor the process
+  does not own (e.g. the reactor's epoll instance), leaving `n` alone.
 - During the conversion `fd::get` of a number that is NOT registered
   (opened by code another agent has not converted yet) lends a duplicate
   (pidfd_getfd) so that mixed code keeps working; it will become EBADF at

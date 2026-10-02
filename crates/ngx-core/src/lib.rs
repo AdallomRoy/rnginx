@@ -58,6 +58,7 @@ pub mod radix_tree;
 pub mod stubs;
 pub mod regex;
 pub mod rc;
+pub mod random;
 pub mod proxy_protocol;
 pub mod crypt;
 pub mod resolver;
