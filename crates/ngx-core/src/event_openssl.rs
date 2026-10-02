@@ -5025,13 +5025,18 @@ mod tests {
 
     /// A context with a self-signed EC certificate for "localhost".
     fn server_ssl(log: &Log) -> NgxSsl {
+        server_ssl_with(log, NGX_SSL_DEFAULT_PROTOCOLS, NGX_SSL_DFLT_BUILTIN_SCACHE, None)
+    }
+
+    /// The same, with the protocols and session cache given.
+    fn server_ssl_with(log: &Log, protocols: u32, builtin: isize, zone: Option<&Rc<ShmZone>>) -> NgxSsl {
         use openssl::ec::{EcGroup, EcKey};
         use openssl::nid::Nid;
         use openssl::pkey::PKey;
         use openssl::x509::{X509Builder, X509NameBuilder};
 
         let mut ssl = NgxSsl::new(log.clone());
-        assert_eq!(ngx_ssl_create(&mut ssl, NGX_SSL_DEFAULT_PROTOCOLS, None), NGX_OK);
+        assert_eq!(ngx_ssl_create(&mut ssl, protocols, None), NGX_OK);
 
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
         let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
@@ -5056,9 +5061,94 @@ mod tests {
             ctx.set_private_key(&key).unwrap();
         }
 
-        assert_eq!(ngx_ssl_session_cache(&mut ssl, b"TEST", None, NGX_SSL_DFLT_BUILTIN_SCACHE, None, 300), NGX_OK);
+        assert_eq!(ngx_ssl_session_cache(&mut ssl, b"TEST", None, builtin, zone, 300), NGX_OK);
 
         ssl
+    }
+
+    /// A session cache zone, its slab pool initialized and the cache made
+    /// by the zone init.
+    fn session_zone() -> Rc<ShmZone> {
+        let mem = Rc::new(ShmMem::private(1 << 19).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"SSL".to_vec(), mem.len(), "ngx_http_ssl_module");
+        zone.shm.attach(mem);
+
+        ngx_ssl_session_cache_init(&zone, None).unwrap();
+
+        zone
+    }
+
+    /// The sessions in the cache of the zone.
+    fn cached_sessions(zone: &ShmZone) -> usize {
+        let (mem, cache) = session_cache_of(zone).unwrap();
+        rb::walk(&session_rbtree(&mem, cache)).len()
+    }
+
+    #[test]
+    fn shared_session_cache() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async {
+            let log = Log::stderr(NGX_LOG_EMERG);
+
+            let zone = session_zone();
+
+            // TLSv1.2 sessions resumed by their id: in the shared cache only
+            let mut server = server_ssl_with(&log, NGX_SSL_TLSV1_2, NGX_SSL_NO_BUILTIN_SCACHE, Some(&zone));
+            ngx_ssl_set_options(&mut server, sys::SSL_OP_NO_TICKET);
+
+            let mut client = NgxSsl::new(log.clone());
+            assert_eq!(ngx_ssl_create(&mut client, NGX_SSL_TLSV1_2, None), NGX_OK);
+
+            {
+                let ctx = client.ctx.builder_mut().unwrap();
+                ctx.set_session_cache_mode(SslSessionCacheMode::from_bits_retain((sys::SSL_SESS_CACHE_CLIENT | sys::SSL_SESS_CACHE_NO_INTERNAL) as _));
+                ctx.set_new_session_callback(ngx_ssl_new_client_session);
+            }
+
+            let saved: Rc<RefCell<Option<SslSession>>> = Rc::new(RefCell::new(None));
+
+            for round in 0..3 {
+                let (s, c) = pair(&log);
+
+                assert_eq!(ngx_ssl_create_connection(&server, &s, 0), NGX_OK);
+                assert_eq!(ngx_ssl_create_connection(&client, &c, NGX_SSL_CLIENT), NGX_OK);
+
+                assert_eq!(ngx_ssl_set_session(&c, saved.borrow().as_deref()), NGX_OK);
+
+                let save = saved.clone();
+                ngx_ssl_set_save_session(&c, Some(Rc::new(move |c: &Connection| *save.borrow_mut() = ngx_ssl_get_session(c))));
+
+                let (rs, rc) = tokio::join!(handshake(&s), handshake(&c));
+                assert_eq!((rs, rc), (NGX_OK, NGX_OK));
+
+                // found in the shared cache the second time, removed then
+                assert_eq!(ngx_ssl_session_reused(&s), round == 1, "round {}", round);
+                assert_eq!(ngx_ssl_session_reused(&c), round == 1, "round {}", round);
+
+                assert_eq!(cached_sessions(&zone), 1);
+
+                if round == 1 {
+                    // a client certificate failed: the session can't be
+                    // resumed
+                    ngx_ssl_remove_cached_session(&s);
+                    assert_eq!(cached_sessions(&zone), 0);
+                }
+
+                if round == 2 {
+                    // a new session was cached instead
+                    assert_eq!(cached_sessions(&zone), 1);
+                }
+
+                c.ssl.borrow().as_ref().unwrap().no_wait_shutdown.set(true);
+                assert_eq!(ngx_ssl_shutdown(&c), NGX_OK);
+                s.ssl.borrow().as_ref().unwrap().no_wait_shutdown.set(true);
+                assert_eq!(ngx_ssl_shutdown(&s), NGX_OK);
+            }
+        });
     }
 
     fn pair(log: &Log) -> (Rc<Connection>, Rc<Connection>) {

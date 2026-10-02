@@ -2260,6 +2260,110 @@ fn ngx_ssl_ocsp_create_key(ctx: &mut OcspCtx) -> i64 {
 mod tests {
     use super::*;
 
+    /// A certificate of the name, signed by the issuer's key (self-signed
+    /// without), with the serial given.
+    fn cert(name: &str, serial: u32, issuer: Option<(&X509, &openssl::pkey::PKey<openssl::pkey::Private>)>) -> (X509, openssl::pkey::PKey<openssl::pkey::Private>) {
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509Builder, X509NameBuilder};
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+
+        let mut n = X509NameBuilder::new().unwrap();
+        n.append_entry_by_text("CN", name).unwrap();
+        let n = n.build();
+
+        let mut b = X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        b.set_serial_number(&openssl::bn::BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap()).unwrap();
+        b.set_subject_name(&n).unwrap();
+        b.set_issuer_name(issuer.map(|(c, _)| c.subject_name()).unwrap_or(&n)).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap()).unwrap();
+        b.sign(issuer.map(|(_, k)| k).unwrap_or(&key), openssl::hash::MessageDigest::sha256()).unwrap();
+
+        (b.build(), key)
+    }
+
+    /// An OCSP cache zone, its slab pool initialized and the cache made by
+    /// the zone init.
+    fn ocsp_zone() -> Rc<ShmZone> {
+        let mem = Rc::new(ShmMem::private(1 << 19).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"OCSP".to_vec(), mem.len(), "ngx_http_ssl_module_ctx");
+        zone.shm.attach(mem);
+
+        ngx_ssl_ocsp_cache_init(&zone, None).unwrap();
+
+        zone
+    }
+
+    #[test]
+    fn ocsp_cache() {
+        let (ca, ca_key) = cert("CA", 1, None);
+        let (leaf, _) = cert("leaf", 0x1234, Some((&ca, &ca_key)));
+        let (other, _) = cert("other", 0x1235, Some((&ca, &ca_key)));
+
+        let zone = ocsp_zone();
+
+        let mut ctx = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));
+        ctx.cert = Some(leaf.clone());
+        ctx.issuer = Some(ca.clone());
+        ctx.shm_zone = Some(zone.clone());
+
+        // the key: the issuer name and key hashes, the serial
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_DECLINED);
+        assert_eq!(ctx.key.len(), 60);
+        assert_eq!(&ctx.key[40..42], &[0x12, 0x34]);
+        assert!(ctx.key[42..].iter().all(|&b| b == 0));
+
+        ctx.status = V_OCSP_CERTSTATUS_REVOKED;
+        ctx.valid = crate::times::time() + 100;
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx), NGX_OK);
+
+        ctx.status = V_OCSP_CERTSTATUS_GOOD;
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_OK);
+        assert_eq!(ctx.status, V_OCSP_CERTSTATUS_REVOKED);
+
+        // another certificate of the issuer
+        let mut ctx2 = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));
+        ctx2.cert = Some(other);
+        ctx2.issuer = Some(ca);
+        ctx2.shm_zone = Some(zone.clone());
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx2), NGX_DECLINED);
+
+        // an expired entry is removed
+        ctx2.status = V_OCSP_CERTSTATUS_GOOD;
+        ctx2.valid = crate::times::time();
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx2), NGX_OK);
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx2), NGX_DECLINED);
+
+        let (mem, cache) = cache_of(&zone).unwrap();
+        assert_eq!(rb::walk(&ocsp_rbtree(&mem, cache)).len(), 1);
+
+        // still found
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_OK);
+
+        // past responses are not stored
+        ctx2.valid = crate::times::time() - 1;
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx2), NGX_OK);
+        assert_eq!(rb::walk(&ocsp_rbtree(&mem, cache)).len(), 1);
+    }
+
+    #[test]
+    fn status_strings() {
+        assert_eq!(status_str(0), "good");
+        assert_eq!(status_str(1), "revoked");
+        assert_eq!(status_str(2), "unknown");
+        assert_eq!(status_str(7), "(UNKNOWN)");
+        assert_eq!(response_status_str(5), "sigrequired");
+        assert_eq!(response_status_str(4), "(UNKNOWN)");
+    }
+
     fn ctx_with(data: &[u8]) -> Box<OcspCtx> {
         let mut ctx = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));
         let mut buf = vec![0u8; 16384];
