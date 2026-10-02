@@ -972,7 +972,9 @@ pub async fn internal_redirect(r: &R, uri: &[u8], args: Option<&[u8]>) -> i64 {
     r.internal.set(true);
     r.valid_unparsed_uri.set(false);
     r.add_uri_to_alias.set(false);
-    let rc = Box::pin(handler(r.clone())).await;
+    // the phases of the new URI: a future of its own type, awaited in
+    // place (not boxed: it does not contain this function's future)
+    let rc = handler(r.clone()).await;
     Box::pin(crate::request_rt::finalize_request(r, rc)).await;
     NGX_DONE
 }
@@ -991,18 +993,23 @@ pub async fn named_location(r: &R, name: &[u8]) -> i64 {
         return NGX_DONE;
     }
     let cscf = r.cscf();
-    let named = cscf.borrow().named_locations.clone();
-    for clcf in named.iter() {
-        let cname = clcf.borrow().name.clone();
-        http_debug!(r, "test location: \"{}\"", B(&cname));
-        if cname != name {
-            continue;
-        }
+    let found = {
+        let srv = cscf.borrow();
+        srv.named_locations
+            .iter()
+            .find(|clcf| {
+                let c = clcf.borrow();
+                http_debug!(r, "test location: \"{}\"", B(&c.name));
+                c.name == name
+            })
+            .map(|clcf| clcf.borrow().loc_conf.clone().unwrap())
+    };
+    if let Some(loc_conf) = found {
         http_debug!(r, "using location: {} \"{}?{}\"", B(name), B(&r.uri.borrow()), B(&r.args.borrow()));
         r.internal.set(true);
         *r.content_handler.borrow_mut() = None;
         r.uri_changed.set(false);
-        *r.loc_conf.borrow_mut() = clcf.borrow().loc_conf.clone().unwrap();
+        *r.loc_conf.borrow_mut() = loc_conf;
         {
             let mut ctx = r.ctx.borrow_mut();
             for c in ctx.iter_mut() {
@@ -1013,7 +1020,7 @@ pub async fn named_location(r: &R, name: &[u8]) -> i64 {
         let cmcf = r.cmcf();
         let idx = cmcf.borrow().phase_engine.location_rewrite_index;
         r.phase_handler.set(idx);
-        let rc = Box::pin(run_phases(r.clone())).await;
+        let rc = run_phases(r.clone()).await;
         Box::pin(crate::request_rt::finalize_request(r, rc)).await;
         return NGX_DONE;
     }
