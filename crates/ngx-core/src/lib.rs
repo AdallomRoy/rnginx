@@ -36,6 +36,7 @@ pub use conf::{Conf, ConfError, ConfResult, Val};
 pub use log::Log;
 pub use cycle::Cycle;
 pub mod shm;
+pub mod shmem;
 pub mod slab;
 pub mod shmtx;
 pub mod rbtree;

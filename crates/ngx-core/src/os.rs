@@ -22,12 +22,20 @@ pub fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+// The errors of rustix and of the descriptor table are returned, not left
+// in errno as libc does: they are set in errno too, so that the callers
+// logging os::errno() after a failed call report the right one.
+
 fn io_errno(e: std::io::Error) -> i32 {
-    e.raw_os_error().unwrap_or(libc::EIO)
+    let err = e.raw_os_error().unwrap_or(libc::EIO);
+    nix::errno::Errno::set_raw(err);
+    err
 }
 
 fn rustix_errno(e: rustix::io::Errno) -> i32 {
-    e.raw_os_error()
+    let err = e.raw_os_error();
+    nix::errno::Errno::set_raw(err);
+    err
 }
 
 /// The text of an errno value, strerror() as glibc words it
@@ -675,6 +683,14 @@ mod tests {
         assert_eq!(glob(&p("/b.con[f]")).unwrap(), vec![p("/b.conf")]);
 
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn failures_set_errno() {
+        assert_eq!(rename(b"/nonexistent/a", b"/nonexistent/b"), Err(libc::ENOENT));
+        assert_eq!(errno(), libc::ENOENT);
+        assert_eq!(set_nonblocking(1 << 20), Err(libc::EBADF));
+        assert_eq!(errno(), libc::EBADF);
     }
 
     #[test]

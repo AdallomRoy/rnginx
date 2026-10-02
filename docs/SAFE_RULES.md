@@ -97,12 +97,57 @@ function is needed. Already there: `os::fork`, `os::setsockopt_int`,
 `os::getsockopt_int`, `os::tcp_info`, `os::ioctl_fioasync`,
 `os::fcntl_setown`.
 
-## Shared memory
-Zones will get a safe API (offsets into an atomic word array instead of
-pointers; slab allocator, rbtree and queue working on offsets). It is being
-written on the `safe` branch; the agents converting shm users get it when
-it lands. Others: don't touch shm.rs, slab.rs, rbtree.rs, queue.rs,
-shmtx.rs, rwlock.rs.
+## Shared memory (crates/ngx-core/src/shmem/)
+Zones no longer hold raw pointers. A zone's memory is a `ShmMem` (a
+MAP_SHARED anonymous mapping owned by vm-memory, seen as atomic words);
+what C stores as a pointer in a zone is a byte offset from the zone's start
+(0 = NULL). The worked example is crates/ngx-http/src/limit_conn.rs
+(converted): read it first.
+- `ShmMem` (`ngx_core::shmem::ShmMem`): `get(off)`/`set(off, v)` for words,
+  `load::<T>(off)`/`store(off, v)` for u8..u64/usize/isize/bool (aligned to
+  their size), `read`/`write`/`bytes`/`fill`/`copy` for byte strings,
+  `cmp_bytes`/`eq_bytes` (memcmp without copying), `word(off)` for an
+  `&AtomicUsize` (counters updated without a lock: `fetch_add`, CAS).
+  Sub-word values and bytes are written by read-modify-write of their word:
+  write them under the zone's mutex, as C does.
+- `shm_struct! { struct Node { key: usize, color: u8, len: u16, ... } }`
+  declares a structure laid out as repr(C) would (so allocation sizes stay
+  the C ones): `Node::SIZE`, `Node::at(&mem, off)`, `n.get(Node::len)`,
+  `n.set(Node::len, 3)`, `n.field(Node::len)` (the offset of the field,
+  i.e. `&n->len`), `Node::len.off`. Embedded C structures (an
+  ngx_rbtree_node_t, an ngx_queue_t, an ngx_str_t) are flattened into their
+  fields; overlays work as in C (`RbNode::color.off` is
+  offsetof(ngx_rbtree_node_t, color)).
+- `shmem::slab::SlabPool::of(&mem)`: `alloc`/`calloc`/`free` and their
+  `_locked` forms (offsets, 0 on failure), `lock`/`unlock`/`trylock`,
+  `data`/`set_data` (pool->data), `set_log_ctx`, `log_nomem`/
+  `set_log_nomem`, `pfree`, `stats(slot)`.
+- `shmem::rbtree`: `ShmRbtree::at(&mem, off_of_the_ngx_rbtree_t)`,
+  `.init(sentinel_off)`, `rbtree::insert(&tree, node, insert_value)` where
+  insert_value is `rbtree::insert_value`, `rbtree::insert_timer_value`,
+  `ShmRbtree::str_insert_value`, or your own fn built on
+  `rbtree::insert_by(tree, temp, node, sentinel, |t, node, temp| goes_left)`;
+  `rbtree::delete`, `rbtree::min`, `rbtree::next` (0 after the last),
+  `rbtree::walk`; `tree.key(n)`, `tree.left(n)`, ... (trait `RbTree`);
+  `str_lookup`; `RbNode`, `StrNode`, `RbtreeHeader` layouts.
+  `LocalRbtree<V>`: the same algorithm for a tree of the process (nodes in
+  a vector with a value each) where C uses an rbtree in process memory and
+  its order matters.
+- `shmem::queue`: `init`, `empty`, `insert_head`, `insert_tail`,
+  `insert_after`, `head`, `last`, `next`, `prev`, `remove`, `split`, `add`,
+  `walk`, all on (`&mem`, offset of the ngx_queue_t).
+- Other locks in zones: `shmem::lock::shmtx_lock(mem.word(off))` etc.;
+  `ngx_core::rwlock::{rlock, wlock, unlock, downgrade}(mem.word(off))`.
+- A zone: in the directive that adds it, right after `shared_memory_add`,
+  `shm_zone.safe_pool.set(true)` (ngx_init_zone_pool then makes the new
+  pool; it goes away once every zone user is converted). In the zone's init
+  callback `shm_zone.mem()` is the `Rc<ShmMem>`; keep it in the module's
+  context with the offsets (e.g. `sh: Cell<usize>`); on reuse take the old
+  context's. Tests: `ShmMem::private(size)`, `SlabPool::init_zone(&mem)`,
+  `zone.shm.attach(Rc::new(mem))`.
+- The old crates/ngx-core/src/{slab,rbtree,queue,shmtx}.rs are for the
+  code not converted yet: don't use them, don't edit them; the orchestrator
+  deletes them at the end.
 
 ## File ownership
 Edit only your files. If you really need a change in a file you don't own

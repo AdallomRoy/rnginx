@@ -39,9 +39,8 @@ pub fn wlock(lock: &AtomicUsize) {
             }
         }
 
-        unsafe {
-            libc::sched_yield();
-        }
+        // ngx_sched_yield()
+        std::thread::yield_now();
     }
 }
 
@@ -71,9 +70,8 @@ pub fn rlock(lock: &AtomicUsize) {
             }
         }
 
-        unsafe {
-            libc::sched_yield();
-        }
+        // ngx_sched_yield()
+        std::thread::yield_now();
     }
 }
 

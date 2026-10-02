@@ -151,6 +151,11 @@ unsafe fn slab_page_addr(pool: *mut SlabPool, page: *mut SlabPage) -> usize {
 
 /// ngx_init_zone_pool: the pool at the start of a new zone.
 pub fn init_zone_pool(cycle: &crate::cycle::Cycle, zone: &std::rc::Rc<crate::shm::ShmZone>) -> Result<(), ()> {
+    if zone.safe_pool.get() {
+        crate::shmem::slab::SlabPool::init_zone(&zone.mem());
+        return Ok(());
+    }
+
     let addr = zone.shm.addr.get();
     let sp = addr as *mut SlabPool;
 
