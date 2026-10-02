@@ -54,6 +54,16 @@ pub struct ChunkedCtx {
     pub done: bool,
 }
 
+/// A chunk size or end, in a small buffer kept for reuse once sent (C
+/// keeps its chunk buffers in ctx->free)
+fn small_buf(len: usize, fill: impl FnOnce(&mut Vec<u8>)) -> Buf {
+    let mut v = crate::header_filter::take_header_buf(len);
+    fill(&mut v);
+    let mut b = Buf::from_vec(v);
+    b.tag = crate::header_filter::HEADER_BUF_TAG;
+    b
+}
+
 /// ngx_http_chunked_body_filter
 fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
     if !r.chunked.get() || input.is_empty() || !r.has_ctx(ctx_index()) {
@@ -73,7 +83,11 @@ fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
         }
     }
     if size > 0 {
-        out.push_back(Buf::from_vec(format!("{:x}\r\n", size).into_bytes()));
+        // "%xO" CRLF
+        out.push_back(small_buf(16 + 2, |v| {
+            crate::header_filter::write_hex(v, size);
+            v.extend_from_slice(b"\r\n");
+        }));
         while let Some(mut b) = input.pop_front() {
             let was_last = b.last_buf;
             b.last_buf = false;
@@ -83,7 +97,7 @@ fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
                 out.push_back(b);
             }
         }
-        out.push_back(Buf::from_vec(b"\r\n".to_vec()));
+        out.push_back(small_buf(2, |v| v.extend_from_slice(b"\r\n")));
     } else {
         while let Some(mut b) = input.pop_front() {
             let was_last = b.last_buf;
@@ -98,27 +112,23 @@ fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
         // 0-chunk seen), propagate that state to the client instead of
         // synthesising a terminator. proxy_unfinished.t "chunked no
         // final chunk" checks that the on-wire body ends mid-chunk.
-        let mut tail: Vec<u8> = if r.upstream_response_incomplete.get() {
-            Vec::new()
+        let mut b = if r.upstream_response_incomplete.get() {
+            Buf::from_vec(Vec::new())
         } else {
-            let mut t = b"0\r\n".to_vec();
-            let trailers = r.headers_out.borrow().trailers.clone();
-            for tr in trailers.iter() {
-                if tr.hash.get() == 0 { continue; }
-                t.extend_from_slice(&tr.key);
-                t.extend_from_slice(b": ");
-                t.extend_from_slice(&tr.value.borrow());
+            let ho = r.headers_out.borrow();
+            let trailers = ho.trailers.iter().filter(|tr| tr.hash.get() != 0);
+            let len = 3 + trailers.clone().map(|tr| tr.key.len() + 2 + tr.value.borrow().len() + 2).sum::<usize>() + 2;
+            small_buf(len, |t| {
+                t.extend_from_slice(b"0\r\n");
+                for tr in trailers {
+                    t.extend_from_slice(&tr.key);
+                    t.extend_from_slice(b": ");
+                    t.extend_from_slice(&tr.value.borrow());
+                    t.extend_from_slice(b"\r\n");
+                }
                 t.extend_from_slice(b"\r\n");
-            }
-            t.extend_from_slice(b"\r\n");
-            t
+            })
         };
-        // Reference `r.headers_out.trailers` to keep the borrow shape;
-        // real work happens in the tail construction above.
-        let _ = &r.headers_out;
-        let _ = &tail;
-        let tail_bytes = std::mem::take(&mut tail);
-        let mut b = Buf::from_vec(tail_bytes);
         b.last_buf = true;
         out.push_back(b);
     } else if flush_or_sync && size == 0 && out.is_empty() {

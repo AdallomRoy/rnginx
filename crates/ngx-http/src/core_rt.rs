@@ -561,7 +561,7 @@ pub fn test_content_type(r: &R, types_hash: &ngx_core::hash::Hash<Rc<Vec<u8>>>) 
         ho.content_type_hash = ngx_core::hash::hash_key(&lower);
         ho.content_type_lowcase = Some(lower);
     }
-    let lc = ho.content_type_lowcase.clone().unwrap();
+    let lc = ho.content_type_lowcase.as_ref().unwrap();
     types_hash.find(ho.content_type_hash, &lc[..len]).cloned()
 }
 
@@ -655,18 +655,18 @@ pub fn weak_etag(r: &R) {
         Some(e) => e.clone(),
         None => return,
     };
-    let v = etag.value.borrow().clone();
+    let mut v = etag.value.borrow_mut();
     if v.len() > 2 && v[0] == b'W' && v[1] == b'/' {
         return;
     }
     if v.is_empty() || v[0] != b'"' {
+        drop(v);
         etag.hash.set(0);
         ho.etag = None;
         return;
     }
-    let mut nv = b"W/".to_vec();
-    nv.extend_from_slice(&v);
-    etag.set_value(&nv);
+    // "W/" before the value, in place
+    v.splice(0..0, *b"W/");
 }
 
 /// ngx_http_send_early_hints: the early hints of r->headers_out, if the
@@ -1096,15 +1096,17 @@ pub fn gzip_ok(r: &R) -> i64 {
         return NGX_DECLINED;
     }
     let hin = r.headers_in.borrow();
-    let ae = match hin.accept_encoding.first() {
-        Some(a) => a.value.borrow().clone(),
-        None => return NGX_DECLINED,
-    };
-    if ae.len() < 4 {
-        return NGX_DECLINED;
-    }
-    if !ae.starts_with(b"gzip,") && gzip_accept_encoding(&ae) != NGX_OK {
-        return NGX_DECLINED;
+    {
+        let ae = match hin.accept_encoding.first() {
+            Some(a) => a.value.borrow(),
+            None => return NGX_DECLINED,
+        };
+        if ae.len() < 4 {
+            return NGX_DECLINED;
+        }
+        if !ae.starts_with(b"gzip,") && gzip_accept_encoding(&ae) != NGX_OK {
+            return NGX_DECLINED;
+        }
     }
     let clcf = r.clcf();
     let c = clcf.borrow();
