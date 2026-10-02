@@ -27,7 +27,7 @@ use super::tokens::{ngx_quic_new_sr_token, ngx_quic_new_token};
 use super::transport::*;
 use super::{ngx_quic_address_hash, ngx_quic_get_connection, QuicConf, QuicConnection, QuicPath, QuicSendCtx, NGX_QUIC_ENCRYPTION_APPLICATION, NGX_QUIC_ENCRYPTION_HANDSHAKE, NGX_QUIC_ENCRYPTION_INITIAL, NGX_QUIC_MAX_UDP_PAYLOAD_SIZE, NGX_QUIC_MIN_INITIAL_SIZE, NGX_QUIC_SEND_CTX_LAST, NGX_QUIC_SR_TOKEN_LEN};
 
-const NGX_QUIC_MAX_UDP_SEGMENT_BUF: usize = 65487; /* 65K - IPv6 header */
+use super::scratch::{Kind, Scratch, NGX_QUIC_MAX_UDP_SEGMENT_BUF};
 const NGX_QUIC_MAX_SEGMENTS: usize = 64; /* UDP_MAX_SEGMENTS */
 
 const NGX_QUIC_RETRY_TOKEN_LIFETIME: i64 = 3; /* seconds */
@@ -47,14 +47,14 @@ const NGX_QUIC_CC_MIN_INTERVAL: u64 = 1000; /* 1s */
 
 const NGX_QUIC_SOCKET_RETRY_DELAY: u64 = 10; /* ms, for NGX_AGAIN on write */
 
-/// ngx_quic_log_packet
-fn ngx_quic_log_packet(log: &Log, pkt: &QuicHeader<'_>) {
+/// ngx_quic_log_packet of a packet of `payload_len` bytes of payload
+fn ngx_quic_log_packet(log: &Log, pkt: &QuicHeader<'_>, payload_len: usize) {
     ngx_log_debug!(
         NGX_LOG_DEBUG_EVENT,
         log,
         "quic packet tx {} bytes:{} need_ack:{} number:{} encoded nl:{} trunc:0x{:x}",
         ngx_quic_level_name(pkt.level),
-        pkt.payload.len(),
+        payload_len,
         pkt.need_ack as i32,
         pkt.number as i64,
         pkt.num_len,
@@ -104,10 +104,11 @@ fn ngx_quic_create_datagrams(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
 
     let mut preserved_pnum = [0u64; NGX_QUIC_SEND_CTX_LAST];
 
-    let mut dst: Vec<u8> = Vec::with_capacity(NGX_QUIC_MAX_UDP_PAYLOAD_SIZE);
+    // static u_char dst[NGX_QUIC_MAX_UDP_PAYLOAD_SIZE]
+    let mut dst = Scratch::take(Kind::Dst);
 
     loop {
-        dst.clear();
+        let mut dlen = 0usize;
 
         let mut len = ngx_quic_path_limit(c, &path, path.mtu.get());
 
@@ -124,7 +125,7 @@ fn ngx_quic_create_datagrams(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
                 }
             }
 
-            let min = if i == pad && dst.len() < NGX_QUIC_MIN_INITIAL_SIZE { NGX_QUIC_MIN_INITIAL_SIZE - dst.len() } else { 0 };
+            let min = if i == pad && dlen < NGX_QUIC_MIN_INITIAL_SIZE { NGX_QUIC_MIN_INITIAL_SIZE - dlen } else { 0 };
 
             if min > len {
                 /* padding can't be applied - avoid sending the packet */
@@ -132,22 +133,23 @@ fn ngx_quic_create_datagrams(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
                 return NGX_OK;
             }
 
-            let n = ngx_quic_output_packet(c, qc, i, &mut dst, len, min, cg.in_flight.get() >= cg.window.get());
+            let n = ngx_quic_output_packet(c, qc, i, &mut dst[dlen..], len, min, cg.in_flight.get() >= cg.window.get());
             if n == NGX_ERROR as isize {
                 return NGX_ERROR;
             }
 
+            dlen += n as usize;
             len -= n as usize;
         }
 
-        let len = dst.len();
+        let len = dlen;
         if len == 0 {
             break;
         }
 
         let sockaddr = path.sockaddr.borrow().clone();
 
-        let n = ngx_quic_send(c, &dst, &sockaddr);
+        let n = ngx_quic_send(c, &dst[..len], &sockaddr);
 
         if n == NGX_ERROR as isize {
             return NGX_ERROR;
@@ -178,7 +180,7 @@ fn ngx_quic_commit_send(c: &Connection, qc: &QuicConnection) {
     let mut idle = true;
 
     for i in 0..NGX_QUIC_SEND_CTX_LAST {
-        let sending = {
+        let mut sending = {
             let mut ctx = qc.send_ctx[i].borrow_mut();
 
             if !ctx.frames.is_empty() {
@@ -188,7 +190,7 @@ fn ngx_quic_commit_send(c: &Connection, qc: &QuicConnection) {
             std::mem::take(&mut ctx.sending)
         };
 
-        for f in sending {
+        for f in sending.drain(..) {
             if f.pkt_need_ack && !qc.closing.get() {
                 cg.in_flight.set(cg.in_flight.get() + f.plen);
 
@@ -196,6 +198,13 @@ fn ngx_quic_commit_send(c: &Connection, qc: &QuicConnection) {
             } else {
                 ngx_quic_free_frame(c, f);
             }
+        }
+
+        // the queue back, for its capacity
+        let mut ctx = qc.send_ctx[i].borrow_mut();
+
+        if ctx.sending.is_empty() {
+            ctx.sending = sending;
         }
     }
 
@@ -282,7 +291,9 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
 
     let segsize = path.mtu.get().min(NGX_QUIC_MAX_UDP_SEGMENT_BUF);
 
-    let mut dst: Vec<u8> = Vec::with_capacity(NGX_QUIC_MAX_UDP_SEGMENT_BUF);
+    // static u_char dst[NGX_QUIC_MAX_UDP_SEGMENT_BUF]
+    let mut dst = Scratch::take(Kind::Gso);
+    let mut dlen = 0usize;
 
     let mut nseg = 0;
 
@@ -291,12 +302,12 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
     preserved_pnum[level] = qc.send_ctx[level].borrow().pnum;
 
     loop {
-        let len = segsize.min(NGX_QUIC_MAX_UDP_SEGMENT_BUF - dst.len());
+        let len = segsize.min(NGX_QUIC_MAX_UDP_SEGMENT_BUF - dlen);
 
         let mut n: isize;
 
-        if len != 0 && cg.in_flight.get() + dst.len() < cg.window.get() {
-            n = ngx_quic_output_packet(c, qc, level, &mut dst, len, len, false);
+        if len != 0 && cg.in_flight.get() + dlen < cg.window.get() {
+            n = ngx_quic_output_packet(c, qc, level, &mut dst[dlen..], len, len, false);
             if n == NGX_ERROR as isize {
                 return NGX_ERROR;
             }
@@ -304,18 +315,20 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
             if n != 0 {
                 nseg += 1;
             }
+
+            dlen += n as usize;
         } else {
             n = 0;
         }
 
-        if dst.is_empty() {
+        if dlen == 0 {
             break;
         }
 
         if n == 0 || nseg == NGX_QUIC_MAX_SEGMENTS {
             let sockaddr = path.sockaddr.borrow().clone();
 
-            n = ngx_quic_send_segments(c, &dst, &sockaddr, segsize);
+            n = ngx_quic_send_segments(c, &dst[..dlen], &sockaddr, segsize);
             if n == NGX_ERROR as isize {
                 return NGX_ERROR;
             }
@@ -330,7 +343,7 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
 
             path.sent.set(path.sent.get() + n as i64);
 
-            dst.clear();
+            dlen = 0;
             nseg = 0;
             preserved_pnum[level] = qc.send_ctx[level].borrow().pnum;
         }
@@ -404,8 +417,8 @@ fn ngx_quic_get_padding_level(qc: &QuicConnection) -> usize {
 }
 
 /// ngx_quic_output_packet: a packet of the frames of qc->send_ctx[i]
-/// appended to `out`; its length
-fn ngx_quic_output_packet(c: &Connection, qc: &QuicConnection, i: usize, out: &mut Vec<u8>, max: usize, min: usize, ack_only: bool) -> isize {
+/// written at the start of `out` (of at most `max` bytes); its length
+fn ngx_quic_output_packet(c: &Connection, qc: &QuicConnection, i: usize, out: &mut [u8], max: usize, min: usize, ack_only: bool) -> isize {
     let mut ctx = qc.send_ctx[i].borrow_mut();
 
     if ctx.frames.is_empty() {
@@ -445,7 +458,9 @@ fn ngx_quic_output_packet(c: &Connection, qc: &QuicConnection, i: usize, out: &m
 
     let now = times::event_msec();
     let mut nframes = 0;
-    let mut src: Vec<u8> = Vec::new();
+
+    // static u_char src[NGX_QUIC_MAX_UDP_PAYLOAD_SIZE]
+    let mut src = Scratch::take(Kind::Src);
 
     let mut k = 0;
 
@@ -502,17 +517,12 @@ fn ngx_quic_output_packet(c: &Connection, qc: &QuicConnection, i: usize, out: &m
         src.resize(min_payload, NGX_QUIC_FT_PADDING as u8);
     }
 
-    pkt.payload = src;
+    ngx_quic_log_packet(&c.log, &pkt, src.len());
 
-    ngx_quic_log_packet(&c.log, &pkt);
-
-    let start = out.len();
-
-    if ngx_quic_encrypt(&pkt, out) != NGX_OK {
-        return NGX_ERROR as isize;
-    }
-
-    let res_len = out.len() - start;
+    let res_len = match ngx_quic_encrypt_into(&pkt, &src, out) {
+        Ok(n) => n,
+        Err(()) => return NGX_ERROR as isize,
+    };
 
     ctx.pnum += 1;
 
@@ -547,9 +557,9 @@ fn ngx_quic_init_packet<'a>(c: &Connection, qc: &QuicConnection, ctx: &QuicSendC
         pkt.flags |= NGX_QUIC_PKT_KPHASE;
     }
 
-    pkt.dcid = path.cid.borrow().as_ref().map(|cid| cid.id.borrow().clone()).unwrap_or_default();
+    pkt.dcid = path.cid.borrow().as_ref().map(|cid| QuicCid::new(&cid.id.borrow())).unwrap_or_default();
 
-    pkt.scid = qc.tp.borrow().initial_scid.clone();
+    pkt.scid = QuicCid::new(&qc.tp.borrow().initial_scid);
 
     pkt.version = qc.version.get();
     pkt.log = Some(c.log.clone());
@@ -845,7 +855,7 @@ pub fn ngx_quic_send_early_cc(c: &Connection, inpkt: &QuicHeader<'_>, err: u64, 
 
     let mut res = Vec::new();
 
-    ngx_quic_log_packet(&c.log, &pkt);
+    ngx_quic_log_packet(&c.log, &pkt, pkt.payload().len());
 
     if ngx_quic_encrypt(&pkt, &mut res) != NGX_OK {
         ngx_quic_keys_cleanup(&mut keys.borrow_mut());
@@ -888,7 +898,7 @@ pub fn ngx_quic_send_retry(c: &Connection, conf: &QuicConf, inpkt: &QuicHeader<'
         log: Some(c.log.clone()),
         odcid: inpkt.dcid.clone(),
         dcid: inpkt.scid.clone(),
-        scid: dcid.to_vec(),
+        scid: QuicCid::new(&dcid),
         token,
         ..Default::default()
     };
@@ -1089,7 +1099,7 @@ pub fn ngx_quic_frame_sendto(c: &Connection, mut frame: Box<QuicFrame>, min: usi
 
     let mut res = Vec::new();
 
-    ngx_quic_log_packet(&c.log, &pkt);
+    ngx_quic_log_packet(&c.log, &pkt, pkt.payload().len());
 
     if ngx_quic_encrypt(&pkt, &mut res) != NGX_OK {
         ngx_quic_free_frame(c, frame);

@@ -358,9 +358,75 @@ pub struct QuicFrame {
     pub u: QuicFrameU,
 }
 
+/// A connection id, at most NGX_QUIC_CID_LEN_MAX bytes, held inline (C
+/// points to it): copied without an allocation, compared and hashed as its
+/// bytes.
+#[derive(Clone, Copy, Default)]
+pub struct QuicCid {
+    len: u8,
+    data: [u8; NGX_QUIC_CID_LEN_MAX],
+}
+
+impl QuicCid {
+    /// The id of these bytes; longer ones (never parsed: the parsers
+    /// reject them) are cut at NGX_QUIC_CID_LEN_MAX.
+    pub fn new(id: &[u8]) -> QuicCid {
+        let len = id.len().min(NGX_QUIC_CID_LEN_MAX);
+        let mut data = [0u8; NGX_QUIC_CID_LEN_MAX];
+
+        data[..len].copy_from_slice(&id[..len]);
+
+        QuicCid { len: len as u8, data }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+}
+
+impl std::ops::Deref for QuicCid {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for QuicCid {
+    fn eq(&self, other: &QuicCid) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for QuicCid {}
+
+impl PartialEq<[u8]> for QuicCid {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl PartialEq<Vec<u8>> for QuicCid {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl std::hash::Hash for QuicCid {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl std::fmt::Debug for QuicCid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_slice())
+    }
+}
+
 /// ngx_quic_header_t. The packet read is `raw` (the UDP datagram) from
 /// `data` for `len` bytes; the parser moves `raw_pos` (pkt->raw->pos)
-/// along it. The connection ids and the token are copies.
+/// along it. The connection ids are held inline, the token is a copy.
 #[derive(Default)]
 pub struct QuicHeader<'a> {
     pub log: Option<Log>,
@@ -386,11 +452,14 @@ pub struct QuicHeader<'a> {
     pub len: usize,
 
     /* cleartext fields */
-    pub odcid: Vec<u8>, /* retry packet tag */
-    pub dcid: Vec<u8>,
-    pub scid: Vec<u8>,
+    pub odcid: QuicCid, /* retry packet tag */
+    pub dcid: QuicCid,
+    pub scid: QuicCid,
     pub pn: u64,
     pub payload: Vec<u8>, /* decrypted data */
+    /// the part of `payload` which is the payload, if not all of it (the
+    /// plaintext buffer of a packet read holds its header before it)
+    pub payload_range: Option<(usize, usize)>,
 
     pub need_ack: bool,
     pub key_phase: bool,
@@ -407,6 +476,14 @@ pub struct QuicHeader<'a> {
 impl<'a> QuicHeader<'a> {
     pub fn log(&self) -> &Log {
         self.log.as_ref().expect("pkt log")
+    }
+
+    /// pkt->payload
+    pub fn payload(&self) -> &[u8] {
+        match self.payload_range {
+            Some((pos, end)) => &self.payload[pos..end],
+            None => &self.payload,
+        }
     }
 }
 
@@ -602,7 +679,7 @@ fn ngx_quic_parse_short_header(pkt: &mut QuicHeader<'_>, dcid_len: usize) -> i64
         }
     };
 
-    pkt.dcid = pkt.raw[r.0..r.1].to_vec();
+    pkt.dcid = QuicCid::new(&pkt.raw[r.0..r.1]);
 
     pkt.raw_pos = p;
 
@@ -660,7 +737,7 @@ fn ngx_quic_parse_long_header(pkt: &mut QuicHeader<'_>) -> i64 {
         }
     };
 
-    pkt.dcid = raw[r.0..r.1].to_vec();
+    pkt.dcid = QuicCid::new(&raw[r.0..r.1]);
 
     let p = match ngx_quic_read_uint8(raw, p, end, &mut idlen) {
         Some(p) => p,
@@ -683,7 +760,7 @@ fn ngx_quic_parse_long_header(pkt: &mut QuicHeader<'_>) -> i64 {
         }
     };
 
-    pkt.scid = raw[r.0..r.1].to_vec();
+    pkt.scid = QuicCid::new(&raw[r.0..r.1]);
 
     pkt.raw_pos = p;
 
@@ -846,6 +923,82 @@ pub fn ngx_quic_payload_size(pkt: &QuicHeader<'_>, pkt_len: usize) -> usize {
     pkt_len - len
 }
 
+/// ngx_quic_create_header of a packet of `payload_len` bytes of payload,
+/// written at the start of `out` (which has room for it, see
+/// ngx_quic_header_len()); the length and the offset of the packet number
+/// in it
+pub fn ngx_quic_create_header_into(pkt: &QuicHeader<'_>, payload_len: usize, out: &mut [u8]) -> (usize, usize) {
+    let mut w = SliceWriter { buf: out, pos: 0 };
+
+    w.push(pkt.flags);
+
+    if !ngx_quic_short_pkt(pkt.flags) {
+        let rem_len = pkt.num_len as usize + payload_len + NGX_QUIC_TAG_LEN;
+
+        w.extend(&pkt.version.to_be_bytes());
+
+        w.push(pkt.dcid.len() as u8);
+        w.extend(&pkt.dcid);
+
+        w.push(pkt.scid.len() as u8);
+        w.extend(&pkt.scid);
+
+        if pkt.level == NGX_QUIC_ENCRYPTION_INITIAL {
+            w.varint(0);
+        }
+
+        w.varint(rem_len as u64);
+    } else {
+        w.extend(&pkt.dcid);
+    }
+
+    let pnp = w.pos;
+
+    let trunc = pkt.trunc.to_be_bytes();
+
+    match pkt.num_len {
+        1..=4 => w.extend(&trunc[4 - pkt.num_len as usize..]),
+        _ => {}
+    }
+
+    (w.pos, pnp)
+}
+
+/// A cursor writing into a slice (C's u_char *p over a buffer).
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl SliceWriter<'_> {
+    fn push(&mut self, b: u8) {
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn extend(&mut self, data: &[u8]) {
+        self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
+        self.pos += data.len();
+    }
+
+    /// ngx_quic_build_int
+    fn varint(&mut self, value: u64) {
+        let (len, bits) = if value < (1 << 6) {
+            (1, 0u64)
+        } else if value < (1 << 14) {
+            (2, 1)
+        } else if value < (1 << 30) {
+            (4, 2)
+        } else {
+            (8, 3)
+        };
+
+        let v = (value | bits << (len * 8 - 2)).to_be_bytes();
+
+        self.extend(&v[8 - len..]);
+    }
+}
+
 /// ngx_quic_create_header: the header into `out`; the length and the
 /// offset of the packet number in it
 pub fn ngx_quic_create_header(pkt: &QuicHeader<'_>, out: &mut Vec<u8>) -> (usize, usize) {
@@ -862,7 +1015,7 @@ pub fn ngx_quic_header_len(pkt: &QuicHeader<'_>) -> usize {
         return 1 + pkt.dcid.len() + pkt.num_len as usize;
     }
 
-    let rem_len = pkt.num_len as usize + pkt.payload.len() + NGX_QUIC_TAG_LEN;
+    let rem_len = pkt.num_len as usize + pkt.payload().len() + NGX_QUIC_TAG_LEN;
 
     5 + 2 + pkt.dcid.len() + pkt.scid.len() + ngx_quic_varint_len(rem_len as u64) + pkt.num_len as usize + if pkt.level == NGX_QUIC_ENCRYPTION_INITIAL { 1 } else { 0 }
 }
@@ -879,7 +1032,7 @@ fn ngx_quic_write_pn(pkt: &QuicHeader<'_>, out: &mut Vec<u8>) {
 
 /// ngx_quic_create_long_header
 fn ngx_quic_create_long_header(pkt: &QuicHeader<'_>, out: &mut Vec<u8>) -> (usize, usize) {
-    let rem_len = pkt.num_len as usize + pkt.payload.len() + NGX_QUIC_TAG_LEN;
+    let rem_len = pkt.num_len as usize + pkt.payload().len() + NGX_QUIC_TAG_LEN;
 
     let start = out.len();
 
@@ -2025,6 +2178,62 @@ fn _silence(log: &Log) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_ids_inline() {
+        let a = QuicCid::new(b"0123456789");
+        let b = a;
+
+        assert_eq!(a.len(), 10);
+        assert_eq!(&a[..], b"0123456789");
+        assert!(a == b && a == b"0123456789".to_vec() && a == b"0123456789"[..]);
+        assert!(a != QuicCid::new(b"012345678"));
+        assert!(QuicCid::default().is_empty());
+
+        let max = [7u8; NGX_QUIC_CID_LEN_MAX];
+        assert_eq!(QuicCid::new(&max).as_slice(), &max);
+
+        // as keys: hashed as their bytes
+        let mut m = std::collections::HashMap::new();
+        m.insert(a, 1);
+        assert_eq!(m.get(&QuicCid::new(b"0123456789")), Some(&1));
+    }
+
+    #[test]
+    fn headers_into_slices() {
+        let long = |num_len: u8, level: usize, flags: u8| QuicHeader {
+            flags,
+            version: 1,
+            level,
+            dcid: QuicCid::new(b"destination-id"),
+            scid: QuicCid::new(b"src-id"),
+            num_len,
+            trunc: 0x01020304,
+            ..Default::default()
+        };
+
+        for num_len in 1..=4u8 {
+            for payload_len in [1usize, 40, 100, 20000] {
+                for pkt in [
+                    long(num_len, crate::quic::NGX_QUIC_ENCRYPTION_INITIAL, NGX_QUIC_PKT_FIXED_BIT | NGX_QUIC_PKT_LONG | NGX_QUIC_PKT_INITIAL),
+                    long(num_len, crate::quic::NGX_QUIC_ENCRYPTION_HANDSHAKE, NGX_QUIC_PKT_FIXED_BIT | NGX_QUIC_PKT_LONG | NGX_QUIC_PKT_HANDSHAKE),
+                    long(num_len, crate::quic::NGX_QUIC_ENCRYPTION_APPLICATION, NGX_QUIC_PKT_FIXED_BIT | 0x01),
+                ] {
+                    let pkt = QuicHeader { payload: vec![0; payload_len], ..pkt };
+
+                    let mut want = Vec::new();
+                    let (wlen, wpnp) = ngx_quic_create_header(&pkt, &mut want);
+
+                    let mut buf = [0xaau8; 128];
+                    let (len, pnp) = ngx_quic_create_header_into(&pkt, payload_len, &mut buf);
+
+                    assert_eq!((len, pnp), (wlen, wpnp));
+                    assert_eq!(&buf[..len], &want[..]);
+                    assert_eq!(len, ngx_quic_header_len(&pkt));
+                }
+            }
+        }
+    }
 
     #[test]
     fn varints_as_rfc9000() {

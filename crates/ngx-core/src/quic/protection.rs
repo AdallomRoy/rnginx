@@ -21,6 +21,7 @@ use crate::log::*;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
+use super::scratch::{self, Kind, Scratch};
 use super::transport::*;
 use super::{NGX_QUIC_ENCRYPTION_APPLICATION, NGX_QUIC_ENCRYPTION_LAST};
 
@@ -393,6 +394,7 @@ pub fn ngx_quic_crypto_init(cipher: &CipherRef, s: &mut QuicSecret, key: &QuicMd
 
 /// ngx_quic_crypto_open: the decrypted `input` (with the tag) appended to
 /// `out`
+#[cfg(test)]
 fn ngx_quic_crypto_open(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> i64 {
     ngx_quic_crypto_common(s, out, nonce, input, ad, log)
 }
@@ -405,9 +407,41 @@ pub fn ngx_quic_crypto_seal(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], inp
 
 /// ngx_quic_crypto_common
 fn ngx_quic_crypto_common(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> i64 {
+    let base = out.len();
+    out.resize(base + input.len() + NGX_QUIC_TAG_LEN, 0);
+
+    match ngx_quic_crypto_common_into(s, &mut out[base..], nonce, input, ad, log) {
+        Ok(n) => {
+            out.truncate(base + n);
+            NGX_OK
+        }
+
+        Err(()) => {
+            out.truncate(base);
+            NGX_ERROR
+        }
+    }
+}
+
+/// ngx_quic_crypto_seal into `out`, which has room for the encrypted
+/// `input` and the tag: their length
+pub fn ngx_quic_crypto_seal_into(s: &QuicSecret, out: &mut [u8], nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> Result<usize, ()> {
+    ngx_quic_crypto_common_into(s, out, nonce, input, ad, log)
+}
+
+/// ngx_quic_crypto_open into `out`, which has room for the decrypted
+/// `input` (less the tag): its length
+fn ngx_quic_crypto_open_into(s: &QuicSecret, out: &mut [u8], nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> Result<usize, ()> {
+    ngx_quic_crypto_common_into(s, out, nonce, input, ad, log)
+}
+
+/// ngx_quic_crypto_common, the result written at the start of `out`
+/// (the AEAD ciphers work by the byte: the output is the input's length,
+/// and the tag when sealing): its length
+fn ngx_quic_crypto_common_into(s: &QuicSecret, out: &mut [u8], nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> Result<usize, ()> {
     let ctx = match &s.ctx {
         Some(ctx) => ctx,
-        None => return NGX_ERROR,
+        None => return Err(()),
     };
 
     let enc = ctx.enc;
@@ -415,14 +449,14 @@ fn ngx_quic_crypto_common(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], input
 
     if let Err(e) = cipher_init(&mut evp, None, None, Some(nonce), enc) {
         ssl_error(e, log, format_args!("EVP_CipherInit_ex() failed"));
-        return NGX_ERROR;
+        return Err(());
     }
 
     let mut input = input;
 
     if !enc {
         if input.len() < NGX_QUIC_TAG_LEN {
-            return NGX_ERROR;
+            return Err(());
         }
 
         let (data, tag) = input.split_at(input.len() - NGX_QUIC_TAG_LEN);
@@ -430,56 +464,54 @@ fn ngx_quic_crypto_common(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], input
 
         if let Err(e) = evp.set_tag(tag) {
             ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) failed"));
-            return NGX_ERROR;
+            return Err(());
         }
     }
 
     if ctx.ccm {
         if let Err(e) = evp.set_data_len(input.len()) {
             ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
-            return NGX_ERROR;
+            return Err(());
         }
     }
 
     if let Err(e) = evp.cipher_update(ad, None) {
         ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
-        return NGX_ERROR;
+        return Err(());
     }
 
-    let base = out.len();
-    out.resize(base + input.len() + NGX_QUIC_TAG_LEN + 16, 0);
+    let need = input.len() + if enc { NGX_QUIC_TAG_LEN } else { 0 };
 
-    let mut olen = match evp.cipher_update(input, Some(&mut out[base..])) {
+    if out.len() < need {
+        return Err(());
+    }
+
+    let mut olen = match evp.cipher_update(input, Some(&mut out[..input.len()])) {
         Ok(n) => n,
         Err(e) => {
             ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
-            out.truncate(base);
-            return NGX_ERROR;
+            return Err(());
         }
     };
 
-    match evp.cipher_final(&mut out[base + olen..]) {
+    match evp.cipher_final(&mut out[olen..]) {
         Ok(n) => olen += n,
         Err(e) => {
             ssl_error(e, log, format_args!("EVP_CipherFinal_ex failed"));
-            out.truncate(base);
-            return NGX_ERROR;
+            return Err(());
         }
     }
 
     if enc {
-        if let Err(e) = evp.tag(&mut out[base + olen..base + olen + NGX_QUIC_TAG_LEN]) {
+        if let Err(e) = evp.tag(&mut out[olen..olen + NGX_QUIC_TAG_LEN]) {
             ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_GET_TAG) failed"));
-            out.truncate(base);
-            return NGX_ERROR;
+            return Err(());
         }
 
         olen += NGX_QUIC_TAG_LEN;
     }
 
-    out.truncate(base + olen);
-
-    NGX_OK
+    Ok(olen)
 }
 
 /// ngx_quic_crypto_cleanup
@@ -751,10 +783,31 @@ pub fn ngx_quic_keys_cleanup(keys: &mut QuicKeys) {
 
 /// ngx_quic_create_packet: the protected packet appended to `res`
 fn ngx_quic_create_packet(pkt: &QuicHeader<'_>, keys: &QuicKeys, res: &mut Vec<u8>) -> i64 {
-    let log = pkt.log();
     let base = res.len();
+    let payload = pkt.payload();
 
-    let (ad_len, pnp) = ngx_quic_create_header(pkt, res);
+    res.resize(base + ngx_quic_header_len_of(pkt, payload.len()) + payload.len() + NGX_QUIC_TAG_LEN, 0);
+
+    match ngx_quic_create_packet_into(pkt, keys, payload, &mut res[base..]) {
+        Ok(n) => {
+            res.truncate(base + n);
+            NGX_OK
+        }
+
+        Err(()) => {
+            res.truncate(base);
+            NGX_ERROR
+        }
+    }
+}
+
+/// ngx_quic_create_packet of `payload`, written at the start of `out` (C's
+/// res->data): the header, the protected payload behind it (sealed with
+/// the header as associated data, read where it was written); the length
+fn ngx_quic_create_packet_into(pkt: &QuicHeader<'_>, keys: &QuicKeys, payload: &[u8], out: &mut [u8]) -> Result<usize, ()> {
+    let log = pkt.log();
+
+    let (ad_len, pnp) = ngx_quic_create_header_into(pkt, payload.len(), out);
 
     let secret = &keys.secrets[pkt.level].server;
 
@@ -762,29 +815,54 @@ fn ngx_quic_create_packet(pkt: &QuicHeader<'_>, keys: &QuicKeys, res: &mut Vec<u
     nonce[..secret.iv.len].copy_from_slice(&secret.iv.data[..secret.iv.len]);
     ngx_quic_compute_nonce(&mut nonce, pkt.number);
 
-    let ad = res[base..base + ad_len].to_vec();
+    let (ad, rest) = out.split_at_mut(ad_len);
 
-    if ngx_quic_crypto_seal(secret, res, &nonce, &pkt.payload, &ad, log) != NGX_OK {
-        res.truncate(base);
-        return NGX_ERROR;
-    }
+    let n = ngx_quic_crypto_seal_into(secret, &mut rest[..payload.len() + NGX_QUIC_TAG_LEN], &nonce, payload, ad, log)?;
 
-    let sample = base + ad_len + 4 - pkt.num_len as usize;
+    let sample = ad_len + 4 - pkt.num_len as usize;
     let mut mask = [0u8; 32];
 
-    if ngx_quic_crypto_hp(secret, &mut mask, &res[sample..sample + 16], log) != NGX_OK {
-        res.truncate(base);
-        return NGX_ERROR;
+    if ngx_quic_crypto_hp(secret, &mut mask, &out[sample..sample + 16], log) != NGX_OK {
+        return Err(());
     }
 
     /* RFC 9001, 5.4.1.  Header Protection Application */
-    res[base] ^= mask[0] & ngx_quic_pkt_hp_mask(pkt.flags);
+    out[0] ^= mask[0] & ngx_quic_pkt_hp_mask(pkt.flags);
 
     for i in 0..pkt.num_len as usize {
-        res[base + pnp + i] ^= mask[i + 1];
+        out[pnp + i] ^= mask[i + 1];
     }
 
-    NGX_OK
+    Ok(ad_len + n)
+}
+
+/// The length of the header of a packet of `payload_len` bytes of
+/// payload.
+fn ngx_quic_header_len_of(pkt: &QuicHeader<'_>, payload_len: usize) -> usize {
+    if ngx_quic_short_pkt(pkt.flags) {
+        return 1 + pkt.dcid.len() + pkt.num_len as usize;
+    }
+
+    let rem_len = pkt.num_len as usize + payload_len + NGX_QUIC_TAG_LEN;
+
+    5 + 2 + pkt.dcid.len() + pkt.scid.len() + ngx_quic_varint_len(rem_len as u64) + pkt.num_len as usize + if pkt.level == super::NGX_QUIC_ENCRYPTION_INITIAL { 1 } else { 0 }
+}
+
+/// ngx_quic_encrypt of a packet (not a Retry one) of `payload`, written
+/// at the start of `out`, which has room for it: its length
+pub fn ngx_quic_encrypt_into(pkt: &QuicHeader<'_>, payload: &[u8], out: &mut [u8]) -> Result<usize, ()> {
+    let keys = match &pkt.keys {
+        Some(k) => k.clone(),
+        None => return Err(()),
+    };
+
+    let keys = keys.borrow();
+
+    if out.len() < ngx_quic_header_len_of(pkt, payload.len()) + payload.len() + NGX_QUIC_TAG_LEN {
+        return Err(());
+    }
+
+    ngx_quic_create_packet_into(pkt, &keys, payload, out)
 }
 
 /// ngx_quic_create_retry_packet: the Retry packet appended to `res`
@@ -1003,13 +1081,23 @@ pub fn ngx_quic_decrypt(pkt: &mut QuicHeader<'_>, largest_pn: &mut u64) -> i64 {
 
     let input = &raw[p..p + len - pnl];
 
-    let mut ad = raw[pkt.data..p].to_vec();
-    ad[0] = pkt.flags;
+    // pkt->plaintext, the worker's buffer: the header (the associated
+    // data, unprotected) and the payload decrypted behind it; it goes back
+    // to the worker once the packet is handled (ngx_quic_handle_datagram)
+    let ad_len = p - pkt.data;
 
-    let ad_len = ad.len();
+    let mut plain = Scratch::take(Kind::Plain).take_vec();
+
+    if ad_len + input.len() > plain.len() {
+        scratch::give_back(Kind::Plain, plain);
+        return NGX_DECLINED;
+    }
+
+    plain[..ad_len].copy_from_slice(&raw[pkt.data..p]);
+    plain[0] = pkt.flags;
 
     loop {
-        ad[ad_len - pnl] = (pn >> (8 * (pnl - 1))) as u8;
+        plain[ad_len - pnl] = (pn >> (8 * (pnl - 1))) as u8;
 
         pnl -= 1;
         if pnl == 0 {
@@ -1021,15 +1109,20 @@ pub fn ngx_quic_decrypt(pkt: &mut QuicHeader<'_>, largest_pn: &mut u64) -> i64 {
     nonce[..secret.iv.len].copy_from_slice(&secret.iv.data[..secret.iv.len]);
     ngx_quic_compute_nonce(&mut nonce, pn);
 
-    let mut payload = Vec::with_capacity(input.len());
+    let (ad, out) = plain.split_at_mut(ad_len);
 
-    if ngx_quic_crypto_open(secret, &mut payload, &nonce, input, &ad, &log) != NGX_OK {
-        return NGX_DECLINED;
-    }
+    let n = match ngx_quic_crypto_open_into(secret, out, &nonce, input, ad, &log) {
+        Ok(n) => n,
+        Err(()) => {
+            scratch::give_back(Kind::Plain, plain);
+            return NGX_DECLINED;
+        }
+    };
 
-    pkt.payload = payload;
+    pkt.payload = plain;
+    pkt.payload_range = Some((ad_len, ad_len + n));
 
-    if pkt.payload.is_empty() {
+    if pkt.payload().is_empty() {
         // RFC 9000, 12.4.  Frames and Frame Types
         //
         // An endpoint MUST treat receipt of a packet containing no
@@ -1393,8 +1486,8 @@ mod tests {
             flags: NGX_QUIC_PKT_FIXED_BIT | NGX_QUIC_PKT_LONG | NGX_QUIC_PKT_INITIAL | 0x01,
             version: 1,
             level: super::super::NGX_QUIC_ENCRYPTION_INITIAL,
-            dcid: vec![],
-            scid: unhex("f067a5502a4262b5"),
+            dcid: QuicCid::default(),
+            scid: QuicCid::new(&unhex("f067a5502a4262b5")),
             number: 1,
             num_len: 2,
             trunc: 1,
@@ -1459,7 +1552,7 @@ mod tests {
         assert_eq!(ngx_quic_decrypt(&mut rpkt, &mut largest), NGX_OK);
         assert_eq!(rpkt.pn, 1);
         assert_eq!(largest, 1);
-        assert_eq!(rpkt.payload, pkt.payload);
+        assert_eq!(rpkt.payload(), pkt.payload());
     }
 
     fn ngx_quic_read_uint32_pub(buf: &[u8], pos: usize, v: &mut u32) -> usize {
@@ -1474,9 +1567,9 @@ mod tests {
             log: Some(log()),
             flags: NGX_QUIC_PKT_FIXED_BIT | NGX_QUIC_PKT_LONG | NGX_QUIC_PKT_RETRY | 0x0f,
             version: 1,
-            odcid: unhex("8394c8f03e515708"),
-            dcid: vec![],
-            scid: unhex("f067a5502a4262b5"),
+            odcid: QuicCid::new(&unhex("8394c8f03e515708")),
+            dcid: QuicCid::default(),
+            scid: QuicCid::new(&unhex("f067a5502a4262b5")),
             token: b"token".to_vec(),
             ..Default::default()
         };
@@ -1511,7 +1604,7 @@ mod tests {
             keys: Some(Rc::new(std::cell::RefCell::new(keys))),
             flags: 0x42,
             level: NGX_QUIC_ENCRYPTION_APPLICATION,
-            dcid: vec![],
+            dcid: QuicCid::default(),
             number: 654360564,
             num_len: 3,
             trunc: 654360564 & 0xffffff,
