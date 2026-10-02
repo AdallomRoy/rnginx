@@ -25,9 +25,13 @@ pub fn foo_module() -> ModuleDef {
     http_module_def("ngx_http_foo_module", def, commands)
 }
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(handler(r))));  // or ACCESS/PREACCESS/PRECONTENT/REWRITE...
-    install_header_filter(|r, next| async move { ... next(r).await });          // header filter
-    install_body_filter(|r, chain, next| async move { ... next(r, chain).await }); // body filter
+    // or ACCESS/PREACCESS/PRECONTENT/REWRITE...; phase_handler(idle, async_fn) for an async handler
+    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler_fn(handler)); // fn(R) -> Step
+    install_header_filter(|r, next| async move { ... next(r).await });          // header filter (async)
+    install_body_filter(|r, chain, next| async move { ... next(r, chain).await }); // body filter (async)
+    // plain filters: install_header_filter_fn(fn(R, &HeaderFilter) -> Step) and
+    // install_body_filter_fn(fn(R, Chain, &BodyFilter) -> Step) return next's Step,
+    // Step::boxed(async move { ... }) only where they have to wait
     Ok(())
 }
 ```
