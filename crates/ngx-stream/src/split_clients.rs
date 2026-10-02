@@ -30,8 +30,9 @@ pub struct SplitClientsCtx {
     pub parts: Vec<SplitClientsPart>,
 }
 
-/// The contexts of the split_clients blocks, the variables' data point to
-/// them (the configuration pool in C; the C module has no main conf).
+/// The contexts of the split_clients blocks (the configuration pool in C;
+/// the C module has no main conf): the variables' data is the index of
+/// their context.
 #[derive(Default)]
 pub struct SplitClientsMainConf {
     pub ctxs: Vec<Rc<SplitClientsCtx>>,
@@ -81,9 +82,8 @@ pub fn murmur_hash2(data: &[u8]) -> u32 {
 
 /// ngx_stream_split_clients_variable
 fn split_clients_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
-    // data is Rc::as_ptr() of a SplitClientsCtx kept alive by the module's
-    // main conf of the configuration the session uses
-    let ctx = unsafe { &*(data as *const SplitClientsCtx) };
+    // data: the index of the context in the module's main conf
+    let ctx = s.main_conf::<SplitClientsMainConf>(ctx_index()).borrow().ctxs[data].clone();
 
     *v = null_value();
 
@@ -166,10 +166,12 @@ fn split_clients_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>)
 
     let ctx = Rc::new(SplitClientsCtx { value: cv, parts });
 
-    var.data.set(Rc::as_ptr(&ctx) as usize);
-
     let mcf = conf_rc::<SplitClientsMainConf>(conf.as_ref().expect("split_clients conf"));
-    mcf.borrow_mut().ctxs.push(ctx);
+    let mut m = mcf.borrow_mut();
+
+    var.data.set(m.ctxs.len());
+
+    m.ctxs.push(ctx);
 
     Ok(())
 }

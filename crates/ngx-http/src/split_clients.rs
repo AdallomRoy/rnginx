@@ -71,8 +71,21 @@ pub struct SplitClientsCtx {
     pub parts: RefCell<Vec<SplitClientsPart>>,
 }
 
+/// The contexts of the "split_clients" blocks (the configuration pool in
+/// C; the C module has no main conf): the variables' data is the index of
+/// their context.
+#[derive(Default)]
+pub struct SplitClientsMainConf {
+    pub ctxs: Vec<Rc<SplitClientsCtx>>,
+}
+
+fn split_clients_create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
+    make_slot(SplitClientsMainConf::default())
+}
+
 fn split_clients_variable(r: &R, v: &mut VariableValue, data: usize) -> i64 {
-    let ctx = unsafe { &*(data as *const SplitClientsCtx) };
+    // data: the index of the context in the module's main conf
+    let ctx = r.main_conf::<SplitClientsMainConf>(ctx_index()).borrow().ctxs[data].clone();
 
     v.valid = true;
     v.not_found = false;
@@ -141,9 +154,7 @@ fn split_clients_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
     let percent_str = &args[0];
     let value = &args[1];
 
-    let ctx_ptr = *conf.downcast_ref::<usize>()
-        .ok_or_else(|| msg("invalid conf"))?;
-    let ctx = unsafe { &*(ctx_ptr as *const SplitClientsCtx) };
+    let ctx = conf.downcast::<SplitClientsCtx>().map_err(|_| msg("invalid conf"))?;
 
     let percent = if percent_str == b"*" {
         0u32
@@ -167,7 +178,7 @@ fn split_clients_item_handler(cf: &mut Conf, conf: Rc<dyn Any>) -> ConfResult {
     Ok(())
 }
 
-fn split_clients_directive(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> ConfResult {
+fn split_clients_directive(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResult {
     let args = cf.args.clone();
     if args.len() < 3 {
         return Err(msg("requires at least 2 arguments"));
@@ -182,18 +193,25 @@ fn split_clients_directive(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn A
 
     let var = add_variable(cf, &var_name[1..], NGX_HTTP_VAR_CHANGEABLE)?;
 
-    let ctx = Box::leak(Box::new(SplitClientsCtx {
+    let ctx = Rc::new(SplitClientsCtx {
         cv,
         parts: RefCell::new(Vec::new()),
-    }));
+    });
+
+    let index = {
+        let mcf = conf_rc::<SplitClientsMainConf>(conf.as_ref().ok_or_else(|| msg("no conf"))?);
+        let mut m = mcf.borrow_mut();
+        m.ctxs.push(ctx.clone());
+        m.ctxs.len() - 1
+    };
 
     var.get_handler.set(Some(split_clients_variable));
-    var.data.set(ctx as *const _ as usize);
+    var.data.set(index);
 
     let saved_h = cf.handler.take();
     let saved_hc = cf.handler_conf.take();
     cf.handler = Some(split_clients_item_handler);
-    cf.handler_conf = Some(Rc::new(ctx as *const _ as usize));
+    cf.handler_conf = Some(ctx.clone() as Rc<dyn Any>);
 
     cf.parse_block()?;
 
@@ -225,6 +243,7 @@ fn split_clients_directive(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn A
 
 pub fn split_clients_module() -> ModuleDef {
     let def = HttpModuleDef {
+        create_main_conf: Some(split_clients_create_main_conf),
         ..Default::default()
     };
     let commands = vec![

@@ -220,12 +220,12 @@ pub fn cycle_main_conf<T: 'static>(cycle: &ngx_core::cycle::Cycle, idx: fn() -> 
     Some(get_conf::<T>(ctx, ConfLevel::Main, idx()))
 }
 
-fn stream_modules(modules: &Rc<Vec<Module>>) -> Vec<(usize, &'static StreamModuleDef)> {
+/// The stream modules and their contexts, borrowed from the module table
+/// (a clone of the cycle's Rc, alive while the block is parsed).
+fn stream_modules(modules: &[Module]) -> Vec<(usize, &StreamModuleDef)> {
     let mut v = Vec::new();
     for m in modules.iter().filter(|m| m.def.ty == NGX_STREAM_MODULE) {
         if let Some(d) = m.ctx::<StreamModuleDef>() {
-            // modules live for the whole process (held by the cycle)
-            let d: &'static StreamModuleDef = unsafe { &*(d as *const StreamModuleDef) };
             v.push((m.ctx_index, d));
         }
     }
