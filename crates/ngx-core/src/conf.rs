@@ -814,8 +814,6 @@ fn read_token_impl(cf: &mut ConfFile, b: &[u8], args: &mut Vec<Vec<u8>>) -> Resu
     }
 }
 
-use std::os::unix::ffi::OsStrExt;
-
 // ---------------------------------------------------------------------------
 // Generic slot setters (ngx_conf_set_*_slot).
 

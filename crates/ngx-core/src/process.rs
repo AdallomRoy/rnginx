@@ -1628,9 +1628,12 @@ mod tests {
     fn signal_notices() {
         let (log, l) = capture();
 
-        // not init_signals(): ngx_parent is the one of another test
+        // SIGUSR1 only (Ctrl-C still stops the tests), and not by
+        // init_signals(): ngx_parent is the one of another test
         PROCESS_KIND.store(3, Ordering::Relaxed);
-        register_signals(&log).unwrap();
+        let delivery = new_delivery().unwrap();
+        register_signal(&delivery, libc::SIGUSR1).unwrap();
+        DELIVERY.with(|d| *d.borrow_mut() = Some(delivery));
 
         // a worker: SIGUSR1 sets ngx_reopen in the handler (which may run in
         // another thread of the test)
