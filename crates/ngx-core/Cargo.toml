@@ -23,7 +23,6 @@ socket2.workspace = true
 mmap-rs.workspace = true
 zerocopy.workspace = true
 signal-hook = { workspace = true, features = ["extended-siginfo"] }
-chrono.workspace = true
 pwhash.workspace = true
 blowfish.workspace = true
 vm-memory.workspace = true

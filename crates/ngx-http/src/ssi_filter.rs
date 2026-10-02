@@ -24,7 +24,7 @@ use crate::request::*;
 use crate::variables::*;
 use crate::*;
 
-mod libc_time;
+use ngx_core::libc_time;
 
 crate::http_module_index!("ngx_http_ssi_filter_module");
 
@@ -2259,7 +2259,7 @@ fn ssi_date_gmt_local_variable(r: &R, v: &mut VariableValue, gmt: usize) -> i64 
 
     // ngx_libc_gmtime(), ngx_libc_localtime(): they ignore a failure,
     // which needs a year beyond an int
-    let tm = if gmt != 0 { libc_time::gmtime(now) } else { libc_time::localtime(now) };
+    let tm = if gmt != 0 { libc_time::gmtime(now) } else { libc_time::localtime_r(now) };
     let tm = tm.unwrap_or_default();
 
     v.data = libc_time::strftime(NGX_HTTP_SSI_DATE_LEN, &fmt, &tm);

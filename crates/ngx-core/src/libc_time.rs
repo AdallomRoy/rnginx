@@ -1,16 +1,16 @@
-//! The gmtime_r(), localtime_r(), mktime() and strftime() of glibc 2.35 in
-//! the C locale, which ngx_http_ssi_date_gmt_local_variable() uses for the
-//! "timefmt" of $date_local and $date_gmt.  The time zone is glibc's: the
-//! TZ variable (a TZif file, or a POSIX TZ string, with the "posixrules"
-//! file for the strings without rules), /etc/localtime by default, UTC
-//! without it (tzset.c, tzfile.c); %Z needs the abbreviation of the zone,
-//! which chrono does not give.  Leap seconds of the "right/" zones are
-//! applied as glibc applies them.
+//! The gmtime_r(), localtime_r(), localtime(), mktime() and strftime() of
+//! glibc 2.35 in the C locale: the local time of the error log, $time_local
+//! and the like (ngx_times.c), ngx_next_time(), and the "timefmt" of SSI's
+//! $date_local and $date_gmt.  The time zone is glibc's: the TZ variable (a
+//! TZif file, or a POSIX TZ string, with the "posixrules" file for the
+//! strings without rules), /etc/localtime by default, UTC without it
+//! (tzset.c, tzfile.c); %Z needs the abbreviation of the zone.  Leap
+//! seconds of the "right/" zones are applied as glibc applies them.
 //!
-//! glibc reads the zone once (localtime_r() initializes it, nginx's
-//! ngx_timezone_update() rereads it at each configuration); here the TZ
-//! variable and the file are checked at each call, the file reread when
-//! it changed.
+//! As in glibc, localtime_r() and gmtime_r() read the zone once (the first
+//! call), localtime(), mktime() and tzset() check the TZ variable and the
+//! file again (tzset_internal(always)), reread when they changed: nginx's
+//! ngx_timezone_update() calls localtime() at each configuration.
 
 use std::cell::RefCell;
 use std::os::unix::ffi::OsStrExt;
@@ -790,8 +790,20 @@ fn tzfile_default(rules: &[TzRule; 2]) -> Option<TzFile> {
     Some(f)
 }
 
-/// tzset_internal(): the zone of the TZ variable, cached
-fn tzset() -> Rc<Zone> {
+/// tzset(): the zone of the TZ variable read again if it changed
+pub fn tzset() {
+    tzset_internal(true);
+}
+
+/// tzset_internal(): the zone of the TZ variable, cached; unless `always`,
+/// the cached zone as it is
+fn tzset_internal(always: bool) -> Rc<Zone> {
+    if !always {
+        if let Some(zone) = CACHE.with(|c| c.borrow().as_ref().map(|c| c.zone.clone())) {
+            return zone;
+        }
+    }
+
     let tz: Option<Vec<u8>> = std::env::var_os("TZ").map(|v| {
         let v = v.as_bytes();
 
@@ -1020,9 +1032,9 @@ fn leap_correction(f: &TzFile, timer: i64) -> (i64, i32) {
     (correct, hit)
 }
 
-/// __tz_convert()
-fn tz_convert(timer: i64, use_localtime: bool) -> Option<Tm> {
-    let zone = tzset();
+/// __tz_convert(): `always` as the call of tzset_internal() it makes
+fn tz_convert(timer: i64, use_localtime: bool, always: bool) -> Option<Tm> {
+    let zone = tzset_internal(always);
     let mut tm = Tm::default();
 
     let (leap_correction, leap_extra_secs) = match &*zone {
@@ -1056,14 +1068,19 @@ fn tz_convert(timer: i64, use_localtime: bool) -> Option<Tm> {
     Some(tm)
 }
 
-/// localtime_r()
+/// localtime_r(): the zone as it was read first
+pub fn localtime_r(t: i64) -> Option<Tm> {
+    tz_convert(t, true, false)
+}
+
+/// localtime(): the zone read again if it changed
 pub fn localtime(t: i64) -> Option<Tm> {
-    tz_convert(t, true)
+    tz_convert(t, true, true)
 }
 
 /// gmtime_r()
 pub fn gmtime(t: i64) -> Option<Tm> {
-    tz_convert(t, false)
+    tz_convert(t, false, false)
 }
 
 /// shr() of mktime.c
@@ -1097,17 +1114,30 @@ fn isdst_differ(a: i32, b: i32) -> bool {
     ((a == 0) != (b == 0)) && 0 <= a && 0 <= b
 }
 
-/// mktime(): the time of the broken-down local time (__mktime_internal()
-/// with localtime), -1 if there is none.  The fields are normalized as C
-/// does, the result is the time only (strftime() uses a copy).
-fn mktime(tp: &Tm) -> i64 {
+/// mktime(): the time of the broken-down local time, -1 if there is none;
+/// *tp normalized as C does (the zone checked by tzset() first, then
+/// __mktime_internal() with localtime_r)
+pub fn mktime(tp: &mut Tm) -> i64 {
+    tzset();
+
+    match mktime_internal(tp) {
+        Some((t, tm)) => {
+            *tp = tm;
+            t
+        }
+        None => -1,
+    }
+}
+
+/// __mktime_internal(): the time and its broken-down local time
+fn mktime_internal(tp: &Tm) -> Option<(i64, Tm)> {
     const EPOCH_YEAR: i64 = 1970;
     const TM_YEAR_BASE: i64 = 1900;
 
     // the conversion with the range checks of ranged_convert(): localtime
     // fails only when the year overflows an int, far outside the times
     // this is used for
-    let convert = |t: i64| localtime(t);
+    let convert = |t: i64| localtime_r(t);
 
     let mut remaining_probes = 6;
 
@@ -1156,7 +1186,7 @@ fn mktime(tp: &Tm) -> i64 {
     loop {
         tm = match convert(t) {
             Some(tm) => tm,
-            None => return -1,
+            None => return None,
         };
 
         let dt = tm_diff(&tm);
@@ -1168,13 +1198,13 @@ fn mktime(tp: &Tm) -> i64 {
         if t == t1 && t != t2 && (tm.isdst < 0 || if isdst < 0 { dst2 <= (tm.isdst != 0) } else { (isdst != 0) != (tm.isdst != 0) }) {
             // We can't possibly find a match, as we are oscillating
             // between two values.
-            return offset_found(t, t0, negative_offset_guess, sec, sec_requested, &tm);
+            return offset_found(t, t0, negative_offset_guess, sec, sec_requested, tm);
         }
 
         remaining_probes -= 1;
 
         if remaining_probes == 0 {
-            return -1;
+            return None;
         }
 
         t1 = t2;
@@ -1199,7 +1229,7 @@ fn mktime(tp: &Tm) -> i64 {
                 if let Some(ot) = t.checked_add(delta * direction) {
                     let otm = match convert(ot) {
                         Some(otm) => otm,
-                        None => return -1,
+                        None => return None,
                     };
 
                     if !isdst_differ(isdst, otm.isdst) {
@@ -1208,7 +1238,7 @@ fn mktime(tp: &Tm) -> i64 {
                         let gt = ot + tm_diff(&otm);
 
                         if let Some(gtm) = convert(gt) {
-                            return offset_found(gt, t0, negative_offset_guess, sec, sec_requested, &gtm);
+                            return offset_found(gt, t0, negative_offset_guess, sec, sec_requested, gtm);
                         }
                     }
                 }
@@ -1217,14 +1247,14 @@ fn mktime(tp: &Tm) -> i64 {
             delta += stride;
         }
 
-        return -1;
+        return None;
     }
 
-    offset_found(t, t0, negative_offset_guess, sec, sec_requested, &tm)
+    offset_found(t, t0, negative_offset_guess, sec, sec_requested, tm)
 }
 
 /// The offset_found part of __mktime_internal()
-fn offset_found(mut t: i64, t0: i64, negative_offset_guess: i64, sec: i64, sec_requested: i64, tm: &Tm) -> i64 {
+fn offset_found(mut t: i64, t0: i64, negative_offset_guess: i64, sec: i64, sec_requested: i64, mut tm: Tm) -> Option<(i64, Tm)> {
     // Set *OFFSET to the low-order bits of T - T0 - NEGATIVE_OFFSET_GUESS.
     LOCALTIME_OFFSET.with(|o| *o.borrow_mut() = t.wrapping_sub(t0).wrapping_sub(negative_offset_guess));
 
@@ -1236,17 +1266,12 @@ fn offset_found(mut t: i64, t0: i64, negative_offset_guess: i64, sec: i64, sec_r
         sec_adjustment -= sec;
         sec_adjustment += sec_requested;
 
-        t = match t.checked_add(sec_adjustment) {
-            Some(t) => t,
-            None => return -1,
-        };
+        t = t.checked_add(sec_adjustment)?;
 
-        if localtime(t).is_none() {
-            return -1;
-        }
+        tm = localtime_r(t)?;
     }
 
-    t
+    Some((t, tm))
 }
 
 /// The names of the C locale (LC_TIME of glibc's C locale)
@@ -1550,7 +1575,8 @@ fn strftime_internal(p: &mut Vec<u8>, maxsize: usize, format: &[u8], tp: &Tm) ->
             b'r' => subfmt = Some(T_FMT_AMPM),
 
             b's' => {
-                let t = mktime(tp);
+                // mktime() of a copy of *tp
+                let t = mktime(&mut tp.clone());
 
                 // the digits of t, then the sign and padding
                 let digits = t.unsigned_abs().to_string().into_bytes();
@@ -1624,7 +1650,7 @@ fn strftime_internal(p: &mut Vec<u8>, maxsize: usize, format: &[u8], tp: &Tm) ->
 
                 // an empty tm_zone: tzname[tm_isdst] after tzset()
                 let zone: Vec<u8> = if tp.zone.is_empty() && tp.isdst >= 0 {
-                    match &*tzset() {
+                    match &*tzset_internal(true) {
                         Zone::Rules(rules) if tp.isdst <= 1 => rules[tp.isdst as usize].name.clone(),
                         Zone::File(file) if tp.isdst <= 1 => file_tzname(file, tp.isdst),
                         _ => b"?".to_vec(),

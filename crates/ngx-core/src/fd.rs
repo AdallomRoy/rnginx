@@ -90,12 +90,8 @@ pub fn register(fd: OwnedFd) -> RawFd {
 }
 
 /// The descriptor of the number `fd`: the table's, or std's for the
-/// standard descriptors 0, 1 and 2 when not registered.
-///
-/// A number the table does not have (a descriptor opened by code not
-/// converted to register() yet) is lent as a duplicate made by
-/// pidfd_getfd(): the same open file, so that options, writes and reads
-/// apply to it; EBADF if it is not open.
+/// standard descriptors 0, 1 and 2 when not registered; EBADF for a
+/// number the table does not have, as for a closed descriptor.
 pub fn get(fd: RawFd) -> io::Result<Fd> {
     if fd < 0 {
         return Err(ebadf());
@@ -109,7 +105,7 @@ pub fn get(fd: RawFd) -> io::Result<Fd> {
         0 => Ok(Fd(Inner::Stdin(std::io::stdin()))),
         1 => Ok(Fd(Inner::Stdout(std::io::stdout()))),
         2 => Ok(Fd(Inner::Stderr(std::io::stderr()))),
-        _ => duplicate(fd).map(|d| Fd(Inner::Owned(Arc::new(d)))),
+        _ => Err(ebadf()),
     }
 }
 
@@ -229,16 +225,12 @@ mod tests {
     fn standard_and_unregistered() {
         assert_eq!(get(2).unwrap().as_raw_fd(), 2);
 
-        let (r, w) = nix::unistd::pipe().unwrap();
+        // a descriptor the table does not own is not lent
+        let (_r, w) = nix::unistd::pipe().unwrap();
         let raw = w.into_raw_fd();
-        let h = get(raw).unwrap();
-        assert_ne!(h.as_raw_fd(), raw, "a duplicate");
-        assert_eq!(nix::unistd::write(&h, b"z").unwrap(), 1);
-        drop(h);
+        assert_eq!(get(raw).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
         let _ = nix::unistd::close(raw);
 
-        let mut buf = [0u8; 2];
-        assert_eq!(nix::unistd::read(r.as_raw_fd(), &mut buf).unwrap(), 1);
         assert_eq!(get(1 << 20).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
     }
 

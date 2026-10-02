@@ -76,21 +76,11 @@ pub fn http_cookie_time(t: i64) -> String {
     }
 }
 
-/// The offset of the local time from UTC at time `t`, in seconds
-/// (tm_gmtoff of localtime_r()); chrono's Local reads the zone as glibc
-/// does, from TZ or /etc/localtime.
-fn offset_at(t: i64) -> Option<i32> {
-    use chrono::{Offset, TimeZone};
-
-    let utc = chrono::DateTime::from_timestamp(t, 0)?;
-
-    Some(chrono::Local.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc())
-}
-
-/// Local timezone offset in minutes for time `t`.
+/// Local timezone offset in minutes for time `t` (tm_gmtoff of
+/// localtime_r(): the zone as glibc reads it, see libc_time.rs).
 pub fn gmtoff(t: i64) -> i64 {
-    match offset_at(t) {
-        Some(off) => (off / 60) as i64,
+    match crate::libc_time::localtime_r(t) {
+        Some(tm) => tm.gmtoff / 60,
         None => 0,
     }
 }
@@ -162,26 +152,15 @@ pub fn time() -> i64 {
     CACHED.with(|c| c.borrow().sec)
 }
 
-/// mktime() of a local time (its fields normalized): the time and its
-/// offset from UTC. `hint`, the offset of the tm_isdst given, picks one of
-/// the two times of a repeated hour, and is the offset of a time skipped by
-/// a change of offset.
-fn mktime(local: chrono::NaiveDateTime, hint: i32) -> Option<(i64, i32)> {
-    use chrono::{LocalResult, Offset, TimeZone};
+/// ngx_timezone_update(): the zone read again, as localtime() of glibc
+/// does on Linux; the cached time is rebuilt with it by the next update()
+/// (ngx_init_cycle() sets tp->sec to 0)
+pub fn timezone_update() {
+    let (sec, _) = now_raw();
 
-    let t = match chrono::Local.from_local_datetime(&local) {
-        LocalResult::Single(t) => t.timestamp(),
-        LocalResult::Ambiguous(a, b) => {
-            if b.offset().fix().local_minus_utc() == hint {
-                b.timestamp()
-            } else {
-                a.timestamp()
-            }
-        }
-        LocalResult::None => local.and_utc().timestamp() - hint as i64,
-    };
+    let _ = crate::libc_time::localtime(sec);
 
-    Some((t, offset_at(t)?))
+    CACHED.with(|c| c.borrow_mut().sec = 0);
 }
 
 /// ngx_next_time: the next moment `when` seconds after a local midnight
@@ -189,27 +168,36 @@ fn mktime(local: chrono::NaiveDateTime, hint: i32) -> Option<(i64, i32)> {
 pub fn next_time(when: i64) -> i64 {
     let now = time();
 
-    let next = || -> Option<i64> {
-        // localtime_r(now): the day, and its offset (as tm_isdst)
-        let local = chrono::DateTime::from_timestamp(now, 0)?.with_timezone(&chrono::Local);
-        let offset = offset_at(now)?;
-        let midnight = local.date_naive().and_hms_opt(0, 0, 0)?;
+    // ngx_libc_localtime() ignores a failure, which needs a year beyond
+    // an int
+    let mut tm = crate::libc_time::localtime_r(now).unwrap_or_default();
 
-        // tm_hour, tm_min and tm_sec of `when` that day, as mktime()
-        // normalizes them
-        let at = midnight.checked_add_signed(chrono::TimeDelta::try_seconds(when)?)?;
+    tm.hour = (when / 3600) as i32;
+    let when = when % 3600;
+    tm.min = (when / 60) as i32;
+    tm.sec = (when % 60) as i32;
 
-        let (next, offset) = mktime(at, offset)?;
+    let next = crate::libc_time::mktime(&mut tm);
 
-        if next - now > 0 {
-            return Some(next);
-        }
+    if next == -1 {
+        return -1;
+    }
 
-        // tm_mday + 1: mktime() normalizes a date (Jan 32, etc)
-        mktime(at.checked_add_signed(chrono::TimeDelta::try_days(1)?)?, offset).map(|(next, _)| next)
-    };
+    if next - now > 0 {
+        return next;
+    }
 
-    next().unwrap_or(-1)
+    tm.mday += 1;
+
+    // mktime() should normalize a date (Jan 32, etc)
+
+    let next = crate::libc_time::mktime(&mut tm);
+
+    if next != -1 {
+        return next;
+    }
+
+    -1
 }
 
 /// Current time in milliseconds since epoch (wall clock).

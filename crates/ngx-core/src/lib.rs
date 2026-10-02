@@ -18,6 +18,7 @@ pub mod json;
 pub mod json_parse;
 pub mod json_unescape;
 pub mod times;
+pub mod libc_time;
 
 pub const NGINX_VERSION: &str = "1.31.7";
 pub const NGINX_VER: &str = "nginx/1.31.7";

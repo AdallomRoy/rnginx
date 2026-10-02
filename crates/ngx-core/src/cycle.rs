@@ -432,6 +432,10 @@ pub struct InitHooks {
 
 /// ngx_init_cycle: build a new cycle from `old`.
 pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
+    crate::times::timezone_update();
+
+    // force localtime update with a new timezone
+
     crate::times::update();
     let log = old.log.clone();
     let modules = old.modules.clone();
