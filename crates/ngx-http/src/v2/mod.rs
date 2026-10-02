@@ -137,6 +137,13 @@ pub const NGX_HTTP_V2_VARY_INDEX: u8 = 59;
 /// it in place.
 pub type Handler = fn(&Rc<H2Connection>, &mut [u8], usize) -> Option<usize>;
 
+/// State::field_in: the last field read is in `field`
+pub const FIELD_IN_FIELD: u8 = 0;
+/// in header_name
+pub const FIELD_IN_NAME: u8 = 1;
+/// in header_value
+pub const FIELD_IN_VALUE: u8 = 2;
+
 /// ngx_http_v2_state_t
 pub struct State {
     pub sid: Cell<u32>,
@@ -157,6 +164,10 @@ pub struct State {
     pub field_state: Cell<u8>,
     /// The field being collected (C: field_start..field_end).
     pub field: RefCell<Vec<u8>>,
+    /// Where the last field read is (FIELD_IN_*): C's header name and
+    /// value point to it, here it is moved to header_name / header_value
+    /// rather than copied, and moved back before they are overwritten.
+    pub field_in: Cell<u8>,
     pub field_rest: Cell<usize>,
 
     pub stream: RefCell<Option<Rc<H2Stream>>>,
@@ -206,12 +217,63 @@ impl State {
             header_limit: Cell::new(0),
             field_state: Cell::new(0),
             field: RefCell::new(Vec::new()),
+            field_in: Cell::new(FIELD_IN_FIELD),
             field_rest: Cell::new(0),
             stream: RefCell::new(None),
             buffer: RefCell::new([0; NGX_HTTP_V2_STATE_BUFFER_SIZE]),
             buffer_used: Cell::new(0),
             handler: Cell::new(handler),
         }
+    }
+
+    /// A field is read into `field` (a new field_start, with room for
+    /// `size` bytes): the last field read from now on.
+    pub fn new_field(&self, size: usize) {
+        let mut field = self.field.borrow_mut();
+        field.clear();
+        field.reserve(size);
+        self.field_in.set(FIELD_IN_FIELD);
+    }
+
+    /// header->name (`value` false) or header->value = field_start..
+    /// field_end: the last field read, moved there.
+    pub fn take_field(&self, value: bool) {
+        let (dst, src, to, other) = if value {
+            (&self.header_value, &self.header_name, FIELD_IN_VALUE, FIELD_IN_NAME)
+        } else {
+            (&self.header_name, &self.header_value, FIELD_IN_NAME, FIELD_IN_VALUE)
+        };
+
+        match self.field_in.get() {
+            FIELD_IN_FIELD => {
+                std::mem::swap(&mut *self.field.borrow_mut(), &mut *dst.borrow_mut());
+                self.field_in.set(to);
+            }
+
+            // a field skipped after the one read (a refused stream): the
+            // name and the value are both the last field read
+            f if f == other => {
+                let mut dst = dst.borrow_mut();
+                dst.clear();
+                dst.extend_from_slice(&src.borrow());
+            }
+
+            _ => {}
+        }
+    }
+
+    /// header_name, and header_value unless `name_only`, are about to be
+    /// overwritten (by an indexed header): the last field read goes back
+    /// to `field` if it is in one of them.
+    pub fn keep_field(&self, name_only: bool) {
+        let from = match self.field_in.get() {
+            FIELD_IN_NAME => &self.header_name,
+            FIELD_IN_VALUE if !name_only => &self.header_value,
+            _ => return,
+        };
+
+        std::mem::swap(&mut *self.field.borrow_mut(), &mut *from.borrow_mut());
+        self.field_in.set(FIELD_IN_FIELD);
     }
 }
 
@@ -538,4 +600,63 @@ pub fn write_frame_head(dst: &mut Vec<u8>, len: usize, ty: u8, flags: u8, sid: u
     write_len_and_type(dst, len, ty);
     dst.push(flags);
     write_uint32(dst, sid);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st() -> State {
+        fn h(_: &Rc<H2Connection>, _: &mut [u8], pos: usize) -> Option<usize> {
+            Some(pos)
+        }
+        State::new(h)
+    }
+
+    fn read(s: &State, data: &[u8]) {
+        s.new_field(data.len());
+        s.field.borrow_mut().extend_from_slice(data);
+    }
+
+    fn header(s: &State) -> (Vec<u8>, Vec<u8>) {
+        (s.header_name.borrow().clone(), s.header_value.borrow().clone())
+    }
+
+    #[test]
+    fn fields_moved_not_copied() {
+        let s = st();
+
+        // a literal name and value: moved from `field`
+        read(&s, b"name");
+        let p = s.field.borrow().as_ptr();
+        s.take_field(false);
+        assert_eq!(s.header_name.borrow().as_ptr(), p);
+
+        read(&s, b"value");
+        s.take_field(true);
+        assert_eq!(header(&s), (b"name".to_vec(), b"value".to_vec()));
+        assert_eq!(s.field_in.get(), FIELD_IN_VALUE);
+
+        // skipped name and value (no field read): both the last field read
+        s.take_field(false);
+        s.take_field(true);
+        assert_eq!(header(&s), (b"value".to_vec(), b"value".to_vec()));
+
+        // an indexed header keeps the last field read for later skips
+        s.keep_field(false);
+        assert_eq!(s.field_in.get(), FIELD_IN_FIELD);
+        *s.header_name.borrow_mut() = b"idx".to_vec();
+        *s.header_value.borrow_mut() = b"idxv".to_vec();
+        s.take_field(false);
+        assert_eq!(&s.header_name.borrow()[..], b"value");
+
+        // an indexed name leaves the value, where the last field read is
+        read(&s, b"v2");
+        s.take_field(true);
+        s.keep_field(true);
+        assert_eq!(s.field_in.get(), FIELD_IN_VALUE);
+        *s.header_name.borrow_mut() = b"idx".to_vec();
+        s.take_field(false);
+        assert_eq!(header(&s), (b"v2".to_vec(), b"v2".to_vec()));
+    }
 }

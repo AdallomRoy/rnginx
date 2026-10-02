@@ -7,6 +7,7 @@
 //! connection's write event; send_chain() waits on the stream's notify.
 
 use std::io;
+use std::io::Write;
 use std::rc::Rc;
 
 use ngx_core::buf::{BufData, Chain};
@@ -110,7 +111,7 @@ async fn early_hints_filter(r: &R) -> i64 {
 
     pos.push(inc_indexed(NGX_HTTP_V2_STATUS_INDEX));
     pos.push(NGX_HTTP_V2_ENCODE_RAW | 3);
-    pos.extend_from_slice(format!("{:03}", NGX_HTTP_EARLY_HINTS).as_bytes());
+    let _ = write!(pos, "{:03}", NGX_HTTP_EARLY_HINTS);
 
     for (key, value) in headers.iter() {
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"{}: {}\"", B(&ngx_core::string::to_lower_vec(key)), B(value));
@@ -231,7 +232,7 @@ async fn header_filter(r: &R) -> i64 {
     } else {
         pos.push(inc_indexed(NGX_HTTP_V2_STATUS_INDEX));
         pos.push(NGX_HTTP_V2_ENCODE_RAW | 3);
-        pos.extend_from_slice(format!("{:03}", status_code).as_bytes());
+        let _ = write!(pos, "{:03}", status_code);
     }
 
     let (server_tokens, absolute_redirect, server_name_in_redirect, port_in_redirect) = {
@@ -295,19 +296,21 @@ async fn header_filter(r: &R) -> i64 {
 
             pos.push(inc_indexed(NGX_HTTP_V2_CONTENT_LENGTH_INDEX));
 
-            let v = ho.content_length_n.to_string();
-            pos.push(NGX_HTTP_V2_ENCODE_RAW | v.len() as u8);
-            pos.extend_from_slice(v.as_bytes());
+            let p = pos.len();
+            pos.push(0);
+            let _ = write!(pos, "{}", ho.content_length_n);
+            pos[p] = NGX_HTTP_V2_ENCODE_RAW | (pos.len() - p - 1) as u8;
         }
 
         if ho.last_modified.is_none() && ho.last_modified_time != -1 {
             pos.push(inc_indexed(NGX_HTTP_V2_LAST_MODIFIED_INDEX));
 
-            let t = ngx_core::times::http_time(ho.last_modified_time);
+            let mut tb = [0u8; 32];
+            let t = super::encode::http_time(&mut tb, ho.last_modified_time);
 
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"last-modified: {}\"", t);
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, fc.log, "http2 output header: \"last-modified: {}\"", B(t));
 
-            write_value(&mut pos, t.as_bytes());
+            write_value(&mut pos, t);
         }
     }
 

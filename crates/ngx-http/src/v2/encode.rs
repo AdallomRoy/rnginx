@@ -21,15 +21,48 @@ pub const fn inc_indexed(i: u8) -> u8 {
     64 + i
 }
 
+thread_local! {
+    /// The tmp buffer of C's header filters: the Huffman coding of a
+    /// string, before the length prefix is known. One for the worker,
+    /// taken by each string_encode() and given back, grown to the longest
+    /// string (never zero-filled again).
+    static TMP: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// The Huffman coding of `src` in `tmp` (len 0 when it is not shorter):
+/// huff_encode() into a buffer of the worker that holds the longest string
+/// seen, so no buffer is allocated per string.
+pub fn with_huff_encoded<T>(src: &[u8], lower: bool, f: impl FnOnce(&[u8]) -> T) -> T {
+    let mut tmp = TMP.try_with(|t| t.take()).unwrap_or_default();
+
+    if tmp.len() < src.len() {
+        tmp.resize(src.len(), 0);
+    }
+
+    let hlen = huff_encode(src, &mut tmp[..src.len()], lower);
+
+    let r = f(&tmp[..hlen]);
+
+    let _ = TMP.try_with(|t| t.set(tmp));
+
+    r
+}
+
 /// ngx_http_v2_string_encode: append `src` as an HPACK string literal,
 /// Huffman-coded when that is shorter; with `lower`, lowercased.
 pub fn string_encode(dst: &mut Vec<u8>, src: &[u8], lower: bool) {
-    let mut tmp = vec![0u8; src.len()];
-    let hlen = huff_encode(src, &mut tmp, lower);
+    let coded = with_huff_encoded(src, lower, |h| {
+        if h.is_empty() {
+            return false;
+        }
 
-    if hlen > 0 {
-        write_int(dst, NGX_HTTP_V2_ENCODE_HUFF, prefix(7), hlen);
-        dst.extend_from_slice(&tmp[..hlen]);
+        write_int(dst, NGX_HTTP_V2_ENCODE_HUFF, prefix(7), h.len());
+        dst.extend_from_slice(h);
+
+        true
+    });
+
+    if coded {
         return;
     }
 
@@ -40,6 +73,21 @@ pub fn string_encode(dst: &mut Vec<u8>, src: &[u8], lower: bool) {
     } else {
         dst.extend_from_slice(src);
     }
+}
+
+/// ngx_http_time() into `buf`: the bytes of ngx_core::times::http_time()
+/// ("Wed, 31 Dec 1986 18:00:00 GMT"), without a String.
+pub fn http_time(buf: &mut [u8; 32], t: i64) -> &[u8] {
+    use ngx_core::times::{gmtime, MONTHS, WEEK};
+    use std::io::Write;
+
+    let tm = gmtime(t);
+
+    let mut w = &mut buf[..];
+    let _ = write!(w, "{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT", WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec);
+    let n = 32 - w.len();
+
+    &buf[..n]
 }
 
 /// ngx_http_v2_write_name
