@@ -484,9 +484,9 @@ impl FastcgiModule {
 
         lowcase_key = if key.len() == self.pr.lowcase_index { self.pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
 
-        let h = TableElt::with_hash(&key, &value, hash, lowcase_key);
+        let h = crate::upstream_rt::upstream_header(key, value, hash, lowcase_key);
 
-        u.resp.headers.push(h.clone());
+        u.resp.push_header(h.clone());
 
         // hh->handler(r, h, hh->offset)
         if crate::upstream_rt::process_header_line(r, u, &h).is_err() {

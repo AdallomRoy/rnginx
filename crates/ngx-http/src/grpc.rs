@@ -1122,9 +1122,10 @@ impl GrpcModule {
                         return NGX_HTTP_UPSTREAM_INVALID_HEADER;
                     }
 
-                    let h = TableElt::with_hash(&name, &value, hash_key(&name), name.clone());
+                    let hash = hash_key(&name);
+                    let h = crate::upstream_rt::upstream_header(name.clone(), value, hash, name);
 
-                    u.resp.headers.push(h.clone());
+                    u.resp.push_header(h.clone());
 
                     if u.resp.status_n == NGX_HTTP_EARLY_HINTS {
                         continue;
@@ -1458,7 +1459,8 @@ impl GrpcModule {
                             return NGX_ERROR;
                         }
 
-                        let h = TableElt::with_hash(&name, &value, hash_key(&name), name.clone());
+                        let hash = hash_key(&name);
+                        let h = crate::upstream_rt::upstream_header(name.clone(), value, hash, name);
 
                         u.resp.trailers.push(h);
 

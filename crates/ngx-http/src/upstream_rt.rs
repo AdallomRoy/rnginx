@@ -212,6 +212,32 @@ impl UpstreamResponse {
     pub fn header(&self, lowcase_key: &[u8]) -> Option<Header> {
         self.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == lowcase_key).cloned()
     }
+
+    /// A header line to u->headers_in.headers (the list has room for a
+    /// usual header from the first one on).
+    pub fn push_header(&mut self, h: Header) {
+        if self.headers.capacity() == 0 {
+            self.headers.reserve(16);
+        }
+
+        self.headers.push(h);
+    }
+
+    /// The headers that count, as $upstream_http_* see them
+    /// (r->upstream->headers_in.headers).
+    pub fn headers_in(&self) -> Vec<Header> {
+        let mut v = Vec::with_capacity(self.headers.len());
+
+        v.extend(self.headers.iter().filter(|h| h.hash.get() != 0).cloned());
+
+        v
+    }
+}
+
+/// A header line of the upstream's response (an ngx_table_elt_t of
+/// u->headers_in), owning its key, value and lowcase key.
+pub fn upstream_header(key: Vec<u8>, value: Vec<u8>, hash: usize, lowcase_key: Vec<u8>) -> Header {
+    Rc::new(TableElt { hash: std::cell::Cell::new(hash), key, value: RefCell::new(value), lowcase_key, null: std::cell::Cell::new(false) })
 }
 
 impl Default for UpstreamResponse {
@@ -2369,15 +2395,21 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
 
         rc = m.process_header(r, u);
     } else {
-        let mut chunk = vec![0u8; buffer_size];
         let watch = u.watch.clone();
 
+        // u->buffer of u->conf->buffer_size
+        u.resp.buf.reserve_exact(buffer_size.saturating_sub(u.resp.buf.len()));
+
         'read: loop {
-            let room = buffer_size.saturating_sub(u.resp.buf.len()).clamp(1, chunk.len());
+            let len = u.resp.buf.len();
+            let room = buffer_size.saturating_sub(len).max(1);
+
+            // the read goes into u->buffer, initialized where it may read
+            u.resp.buf.resize(len + room, 0);
 
             let res = {
                 let sock = u.sock.as_mut().expect("connection");
-                let read = tokio::time::timeout_at(deadline, sock.read(&mut chunk[..room]));
+                let read = tokio::time::timeout_at(deadline, sock.read(&mut u.resp.buf[len..]));
 
                 tokio::select! {
                     res = read => Some(res),
@@ -2387,6 +2419,14 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                     }
                 }
             };
+
+            // what was not read is not data
+            let got = match &res {
+                Some(Ok(Ok(n))) => *n,
+                _ => 0,
+            };
+
+            u.resp.buf.truncate(len + got);
 
             let res = match res {
                 None => {
@@ -2431,8 +2471,6 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
             };
 
             Upstream::with_state(r, |st| st.bytes_received += n as i64);
-
-            u.resp.buf.extend_from_slice(&chunk[..n]);
 
             u.response_received = true;
 
@@ -2481,7 +2519,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
     Upstream::with_state(r, |st| st.header_time = ngx_core::times::current_msec().saturating_sub(start_time));
 
     // u->headers_in, for $upstream_http_* and the balancer's notify
-    *r.upstream_headers_in.borrow_mut() = u.resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
+    *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
 
     Ok(())
 }
@@ -2921,10 +2959,19 @@ pub fn content_type_charset(value: &[u8]) -> Option<(usize, Vec<u8>)> {
     None
 }
 
-/// A copy of an upstream header in r->headers_out (*ho = *h).
+/// A copy of an upstream header in r->headers_out (*ho = *h), its lowcase
+/// key copied too.
 fn push_copy(ho: &mut HeadersOut, h: &Header) -> Header {
-    let o = ho.add(&h.key, &h.value.borrow());
-    o.null.set(h.null.get());
+    let o = Rc::new(TableElt {
+        hash: std::cell::Cell::new(1),
+        key: h.key.clone(),
+        value: RefCell::new(h.value.borrow().clone()),
+        lowcase_key: h.lowcase_key.clone(),
+        null: std::cell::Cell::new(h.null.get()),
+    });
+
+    ho.headers.push(o.clone());
+
     o
 }
 
@@ -3137,16 +3184,10 @@ async fn process_headers(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) ->
         if !u.conf.ignores(NGX_HTTP_UPSTREAM_IGN_XA_REDIRECT) {
             finalize(r, u, m, NGX_DECLINED).await;
 
-            let headers: Vec<Header> = u.resp.headers.clone();
+            let failed = u.resp.headers.iter().any(|h| h.hash.get() != 0 && REDIRECT_HEADERS.iter().any(|k| h.lowcase_key == *k) && copy_header(r, u, m, h) != NGX_OK);
 
-            for h in headers.iter() {
-                if h.hash.get() == 0 {
-                    continue;
-                }
-
-                if REDIRECT_HEADERS.iter().any(|k| h.lowcase_key == *k) && copy_header(r, u, m, h) != NGX_OK {
-                    return Processed::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
-                }
+            if failed {
+                return Processed::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
             }
 
             let uri = xar.value.borrow().clone();
@@ -3155,20 +3196,13 @@ async fn process_headers(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) ->
         }
     }
 
-    let headers: Vec<Header> = u.resp.headers.clone();
+    // room in r->headers_out.headers for the headers copied
+    r.headers_out.borrow_mut().headers.reserve(u.resp.headers.len());
 
-    for h in headers.iter() {
-        if h.hash.get() == 0 {
-            continue;
-        }
+    let failed = u.resp.headers.iter().any(|h| h.hash.get() != 0 && !u.conf.hidden(&h.lowcase_key) && copy_header(r, u, m, h) != NGX_OK);
 
-        if u.conf.hidden(&h.lowcase_key) {
-            continue;
-        }
-
-        if copy_header(r, u, m, h) != NGX_OK {
-            return Processed::Done(finalize(r, u, m, NGX_HTTP_INTERNAL_SERVER_ERROR).await);
-        }
+    if failed {
+        return Processed::Done(finalize(r, u, m, NGX_HTTP_INTERNAL_SERVER_ERROR).await);
     }
 
     {
@@ -3251,7 +3285,7 @@ async fn cache_send(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i64 
         }
 
         // u->headers_in, for $upstream_http_*
-        *r.upstream_headers_in.borrow_mut() = u.resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
+        *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
 
         match process_headers(r, u, m).await {
             Processed::Ok => NGX_OK,
@@ -3389,7 +3423,11 @@ async fn process_non_buffered_request(r: &R, u: &mut Upstream, m: &mut dyn Upstr
     let buffer_size = u.conf.buffer_size.max(1);
     let read_timeout = u.conf.read_timeout;
 
-    let mut chunk = vec![0u8; buffer_size];
+    // u->buffer, read into from its start (initialized once)
+    let mut chunk = std::mem::take(&mut u.resp.buf);
+
+    chunk.clear();
+    chunk.resize(buffer_size, 0);
 
     let mut eof = false;
     let mut read_error = false;
@@ -3781,8 +3819,10 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
     let header_start = crate::file_cache::cache_of(r).map(|c| c.borrow().header_start).unwrap_or(0);
     let buffer_size = u.conf.buffer_size.saturating_sub(header_start).max(1);
 
-    let mut chunk = vec![0u8; buffer_size];
     let mut down = None;
+
+    // u->buffer of u->conf->buffer_size
+    u.resp.buf.reserve_exact(buffer_size.saturating_sub(u.resp.buf.len()));
 
     loop {
         if u.post_write {
@@ -3792,9 +3832,27 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
             continue;
         }
 
-        let room = buffer_size.saturating_sub(u.resp.buf.len()).clamp(1, chunk.len());
+        // the read goes into u->buffer, initialized where it may read
+        let mut buf = std::mem::take(&mut u.resp.buf);
 
-        match duplex_wait(r, u, &mut chunk[..room], true, body_timer, &mut down).await {
+        let len = buf.len();
+        let room = buffer_size.saturating_sub(len).max(1);
+
+        buf.resize(len + room, 0);
+
+        let ev = duplex_wait(r, u, &mut buf[len..], true, body_timer, &mut down).await;
+
+        // what was not read is not data
+        let got = match &ev {
+            DuplexEvent::Read(Ok(n)) => *n,
+            _ => 0,
+        };
+
+        buf.truncate(len + got);
+
+        u.resp.buf = buf;
+
+        match ev {
             DuplexEvent::Read(res) => {
                 // ngx_http_upstream_process_header
                 http_debug!(r, "http upstream process header");
@@ -3819,8 +3877,6 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
                 };
 
                 Upstream::with_state(r, |st| st.bytes_received += n as i64);
-
-                u.resp.buf.extend_from_slice(&chunk[..n]);
 
                 u.response_received = true;
 
@@ -3871,7 +3927,7 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
 
                 Upstream::with_state(r, |st| st.header_time = ngx_core::times::current_msec().saturating_sub(start_time));
 
-                *r.upstream_headers_in.borrow_mut() = u.resp.headers.iter().filter(|h| h.hash.get() != 0).cloned().collect();
+                *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
 
                 return test_next_and_intercept(r, u, m).await;
             }
@@ -3931,7 +3987,11 @@ async fn process_non_buffered_duplex(r: &R, u: &mut Upstream, m: &mut dyn Upstre
     let buffer_size = u.conf.buffer_size.max(1);
     let read_timeout = u.conf.read_timeout;
 
-    let mut chunk = vec![0u8; buffer_size];
+    // u->buffer, read into from its start (initialized once)
+    let mut chunk = std::mem::take(&mut u.resp.buf);
+
+    chunk.clear();
+    chunk.resize(buffer_size, 0);
 
     let mut eof = false;
     let mut read_error = false;
@@ -5623,9 +5683,9 @@ pub fn cgi_process_header(r: &R, up: &mut Upstream, st: &mut CgiHeaderParse) -> 
 
             let lowcase_key = if key.len() == pr.lowcase_index { pr.lowcase_header[..key.len()].to_vec() } else { key.to_ascii_lowercase() };
 
-            let h = TableElt::with_hash(&key, &value, pr.header_hash, lowcase_key);
+            let h = upstream_header(key, value, pr.header_hash, lowcase_key);
 
-            u.headers.push(h.clone());
+            u.push_header(h.clone());
 
             // hh->handler(r, h, hh->offset)
             process_header_line(r, up, &h)?;

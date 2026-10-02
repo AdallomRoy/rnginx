@@ -2580,9 +2580,9 @@ fn process_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, up: &mut crate::upstream_r
 
             ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy header: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
 
-            let h = crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase);
+            let h = crate::upstream_rt::upstream_header(key, value, pr.header_hash, lowcase);
 
-            up.resp.headers.push(h.clone());
+            up.resp.push_header(h.clone());
 
             if up.resp.status_n == crate::NGX_HTTP_EARLY_HINTS {
                 continue;
@@ -2612,13 +2612,13 @@ fn process_header(r: &R, ctx: &Rc<RefCell<ProxyCtx>>, up: &mut crate::upstream_r
             // special empty headers
 
             if !up.resp.server {
-                let h = crate::request::TableElt::with_hash(b"Server", b"", ngx_core::hash::hash_key(b"server"), b"server".to_vec());
+                let h = crate::upstream_rt::upstream_header(b"Server".to_vec(), Vec::new(), ngx_core::hash::hash_key(b"server"), b"server".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }
 
             if !up.resp.date {
-                let h = crate::request::TableElt::with_hash(b"Date", b"", ngx_core::hash::hash_key(b"date"), b"date".to_vec());
+                let h = crate::upstream_rt::upstream_header(b"Date".to_vec(), Vec::new(), ngx_core::hash::hash_key(b"date"), b"date".to_vec());
                 h.null.set(true);
                 up.resp.headers.push(h);
             }
@@ -2706,7 +2706,7 @@ fn process_trailer(
 
             ngx_core::ngx_log_debug!(ngx_core::log::NGX_LOG_DEBUG_HTTP, r.connection.log, "http proxy trailer: \"{}: {}\"", ngx_core::string::B(&key), ngx_core::string::B(&value));
 
-            trailers.push(crate::request::TableElt::with_hash(&key, &value, pr.header_hash, lowcase));
+            trailers.push(crate::upstream_rt::upstream_header(key, value, pr.header_hash, lowcase));
 
             continue;
         }
