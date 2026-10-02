@@ -6,7 +6,6 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::ptr::null_mut;
 use std::rc::Rc;
 
 use ngx_core::conf::*;
@@ -15,7 +14,8 @@ use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
 use ngx_core::resolver::{ResolverCtx, Resolved, Resolver, NGX_RESOLVE_NXDOMAIN};
 use ngx_core::shm::ShmZone;
-use ngx_core::slab::SlabPool;
+use ngx_core::shmem::slab::{PoolHeader, SlabPool};
+use ngx_core::shmem::ShmMem;
 use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
@@ -51,6 +51,8 @@ fn zone_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> Co
 
     let shm_zone = ngx_core::cycle::shared_memory_add(cf, &value[1], size, "ngx_stream_upstream_module")?;
 
+    shm_zone.safe_pool.set(true);
+
     *shm_zone.init.borrow_mut() = Some(Rc::new(init_zone));
     *shm_zone.data.borrow_mut() = Some(umcf);
 
@@ -68,277 +70,334 @@ fn zone_umcf(data: &Option<Rc<dyn Any>>) -> Option<Rc<RefCell<UpstreamMainConf>>
 /// ngx_stream_upstream_init_zone: the peers of the zone's upstreams copied
 /// to it; data is the upstreams of the previous configuration.
 fn init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Result<(), ()> {
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
+    let zm = PeerMem::zone(shm_zone.mem());
+    let mem = &*zm.mem;
+    let shpool = SlabPool::of(mem);
 
     let umcf = zone_umcf(&shm_zone.data.borrow()).ok_or(())?;
     let upstreams = umcf.borrow().upstreams.clone();
 
     let in_zone = |uscf: &Rc<UpstreamSrvConf>| uscf.shm_zone.borrow().as_ref().is_some_and(|z| Rc::ptr_eq(z, shm_zone));
 
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            let mut peers = (*shpool).data as *mut RrPeers;
-
-            for uscf in upstreams.iter().filter(|u| in_zone(u)) {
-                uscf.peers.set(peers);
-                peers = (*peers).zone_next;
-            }
-
-            return Ok(());
-        }
-
-        let ctx = format!(" in upstream zone \"{}\"", B(shm_zone.name()));
-        (*shpool).set_log_ctx(ctx.as_bytes())?;
-
-        // copy peers to shared memory
-
-        let mut peersp: *mut *mut RrPeers = &mut (*shpool).data as *mut *mut u8 as *mut *mut RrPeers;
-
-        let oumcf = zone_umcf(&data);
+    if shm_zone.shm.exists.get() {
+        let mut peers = shpool.data();
 
         for uscf in upstreams.iter().filter(|u| in_zone(u)) {
-            let mut ouscf: Option<Rc<UpstreamSrvConf>> = None;
+            uscf.peers.set(Peers { mem: zm.clone(), off: peers });
+            peers = RrPeers::at(mem, peers).get(RrPeers::zone_next);
+        }
 
-            if let Some(oumcf) = oumcf.as_ref() {
-                let oupstreams = oumcf.borrow().upstreams.clone();
+        return Ok(());
+    }
 
-                for o in oupstreams.iter() {
-                    let same_zone = o.shm_zone.borrow().as_ref().is_some_and(|z| z.name() == shm_zone.name());
+    let ctx = format!(" in upstream zone \"{}\"", B(shm_zone.name()));
+    shpool.set_log_ctx(ctx.as_bytes())?;
 
-                    if !same_zone {
-                        continue;
-                    }
+    // copy peers to shared memory
 
-                    if o.host == uscf.host {
-                        ouscf = Some(o.clone());
-                        break;
-                    }
+    // &shpool->data: the pool is at the start of the zone
+    let mut peersp = PoolHeader::data.off;
+
+    let oumcf = zone_umcf(&data);
+
+    for uscf in upstreams.iter().filter(|u| in_zone(u)) {
+        let mut ouscf: Option<Rc<UpstreamSrvConf>> = None;
+
+        if let Some(oumcf) = oumcf.as_ref() {
+            let oupstreams = oumcf.borrow().upstreams.clone();
+
+            for o in oupstreams.iter() {
+                let same_zone = o.shm_zone.borrow().as_ref().is_some_and(|z| z.name() == shm_zone.name());
+
+                if !same_zone {
+                    continue;
+                }
+
+                if o.host == uscf.host {
+                    ouscf = Some(o.clone());
+                    break;
                 }
             }
-
-            let peers = copy_peers(shpool, uscf, ouscf.as_ref());
-            if peers.is_null() {
-                return Err(());
-            }
-
-            *peersp = peers;
-            peersp = &mut (*peers).zone_next;
         }
+
+        let peers = copy_peers(&zm, uscf, ouscf.as_ref());
+        if peers == 0 {
+            return Err(());
+        }
+
+        mem.set(peersp, peers);
+        peersp = peers + RrPeers::zone_next.off;
     }
 
     Ok(())
 }
 
-/// A copy of bytes in the zone.
-unsafe fn shm_dup(pool: &SlabPool, s: &[u8], locked: bool) -> Option<NgxStr> {
-    if s.is_empty() {
-        return Some(NgxStr::NULL);
-    }
+/// ngx_stream_upstream_zone_copy_peers: the peers of the upstream (in a
+/// memory of the process) copied to the zone, 0 on failure
+fn copy_peers(zm: &Rc<PeerMem>, uscf: &Rc<UpstreamSrvConf>, ouscf: Option<&Rc<UpstreamSrvConf>>) -> usize {
+    let mem = &*zm.mem;
+    let pool = SlabPool::of(mem);
 
-    let p = if locked { pool.alloc_locked(s.len()) } else { pool.alloc(s.len()) };
-    if p.is_null() {
-        return None;
-    }
-
-    std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
-
-    Some(NgxStr { data: p, len: s.len() })
-}
-
-/// ngx_stream_upstream_zone_copy_peers
-unsafe fn copy_peers(shpool: *mut SlabPool, uscf: &Rc<UpstreamSrvConf>, ouscf: Option<&Rc<UpstreamSrvConf>>) -> *mut RrPeers {
-    let pool = &*shpool;
-
-    let opeers = ouscf.map_or(null_mut(), |o| o.peers.get());
-
-    let config = pool.calloc(std::mem::size_of::<usize>()) as *mut usize;
-    if config.is_null() {
-        return null_mut();
-    }
-
-    let peers = pool.alloc(std::mem::size_of::<RrPeers>()) as *mut RrPeers;
-    if peers.is_null() {
-        return null_mut();
-    }
-
-    std::ptr::copy_nonoverlapping(uscf.peers.get() as *const RrPeers, peers, 1);
-
-    let name = pool.alloc(std::mem::size_of::<NgxStr>()) as *mut NgxStr;
-    if name.is_null() {
-        return null_mut();
-    }
-
-    *name = match shm_dup(pool, (*(*peers).name).bytes(), false) {
-        Some(s) => s,
-        None => return null_mut(),
+    let src = match uscf.peers.get() {
+        Some(p) => p,
+        None => return 0,
     };
+    let smem = &*src.mem.mem;
 
-    (*peers).name = name;
+    let opeers = ouscf.and_then(|o| o.peers.get());
 
-    (*peers).shpool = shpool;
-    (*peers).config = config;
-
-    if copy_list(peers, &mut (*peers).peer).is_err() {
-        return null_mut();
+    let config = pool.calloc(std::mem::size_of::<usize>());
+    if config == 0 {
+        return 0;
     }
 
-    if copy_list(peers, &mut (*peers).resolve).is_err() {
-        return null_mut();
+    let peers = pool.alloc(RrPeers::SIZE);
+    if peers == 0 {
+        return 0;
     }
 
-    if !opeers.is_null() && preresolve((*peers).resolve, peers, (*opeers).resolve, opeers).is_err() {
-        return null_mut();
+    // ngx_memcpy(): the links of the copy are those of the process memory
+    // until the peers they link are copied in turn
+    mem.write(peers, &smem.bytes(src.off, RrPeers::SIZE));
+
+    let ps = RrPeers::at(mem, peers);
+
+    let sname = NgxStr::at(smem, ps.get(RrPeers::name));
+
+    let name = pool.alloc(NgxStr::SIZE);
+    if name == 0 {
+        return 0;
     }
 
-    if !(*peers).next.is_null() {
-        let backup = pool.alloc(std::mem::size_of::<RrPeers>()) as *mut RrPeers;
-        if backup.is_null() {
-            return null_mut();
+    let name_data = pool.alloc(sname.get(NgxStr::len));
+    if name_data == 0 {
+        return 0;
+    }
+
+    mem.write(name_data, &sname.bytes());
+    NgxStr::at(mem, name).set(NgxStr::data, name_data);
+    NgxStr::at(mem, name).set(NgxStr::len, sname.get(NgxStr::len));
+
+    ps.set(RrPeers::name, name);
+
+    ps.set(RrPeers::shpool, 1);
+    ps.set(RrPeers::config, config);
+
+    if copy_list(mem, smem, peers, peers + RrPeers::peer.off).is_err() {
+        return 0;
+    }
+
+    if copy_list(mem, smem, peers, peers + RrPeers::resolve.off).is_err() {
+        return 0;
+    }
+
+    if let Some(o) = opeers.as_ref() {
+        let omem = &*o.mem.mem;
+        let oresolve = RrPeers::at(omem, o.off).get(RrPeers::resolve);
+
+        if preresolve(mem, ps.get(RrPeers::resolve), peers, omem, oresolve, o.off).is_err() {
+            return 0;
+        }
+    }
+
+    let snext = ps.get(RrPeers::next);
+
+    if snext != 0 {
+        let backup = pool.alloc(RrPeers::SIZE);
+        if backup == 0 {
+            return 0;
         }
 
-        std::ptr::copy_nonoverlapping((*peers).next as *const RrPeers, backup, 1);
+        mem.write(backup, &smem.bytes(snext, RrPeers::SIZE));
 
-        (*backup).name = name;
+        let bs = RrPeers::at(mem, backup);
 
-        (*backup).shpool = shpool;
-        (*backup).config = config;
+        bs.set(RrPeers::name, name);
 
-        if copy_list(backup, &mut (*backup).peer).is_err() {
-            return null_mut();
+        bs.set(RrPeers::shpool, 1);
+        bs.set(RrPeers::config, config);
+
+        if copy_list(mem, smem, backup, backup + RrPeers::peer.off).is_err() {
+            return 0;
         }
 
-        if copy_list(backup, &mut (*backup).resolve).is_err() {
-            return null_mut();
+        if copy_list(mem, smem, backup, backup + RrPeers::resolve.off).is_err() {
+            return 0;
         }
 
-        (*peers).next = backup;
+        ps.set(RrPeers::next, backup);
 
-        if !opeers.is_null() && !(*opeers).next.is_null() {
-            if preresolve((*peers).resolve, backup, (*opeers).resolve, (*opeers).next).is_err() {
-                return null_mut();
-            }
+        if let Some(o) = opeers.as_ref() {
+            let omem = &*o.mem.mem;
+            let os = RrPeers::at(omem, o.off);
+            let onext = os.get(RrPeers::next);
 
-            if preresolve((*backup).resolve, backup, (*(*opeers).next).resolve, (*opeers).next).is_err() {
-                return null_mut();
+            if onext != 0 {
+                if preresolve(mem, ps.get(RrPeers::resolve), backup, omem, os.get(RrPeers::resolve), onext).is_err() {
+                    return 0;
+                }
+
+                let onext_resolve = RrPeers::at(omem, onext).get(RrPeers::resolve);
+
+                if preresolve(mem, bs.get(RrPeers::resolve), backup, omem, onext_resolve, onext).is_err() {
+                    return 0;
+                }
             }
         }
     }
 
     // done:
 
-    uscf.peers.set(peers);
+    uscf.peers.set(Peers { mem: zm.clone(), off: peers });
 
     set_single(uscf);
 
     peers
 }
 
-/// The peers of a list copied, each counted in the zone's config.
-unsafe fn copy_list(peers: *mut RrPeers, mut peerp: *mut *mut RrPeer) -> Result<(), ()> {
-    while !(*peerp).is_null() {
+/// The peers of a list copied, each counted in the zone's config:
+/// `peerp` is the link to the first one, an offset in the process memory
+/// `smem` as every next link of the peers copied.
+fn copy_list(mem: &ShmMem, smem: &ShmMem, peers: usize, mut peerp: usize) -> Result<(), ()> {
+    let config = RrPeers::at(mem, peers).get(RrPeers::config);
+
+    loop {
+        let src = mem.get(peerp);
+
+        if src == 0 {
+            break;
+        }
+
         // pool is unlocked
-        let peer = copy_peer(peers, *peerp);
-        if peer.is_null() {
+        let peer = copy_peer(mem, peers, Some((smem, src)));
+        if peer == 0 {
             return Err(());
         }
 
-        *peerp = peer;
-        *(*peers).config += 1;
+        mem.set(peerp, peer);
+        config_inc(mem, config);
 
-        peerp = &mut (*peer).next;
+        peerp = peer + RrPeer::next.off;
     }
 
     Ok(())
 }
 
-/// ngx_stream_upstream_zone_copy_peer: a peer in the zone, a copy of src or
-/// empty
-pub unsafe fn copy_peer(peers: *mut RrPeers, src: *mut RrPeer) -> *mut RrPeer {
-    let pool = &*(*peers).shpool;
+/// The part of ngx_stream_upstream_zone_copy_peer that frees the peer it
+/// failed to make.
+fn copy_peer_failed(pool: &SlabPool<'_>, d: RrPeer<'_>) -> usize {
+    let host = d.get(RrPeer::host);
 
-    let dst = pool.calloc_locked(std::mem::size_of::<RrPeer>()) as *mut RrPeer;
-    if dst.is_null() {
-        return null_mut();
+    if host != 0 {
+        let name = UpstreamHost::at(d.mem, host).get(UpstreamHost::name_data);
+
+        if name != 0 {
+            pool.free_locked(name);
+        }
+
+        pool.free_locked(host);
     }
 
-    if !src.is_null() {
-        std::ptr::copy_nonoverlapping(src as *const RrPeer, dst, 1);
-        (*dst).sockaddr = null_mut();
-        (*dst).name.data = null_mut();
-        (*dst).server.data = null_mut();
-        (*dst).host = null_mut();
+    if d.get(RrPeer::server_data) != 0 {
+        pool.free_locked(d.get(RrPeer::server_data));
     }
 
-    let failed = |dst: *mut RrPeer| {
-        if !(*dst).host.is_null() {
-            if !(*(*dst).host).name.data.is_null() {
-                pool.free_locked((*(*dst).host).name.data);
+    if d.get(RrPeer::name_data) != 0 {
+        pool.free_locked(d.get(RrPeer::name_data));
+    }
+
+    if d.get(RrPeer::sockaddr) != 0 {
+        pool.free_locked(d.get(RrPeer::sockaddr));
+    }
+
+    pool.free_locked(d.off);
+
+    0
+}
+
+/// ngx_stream_upstream_zone_copy_peer: a peer in the zone, a copy of src (a
+/// peer of the memory given) or empty; 0 on failure
+pub fn copy_peer(mem: &ShmMem, peers: usize, src: Option<(&ShmMem, usize)>) -> usize {
+    let pool = SlabPool::of(mem);
+
+    let dst = pool.calloc_locked(RrPeer::SIZE);
+    if dst == 0 {
+        return 0;
+    }
+
+    let d = RrPeer::at(mem, dst);
+
+    if let Some((smem, src)) = src {
+        mem.write(dst, &smem.bytes(src, RrPeer::SIZE));
+        d.set(RrPeer::sockaddr, 0);
+        d.set(RrPeer::name_data, 0);
+        d.set(RrPeer::server_data, 0);
+        d.set(RrPeer::host, 0);
+    }
+
+    d.set(RrPeer::sockaddr, pool.calloc_locked(NGX_SOCKADDRLEN));
+    if d.get(RrPeer::sockaddr) == 0 {
+        return copy_peer_failed(&pool, d);
+    }
+
+    d.set(RrPeer::name_data, pool.calloc_locked(NGX_SOCKADDR_STRLEN));
+    if d.get(RrPeer::name_data) == 0 {
+        return copy_peer_failed(&pool, d);
+    }
+
+    if let Some((smem, src)) = src {
+        let s = RrPeer::at(smem, src);
+
+        mem.write(d.get(RrPeer::sockaddr), &smem.bytes(s.get(RrPeer::sockaddr), s.get(RrPeer::socklen) as usize));
+        mem.write(d.get(RrPeer::name_data), &s.name());
+
+        let server = pool.alloc_locked(s.get(RrPeer::server_len));
+        if server == 0 {
+            return copy_peer_failed(&pool, d);
+        }
+
+        d.set(RrPeer::server_data, server);
+        mem.write(server, &s.server());
+
+        let shost = s.get(RrPeer::host);
+
+        if shost != 0 {
+            let sh = UpstreamHost::at(smem, shost);
+
+            let host = pool.calloc_locked(UpstreamHost::SIZE);
+            if host == 0 {
+                return copy_peer_failed(&pool, d);
             }
 
-            pool.free_locked((*dst).host as *mut u8);
-        }
+            d.set(RrPeer::host, host);
 
-        if !(*dst).server.data.is_null() {
-            pool.free_locked((*dst).server.data);
-        }
+            let h = UpstreamHost::at(mem, host);
 
-        if !(*dst).name.data.is_null() {
-            pool.free_locked((*dst).name.data);
-        }
+            h.set(UpstreamHost::worker, sh.get(UpstreamHost::worker));
+            h.set(UpstreamHost::valid, sh.get(UpstreamHost::valid));
 
-        if !(*dst).sockaddr.is_null() {
-            pool.free_locked((*dst).sockaddr as *mut u8);
-        }
-
-        pool.free_locked(dst as *mut u8);
-
-        null_mut()
-    };
-
-    (*dst).sockaddr = pool.calloc_locked(std::mem::size_of::<libc::sockaddr_storage>()) as *mut libc::sockaddr;
-    if (*dst).sockaddr.is_null() {
-        return failed(dst);
-    }
-
-    (*dst).name.data = pool.calloc_locked(NGX_SOCKADDR_STRLEN);
-    if (*dst).name.data.is_null() {
-        return failed(dst);
-    }
-
-    if !src.is_null() {
-        std::ptr::copy_nonoverlapping((*src).sockaddr as *const u8, (*dst).sockaddr as *mut u8, (*src).socklen as usize);
-        std::ptr::copy_nonoverlapping((*src).name.data, (*dst).name.data, (*src).name.len);
-
-        (*dst).server = match shm_dup(pool, (*src).server.bytes(), true) {
-            Some(s) => s,
-            None => return failed(dst),
-        };
-
-        if !(*src).host.is_null() {
-            (*dst).host = pool.calloc_locked(std::mem::size_of::<UpstreamHost>()) as *mut UpstreamHost;
-            if (*dst).host.is_null() {
-                return failed(dst);
+            let name = pool.alloc_locked(sh.get(UpstreamHost::name_len));
+            if name == 0 {
+                return copy_peer_failed(&pool, d);
             }
 
-            let host = (*dst).host;
-            let shost = (*src).host;
+            h.set(UpstreamHost::name_data, name);
 
-            (*host).worker = (*shost).worker;
-            (*host).valid = (*shost).valid;
+            h.set(UpstreamHost::peers, peers);
+            h.set(UpstreamHost::peer, dst);
 
-            (*host).name = match shm_dup(pool, (*shost).name.bytes(), true) {
-                Some(s) => s,
-                None => return failed(dst),
-            };
+            h.set(UpstreamHost::name_len, sh.get(UpstreamHost::name_len));
+            mem.write(name, &sh.name());
 
-            (*host).peers = peers;
-            (*host).peer = dst;
+            if sh.get(UpstreamHost::service_len) > 0 {
+                let service = pool.alloc_locked(sh.get(UpstreamHost::service_len));
+                if service == 0 {
+                    return copy_peer_failed(&pool, d);
+                }
 
-            if (*shost).service.len > 0 {
-                (*host).service = match shm_dup(pool, (*shost).service.bytes(), true) {
-                    Some(s) => s,
-                    None => return failed(dst),
-                };
+                h.set(UpstreamHost::service_data, service);
+                h.set(UpstreamHost::service_len, sh.get(UpstreamHost::service_len));
+                mem.write(service, &sh.service());
             }
         }
     }
@@ -346,141 +405,189 @@ pub unsafe fn copy_peer(peers: *mut RrPeers, src: *mut RrPeer) -> *mut RrPeer {
     dst
 }
 
-/// Set a peer's address and its printable name (ngx_sock_ntop).
-unsafe fn set_peer_addr(peer: *mut RrPeer, sa: &SockAddr) {
-    let (ss, len) = sa.to_libc();
-    std::ptr::copy_nonoverlapping(&ss as *const libc::sockaddr_storage as *const u8, (*peer).sockaddr as *mut u8, len as usize);
-    (*peer).socklen = len;
+/// A peer's address and its printable name (ngx_sock_ntop).
+fn set_peer_addr(mem: &ShmMem, peer: usize, sa: &SockAddr) {
+    let p = RrPeer::at(mem, peer);
+
+    let bytes = sa.raw_bytes();
+    mem.write(p.get(RrPeer::sockaddr), &bytes);
+    p.set(RrPeer::socklen, bytes.len() as u32);
 
     let text = sa.to_text(true);
     let n = text.len().min(NGX_SOCKADDR_STRLEN);
-    std::ptr::copy_nonoverlapping(text.as_ptr(), (*peer).name.data, n);
-    (*peer).name.len = n;
+    mem.write(p.get(RrPeer::name_data), &text[..n]);
+    p.set(RrPeer::name_len, n);
+}
+
+/// A copy of a string in the zone, the data of the peer's server.
+fn set_peer_server(mem: &ShmMem, peer: usize, server: &[u8]) -> Result<(), ()> {
+    let data = SlabPool::of(mem).alloc(server.len());
+    if data == 0 {
+        return Err(());
+    }
+
+    let p = RrPeer::at(mem, peer);
+
+    mem.write(data, server);
+    p.set(RrPeer::server_data, data);
+    p.set(RrPeer::server_len, server.len());
+
+    Ok(())
+}
+
+/// The parameters of a resolved peer from its template's.
+fn set_peer_params(mem: &ShmMem, peer: usize, template: usize, weight: isize) {
+    let (p, t) = (RrPeer::at(mem, peer), RrPeer::at(mem, template));
+
+    p.set(RrPeer::weight, weight);
+    p.set(RrPeer::effective_weight, weight);
+    p.set(RrPeer::max_conns, t.get(RrPeer::max_conns));
+    p.set(RrPeer::max_fails, t.get(RrPeer::max_fails));
+    p.set(RrPeer::fail_timeout, t.get(RrPeer::fail_timeout));
+    p.set(RrPeer::down, t.get(RrPeer::down));
+}
+
+/// A peer added to the peers: number, tries, total_weight, weighted.
+fn count_peer(mem: &ShmMem, peers: usize, peer: usize) {
+    let (ps, p) = (RrPeers::at(mem, peers), RrPeer::at(mem, peer));
+
+    ps.set(RrPeers::number, ps.get(RrPeers::number) + 1);
+    ps.set(RrPeers::tries, ps.get(RrPeers::tries) + (p.get(RrPeer::down) == 0) as usize);
+    ps.set(RrPeers::total_weight, ps.get(RrPeers::total_weight) + p.get(RrPeer::weight) as usize);
+    ps.set(RrPeers::weighted, (ps.get(RrPeers::total_weight) != ps.get(RrPeers::number)) as u8);
 }
 
 /// ngx_stream_upstream_zone_preresolve: the peers resolved for the servers
-/// before a reload, copied to the new ones
-unsafe fn preresolve(resolve: *mut RrPeer, peers: *mut RrPeers, oresolve: *mut RrPeer, opeers: *mut RrPeers) -> Result<(), ()> {
-    if resolve.is_null() || oresolve.is_null() {
+/// before a reload (in the zone `omem` of the previous configuration),
+/// copied to the new ones
+fn preresolve(mem: &ShmMem, resolve: usize, peers: usize, omem: &ShmMem, oresolve: usize, opeers: usize) -> Result<(), ()> {
+    if resolve == 0 || oresolve == 0 {
         return Ok(());
     }
 
-    let mut peerp: *mut *mut RrPeer = &mut (*peers).peer;
+    let mut peerp = peers + RrPeers::peer.off;
 
-    while !(*peerp).is_null() {
-        peerp = &mut (**peerp).next;
+    while mem.get(peerp) != 0 {
+        peerp = mem.get(peerp) + RrPeer::next.off;
     }
 
-    peers_rlock(opeers);
+    peers_rlock(omem, opeers);
 
     let mut template = resolve;
 
-    while !template.is_null() {
+    while template != 0 {
+        let t = RrPeer::at(mem, template);
+        let th = UpstreamHost::at(mem, t.get(RrPeer::host));
+
         let mut ores = oresolve;
 
-        while !ores.is_null() {
-            if (*(*ores).host).name.bytes() != (*(*template).host).name.bytes() || (*(*ores).host).service.bytes() != (*(*template).host).service.bytes() {
-                ores = (*ores).next;
+        while ores != 0 {
+            let or = RrPeer::at(omem, ores);
+            let oh = UpstreamHost::at(omem, or.get(RrPeer::host));
+
+            if oh.name() != th.name() || oh.service() != th.service() {
+                ores = or.get(RrPeer::next);
                 continue;
             }
 
-            let host = (*ores).host;
+            let host = oh.off;
 
-            let mut opeer = (*opeers).peer;
+            let mut opeer = RrPeers::at(omem, opeers).get(RrPeers::peer);
 
-            while !opeer.is_null() {
-                if (*opeer).host != host {
-                    opeer = (*opeer).next;
+            while opeer != 0 {
+                let op = RrPeer::at(omem, opeer);
+
+                if op.get(RrPeer::host) != host {
+                    opeer = op.get(RrPeer::next);
                     continue;
                 }
 
-                let pool = &*(*peers).shpool;
-
-                let peer = copy_peer(peers, null_mut());
-                if peer.is_null() {
-                    peers_unlock(opeers);
+                let peer = copy_peer(mem, peers, None);
+                if peer == 0 {
+                    peers_unlock(omem, opeers);
                     return Err(());
                 }
 
-                let mut sa = peer_sockaddr(opeer);
+                let mut sa = op.addr();
 
-                if (*(*template).host).service.len == 0 {
-                    let port = peer_sockaddr(template).port();
+                if th.get(UpstreamHost::service_len) == 0 {
+                    let port = t.addr().port();
                     sa.set_port(port);
                 }
 
-                set_peer_addr(peer, &sa);
+                set_peer_addr(mem, peer, &sa);
 
-                (*peer).host = (*template).host;
+                let p = RrPeer::at(mem, peer);
 
-                (*(*template).host).valid = (*host).valid;
+                p.set(RrPeer::host, t.get(RrPeer::host));
 
-                let server = if (*(*template).host).service.len > 0 { (*opeer).server.bytes() } else { (*template).server.bytes() };
+                th.set(UpstreamHost::valid, oh.get(UpstreamHost::valid));
 
-                (*peer).server = match shm_dup(pool, server, false) {
-                    Some(s) => s,
-                    None => {
-                        peers_unlock(opeers);
-                        return Err(());
-                    }
-                };
+                let server = if th.get(UpstreamHost::service_len) > 0 { op.server() } else { t.server() };
 
-                (*peer).weight = if (*host).service.len == 0 {
-                    (*template).weight
-                } else if (*template).weight != 1 {
-                    (*template).weight
+                if set_peer_server(mem, peer, &server).is_err() {
+                    peers_unlock(omem, opeers);
+                    return Err(());
+                }
+
+                let weight = if oh.get(UpstreamHost::service_len) == 0 {
+                    t.get(RrPeer::weight)
+                } else if t.get(RrPeer::weight) != 1 {
+                    t.get(RrPeer::weight)
                 } else {
-                    (*opeer).weight
+                    op.get(RrPeer::weight)
                 };
 
-                (*peer).effective_weight = (*peer).weight;
-                (*peer).max_conns = (*template).max_conns;
-                (*peer).max_fails = (*template).max_fails;
-                (*peer).fail_timeout = (*template).fail_timeout;
-                (*peer).down = (*template).down;
+                set_peer_params(mem, peer, template, weight);
 
-                *(*peers).config += 1;
+                config_inc(mem, RrPeers::at(mem, peers).get(RrPeers::config));
 
-                *peerp = peer;
-                peerp = &mut (*peer).next;
+                mem.set(peerp, peer);
+                peerp = peer + RrPeer::next.off;
 
-                (*peers).number += 1;
-                (*peers).tries += ((*peer).down == 0) as usize;
-                (*peers).total_weight += (*peer).weight as usize;
-                (*peers).weighted = (*peers).total_weight != (*peers).number;
+                count_peer(mem, peers, peer);
 
-                opeer = (*opeer).next;
+                opeer = op.get(RrPeer::next);
             }
 
             break;
         }
 
-        template = (*template).next;
+        template = t.get(RrPeer::next);
     }
 
-    peers_unlock(opeers);
+    peers_unlock(omem, opeers);
 
     Ok(())
 }
 
 /// ngx_stream_upstream_zone_set_single
 fn set_single(uscf: &UpstreamSrvConf) {
-    let peers = uscf.peers.get();
+    let Peers { mem: pm, off: peers } = match uscf.peers.get() {
+        Some(p) => p,
+        None => return,
+    };
+    let mem = &*pm.mem;
 
-    unsafe {
-        (*peers).single = (*peers).number == 1 && ((*peers).next.is_null() || (*(*peers).next).number == 0);
-    }
+    let ps = RrPeers::at(mem, peers);
+    let next = ps.get(RrPeers::next);
+
+    let single = ps.get(RrPeers::number) == 1 && (next == 0 || RrPeers::at(mem, next).get(RrPeers::number) == 0);
+
+    ps.set(RrPeers::single, single as u8);
 }
 
 /// ngx_stream_upstream_zone_remove_peer_locked
-unsafe fn remove_peer_locked(peers: *mut RrPeers, peer: *mut RrPeer) {
-    (*peers).total_weight -= (*peer).weight as usize;
-    (*peers).number -= 1;
-    (*peers).tries -= ((*peer).down == 0) as usize;
-    *(*peers).config += 1;
-    (*peers).weighted = (*peers).total_weight != (*peers).number;
+fn remove_peer_locked(mem: &ShmMem, peers: usize, peer: usize) {
+    let (ps, p) = (RrPeers::at(mem, peers), RrPeer::at(mem, peer));
 
-    peer_free(peers, peer);
+    ps.set(RrPeers::total_weight, ps.get(RrPeers::total_weight).wrapping_sub(p.get(RrPeer::weight) as usize));
+    ps.set(RrPeers::number, ps.get(RrPeers::number).wrapping_sub(1));
+    ps.set(RrPeers::tries, ps.get(RrPeers::tries).wrapping_sub((p.get(RrPeer::down) == 0) as usize));
+    config_inc(mem, ps.get(RrPeers::config));
+    ps.set(RrPeers::weighted, (ps.get(RrPeers::total_weight) != ps.get(RrPeers::number)) as u8);
+
+    peer_free(mem, peers, peer);
 }
 
 /// ngx_stream_upstream_zone_init_worker: the resolve timers of the servers
@@ -508,35 +615,40 @@ fn init_worker(cycle: &Rc<ngx_core::cycle::Cycle>) -> Result<(), ()> {
             continue;
         }
 
-        let mut peers = uscf.peers.get();
+        let Peers { mem: pm, off: mut peers } = match uscf.peers.get() {
+            Some(p) => p,
+            None => continue,
+        };
+        let mem = &*pm.mem;
 
-        unsafe {
-            while !peers.is_null() {
-                peers_wlock(peers);
+        while peers != 0 {
+            peers_wlock(mem, peers);
 
-                let mut peer = (*peers).resolve;
+            let mut peer = RrPeers::at(mem, peers).get(RrPeers::resolve);
 
-                while !peer.is_null() {
-                    let host = (*peer).host;
+            while peer != 0 {
+                let host = RrPeer::at(mem, peer).get(RrPeer::host);
+                let h = UpstreamHost::at(mem, host);
 
-                    if (*host).worker == worker {
-                        let timer = if (*host).valid > now { 1000 * ((*host).valid - now) as u64 } else { 1 };
+                if h.get(UpstreamHost::worker) == worker {
+                    let valid = h.get(UpstreamHost::valid);
 
-                        let uscf = uscf.clone();
-                        let host = host as usize;
+                    let timer = if valid > now { 1000 * (valid - now) as u64 } else { 1 };
 
-                        ngx_core::event::spawn_posted(async move {
-                            resolve_loop(uscf, host as *mut UpstreamHost, timer).await;
-                        });
-                    }
+                    let uscf = uscf.clone();
+                    let pm = pm.clone();
 
-                    peer = (*peer).next;
+                    ngx_core::event::spawn_posted(async move {
+                        resolve_loop(uscf, pm, host, timer).await;
+                    });
                 }
 
-                peers_unlock(peers);
-
-                peers = (*peers).next;
+                peer = RrPeer::at(mem, peer).get(RrPeer::next);
             }
+
+            peers_unlock(mem, peers);
+
+            peers = RrPeers::at(mem, peers).get(RrPeers::next);
         }
     }
 
@@ -545,7 +657,7 @@ fn init_worker(cycle: &Rc<ngx_core::cycle::Cycle>) -> Result<(), ()> {
 
 /// The resolve timer of a host: ngx_stream_upstream_zone_resolve_timer, then
 /// again after the handler's time.
-async fn resolve_loop(uscf: Rc<UpstreamSrvConf>, host: *mut UpstreamHost, first: u64) {
+async fn resolve_loop(uscf: Rc<UpstreamSrvConf>, pm: Rc<PeerMem>, host: usize, first: u64) {
     let mut timer = first;
 
     loop {
@@ -553,7 +665,7 @@ async fn resolve_loop(uscf: Rc<UpstreamSrvConf>, host: *mut UpstreamHost, first:
 
         ngx_core::times::update();
 
-        timer = match resolve_timer(&uscf, host).await {
+        timer = match resolve_timer(&uscf, &pm.mem, host).await {
             Some(t) => t,
             None => return,
         };
@@ -566,11 +678,12 @@ fn cycle_log() -> Log {
 
 /// ngx_stream_upstream_zone_resolve_timer: the time of the next resolve, or
 /// None when there is no resolver
-async fn resolve_timer(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost) -> Option<u64> {
+async fn resolve_timer(uscf: &Rc<UpstreamSrvConf>, mem: &ShmMem, host: usize) -> Option<u64> {
     let resolver = uscf.resolver.borrow().clone().unwrap_or_else(Resolver::empty);
     let resolver_timeout = uscf.resolver_timeout.get().unwrap_or(30000);
 
-    let (name, service) = unsafe { ((*host).name.bytes().to_vec(), (*host).service.bytes().to_vec()) };
+    let h = UpstreamHost::at(mem, host);
+    let (name, service) = (h.name(), h.service());
 
     match resolver.resolve(&name, &service, resolver_timeout).await {
         Resolved::NoResolver => {
@@ -581,7 +694,7 @@ async fn resolve_timer(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost) -> O
         // retry:
         Resolved::Error => Some(resolver_timeout.max(1000)),
 
-        Resolved::Done(g) => Some(unsafe { resolve_handler(uscf, host, &g.ctx) }),
+        Resolved::Done(g) => Some(resolve_handler(uscf, mem, host, &g.ctx)),
     }
 }
 
@@ -597,17 +710,20 @@ fn cmp_sockaddr(a: &SockAddr, b: &SockAddr, cmp_port: bool) -> bool {
 
 /// ngx_stream_upstream_zone_resolve_handler: the peers of the host are the
 /// addresses resolved; the time of the next resolve
-unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, ctx: &Rc<ResolverCtx>) -> u64 {
+fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, mem: &ShmMem, host: usize, ctx: &Rc<ResolverCtx>) -> u64 {
     let log = cycle_log();
 
-    let mut peers = (*host).peers;
-    let template = (*host).peer;
+    let h = UpstreamHost::at(mem, host);
 
-    peers_wlock(peers);
+    let mut peers = h.get(UpstreamHost::peers);
+    let template = h.get(UpstreamHost::peer);
+    let t = RrPeer::at(mem, template);
+
+    peers_wlock(mem, peers);
 
     let now = ngx_core::times::time();
 
-    let service = (*host).service.bytes();
+    let service = h.service();
 
     for srv in ctx.srvs.borrow().iter() {
         if srv.state != 0 {
@@ -646,7 +762,7 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
         }
 
         if state != NGX_RESOLVE_NXDOMAIN {
-            peers_unlock(peers);
+            peers_unlock(mem, peers);
 
             return uscf.resolver_timeout.get().unwrap_or(30000).max(1000);
         }
@@ -664,9 +780,9 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
             NGX_LOG_DEBUG_STREAM,
             log,
             "name {} was resolved to {} s:\"{}\" n:\"{}\" w:{} {}",
-            B((*host).name.bytes()),
+            B(&h.name()),
             B(&a.sockaddr.to_text(true)),
-            B(service),
+            B(&service),
             B(&a.name),
             a.weight,
             if a.priority != min_priority { "backup" } else { "" }
@@ -678,17 +794,23 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
     'done: loop {
         // again:
 
-        let mut peerp: *mut *mut RrPeer = &mut (*peers).peer;
+        let mut peerp = peers + RrPeers::peer.off;
 
-        while !(*peerp).is_null() {
-            let peer = *peerp;
+        loop {
+            let peer = mem.get(peerp);
 
-            if (*peer).host != host {
-                peerp = &mut (*peer).next;
+            if peer == 0 {
+                break;
+            }
+
+            let p = RrPeer::at(mem, peer);
+
+            if p.get(RrPeer::host) != host {
+                peerp = peer + RrPeer::next.off;
                 continue;
             }
 
-            let psa = peer_sockaddr(peer);
+            let psa = p.addr();
 
             let mut found = false;
 
@@ -707,11 +829,11 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
                 }
 
                 if !service.is_empty() {
-                    if addr.name.as_slice() != (*peer).server.bytes() {
+                    if addr.name.len() != p.get(RrPeer::server_len) || !mem.eq_bytes(p.get(RrPeer::server_data), &addr.name) {
                         continue;
                     }
 
-                    if (*template).weight == 1 && addr.weight as isize != (*peer).weight {
+                    if t.get(RrPeer::weight) == 1 && addr.weight as isize != p.get(RrPeer::weight) {
                         continue;
                     }
                 }
@@ -723,12 +845,12 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
 
             if found {
                 // next:
-                peerp = &mut (*peer).next;
+                peerp = peer + RrPeer::next.off;
                 continue;
             }
 
-            *peerp = (*peer).next;
-            remove_peer_locked(peers, peer);
+            mem.set(peerp, p.get(RrPeer::next));
+            remove_peer_locked(mem, peers, peer);
 
             set_single(uscf);
         }
@@ -744,73 +866,79 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
                 continue;
             }
 
-            let pool = &*(*peers).shpool;
+            let pool = SlabPool::of(mem);
 
             pool.lock();
-            let peer = copy_peer(peers, null_mut());
+            let peer = copy_peer(mem, peers, None);
             pool.unlock();
 
-            if peer.is_null() {
-                ngx_log_error!(NGX_LOG_ERR, log, None, "cannot add new server to upstream \"{}\", memory exhausted", B((*(*peers).name).bytes()));
+            if peer == 0 {
+                ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log,
+                    None,
+                    "cannot add new server to upstream \"{}\", memory exhausted",
+                    B(&RrPeers::at(mem, peers).name_bytes())
+                );
                 break 'done;
             }
 
             let mut sa = addr.sockaddr.clone();
 
             if service.is_empty() {
-                let port = peer_sockaddr(template).port();
+                let port = t.addr().port();
                 sa.set_port(port);
             }
 
-            set_peer_addr(peer, &sa);
+            set_peer_addr(mem, peer, &sa);
 
-            (*peer).host = (*template).host;
+            let p = RrPeer::at(mem, peer);
 
-            let server = if !service.is_empty() { addr.name.as_slice() } else { (*template).server.bytes() };
+            p.set(RrPeer::host, t.get(RrPeer::host));
 
-            (*peer).server = match shm_dup(pool, server, false) {
-                Some(s) => s,
-                None => {
-                    peer_free(peers, peer);
+            let server = if !service.is_empty() { addr.name.clone() } else { t.server() };
 
-                    ngx_log_error!(NGX_LOG_ERR, log, None, "cannot add new server to upstream \"{}\", memory exhausted", B((*(*peers).name).bytes()));
-                    break 'done;
-                }
-            };
+            if set_peer_server(mem, peer, &server).is_err() {
+                peer_free(mem, peers, peer);
 
-            (*peer).weight = if service.is_empty() {
-                (*template).weight
-            } else if (*template).weight != 1 {
-                (*template).weight
+                ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log,
+                    None,
+                    "cannot add new server to upstream \"{}\", memory exhausted",
+                    B(&RrPeers::at(mem, peers).name_bytes())
+                );
+                break 'done;
+            }
+
+            let weight = if service.is_empty() {
+                t.get(RrPeer::weight)
+            } else if t.get(RrPeer::weight) != 1 {
+                t.get(RrPeer::weight)
             } else {
                 addr.weight as isize
             };
 
-            (*peer).effective_weight = (*peer).weight;
-            (*peer).max_conns = (*template).max_conns;
-            (*peer).max_fails = (*template).max_fails;
-            (*peer).fail_timeout = (*template).fail_timeout;
-            (*peer).down = (*template).down;
+            set_peer_params(mem, peer, template, weight);
 
-            *peerp = peer;
-            peerp = &mut (*peer).next;
+            mem.set(peerp, peer);
+            peerp = peer + RrPeer::next.off;
 
-            (*peers).number += 1;
-            (*peers).tries += ((*peer).down == 0) as usize;
-            (*peers).total_weight += (*peer).weight as usize;
-            (*peers).weighted = (*peers).total_weight != (*peers).number;
-            *(*peers).config += 1;
+            count_peer(mem, peers, peer);
+            config_inc(mem, RrPeers::at(mem, peers).get(RrPeers::config));
 
             set_single(uscf);
         }
 
-        if !service.is_empty() && !(*peers).next.is_null() {
-            peers_unlock(peers);
+        let next = RrPeers::at(mem, peers).get(RrPeers::next);
 
-            peers = (*peers).next;
+        if !service.is_empty() && next != 0 {
+            peers_unlock(mem, peers);
+
+            peers = next;
             backup = true;
 
-            peers_wlock(peers);
+            peers_wlock(mem, peers);
 
             continue;
         }
@@ -822,9 +950,9 @@ unsafe fn resolve_handler(uscf: &Rc<UpstreamSrvConf>, host: *mut UpstreamHost, c
 
     let valid = ctx.valid.get();
 
-    (*host).valid = valid;
+    h.set(UpstreamHost::valid, valid);
 
-    peers_unlock(peers);
+    peers_unlock(mem, peers);
 
     1000 * (if valid > now { valid - now + 1 } else { 1 }) as u64
 }
@@ -834,4 +962,67 @@ pub fn upstream_zone_module() -> ModuleDef {
     let mut m = stream_module_def("ngx_stream_upstream_zone_module", StreamModuleDef::default(), commands);
     m.init_process = Some(init_worker);
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A zone of a process, its slab pool made.
+    fn zone_mem(size: usize) -> Rc<PeerMem> {
+        let mem = Rc::new(ShmMem::private(size).unwrap());
+        SlabPool::init_zone(&mem);
+        PeerMem::zone(mem)
+    }
+
+    #[test]
+    fn peers_come_and_go() {
+        let zm = zone_mem(256 << 10);
+        let mem = &*zm.mem;
+        let pool = SlabPool::of(mem);
+
+        let config = pool.calloc(8);
+        let peers = pool.calloc(RrPeers::SIZE);
+        let ps = RrPeers::at(mem, peers);
+        ps.set(RrPeers::shpool, 1);
+        ps.set(RrPeers::config, config);
+
+        let pfree = pool.pfree();
+
+        let template = copy_peer(mem, peers, None);
+        set_peer_addr(mem, template, &SockAddr::v4("0.0.0.0".parse().unwrap(), 8080));
+        set_peer_server(mem, template, b"example.com:8080").unwrap();
+        RrPeer::at(mem, template).set(RrPeer::weight, 1);
+
+        let mut peerp = peers + RrPeers::peer.off;
+        for ip in ["192.0.2.1", "192.0.2.2"] {
+            let peer = copy_peer(mem, peers, None);
+            set_peer_addr(mem, peer, &SockAddr::v4(ip.parse().unwrap(), 8080));
+            set_peer_server(mem, peer, &RrPeer::at(mem, template).server()).unwrap();
+            set_peer_params(mem, peer, template, 1);
+            mem.set(peerp, peer);
+            peerp = peer + RrPeer::next.off;
+            count_peer(mem, peers, peer);
+        }
+
+        assert_eq!(ps.get(RrPeers::number), 2);
+        assert_eq!(ps.get(RrPeers::weighted), 0);
+
+        // the first one goes
+        let first = ps.get(RrPeers::peer);
+        let p = RrPeer::at(mem, first);
+        assert_eq!(p.name(), b"192.0.2.1:8080");
+        ps.set(RrPeers::peer, p.get(RrPeer::next));
+        remove_peer_locked(mem, peers, first);
+        assert_eq!(ps.get(RrPeers::number), 1);
+        assert_eq!(mem.get(config), 1);
+
+        let second = ps.get(RrPeers::peer);
+        assert_eq!(RrPeer::at(mem, second).name(), b"192.0.2.2:8080");
+        ps.set(RrPeers::peer, 0);
+        remove_peer_locked(mem, peers, second);
+        peer_free(mem, peers, template);
+
+        assert_eq!(pool.pfree(), pfree);
+    }
 }
