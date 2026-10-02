@@ -368,19 +368,22 @@ async fn wait_request_handler(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_c
             return None;
         }
 
-        {
+        // c->recv(c, b->last, size): into the header buffer itself
+        let (mut data, last) = {
             let mut b = hc.buffer.borrow_mut();
 
-            if b.data.len() < size {
-                b.data.resize(size, 0);
-            }
-
             b.cap = size;
+
+            (std::mem::take(&mut b.data), b.last)
+        };
+
+        if data.len() < last + size {
+            data.resize(last + size, 0);
         }
 
-        let mut buf = vec![0u8; size];
+        let n = ngx_quic_stream_recv(c, &mut data[last..last + size]);
 
-        let n = ngx_quic_stream_recv(c, &mut buf);
+        hc.buffer.borrow_mut().data = data;
 
         if n == NGX_AGAIN as isize {
             if deadline.is_none() {
@@ -415,13 +418,7 @@ async fn wait_request_handler(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_c
             return None;
         }
 
-        {
-            let mut b = hc.buffer.borrow_mut();
-            b.data.resize(size, 0);
-            let last = b.last;
-            b.data[last..last + n as usize].copy_from_slice(&buf[..n as usize]);
-            b.last += n as usize;
-        }
+        hc.buffer.borrow_mut().last += n as usize;
 
         break;
     }
@@ -533,9 +530,17 @@ async fn process_request(r: &R, qs: &Rc<QuicStream>, deadline: &mut Option<tokio
             if empty {
                 let cap = hc.buffer.borrow().cap;
 
-                let mut buf = vec![0u8; cap];
+                // c->recv(c, b->start, b->end - b->start): into the header
+                // buffer itself
+                let mut data = std::mem::take(&mut hc.buffer.borrow_mut().data);
 
-                let n = if qs.read_ready.get() { ngx_quic_stream_recv(&c, &mut buf) } else { NGX_AGAIN as isize };
+                if data.len() < cap {
+                    data.resize(cap, 0);
+                }
+
+                let n = if qs.read_ready.get() { ngx_quic_stream_recv(&c, &mut data[..cap]) } else { NGX_AGAIN as isize };
+
+                hc.buffer.borrow_mut().data = data;
 
                 if n == NGX_AGAIN as isize {
                     // the read timer, and the next read event
@@ -554,17 +559,14 @@ async fn process_request(r: &R, qs: &Rc<QuicStream>, deadline: &mut Option<tokio
                 }
 
                 let mut b = hc.buffer.borrow_mut();
-                if b.data.len() < cap {
-                    b.data.resize(cap, 0);
-                }
-                b.data[..n as usize].copy_from_slice(&buf[..n as usize]);
                 b.pos = 0;
                 b.last = n as usize;
             }
 
+            // the header buffer, lent to the parser
             let (data, pos, last) = {
-                let b = hc.buffer.borrow();
-                (b.data.clone(), b.pos, b.last)
+                let mut b = hc.buffer.borrow_mut();
+                (std::mem::take(&mut b.data), b.pos, b.last)
             };
 
             let p = pos;
@@ -579,7 +581,13 @@ async fn process_request(r: &R, qs: &Rc<QuicStream>, deadline: &mut Option<tokio
                 rc
             };
 
-            hc.buffer.borrow_mut().pos = pb.pos;
+            let pos = pb.pos;
+
+            {
+                let mut b = hc.buffer.borrow_mut();
+                b.data = data;
+                b.pos = pos;
+            }
 
             if rc > 0 {
                 ngx_quic_reset_stream(&c, rc as u64);
@@ -591,8 +599,8 @@ async fn process_request(r: &R, qs: &Rc<QuicStream>, deadline: &mut Option<tokio
                 break 'inner Err(Fin::Close(NGX_HTTP_INTERNAL_SERVER_ERROR));
             }
 
-            r.request_length.set(r.request_length.get() + (pb.pos - p) as i64);
-            h3c.total_bytes.set(h3c.total_bytes.get() + (pb.pos - p) as i64);
+            r.request_length.set(r.request_length.get() + (pos - p) as i64);
+            h3c.total_bytes.set(h3c.total_bytes.get() + (pos - p) as i64);
 
             if check_flood(&c) != NGX_OK {
                 break 'inner Err(Fin::Close(NGX_HTTP_CLOSE));
@@ -614,15 +622,17 @@ async fn process_request(r: &R, qs: &Rc<QuicStream>, deadline: &mut Option<tokio
 
             /* rc == NGX_OK || rc == NGX_DONE */
 
-            let (name, value) = {
-                let v3p = v3_parse(r);
-                let p = v3p.borrow();
-                (p.headers.field_rep.field.name.clone(), p.headers.field_rep.field.value.clone())
-            };
+            // the name and value, lent by the parser
+            let v3p = v3_parse(r);
+            let field = v3p.borrow_mut().headers.field_rep.field.lend();
 
-            h3c.payload_bytes.set(h3c.payload_bytes.get() + field_l_len(&name, &value) as i64);
+            h3c.payload_bytes.set(h3c.payload_bytes.get() + field_l_len(field.name(), field.value()) as i64);
 
-            if let Err(f) = process_header(r, &name, &value) {
+            let res = process_header(r, field.name(), field.value());
+
+            v3p.borrow_mut().headers.field_rep.field.give_back(field);
+
+            if let Err(f) = res {
                 break 'inner Err(f);
             }
 
@@ -920,7 +930,8 @@ fn init_pseudo_headers(r: &R) -> Result<(), Fin> {
         return failed;
     }
 
-    let path = match v3p.borrow().path.clone() {
+    // lent out of r->v3_parse, put back below
+    let path = match v3p.borrow_mut().path.take() {
         Some(p) => p,
         None => {
             ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent no \":path\" header");
@@ -928,11 +939,17 @@ fn init_pseudo_headers(r: &R) -> Result<(), Fin> {
         }
     };
 
-    let mut line = r.method_name.borrow().clone();
-    line.push(b' ');
-    line.extend_from_slice(&path);
-    line.push(b' ');
-    line.extend_from_slice(b"HTTP/3.0");
+    let line = {
+        let method = r.method_name.borrow();
+
+        let mut line = Vec::with_capacity(method.len() + 1 + path.len() + 1 + b"HTTP/3.0".len());
+        line.extend_from_slice(&method);
+        line.push(b' ');
+        line.extend_from_slice(&path);
+        line.push(b' ');
+        line.extend_from_slice(b"HTTP/3.0");
+        line
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "http3 request line: \"{}\"", B(&line));
 
@@ -940,15 +957,23 @@ fn init_pseudo_headers(r: &R) -> Result<(), Fin> {
 
     *r.http_protocol.borrow_mut() = b"HTTP/3.0".to_vec();
 
-    if request_rt::process_request_uri_data(r, &path).is_err() {
+    let rc = request_rt::process_request_uri_data(r, &path);
+
+    v3p.borrow_mut().path = Some(path);
+
+    if rc.is_err() {
         // ngx_http_process_request_uri() finalizes the request
         return Err(Fin::Finalize(NGX_HTTP_BAD_REQUEST));
     }
 
-    let authority = v3p.borrow().authority.clone();
+    let authority = v3p.borrow_mut().authority.take();
 
-    if let Some(host) = authority {
-        let (host, port) = match request_rt::validate_host(&host, false) {
+    if let Some(authority) = authority {
+        let host = request_rt::validate_host(&authority, false);
+
+        v3p.borrow_mut().authority = Some(authority);
+
+        let (host, port) = match host {
             Ok(v) => v,
             Err(()) => {
                 ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent invalid \":authority\" header");

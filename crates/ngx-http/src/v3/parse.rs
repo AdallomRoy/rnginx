@@ -75,18 +75,21 @@ pub struct ParseFieldSectionPrefix {
 }
 
 /// ngx_http_v3_parse_literal_t: `buf` is set when the literal is decoded
-/// into the insert buffer of the dynamic table
+/// into the insert buffer of the dynamic table. The value is decoded into
+/// the buffer the caller passes (the name or value buffer of the field).
 #[derive(Default, Clone)]
 pub struct ParseLiteral {
     pub state: u32,
     pub length: u64,
     pub huffman: bool,
-    pub value: Vec<u8>,
     pub huffstate: u8,
     pub buf: bool,
 }
 
-/// ngx_http_v3_parse_field_t
+/// ngx_http_v3_parse_field_t. The name and the value are each an entry of
+/// the static table (C points to it) or the bytes of name_buf / value_buf
+/// (a literal decoded into it, a dynamic table entry copied into it),
+/// buffers kept from field to field.
 #[derive(Default, Clone)]
 pub struct ParseField {
     pub state: u32,
@@ -94,11 +97,77 @@ pub struct ParseField {
     pub base: u64,
     pub dynamic: bool,
 
-    pub name: Vec<u8>,
-    pub value: Vec<u8>,
+    pub name_static: Option<&'static [u8]>,
+    pub name_buf: Vec<u8>,
+    pub value_static: Option<&'static [u8]>,
+    pub value_buf: Vec<u8>,
 
     pub pint: ParsePrefixInt,
     pub literal: ParseLiteral,
+}
+
+impl ParseField {
+    /// st->name
+    pub fn name(&self) -> &[u8] {
+        self.name_static.unwrap_or(&self.name_buf)
+    }
+
+    /// st->value
+    pub fn value(&self) -> &[u8] {
+        self.value_static.unwrap_or(&self.value_buf)
+    }
+
+    /// A new field representation (C: ngx_memzero(&st->field) and its
+    /// base): all fresh but for the buffers' capacity.
+    pub fn reset(&mut self, base: u64) {
+        let mut name_buf = std::mem::take(&mut self.name_buf);
+        let mut value_buf = std::mem::take(&mut self.value_buf);
+
+        name_buf.clear();
+        value_buf.clear();
+
+        *self = ParseField { base, name_buf, value_buf, ..Default::default() };
+    }
+
+    /// The value is empty (a literal of length 0).
+    fn empty_value(&mut self) {
+        self.value_static = None;
+        self.value_buf.clear();
+    }
+
+    /// The name and value, lent out of the parser (then given back with
+    /// give_back(), which keeps the buffers).
+    pub fn lend(&mut self) -> FieldLine {
+        FieldLine {
+            name_static: self.name_static,
+            name_buf: std::mem::take(&mut self.name_buf),
+            value_static: self.value_static,
+            value_buf: std::mem::take(&mut self.value_buf),
+        }
+    }
+
+    pub fn give_back(&mut self, f: FieldLine) {
+        self.name_buf = f.name_buf;
+        self.value_buf = f.value_buf;
+    }
+}
+
+/// The name and value of a field line, lent by ParseField::lend().
+pub struct FieldLine {
+    name_static: Option<&'static [u8]>,
+    name_buf: Vec<u8>,
+    value_static: Option<&'static [u8]>,
+    value_buf: Vec<u8>,
+}
+
+impl FieldLine {
+    pub fn name(&self) -> &[u8] {
+        self.name_static.unwrap_or(&self.name_buf)
+    }
+
+    pub fn value(&self) -> &[u8] {
+        self.value_static.unwrap_or(&self.value_buf)
+    }
 }
 
 /// ngx_http_v3_parse_field_rep_t
@@ -553,9 +622,7 @@ fn parse_field_rep(c: &Rc<Connection>, st: &mut ParseFieldRep, base: u64, b: &mu
 
         let ch = b.data[b.pos];
 
-        st.field = ParseField::default();
-
-        st.field.base = base;
+        st.field.reset(base);
 
         st.state = if ch & 0x80 != 0 {
             /* Indexed Field Line */
@@ -594,8 +661,8 @@ fn parse_field_rep(c: &Rc<Connection>, st: &mut ParseFieldRep, base: u64, b: &mu
     NGX_DONE
 }
 
-/// ngx_http_v3_parse_literal
-fn parse_literal(c: &Rc<Connection>, st: &mut ParseLiteral, b: &mut PBuf<'_>) -> i64 {
+/// ngx_http_v3_parse_literal, into `value`
+fn parse_literal(c: &Rc<Connection>, st: &mut ParseLiteral, value: &mut Vec<u8>, b: &mut PBuf<'_>) -> i64 {
     const SW_START: u32 = 0;
     const SW_VALUE: u32 = 1;
 
@@ -635,7 +702,8 @@ fn parse_literal(c: &Rc<Connection>, st: &mut ParseLiteral, b: &mut PBuf<'_>) ->
                         }
                     }
 
-                    st.value = Vec::with_capacity(n as usize + 1);
+                    value.clear();
+                    value.reserve(n as usize + 1);
                     st.state = SW_VALUE;
                 }
 
@@ -647,12 +715,12 @@ fn parse_literal(c: &Rc<Connection>, st: &mut ParseLiteral, b: &mut PBuf<'_>) ->
                 b.pos += 1;
 
                 if st.huffman {
-                    if crate::huff_decode::huff_decode(&mut st.huffstate, &[ch], &mut st.value, st.length == 1, &c.log).is_err() {
+                    if crate::huff_decode::huff_decode(&mut st.huffstate, &[ch], value, st.length == 1, &c.log).is_err() {
                         ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid encoded field line");
                         return NGX_ERROR;
                     }
                 } else {
-                    st.value.push(ch);
+                    value.push(ch);
                 }
 
                 st.length -= 1;
@@ -670,7 +738,7 @@ fn parse_literal(c: &Rc<Connection>, st: &mut ParseLiteral, b: &mut PBuf<'_>) ->
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse literal done \"{}\"", B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse literal done \"{}\"", B(value));
 
     st.state = SW_START;
     NGX_DONE
@@ -718,7 +786,7 @@ fn parse_field_ri(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -> 
         st.index = st.base.wrapping_sub(st.index).wrapping_sub(1);
     }
 
-    let rc = parse_lookup(c, st.dynamic, st.index, true, true, &mut st.name, &mut st.value);
+    let rc = parse_lookup(c, st.dynamic, st.index, st, true);
     if rc != NGX_OK {
         return rc;
     }
@@ -779,7 +847,7 @@ fn parse_field_lri(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
                 st.literal.length = st.pint.value;
                 if st.literal.length == 0 {
-                    st.value = Vec::new();
+                    st.empty_value();
                     break;
                 }
 
@@ -787,12 +855,12 @@ fn parse_field_lri(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
             }
 
             SW_VALUE => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.value_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.value_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.value = std::mem::take(&mut st.literal.value);
                 break;
             }
 
@@ -802,15 +870,13 @@ fn parse_field_lri(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field lri done {}{}] \"{}\"", if st.dynamic { "dynamic[-" } else { "static[" }, st.index, B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field lri done {}{}] \"{}\"", if st.dynamic { "dynamic[-" } else { "static[" }, st.index, B(st.value()));
 
     if st.dynamic {
         st.index = st.base.wrapping_sub(st.index).wrapping_sub(1);
     }
 
-    let mut unused = Vec::new();
-
-    let rc = parse_lookup(c, st.dynamic, st.index, true, false, &mut st.name, &mut unused);
+    let rc = parse_lookup(c, st.dynamic, st.index, st, false);
     if rc != NGX_OK {
         return rc;
     }
@@ -858,12 +924,12 @@ fn parse_field_l(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -> i
             }
 
             SW_NAME => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.name_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.name_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.name = std::mem::take(&mut st.literal.value);
                 st.state = SW_VALUE_LEN;
             }
 
@@ -886,7 +952,7 @@ fn parse_field_l(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -> i
 
                 st.literal.length = st.pint.value;
                 if st.literal.length == 0 {
-                    st.value = Vec::new();
+                    st.empty_value();
                     break;
                 }
 
@@ -894,12 +960,12 @@ fn parse_field_l(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -> i
             }
 
             SW_VALUE => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.value_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.value_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.value = std::mem::take(&mut st.literal.value);
                 break;
             }
 
@@ -909,7 +975,7 @@ fn parse_field_l(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -> i
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field l done \"{}\" \"{}\"", B(&st.name), B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field l done \"{}\" \"{}\"", B(st.name()), B(st.value()));
 
     st.state = SW_START;
     NGX_DONE
@@ -948,7 +1014,7 @@ fn parse_field_pbi(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
     let index = st.base.wrapping_add(st.index);
 
-    let rc = parse_lookup(c, true, index, true, true, &mut st.name, &mut st.value);
+    let rc = parse_lookup(c, true, index, st, true);
     if rc != NGX_OK {
         return rc;
     }
@@ -1002,7 +1068,7 @@ fn parse_field_lpbi(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -
 
                 st.literal.length = st.pint.value;
                 if st.literal.length == 0 {
-                    st.value = Vec::new();
+                    st.empty_value();
                     break;
                 }
 
@@ -1010,12 +1076,12 @@ fn parse_field_lpbi(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -
             }
 
             SW_VALUE => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.value_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.value_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.value = std::mem::take(&mut st.literal.value);
                 break;
             }
 
@@ -1025,13 +1091,11 @@ fn parse_field_lpbi(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field lpbi done dynamic[+{}] \"{}\"", st.index, B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field lpbi done dynamic[+{}] \"{}\"", st.index, B(st.value()));
 
     let index = st.base.wrapping_add(st.index);
 
-    let mut unused = Vec::new();
-
-    let rc = parse_lookup(c, true, index, true, false, &mut st.name, &mut unused);
+    let rc = parse_lookup(c, true, index, st, false);
     if rc != NGX_OK {
         return rc;
     }
@@ -1041,21 +1105,34 @@ fn parse_field_lpbi(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) -
 }
 
 /// ngx_http_v3_parse_lookup: the name (and the value, if asked) of a
-/// table entry
-fn parse_lookup(c: &Rc<Connection>, dynamic: bool, index: u64, want_name: bool, want_value: bool, name: &mut Vec<u8>, value: &mut Vec<u8>) -> i64 {
-    let field = if !dynamic { table::lookup_static(c, index) } else { table::lookup(c, index) };
+/// table entry, for the field: an entry of the static table by reference,
+/// one of the dynamic table copied into the field's buffers
+fn parse_lookup(c: &Rc<Connection>, dynamic: bool, index: u64, st: &mut ParseField, want_value: bool) -> i64 {
+    if !dynamic {
+        let (name, value) = match table::lookup_static(c, index) {
+            Some(f) => f,
+            None => return NGX_HTTP_V3_ERR_DECOMPRESSION_FAILED as i64,
+        };
 
-    let field = match field {
-        Some(f) => f,
-        None => return NGX_HTTP_V3_ERR_DECOMPRESSION_FAILED as i64,
-    };
+        st.name_static = Some(name);
 
-    if want_name {
-        *name = field.name;
+        if want_value {
+            st.value_static = Some(value);
+        }
+
+        return NGX_OK;
     }
 
+    let value = if want_value { Some(&mut st.value_buf) } else { None };
+
+    if !table::lookup_into(c, index, &mut st.name_buf, value) {
+        return NGX_HTTP_V3_ERR_DECOMPRESSION_FAILED as i64;
+    }
+
+    st.name_static = None;
+
     if want_value {
-        *value = field.value;
+        st.value_static = None;
     }
 
     NGX_OK
@@ -1357,7 +1434,7 @@ fn parse_field_inr(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
                 st.literal.length = st.pint.value;
                 if st.literal.length == 0 {
-                    st.value = Vec::new();
+                    st.empty_value();
                     break;
                 }
 
@@ -1365,12 +1442,12 @@ fn parse_field_inr(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
             }
 
             SW_VALUE => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.value_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.value_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.value = std::mem::take(&mut st.literal.value);
                 break;
             }
 
@@ -1380,9 +1457,9 @@ fn parse_field_inr(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field inr done {}[{}] \"{}\"", if st.dynamic { "dynamic" } else { "static" }, st.index, B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field inr done {}[{}] \"{}\"", if st.dynamic { "dynamic" } else { "static" }, st.index, B(st.value()));
 
-    let rc = table::ref_insert(c, st.dynamic, st.index, &st.value);
+    let rc = table::ref_insert(c, st.dynamic, st.index, st.value());
     if rc != NGX_OK {
         return rc;
     }
@@ -1436,12 +1513,12 @@ fn parse_field_iln(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
             }
 
             SW_NAME => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.name_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.name_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.name = std::mem::take(&mut st.literal.value);
                 st.state = SW_VALUE_LEN;
             }
 
@@ -1464,7 +1541,7 @@ fn parse_field_iln(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
                 st.literal.length = st.pint.value;
                 if st.literal.length == 0 {
-                    st.value = Vec::new();
+                    st.empty_value();
                     break;
                 }
 
@@ -1472,12 +1549,12 @@ fn parse_field_iln(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
             }
 
             SW_VALUE => {
-                let rc = parse_literal(c, &mut st.literal, b);
+                st.value_static = None;
+
+                let rc = parse_literal(c, &mut st.literal, &mut st.value_buf, b);
                 if rc != NGX_DONE {
                     return rc;
                 }
-
-                st.value = std::mem::take(&mut st.literal.value);
                 break;
             }
 
@@ -1487,9 +1564,9 @@ fn parse_field_iln(c: &Rc<Connection>, st: &mut ParseField, b: &mut PBuf<'_>) ->
 
     // done:
 
-    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field iln done \"{}\":\"{}\"", B(&st.name), B(&st.value));
+    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "http3 parse field iln done \"{}\":\"{}\"", B(st.name()), B(st.value()));
 
-    let rc = table::insert(c, &st.name, &st.value);
+    let rc = table::insert(c, st.name(), st.value());
     if rc != NGX_OK {
         return rc;
     }
