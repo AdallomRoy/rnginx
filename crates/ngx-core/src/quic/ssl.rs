@@ -1,13 +1,15 @@
 //! ngx_event_quic_ssl.c: the TLS handshake over CRYPTO frames (the
 //! BoringSSL API, which the OpenSSL compat layer provides).
 
-use std::os::raw::{c_int, c_uint};
+use std::os::raw::c_int;
 use std::rc::Rc;
 
+use ngx_sys::ssl as sys;
+use openssl::ssl::{SslCipherRef, SslRef};
+
 use crate::connection::Connection;
-use crate::event_openssl::{ngx_ssl_conn, ngx_ssl_connection_error, ngx_ssl_error, ngx_ssl_handshake_log};
+use crate::event_openssl::{ngx_ssl_connection_error, ngx_ssl_error, ngx_ssl_handshake_log, ngx_ssl_with};
 use crate::log::*;
-use crate::openssl_ffi::*;
 use crate::rc::*;
 use crate::ngx_log_debug;
 use crate::ngx_log_error;
@@ -50,7 +52,7 @@ fn ngx_quic_map_encryption_level(ssl_level: usize) -> usize {
 }
 
 /// ngx_quic_set_read_secret
-fn ngx_quic_set_read_secret(c: &Connection, ssl_level: usize, cipher: *const SSL_CIPHER, rsecret: &[u8]) -> c_int {
+fn ngx_quic_set_read_secret(c: &Connection, ssl_level: usize, cipher: &SslCipherRef, rsecret: &[u8]) -> c_int {
     let qc = match ngx_quic_get_connection(c) {
         Some(qc) => qc,
         None => return 1,
@@ -68,7 +70,7 @@ fn ngx_quic_set_read_secret(c: &Connection, ssl_level: usize, cipher: *const SSL
 }
 
 /// ngx_quic_set_write_secret
-fn ngx_quic_set_write_secret(c: &Connection, ssl_level: usize, cipher: *const SSL_CIPHER, wsecret: &[u8]) -> c_int {
+fn ngx_quic_set_write_secret(c: &Connection, ssl_level: usize, cipher: &SslCipherRef, wsecret: &[u8]) -> c_int {
     let qc = match ngx_quic_get_connection(c) {
         Some(qc) => qc,
         None => return 1,
@@ -85,8 +87,9 @@ fn ngx_quic_set_write_secret(c: &Connection, ssl_level: usize, cipher: *const SS
     1
 }
 
-/// ngx_quic_add_handshake_data
-fn ngx_quic_add_handshake_data(c: &Connection, ssl_level: usize, data: &[u8]) -> c_int {
+/// ngx_quic_add_handshake_data: `ssl_conn` is the SSL object being
+/// processed (the message callback)
+fn ngx_quic_add_handshake_data(c: &Connection, ssl_conn: &SslRef, ssl_level: usize, data: &[u8]) -> c_int {
     let qc = match ngx_quic_get_connection(c) {
         Some(qc) => qc,
         None => return 1,
@@ -101,17 +104,11 @@ fn ngx_quic_add_handshake_data(c: &Connection, ssl_level: usize, data: &[u8]) ->
         // parameters; we want to break handshake if something is wrong
         // here;
 
-        let ssl_conn = ngx_ssl_conn(c);
-
-        let mut alpn_data: *const u8 = std::ptr::null();
-        let mut alpn_len: c_uint = 0;
-
-        // SAFETY: the SSL object of the connection
-        unsafe { SSL_get0_alpn_selected(ssl_conn, &mut alpn_data, &mut alpn_len) };
+        let alpn_len = ssl_conn.selected_alpn_protocol().map(|p| p.len()).unwrap_or(0);
 
         if alpn_len == 0 {
             if qc.error.get() == 0 {
-                qc.error.set(ngx_quic_err_crypto(SSL_AD_NO_APPLICATION_PROTOCOL as u64));
+                qc.error.set(ngx_quic_err_crypto(sys::SSL_AD_NO_APPLICATION_PROTOCOL as u64));
                 qc.error_reason.set(Some("missing ALPN extension"));
 
                 ngx_log_error!(NGX_LOG_INFO, c.log, None, "quic missing ALPN extension");
@@ -128,7 +125,7 @@ fn ngx_quic_add_handshake_data(c: &Connection, ssl_level: usize, data: &[u8]) ->
             /* RFC 9001, 8.2.  QUIC Transport Parameters Extension */
 
             if qc.error.get() == 0 {
-                qc.error.set(ngx_quic_err_crypto(SSL_AD_MISSING_EXTENSION as u64));
+                qc.error.set(ngx_quic_err_crypto(sys::SSL_AD_MISSING_EXTENSION as u64));
                 qc.error_reason.set(Some("missing transport parameters"));
 
                 ngx_log_error!(NGX_LOG_INFO, c.log, None, "missing transport parameters");
@@ -220,7 +217,7 @@ pub fn ngx_quic_handle_crypto_frame(c: &Rc<Connection>, pkt: &QuicHeader<'_>, fr
     if c.ssl.borrow().as_ref().is_some_and(|s| s.handshaked.get()) {
         /* QUIC doesn't define post-handshake messages for a client */
 
-        qc.error.set(ngx_quic_err_crypto(SSL_AD_UNEXPECTED_MESSAGE as u64));
+        qc.error.set(ngx_quic_err_crypto(sys::SSL_AD_UNEXPECTED_MESSAGE as u64));
         qc.error_reason.set(Some("unexpected CRYPTO frame"));
 
         return NGX_ERROR;
@@ -279,16 +276,22 @@ fn ngx_quic_handshake(c: &Rc<Connection>) -> i64 {
         None => return NGX_ERROR,
     };
 
-    let ssl_conn = ngx_ssl_conn(c);
+    let sc = match c.ssl.borrow().clone() {
+        Some(sc) => sc,
+        None => return NGX_ERROR,
+    };
 
-    // SAFETY: the SSL object of the connection
-    let n = unsafe { SSL_do_handshake(ssl_conn) };
+    let io = match sc.with_mut(sys::do_handshake) {
+        Some(io) => io,
+        None => return NGX_ERROR,
+    };
+
+    let n = io.rc;
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL_do_handshake: {}", n);
 
     if n <= 0 {
-        // SAFETY: the SSL object of the connection
-        let sslerr = unsafe { SSL_get_error(ssl_conn, n) };
+        let sslerr = io.error;
 
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL_get_error: {}", sslerr);
 
@@ -296,19 +299,17 @@ fn ngx_quic_handshake(c: &Rc<Connection>) -> i64 {
 
         if rejected {
             c.connection_error(0, "handshake rejected");
-            // SAFETY: no arguments
-            unsafe { ERR_clear_error() };
+            sys::err_clear_error();
             return NGX_ERROR;
         }
 
         if qc.error.get() != 0 {
             c.connection_error(0, "SSL_do_handshake() failed");
-            // SAFETY: no arguments
-            unsafe { ERR_clear_error() };
+            sys::err_clear_error();
             return NGX_ERROR;
         }
 
-        if sslerr != SSL_ERROR_WANT_READ {
+        if sslerr != sys::SSL_ERROR_WANT_READ {
             ngx_ssl_connection_error(c, sslerr, 0, "SSL_do_handshake() failed");
             return NGX_ERROR;
         }
@@ -319,8 +320,7 @@ fn ngx_quic_handshake(c: &Rc<Connection>) -> i64 {
         return NGX_ERROR;
     }
 
-    // SAFETY: the SSL object of the connection
-    if unsafe { SSL_is_init_finished(ssl_conn) } == 0 {
+    if !ngx_ssl_with(c, |ssl| ssl.is_init_finished()).unwrap_or(false) {
         let early = ngx_quic_keys_available(&qc.keys.borrow(), NGX_QUIC_ENCRYPTION_EARLY_DATA, false);
 
         if early && qc.client_tp_done.get() && ngx_quic_init_streams(c) != NGX_OK {
@@ -430,9 +430,9 @@ pub fn ngx_quic_init_connection(c: &Rc<Connection>) -> i64 {
         sc.no_wait_shutdown.set(true);
     }
 
-    let ssl_conn = ngx_ssl_conn(c);
+    let rc = c.ssl.borrow().clone().and_then(|sc| sc.with_mut(|ssl| ssl_set_quic_method(c, ssl, &QUIC_METHOD))).unwrap_or(0);
 
-    if ssl_set_quic_method(c, ssl_conn, &QUIC_METHOD) == 0 {
+    if rc == 0 {
         ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("quic SSL_set_quic_method() failed"));
         return NGX_ERROR;
     }
@@ -470,5 +470,3 @@ pub fn ngx_quic_init_connection(c: &Rc<Connection>) -> i64 {
     NGX_OK
 }
 
-#[allow(dead_code)]
-fn _unused(_: c_int) {}

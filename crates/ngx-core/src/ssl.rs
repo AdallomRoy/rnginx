@@ -1,22 +1,25 @@
-//! OpenSSL integration (ngx_event_openssl.c). Connection-level I/O via openssl-sys FFI.
+//! OpenSSL integration (ngx_event_openssl.c): the SSL state of a
+//! connection (c->ssl) and its I/O.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::io;
-use std::os::raw::c_void;
 use std::rc::Rc;
 
-use foreign_types::ForeignType;
-use openssl::ssl::Ssl;
+use ngx_sys::ssl as sys;
+use openssl::ssl::{Ssl, SslRef};
 
+use crate::cmd_fn;
 use crate::conf::*;
 use crate::connection::{Connection, IoStep};
 use crate::log::Log;
 use crate::module::*;
-use crate::cmd_fn;
 
 /// Per-connection SSL state.
 pub struct SslConnection {
+    /// c->ssl->connection: borrowed mutably by the SSL calls (the OpenSSL
+    /// callbacks they run get the object from OpenSSL), shared by the
+    /// getters; see with() and with_mut()
     pub inner: RefCell<Option<Ssl>>,
     pub handshaked: Cell<bool>,
     pub no_wait_shutdown: Cell<bool>,
@@ -26,6 +29,12 @@ pub struct SslConnection {
     pub data: RefCell<Option<Rc<dyn Any>>>,
     /// the rest of ngx_ssl_connection_t (ngx_ssl_create_connection())
     pub state: crate::event_openssl::SslConnState,
+}
+
+impl Default for SslConnection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SslConnection {
@@ -42,35 +51,57 @@ impl SslConnection {
         }
     }
 
-    /// Get the raw SSL* pointer. Panics if handshake hasn't started.
-    fn ssl_ptr(&self) -> *mut openssl_sys::SSL {
-        let b = self.inner.borrow();
-        b.as_ref().expect("SSL not initialized").as_ptr()
+    /// The SSL object, shared: c->ssl->connection of the getters. While an
+    /// SSL call of the connection is in progress (its callbacks evaluating
+    /// variables, as the certificate callback does), the object is the one
+    /// the callback lent with ngx_sys::ssl::with_current().
+    pub fn with<R>(&self, f: impl FnOnce(&SslRef) -> R) -> Option<R> {
+        match self.inner.try_borrow() {
+            Ok(ssl) => ssl.as_ref().map(|s| f(s)),
+            Err(_) => sys::current(|cur| match cur {
+                Some(s) if crate::event_openssl::ngx_ssl_connection_id(s) == self.state.id.get() => Some(f(s)),
+                _ => None,
+            }),
+        }
     }
 
-    /// One SSL_read attempt (the body of ngx_ssl_recv).
+    /// The SSL object, for an SSL call or a setting (None without one, or
+    /// in a callback of an SSL call of the connection).
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut SslRef) -> R) -> Option<R> {
+        let mut ssl = self.inner.try_borrow_mut().ok()?;
+        ssl.as_mut().map(|s| f(s))
+    }
+
+    /// SSL_want_write(): the last TLS operation could not write.
+    pub fn want_write(&self) -> bool {
+        self.with(|ssl| sys::want(ssl) == sys::SSL_WRITING).unwrap_or(false)
+    }
+
+    /// One SSL_read attempt of a connection not made by
+    /// ngx_ssl_create_connection().
     fn read_step(&self, c: &Connection, buf: &mut [u8]) -> IoStep<io::Result<usize>> {
-        let rc = unsafe {
-            openssl_sys::SSL_read(self.ssl_ptr(), buf.as_mut_ptr() as *mut c_void, buf.len() as i32)
+        let io = match self.with_mut(|ssl| sys::read(ssl, buf)) {
+            Some(io) => io,
+            None => return IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, "SSL not initialized"))),
         };
-        if rc > 0 {
-            return IoStep::Done(Ok(rc as usize));
+
+        if io.rc > 0 {
+            return IoStep::Done(Ok(io.rc as usize));
         }
-        let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
-        match err {
-            openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
-            openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
-            openssl_sys::SSL_ERROR_ZERO_RETURN => {
+
+        match io.error {
+            sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+            sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+            sys::SSL_ERROR_ZERO_RETURN => {
                 c.read_eof.set(true);
                 IoStep::Done(Ok(0))
             }
-            openssl_sys::SSL_ERROR_SYSCALL => {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(0) {
+            sys::SSL_ERROR_SYSCALL => {
+                if io.errno == 0 {
                     c.read_eof.set(true);
                     return IoStep::Done(Ok(0));
                 }
-                IoStep::Done(Err(e))
+                IoStep::Done(Err(io::Error::from_raw_os_error(io.errno)))
             }
             _ => {
                 let msg = ssl_error_string();
@@ -84,6 +115,27 @@ impl SslConnection {
                 }
                 IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_read failed: {}", msg))))
             }
+        }
+    }
+
+    /// One SSL_write attempt of a connection not made by
+    /// ngx_ssl_create_connection().
+    fn write_step(&self, c: &Connection, buf: &[u8]) -> IoStep<io::Result<usize>> {
+        let io = match self.with_mut(|ssl| sys::write(ssl, buf)) {
+            Some(io) => io,
+            None => return IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, "SSL not initialized"))),
+        };
+
+        if io.rc > 0 {
+            c.sent.set(c.sent.get() + io.rc as u64);
+            return IoStep::Done(Ok(io.rc as usize));
+        }
+
+        match io.error {
+            sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+            sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+            sys::SSL_ERROR_SYSCALL => IoStep::Done(Err(io::Error::from_raw_os_error(io.errno))),
+            _ => IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string())))),
         }
     }
 
@@ -110,42 +162,15 @@ impl SslConnection {
         if self.state.ngx.get() {
             return c.drive_io(|| crate::event_openssl::ngx_ssl_write_step(c, self, buf)).await?;
         }
-        c.drive_io(|| {
-            let rc = unsafe {
-                openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32)
-            };
-            if rc > 0 {
-                c.sent.set(c.sent.get() + rc as u64);
-                return IoStep::Done(Ok(rc as usize));
-            }
-            let err = unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) };
-            match err {
-                openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
-                openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
-                openssl_sys::SSL_ERROR_SYSCALL => IoStep::Done(Err(io::Error::last_os_error())),
-                _ => IoStep::Done(Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string())))),
-            }
-        })
-        .await?
+        c.drive_io(|| self.write_step(c, buf)).await?
     }
 
     /// A single SSL_write attempt; WANT_READ / WANT_WRITE map to WouldBlock.
     pub fn try_send(&self, c: &Connection, buf: &[u8]) -> io::Result<usize> {
-        if self.state.ngx.get() {
-            return match crate::event_openssl::ngx_ssl_write_step(c, self, buf) {
-                IoStep::Done(r) => r,
-                IoStep::WantRead | IoStep::WantWrite => Err(io::ErrorKind::WouldBlock.into()),
-            };
-        }
-        let rc = unsafe { openssl_sys::SSL_write(self.ssl_ptr(), buf.as_ptr() as *const c_void, buf.len() as i32) };
-        if rc > 0 {
-            c.sent.set(c.sent.get() + rc as u64);
-            return Ok(rc as usize);
-        }
-        match unsafe { openssl_sys::SSL_get_error(self.ssl_ptr(), rc) } {
-            openssl_sys::SSL_ERROR_WANT_READ | openssl_sys::SSL_ERROR_WANT_WRITE => Err(io::ErrorKind::WouldBlock.into()),
-            openssl_sys::SSL_ERROR_SYSCALL => Err(io::Error::last_os_error()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, format!("SSL_write failed: {}", ssl_error_string()))),
+        let step = if self.state.ngx.get() { crate::event_openssl::ngx_ssl_write_step(c, self, buf) } else { self.write_step(c, buf) };
+        match step {
+            IoStep::Done(r) => r,
+            IoStep::WantRead | IoStep::WantWrite => Err(io::ErrorKind::WouldBlock.into()),
         }
     }
 
@@ -156,36 +181,23 @@ impl SslConnection {
     /// Selected ALPN protocol after handshake (e.g. b"h2", b"http/1.1").
     /// Returns None if ALPN wasn't negotiated.
     pub fn alpn_selected(&self) -> Option<Vec<u8>> {
-        if !self.handshaked.get() { return None; }
-        let ssl = self.ssl_ptr();
-        let mut data: *const u8 = std::ptr::null();
-        let mut len: u32 = 0;
-        unsafe {
-            openssl_sys::SSL_get0_alpn_selected(ssl, &mut data, &mut len);
-            if data.is_null() || len == 0 { return None; }
-            Some(std::slice::from_raw_parts(data, len as usize).to_vec())
+        if !self.handshaked.get() {
+            return None;
         }
+        self.with(|ssl| ssl.selected_alpn_protocol().filter(|p| !p.is_empty()).map(|p| p.to_vec())).flatten()
     }
 }
 
-/// Read the top of the OpenSSL error queue into a string.
+/// The reasons of the OpenSSL error queue, which is emptied.
 pub fn ssl_error_string() -> String {
-    unsafe {
-        let mut msg = String::new();
-        loop {
-            let e = openssl_sys::ERR_get_error();
-            if e == 0 {
-                break;
-            }
-            let cptr = openssl_sys::ERR_reason_error_string(e);
-            if cptr.is_null() { continue; }
-            let s = std::ffi::CStr::from_ptr(cptr).to_string_lossy();
-            if !msg.is_empty() {
-                msg.push_str("; ");
-            }
-            msg.push_str(&s);
-        }
-        if msg.is_empty() { "unknown".to_string() } else { msg }
+    let stack = openssl::error::ErrorStack::get();
+
+    let msg = stack.errors().iter().filter_map(|e| e.reason()).collect::<Vec<_>>().join("; ");
+
+    if msg.is_empty() {
+        "unknown".to_string()
+    } else {
+        msg
     }
 }
 

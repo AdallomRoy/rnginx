@@ -36,7 +36,7 @@ use openssl::ocsp::OcspResponse;
 use openssl::pkey::{PKey, Params, Private};
 use openssl::ssl::{SslCipherRef, SslContextBuilder, SslContextRef, SslRef, SslSessionRef};
 use openssl::stack::Stack;
-use openssl::x509::store::{X509StoreBuilderRef, X509StoreRef};
+use openssl::x509::store::X509StoreBuilderRef;
 use openssl::x509::{X509CrlRef, X509NameRef, X509Ref, X509StoreContextRef, X509Crl, X509};
 use openssl_sys as ffi;
 
@@ -181,6 +181,8 @@ extern "C" {
     fn ASN1_GENERALIZEDTIME_print(bp: *mut ffi::BIO, t: *const ffi::ASN1_GENERALIZEDTIME) -> c_int;
     fn X509_verify_cert_error_string(n: c_long) -> *const c_char;
     fn X509_STORE_add_crl(store: *mut ffi::X509_STORE, x: *mut ffi::X509_CRL) -> c_int;
+    fn X509_check_host(x: *mut ffi::X509, chk: *const c_char, chklen: usize, flags: c_uint, peername: *mut *mut c_char) -> c_int;
+    fn SSL_CTX_remove_session(ctx: *mut ffi::SSL_CTX, sess: *mut ffi::SSL_SESSION) -> c_int;
     fn X509_STORE_CTX_new() -> *mut ffi::X509_STORE_CTX;
     fn X509_STORE_CTX_init(ctx: *mut ffi::X509_STORE_CTX, store: *mut ffi::X509_STORE, x509: *mut ffi::X509, chain: *mut ffi::stack_st_X509) -> c_int;
     fn X509_STORE_CTX_free(ctx: *mut ffi::X509_STORE_CTX);
@@ -881,6 +883,13 @@ pub fn x509_ocsp_url(x: &X509Ref) -> Option<Vec<u8>> {
     }
 }
 
+/// X509_check_host(x, name, len, 0, NULL)
+pub fn x509_check_host(x: &X509Ref, name: &[u8]) -> i32 {
+    // SAFETY: a valid certificate; the name is read for its length (not
+    // NUL-terminated), no peername is returned
+    unsafe { X509_check_host(x.as_ptr(), name.as_ptr() as *const c_char, name.len(), 0, std::ptr::null_mut()) }
+}
+
 /// X509_STORE_add_crl(store, crl): the store takes a reference
 pub fn store_add_crl(store: &mut X509StoreBuilderRef, crl: &X509CrlRef) -> bool {
     // SAFETY: a valid store (borrowed mutably) and CRL, up-referenced by the
@@ -902,7 +911,7 @@ pub enum IssuerError {
 /// X509_STORE_CTX_init(ctx, store, NULL, NULL) and
 /// X509_STORE_CTX_get1_issuer(): the issuer of the certificate in the
 /// store, if found
-pub fn store_get1_issuer(store: &X509StoreRef, cert: &X509Ref) -> Result<Option<X509>, IssuerError> {
+pub fn store_get1_issuer(store: &X509StoreBuilderRef, cert: &X509Ref) -> Result<Option<X509>, IssuerError> {
     // SAFETY: valid store and certificate; the store context made here is
     // freed; the issuer returned is a new reference, owned by the X509.
     unsafe {
@@ -932,15 +941,6 @@ pub fn store_get1_issuer(store: &X509StoreRef, cert: &X509Ref) -> Result<Option<
 }
 
 // --- SSL_CTX ---
-
-/// The context of a builder, shared: SslContextBuilder has the methods to
-/// configure a context, Ssl::new() and the getters want an &SslContextRef.
-pub fn context_of(builder: &SslContextBuilder) -> &SslContextRef {
-    // SAFETY: the builder owns a valid SSL_CTX as long as it lives; the
-    // reference borrows the builder, which can't be changed (its setters
-    // take &mut) nor dropped meanwhile.
-    unsafe { SslContextRef::from_ptr(builder.as_ptr()) }
-}
 
 /// SSL_CTX_set_cipher_list(ctx, s)
 pub fn ctx_set_cipher_list(ctx: &mut SslContextBuilder, s: &CStr) -> bool {
@@ -1027,10 +1027,22 @@ pub fn ctx_set_verify<H: VerifyCallback>(ctx: &mut SslContextBuilder, mode: i32)
     unsafe { SSL_CTX_set_verify(ctx.as_ptr(), mode, Some(raw_verify::<H>)) }
 }
 
-/// SSL_CTX_get_verify_mode(ctx)
-pub fn ctx_verify_mode(ctx: &SslContextRef) -> i32 {
-    // SAFETY: a valid context
+/// SSL_CTX_get_verify_mode(ctx) of a context being configured
+pub fn ctx_verify_mode(ctx: &SslContextBuilder) -> i32 {
+    // SAFETY: a valid context; reads its mode
     unsafe { SSL_CTX_get_verify_mode(ctx.as_ptr()) }
+}
+
+/// SSL_CTX_remove_session(ctx, session): the session is removed from the
+/// context's internal cache (the remove callback is called) and marked not
+/// resumable.
+pub fn ctx_remove_session(ctx: &SslContextRef, session: &SslSessionRef) -> bool {
+    // SAFETY: valid context and session. OpenSSL looks the session id up in
+    // the context's own cache, under the context's lock, and unlinks the
+    // entry it finds there (an object of that cache, whatever session was
+    // passed), then sets the not_resumable flag of the session passed: no
+    // list of another context is touched.
+    unsafe { SSL_CTX_remove_session(ctx.as_ptr(), session.as_ptr()) == 1 }
 }
 
 /// The SSL_CTX_set_tlsext_status_arg() of nginx is not needed: the status
@@ -1901,7 +1913,8 @@ mod tests {
         err_clear_error();
 
         ctx_set_timeout(&mut b, 123);
-        assert_eq!(ctx_timeout(context_of(&b)), 123);
+        assert_eq!(ctx_timeout(&b.build()), 123);
+        let mut b = SslContext::builder(SslMethod::tls()).unwrap();
 
         assert!(ctx_set1_curves_list(&mut b, c"X25519:prime256v1"));
 
@@ -1910,7 +1923,7 @@ mod tests {
         assert_eq!(conf.finish(), 1);
         drop(conf);
 
-        assert_ne!(ctx_options(context_of(&b)) & SSL_OP_NO_TICKET, 0);
+        assert_ne!(ctx_options(&b.build()) & SSL_OP_NO_TICKET, 0);
     }
 
     #[test]

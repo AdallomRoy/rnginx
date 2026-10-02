@@ -7,23 +7,25 @@
 //! OpenSSL as TLS records (encrypted with the client's handshake keys past
 //! the Initial level) in a memory BIO.
 
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::raw::c_int;
+
+use ngx_sys::ssl as sys;
+use openssl::ssl::{ExtensionContext, SslAlert, SslCipherRef, SslRef};
+use openssl::x509::X509Ref;
 
 use crate::connection::Connection;
-use crate::event_openssl::{explicit_memzero, ngx_ssl_conn, ngx_ssl_error, ngx_ssl_get_connection};
+use crate::event_openssl::{explicit_memzero, ngx_ssl_error, ngx_ssl_get_connection, NgxSsl};
 use crate::log::*;
-use crate::openssl_ffi::*;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
+use super::ngx_quic_get_connection;
 use super::protection::*;
 use super::transport::*;
-use super::ngx_quic_get_connection;
 
 const NGX_QUIC_COMPAT_RECORD_SIZE: usize = 1024;
 
-const NGX_QUIC_COMPAT_SSL_TP_EXT: c_uint = 0x39;
+const NGX_QUIC_COMPAT_SSL_TP_EXT: u16 = 0x39;
 
 const NGX_QUIC_COMPAT_CLIENT_HANDSHAKE: &[u8] = b"CLIENT_HANDSHAKE_TRAFFIC_SECRET";
 const NGX_QUIC_COMPAT_SERVER_HANDSHAKE: &[u8] = b"SERVER_HANDSHAKE_TRAFFIC_SECRET";
@@ -36,11 +38,12 @@ pub const SSL_ENCRYPTION_EARLY_DATA: usize = 1;
 pub const SSL_ENCRYPTION_HANDSHAKE: usize = 2;
 pub const SSL_ENCRYPTION_APPLICATION: usize = 3;
 
-/// SSL_QUIC_METHOD
+/// SSL_QUIC_METHOD; add_handshake_data is called from the message callback
+/// with the SSL object being processed
 pub struct SslQuicMethod {
-    pub set_read_secret: fn(c: &Connection, level: usize, cipher: *const SSL_CIPHER, secret: &[u8]) -> c_int,
-    pub set_write_secret: fn(c: &Connection, level: usize, cipher: *const SSL_CIPHER, secret: &[u8]) -> c_int,
-    pub add_handshake_data: fn(c: &Connection, level: usize, data: &[u8]) -> c_int,
+    pub set_read_secret: fn(c: &Connection, level: usize, cipher: &SslCipherRef, secret: &[u8]) -> c_int,
+    pub set_write_secret: fn(c: &Connection, level: usize, cipher: &SslCipherRef, secret: &[u8]) -> c_int,
+    pub add_handshake_data: fn(c: &Connection, ssl: &SslRef, level: usize, data: &[u8]) -> c_int,
     pub flush_flight: fn(c: &Connection) -> c_int,
     pub send_alert: fn(c: &Connection, level: usize, alert: u8) -> c_int,
 }
@@ -76,40 +79,37 @@ pub struct QuicCompat {
 }
 
 /// ngx_quic_compat_keylog_init
-pub fn ngx_quic_compat_keylog_init(ctx: *mut SSL_CTX) {
-    // SAFETY: a valid context
-    unsafe { SSL_CTX_set_keylog_callback(ctx, Some(ngx_quic_compat_keylog_callback)) }
+pub fn ngx_quic_compat_keylog_init(ssl: &mut NgxSsl) {
+    if let Some(ctx) = ssl.ctx.builder_mut() {
+        ctx.set_keylog_callback(ngx_quic_compat_keylog_callback);
+    }
 }
 
 /// ngx_quic_compat_ext_init
-pub fn ngx_quic_compat_ext_init(log: &Log, ctx: *mut SSL_CTX) -> i64 {
-    // SAFETY: a valid context; the callbacks are static
-    unsafe {
-        if SSL_CTX_has_client_custom_ext(ctx, NGX_QUIC_COMPAT_SSL_TP_EXT) != 0 {
-            return NGX_OK;
-        }
-
-        if SSL_CTX_add_custom_ext(
-            ctx,
-            NGX_QUIC_COMPAT_SSL_TP_EXT,
-            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
-            Some(ngx_quic_compat_add_transport_params_callback),
-            None,
-            std::ptr::null_mut(),
-            Some(ngx_quic_compat_parse_transport_params_callback),
-            std::ptr::null_mut(),
-        ) == 0
-        {
-            ngx_log_error!(NGX_LOG_EMERG, log, None, "SSL_CTX_add_custom_ext() failed");
-            return NGX_ERROR;
-        }
+pub fn ngx_quic_compat_ext_init(log: &Log, ssl: &mut NgxSsl) -> i64 {
+    // SSL_CTX_has_client_custom_ext()
+    if ssl.quic_compat_ext {
+        return NGX_OK;
     }
+
+    let ctx = match ssl.ctx.builder_mut() {
+        Some(ctx) => ctx,
+        None => return NGX_ERROR,
+    };
+
+    if let Err(e) = ctx.add_custom_ext(NGX_QUIC_COMPAT_SSL_TP_EXT, ExtensionContext::CLIENT_HELLO | ExtensionContext::TLS1_3_ENCRYPTED_EXTENSIONS, ngx_quic_compat_add_transport_params_callback, ngx_quic_compat_parse_transport_params_callback) {
+        e.put();
+        ngx_log_error!(NGX_LOG_EMERG, log, None, "SSL_CTX_add_custom_ext() failed");
+        return NGX_ERROR;
+    }
+
+    ssl.quic_compat_ext = true;
 
     NGX_OK
 }
 
 /// ngx_quic_compat_keylog_callback
-unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *const c_char) {
+fn ngx_quic_compat_keylog_callback(ssl: &SslRef, line: &str) {
     let c = match ngx_ssl_get_connection(ssl) {
         Some(c) => c,
         None => return,
@@ -119,7 +119,7 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
         return;
     }
 
-    let line = CStr::from_ptr(line).to_bytes();
+    let line = line.as_bytes();
 
     let mut p = 0;
 
@@ -161,7 +161,7 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
 
     let start = p;
 
-    let mut secret = [0u8; EVP_MAX_MD_SIZE];
+    let mut secret = [0u8; sys::EVP_MAX_MD_SIZE];
     let mut n = 0usize;
 
     while p < line.len() {
@@ -185,7 +185,7 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
             secret[n] += value;
             n += 1;
         } else {
-            if n >= EVP_MAX_MD_SIZE {
+            if n >= sys::EVP_MAX_MD_SIZE {
                 ngx_log_error!(NGX_LOG_EMERG, c.log, None, "too big OpenSSL QUIC secret");
                 return;
             }
@@ -196,12 +196,15 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
         p += 1;
     }
 
-    let qc = match ngx_quic_get_connection(c) {
+    let qc = match ngx_quic_get_connection(&c) {
         Some(qc) => qc,
         None => return,
     };
 
-    let cipher = SSL_get_current_cipher(ssl);
+    let cipher = match ssl.current_cipher() {
+        Some(cipher) => cipher,
+        None => return,
+    };
 
     let method = match qc.compat.borrow().as_ref() {
         Some(com) => com.method,
@@ -209,19 +212,19 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
     };
 
     if write {
-        (method.set_write_secret)(c, level, cipher, &secret[..n]);
+        (method.set_write_secret)(&c, level, cipher, &secret[..n]);
 
         if let Some(com) = qc.compat.borrow_mut().as_mut() {
             com.write_level = level;
         }
     } else {
-        (method.set_read_secret)(c, level, cipher, &secret[..n]);
+        (method.set_read_secret)(&c, level, cipher, &secret[..n]);
 
         let rc = match qc.compat.borrow_mut().as_mut() {
             Some(com) => {
                 com.read_record = 0;
 
-                ngx_quic_compat_set_encryption_secret(c, &mut com.keys, level, cipher, &secret[..n])
+                ngx_quic_compat_set_encryption_secret(&c, &mut com.keys, level, cipher, &secret[..n])
             }
 
             None => NGX_ERROR,
@@ -236,13 +239,10 @@ unsafe extern "C" fn ngx_quic_compat_keylog_callback(ssl: *const SSL, line: *con
 }
 
 /// ngx_quic_compat_set_encryption_secret
-fn ngx_quic_compat_set_encryption_secret(c: &Connection, keys: &mut QuicCompatKeys, _level: usize, cipher: *const SSL_CIPHER, secret: &[u8]) -> i64 {
-    let peer_secret = &mut keys.secret;
+fn ngx_quic_compat_set_encryption_secret(c: &Connection, keys: &mut QuicCompatKeys, _level: usize, cipher: &SslCipherRef, secret: &[u8]) -> i64 {
+    keys.cipher = ngx_quic_cipher_id(cipher);
 
-    // SAFETY: the cipher of the connection
-    keys.cipher = unsafe { SSL_CIPHER_get_id(cipher) };
-
-    let mut ciphers = QuicCiphers { c: std::ptr::null(), hp: std::ptr::null(), d: std::ptr::null() };
+    let mut ciphers = QuicCiphers::default();
 
     let key_len = ngx_quic_ciphers(keys.cipher, &mut ciphers);
 
@@ -250,6 +250,8 @@ fn ngx_quic_compat_set_encryption_secret(c: &Connection, keys: &mut QuicCompatKe
         ngx_ssl_error(NGX_LOG_INFO, &c.log, 0, format_args!("unexpected cipher"));
         return NGX_ERROR;
     }
+
+    let peer_secret = &mut keys.secret;
 
     let mut key = QuicMd { len: key_len as usize, ..Default::default() };
 
@@ -278,70 +280,72 @@ fn ngx_quic_compat_set_encryption_secret(c: &Connection, keys: &mut QuicCompatKe
     NGX_OK
 }
 
-/// ngx_quic_compat_add_transport_params_callback
-unsafe extern "C" fn ngx_quic_compat_add_transport_params_callback(ssl: *mut SSL, _ext_type: c_uint, _context: c_uint, out: *mut *const u8, outlen: *mut usize, _x: *mut X509, _chainidx: usize, _al: *mut c_int, _add_arg: *mut c_void) -> c_int {
+/// ngx_quic_compat_add_transport_params_callback: the parameters of the
+/// connection (None: the extension is not added)
+fn ngx_quic_compat_add_transport_params_callback(ssl: &mut SslRef, _ctx: ExtensionContext, _x: Option<(usize, &X509Ref)>) -> Result<Option<Vec<u8>>, SslAlert> {
     let c = match ngx_ssl_get_connection(ssl) {
         Some(c) => c,
-        None => return 0,
+        None => return Ok(None),
     };
 
     if c.ty != libc::SOCK_DGRAM {
-        return 0;
+        return Ok(None);
     }
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic compat add transport params");
 
-    let qc = match ngx_quic_get_connection(c) {
+    let qc = match ngx_quic_get_connection(&c) {
         Some(qc) => qc,
-        None => return 0,
+        None => return Ok(None),
     };
 
     let com = qc.compat.borrow();
 
-    let com = match com.as_ref() {
-        Some(com) => com,
-        None => return 0,
-    };
-
-    // the parameters stay with the connection, OpenSSL copies them
-    *out = com.tp.as_ptr();
-    *outlen = com.tp.len();
-
-    1
+    // OpenSSL copies the parameters
+    Ok(com.as_ref().map(|com| com.tp.clone()))
 }
 
 /// ngx_quic_compat_parse_transport_params_callback
-unsafe extern "C" fn ngx_quic_compat_parse_transport_params_callback(ssl: *mut SSL, _ext_type: c_uint, _context: c_uint, inp: *const u8, inlen: usize, _x: *mut X509, _chainidx: usize, _al: *mut c_int, _parse_arg: *mut c_void) -> c_int {
+fn ngx_quic_compat_parse_transport_params_callback(ssl: &mut SslRef, _ctx: ExtensionContext, inp: &[u8], _x: Option<(usize, &X509Ref)>) -> Result<(), SslAlert> {
     let c = match ngx_ssl_get_connection(ssl) {
         Some(c) => c,
-        None => return 1,
+        None => return Ok(()),
     };
 
     if c.ty != libc::SOCK_DGRAM {
-        return 1;
+        return Ok(());
     }
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic compat parse transport params");
 
-    let qc = match ngx_quic_get_connection(c) {
+    let qc = match ngx_quic_get_connection(&c) {
         Some(qc) => qc,
-        None => return 0,
+        None => return Err(SslAlert::DECODE_ERROR),
     };
 
     let mut com = qc.compat.borrow_mut();
 
     let com = match com.as_mut() {
         Some(com) => com,
-        None => return 0,
+        None => return Err(SslAlert::DECODE_ERROR),
     };
 
-    com.ctp = if inlen == 0 { Vec::new() } else { std::slice::from_raw_parts(inp, inlen).to_vec() };
+    com.ctp = inp.to_vec();
 
-    1
+    Ok(())
+}
+
+/// The message callback of the SSL objects of the QUIC connections.
+struct MsgCb;
+
+impl sys::MsgCallback for MsgCb {
+    fn msg(write_p: bool, version: i32, content_type: i32, buf: &[u8], ssl: &SslRef) {
+        ngx_quic_compat_message_callback(write_p, version, content_type, buf, ssl);
+    }
 }
 
 /// SSL_set_quic_method
-pub fn ssl_set_quic_method(c: &Connection, ssl: *mut SSL, quic_method: &'static SslQuicMethod) -> c_int {
+pub fn ssl_set_quic_method(c: &Connection, ssl: &mut SslRef, quic_method: &'static SslQuicMethod) -> c_int {
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic compat set method");
 
     let qc = match ngx_quic_get_connection(c) {
@@ -351,33 +355,21 @@ pub fn ssl_set_quic_method(c: &Connection, ssl: *mut SSL, quic_method: &'static 
 
     *qc.compat.borrow_mut() = Some(QuicCompat { method: quic_method, write_level: SSL_ENCRYPTION_INITIAL, read_record: 0, keys: QuicCompatKeys::default(), tp: Vec::new(), ctp: Vec::new() });
 
-    // SAFETY: a valid SSL object, which owns the BIOs set
-    unsafe {
-        let rbio = BIO_new(BIO_s_mem());
-        if rbio.is_null() {
-            return 0;
-        }
-
-        let wbio = BIO_new(BIO_s_null());
-        if wbio.is_null() {
-            BIO_free(rbio);
-            return 0;
-        }
-
-        SSL_set_bio(ssl, rbio, wbio);
-
-        SSL_set_msg_callback(ssl, Some(ngx_quic_compat_message_callback));
-
-        /* early data is not supported */
-        SSL_set_max_early_data(ssl, 0);
+    if !sys::set_quic_compat_bio(ssl) {
+        return 0;
     }
+
+    sys::set_msg_callback::<MsgCb>(ssl);
+
+    /* early data is not supported */
+    let _ = ssl.set_max_early_data(0);
 
     1
 }
 
 /// ngx_quic_compat_message_callback
-unsafe extern "C" fn ngx_quic_compat_message_callback(write_p: c_int, _version: c_int, content_type: c_int, buf: *const c_void, len: usize, ssl: *mut SSL, _arg: *mut c_void) {
-    if write_p == 0 {
+fn ngx_quic_compat_message_callback(write_p: bool, _version: i32, content_type: i32, data: &[u8], ssl: &SslRef) {
+    if !write_p {
         return;
     }
 
@@ -386,7 +378,7 @@ unsafe extern "C" fn ngx_quic_compat_message_callback(write_p: c_int, _version: 
         None => return,
     };
 
-    let qc = match ngx_quic_get_connection(c) {
+    let qc = match ngx_quic_get_connection(&c) {
         Some(qc) => qc,
         /* closing */
         None => return,
@@ -397,22 +389,22 @@ unsafe extern "C" fn ngx_quic_compat_message_callback(write_p: c_int, _version: 
         None => return,
     };
 
-    let data = if len == 0 { &[][..] } else { std::slice::from_raw_parts(buf as *const u8, len) };
+    let len = data.len();
 
     match content_type {
-        SSL3_RT_HANDSHAKE => {
+        sys::SSL3_RT_HANDSHAKE => {
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic compat tx level:{} len:{}", level, len);
 
-            (method.add_handshake_data)(c, level, data);
+            (method.add_handshake_data)(&c, ssl, level, data);
         }
 
-        SSL3_RT_ALERT => {
+        sys::SSL3_RT_ALERT => {
             if len >= 2 {
                 let alert = data[1];
 
                 ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic compat level:{} alert:{} len:{}", level, alert, len);
 
-                (method.send_alert)(c, level, alert);
+                (method.send_alert)(&c, level, alert);
             }
         }
 
@@ -429,16 +421,21 @@ pub fn ssl_provide_quic_data(c: &Connection, level: usize, mut data: &[u8]) -> c
         None => return 0,
     };
 
-    let ssl = ngx_ssl_conn(c);
-
-    // SAFETY: the SSL object of the connection
-    let rbio = unsafe { SSL_get_rbio(ssl) };
+    let sc = match c.ssl.borrow().clone() {
+        Some(sc) => sc,
+        None => return 0,
+    };
 
     let mut com = qc.compat.borrow_mut();
 
     let com = match com.as_mut() {
         Some(com) => com,
         None => return 0,
+    };
+
+    // the memory BIO takes all the data written
+    let rbio_write = |b: &[u8]| {
+        sc.with_mut(|ssl| sys::rbio_write(ssl, b));
     };
 
     while !data.is_empty() {
@@ -448,17 +445,14 @@ pub fn ssl_provide_quic_data(c: &Connection, level: usize, mut data: &[u8]) -> c
         if level == SSL_ENCRYPTION_INITIAL {
             let n = data.len().min(65535);
 
-            let rec = QuicCompatRecord { log: &c.log, ty: SSL3_RT_HANDSHAKE as u8, payload: &data[..n], number, keys: &com.keys };
+            let rec = QuicCompatRecord { log: &c.log, ty: sys::SSL3_RT_HANDSHAKE as u8, payload: &data[..n], number, keys: &com.keys };
 
-            let mut out = Vec::with_capacity(SSL3_RT_HEADER_LENGTH);
+            let mut out = Vec::with_capacity(sys::SSL3_RT_HEADER_LENGTH);
 
             ngx_quic_compat_create_header(&rec, &mut out, true);
 
-            // SAFETY: a memory BIO takes all the data written
-            unsafe {
-                BIO_write(rbio, out.as_ptr() as *const c_void, SSL3_RT_HEADER_LENGTH as c_int);
-                BIO_write(rbio, data.as_ptr() as *const c_void, n as c_int);
-            }
+            rbio_write(&out[..sys::SSL3_RT_HEADER_LENGTH]);
+            rbio_write(&data[..n]);
 
             data = &data[n..];
         } else {
@@ -466,20 +460,17 @@ pub fn ssl_provide_quic_data(c: &Connection, level: usize, mut data: &[u8]) -> c
 
             let mut input = Vec::with_capacity(n + 1);
             input.extend_from_slice(&data[..n]);
-            input.push(SSL3_RT_HANDSHAKE as u8);
+            input.push(sys::SSL3_RT_HANDSHAKE as u8);
 
-            let rec = QuicCompatRecord { log: &c.log, ty: SSL3_RT_HANDSHAKE as u8, payload: &input, number, keys: &com.keys };
+            let rec = QuicCompatRecord { log: &c.log, ty: sys::SSL3_RT_HANDSHAKE as u8, payload: &input, number, keys: &com.keys };
 
-            let mut res = Vec::with_capacity(NGX_QUIC_COMPAT_RECORD_SIZE + 1 + SSL3_RT_HEADER_LENGTH + NGX_QUIC_TAG_LEN);
+            let mut res = Vec::with_capacity(NGX_QUIC_COMPAT_RECORD_SIZE + 1 + sys::SSL3_RT_HEADER_LENGTH + NGX_QUIC_TAG_LEN);
 
             if ngx_quic_compat_create_record(&rec, &mut res) != NGX_OK {
                 return 0;
             }
 
-            // SAFETY: a memory BIO takes all the data written
-            unsafe {
-                BIO_write(rbio, res.as_ptr() as *const c_void, res.len() as c_int);
-            }
+            rbio_write(&res);
 
             data = &data[n..];
         }
@@ -496,7 +487,7 @@ fn ngx_quic_compat_create_header(rec: &QuicCompatRecord<'_>, out: &mut Vec<u8>, 
         rec.ty
     } else {
         len += NGX_QUIC_TAG_LEN;
-        SSL3_RT_APPLICATION_DATA as u8
+        sys::SSL3_RT_APPLICATION_DATA as u8
     };
 
     out.push(ty);

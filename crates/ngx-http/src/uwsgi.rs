@@ -998,7 +998,7 @@ fn uwsgi_set_ssl(cf: &mut Conf, uwcf: &mut NgxHttpUwsgiLocConf) -> ConfResult {
         return Ok(());
     }
 
-    if ngx_ssl_create(&mut ssl, uwcf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+    if ngx_ssl_create(&mut ssl, uwcf.ssl_protocols, None) != NGX_OK {
         return Err(ConfError::Logged);
     }
 

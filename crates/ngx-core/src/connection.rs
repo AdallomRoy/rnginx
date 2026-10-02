@@ -903,10 +903,7 @@ impl Connection {
     /// (ngx_ssl_handle_recv's SSL_ERROR_WANT_WRITE: ngx_ssl_write_handler).
     pub fn ssl_want_write(&self) -> bool {
         match self.ssl.borrow().as_ref() {
-            Some(sc) => {
-                let ssl = crate::event_openssl::ssl_ptr(sc);
-                !ssl.is_null() && unsafe { crate::openssl_ffi::SSL_want(ssl) } == crate::openssl_ffi::SSL_WRITING
-            }
+            Some(sc) => sc.want_write(),
             None => false,
         }
     }
