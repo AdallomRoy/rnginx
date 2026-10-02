@@ -4,9 +4,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use openssl::rand::rand_bytes;
+
 use crate::connection::Connection;
 use crate::log::*;
-use crate::openssl_ffi::RAND_bytes;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
@@ -20,8 +21,9 @@ const NGX_QUIC_MAX_SERVER_IDS: u64 = 8;
 
 /// ngx_quic_create_server_id
 pub fn ngx_quic_create_server_id(c: &Connection, id: &mut [u8; NGX_QUIC_SERVER_CID_LEN]) -> i64 {
-    // SAFETY: the buffer has NGX_QUIC_SERVER_CID_LEN bytes
-    if unsafe { RAND_bytes(id.as_mut_ptr(), NGX_QUIC_SERVER_CID_LEN as i32) } != 1 {
+    if let Err(e) = rand_bytes(id) {
+        /* the C leaves the errors on OpenSSL's queue */
+        e.put();
         return NGX_ERROR;
     }
 
@@ -40,15 +42,14 @@ fn ngx_quic_bpf_attach_id(c: &Connection, id: &mut [u8; NGX_QUIC_SERVER_CID_LEN]
         None => c.fd.get(),
     };
 
-    let mut cookie: u64 = 0;
-    let mut optlen = std::mem::size_of::<u64>() as libc::socklen_t;
+    let cookie = match crate::fd::get(fd).and_then(|fd| rustix::net::sockopt::socket_cookie(&fd).map_err(std::io::Error::from)) {
+        Ok(cookie) => cookie,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ERR, c.log, e.raw_os_error(), "quic getsockopt(SO_COOKIE) failed");
 
-    // SAFETY: cookie is a u64 of optlen bytes
-    if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_COOKIE, &mut cookie as *mut u64 as *mut libc::c_void, &mut optlen) } == -1 {
-        ngx_log_error!(NGX_LOG_ERR, c.log, Some(crate::os::errno()), "quic getsockopt(SO_COOKIE) failed");
-
-        return NGX_ERROR;
-    }
+            return NGX_ERROR;
+        }
+    };
 
     ngx_quic_dcid_encode_key(id, cookie);
 

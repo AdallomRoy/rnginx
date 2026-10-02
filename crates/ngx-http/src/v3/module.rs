@@ -5,11 +5,12 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use openssl::rand::rand_bytes;
+
 use ngx_core::conf::*;
 use ngx_core::connection::Connection;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
-use ngx_core::openssl_ffi::RAND_bytes;
 use ngx_core::quic::protection::ngx_quic_derive_key;
 use ngx_core::quic::{QuicConf, NGX_QUIC_AV_KEY_LEN, NGX_QUIC_DEFAULT_HOST_KEY_LEN, NGX_QUIC_SR_KEY_LEN};
 use ngx_core::rc::*;
@@ -160,8 +161,9 @@ fn merge_srv_conf(cf: &mut Conf, prev: &Rc<dyn Any>, conf: &Rc<dyn Any>) -> Conf
         _ => {
             let mut k = vec![0u8; NGX_QUIC_DEFAULT_HOST_KEY_LEN];
 
-            // SAFETY: the buffer has NGX_QUIC_DEFAULT_HOST_KEY_LEN bytes
-            if unsafe { RAND_bytes(k.as_mut_ptr(), NGX_QUIC_DEFAULT_HOST_KEY_LEN as i32) } <= 0 {
+            if let Err(e) = rand_bytes(&mut k) {
+                /* the C leaves the errors on OpenSSL's queue */
+                e.put();
                 return Err(ConfError::Logged);
             }
 
