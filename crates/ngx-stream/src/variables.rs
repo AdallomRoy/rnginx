@@ -629,10 +629,20 @@ pub struct StreamMap<T: Clone> {
 pub fn map_find<T: Clone>(s: &Session, map: &StreamMap<T>, m: &[u8]) -> Option<T> {
     let len = m.len();
 
-    let mut low = vec![0u8; len];
-    let key = hash_strlow(&mut low, m);
+    // the value lowercased on the stack for the usual values
+    let mut stack = [0u8; 256];
+    let mut heap = Vec::new();
 
-    if let Some(v) = map.hash.find(key, &low) {
+    let low: &mut [u8] = if len <= stack.len() {
+        &mut stack[..len]
+    } else {
+        heap.resize(len, 0);
+        &mut heap
+    };
+
+    let key = hash_strlow(low, m);
+
+    if let Some(v) = map.hash.find(key, low) {
         return Some(v.clone());
     }
 
