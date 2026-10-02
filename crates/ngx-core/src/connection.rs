@@ -264,7 +264,7 @@ pub fn connection_rc(c: &Connection) -> Option<Rc<Connection>> {
 
 pub struct Connection {
     pub fd: Cell<RawFd>,
-    afd: RefCell<Option<Rc<AsyncFd<Fd>>>>,
+    afd: RefCell<Option<Rc<AsyncFd<fd::Fd>>>>,
     pub number: u64,
     pub log: Log,
     pub listening: Option<Rc<Listening>>,
@@ -657,7 +657,7 @@ impl Connection {
         Ok(())
     }
 
-    fn afd(&self) -> io::Result<Rc<AsyncFd<Fd>>> {
+    fn afd(&self) -> io::Result<Rc<AsyncFd<fd::Fd>>> {
         if let Some(a) = self.afd.borrow().as_ref() {
             return Ok(a.clone());
         }
@@ -667,7 +667,11 @@ impl Connection {
             // and written through its UDP state (event_udp.rs)
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        let a = Rc::new(AsyncFd::with_interest(Fd(fd), Interest::READABLE | Interest::WRITABLE)?);
+        // the registration holds the connection's handle of its socket:
+        // the I/O borrows it without a lookup in the descriptor table, and
+        // the socket stays open until the registration is gone, so a late
+        // deregistration cannot hit a number given to another descriptor
+        let a = Rc::new(AsyncFd::with_interest(fd::get(fd)?, Interest::READABLE | Interest::WRITABLE)?);
         *self.afd.borrow_mut() = Some(a.clone());
         Ok(a)
     }
@@ -1018,7 +1022,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::empty()).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)) {
                 Ok(r) => {
                     let r = r?;
                     if r == 0 && self.ty != libc::SOCK_DGRAM {
@@ -1058,7 +1062,7 @@ impl Connection {
 
             let peek = guard.try_io(|inner| {
                 let mut b = [0u8; 1];
-                nix::sys::socket::recv(inner.get_ref().0, &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
+                nix::sys::socket::recv(inner.get_ref().as_raw_fd(), &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
             });
 
             match peek {
@@ -1078,7 +1082,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::MSG_PEEK).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().as_raw_fd(), buf, MsgFlags::MSG_PEEK).map_err(io::Error::from)) {
                 Ok(r) => return r,
                 Err(_) => continue,
             }
@@ -1130,7 +1134,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
-            match guard.try_io(|inner| nix::sys::socket::send(inner.get_ref().0, buf, MsgFlags::MSG_NOSIGNAL).map_err(io::Error::from)) {
+            match guard.try_io(|inner| nix::sys::socket::send(inner.get_ref().as_raw_fd(), buf, MsgFlags::MSG_NOSIGNAL).map_err(io::Error::from)) {
                 Ok(r) => {
                     let n = r?;
                     self.sent.set(self.sent.get() + n as u64);
@@ -1167,10 +1171,7 @@ impl Connection {
         let iovs = &iovs[..iovs.len().min(1024)];
         loop {
             let mut guard = afd.writable().await?;
-            match guard.try_io(|inner| {
-                let s = fd::get(inner.get_ref().0)?;
-                nix::sys::uio::writev(&s, iovs).map_err(io::Error::from)
-            }) {
+            match guard.try_io(|inner| nix::sys::uio::writev(inner.get_ref(), iovs).map_err(io::Error::from)) {
                 Ok(r) => {
                     let n = r?;
                     self.sent.set(self.sent.get() + n as u64);
@@ -1188,11 +1189,10 @@ impl Connection {
         loop {
             let mut guard = afd.writable().await?;
             match guard.try_io(|inner| {
-                let s = fd::get(inner.get_ref().0)?;
                 let file = fd::get(file_fd)?;
                 // the off_t of the kernel, as unsigned
                 let mut off = offset as u64;
-                rustix::fs::sendfile(&s, &file, Some(&mut off), count).map_err(io::Error::from)
+                rustix::fs::sendfile(inner.get_ref(), &file, Some(&mut off), count).map_err(io::Error::from)
             }) {
                 Ok(r) => {
                     let n = r?;
@@ -1239,12 +1239,18 @@ impl Connection {
     }
 
     pub fn setsockopt_int(&self, level: i32, name: i32, value: i32) -> io::Result<()> {
-        let s = fd::get(self.fd.get())?;
-        ngx_sys::os::setsockopt_int(s.as_fd(), level, name, value)
+        self.with_socket(|s| ngx_sys::os::setsockopt_int(s, level, name, value))
     }
 
-    /// An option set on the socket, the error as io::Error.
-    fn with_socket<T, E: Into<io::Error>>(&self, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> io::Result<T> {
+    /// An operation on the connection's socket (an option set, a system
+    /// call the connection has no method for), the error as io::Error. The
+    /// socket is borrowed from the connection's own handle once it waited
+    /// for an event, else from the descriptor table; EBADF for a closed
+    /// connection.
+    pub fn with_socket<T, E: Into<io::Error>>(&self, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> io::Result<T> {
+        if let Some(afd) = self.afd.borrow().as_ref() {
+            return op(afd.get_ref().as_fd()).map_err(Into::into);
+        }
         let s = fd::get(self.fd.get())?;
         op(s.as_fd()).map_err(Into::into)
     }
@@ -2144,6 +2150,34 @@ mod tests {
             assert_eq!(c.try_send(b"x").unwrap(), 1, "the socket itself is untouched");
 
             c.close();
+        });
+    }
+
+    #[test]
+    fn registration_holds_the_socket() {
+        run_local(async {
+            let (c, peer) = tcp_pair(None);
+            let n = c.fd.get();
+
+            c.writable().await.unwrap();
+            assert!(c.with_socket(|s| rustix::net::sockopt::set_tcp_nodelay(s, true)).is_ok());
+            assert!(c.set_tcp_nodelay());
+
+            // a wait still holding the registration when the connection
+            // is closed (a task not yet dropped)
+            let late = c.afd().unwrap();
+            c.close();
+            assert!(!fd::contains(n));
+            assert_eq!(c.with_socket(|_| Ok::<(), io::Error>(())).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+
+            // the socket stays open until the registration goes
+            peer.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+            let mut b = [0u8; 1];
+            assert!(std::io::Read::read(&mut &peer, &mut b).is_err(), "no end of stream yet");
+
+            drop(late);
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            assert_eq!(std::io::Read::read(&mut &peer, &mut b).unwrap(), 0, "closed with the registration");
         });
     }
 
