@@ -52,29 +52,62 @@ pub fn gmtime(t: i64) -> Tm {
     Tm { sec: sec as u32, min, hour, mday: mday as u32, mon: mon as u32, year: year as u32, wday }
 }
 
+/// The length of an HTTP time, "Sun, 06 Nov 1994 08:49:37 GMT".
+pub const HTTP_TIME_LEN: usize = 29;
+
+/// Two digits of `v` (0..=99), as "%02d" prints them.
+fn put2(d: &mut [u8], v: u32) {
+    d[0] = b'0' + (v / 10 % 10) as u8;
+    d[1] = b'0' + (v % 10) as u8;
+}
+
+/// ngx_http_time() into an array, without allocating: "Sun, 06 Nov 1994
+/// 08:49:37 GMT" ("%s, %02d %s %4d %02d:%02d:%02d GMT"; ngx_gmtime() keeps
+/// the year within four digits).
+pub fn http_time_bytes(t: i64) -> [u8; HTTP_TIME_LEN] {
+    let tm = gmtime(t);
+    let mut b = *b"Sun, 00 Jan 0000 00:00:00 GMT";
+
+    b[..3].copy_from_slice(WEEK[tm.wday as usize].as_bytes());
+    put2(&mut b[5..7], tm.mday);
+    b[8..11].copy_from_slice(MONTHS[(tm.mon - 1) as usize].as_bytes());
+    put2(&mut b[12..14], tm.year / 100);
+    put2(&mut b[14..16], tm.year % 100);
+    put2(&mut b[17..19], tm.hour);
+    put2(&mut b[20..22], tm.min);
+    put2(&mut b[23..25], tm.sec);
+
+    b
+}
+
 /// "Sun, 06 Nov 1994 08:49:37 GMT"
 pub fn http_time(t: i64) -> String {
-    let tm = gmtime(t);
-    format!(
-        "{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT",
-        WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec
-    )
+    let mut s = String::with_capacity(HTTP_TIME_LEN);
+    s.extend(http_time_bytes(t).iter().map(|&c| c as char));
+    s
 }
 
 /// "Sun, 06-Nov-94 08:49:37 GMT" (two digit year unless > 2037)
 pub fn http_cookie_time(t: i64) -> String {
+    use std::fmt::Write;
+
     let tm = gmtime(t);
+    // written into its size at once
+    let mut s = String::with_capacity(HTTP_TIME_LEN);
     if tm.year > 2037 {
-        format!(
+        let _ = write!(
+            s,
             "{}, {:02}-{}-{} {:02}:{:02}:{:02} GMT",
             WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec
-        )
+        );
     } else {
-        format!(
+        let _ = write!(
+            s,
             "{}, {:02}-{}-{:02} {:02}:{:02}:{:02} GMT",
             WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year % 100, tm.hour, tm.min, tm.sec
-        )
+        );
     }
+    s
 }
 
 /// Local timezone offset in minutes for time `t` (tm_gmtoff of
@@ -343,6 +376,31 @@ mod tests {
         let t = time();
         assert_eq!(&*cached_http_time(), http_time(t));
         assert!(with_cached(|c| c.http_time.clone()) == cached().http_time);
+    }
+
+    #[test]
+    fn http_time_as_sprintf() {
+        let old = |t: i64| {
+            let tm = gmtime(t);
+            format!("{}, {:02} {} {:4} {:02}:{:02}:{:02} GMT", WEEK[tm.wday as usize], tm.mday, MONTHS[(tm.mon - 1) as usize], tm.year, tm.hour, tm.min, tm.sec)
+        };
+
+        let mut t: i64 = 1;
+        let mut cases = vec![-1, 0, 59, 951782400, 951868799, 2147483647, 2147483648, 253402300799, 253402300800, i64::MAX / 2];
+        for _ in 0..2000 {
+            t = t.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            cases.push((t as u64 % 253402300800) as i64);
+        }
+
+        for t in cases {
+            let b = http_time_bytes(t);
+            assert_eq!(std::str::from_utf8(&b).unwrap(), old(t), "{t}");
+            assert_eq!(http_time(t), old(t), "{t}");
+            assert_eq!(http_time(t).capacity(), HTTP_TIME_LEN);
+        }
+
+        assert_eq!(http_cookie_time(2147483647 + 86400 * 365), "Wed, 19-Jan-2039 03:14:07 GMT");
+        assert_eq!(http_cookie_time(0), "Thu, 01-Jan-70 00:00:00 GMT");
     }
 
     #[test]
