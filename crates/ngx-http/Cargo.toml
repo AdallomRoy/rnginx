@@ -18,3 +18,6 @@ sha1.workspace = true
 crc32fast.workspace = true
 memchr.workspace = true
 libz-sys.workspace = true
+ngx-sys.workspace = true
+rustix.workspace = true
+socket2.workspace = true

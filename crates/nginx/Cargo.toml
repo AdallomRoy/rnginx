@@ -17,3 +17,6 @@ libc.workspace = true
 nix.workspace = true
 tokio.workspace = true
 memchr.workspace = true
+ngx-sys.workspace = true
+rustix.workspace = true
+socket2.workspace = true

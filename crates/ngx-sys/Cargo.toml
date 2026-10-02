@@ -1,0 +1,11 @@
+[package]
+name = "ngx-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+openssl.workspace = true
+openssl-sys.workspace = true
+foreign-types.workspace = true

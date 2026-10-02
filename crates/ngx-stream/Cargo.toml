@@ -13,3 +13,6 @@ openssl.workspace = true
 crc32fast.workspace = true
 foreign-types.workspace = true
 libz-sys.workspace = true
+ngx-sys.workspace = true
+rustix.workspace = true
+socket2.workspace = true

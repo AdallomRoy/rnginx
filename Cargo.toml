@@ -6,6 +6,7 @@ members = [
     "crates/ngx-stream",
     "crates/ngx-mail",
     "crates/nginx",
+    "crates/ngx-sys",
 ]
 
 [workspace.package]
@@ -32,6 +33,14 @@ ngx-core = { path = "crates/ngx-core" }
 ngx-http = { path = "crates/ngx-http" }
 ngx-stream = { path = "crates/ngx-stream" }
 ngx-mail = { path = "crates/ngx-mail" }
+ngx-sys = { path = "crates/ngx-sys" }
+rustix = { version = "1", features = ["fs", "net", "process", "pipe", "event", "time", "thread", "system", "param", "stdio"] }
+socket2 = { version = "0.6", features = ["all"] }
+mmap-rs = "0.7"
+zerocopy = "0.8"
+signal-hook = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+pwhash = "1"
 
 [profile.dev]
 opt-level = 1

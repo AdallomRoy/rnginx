@@ -10,3 +10,6 @@ libc.workspace = true
 nix.workspace = true
 tokio.workspace = true
 openssl.workspace = true
+ngx-sys.workspace = true
+rustix.workspace = true
+socket2.workspace = true
