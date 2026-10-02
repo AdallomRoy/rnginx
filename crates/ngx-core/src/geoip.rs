@@ -164,7 +164,7 @@ fn city_db_description(dbtype: i32) -> &'static str {
 /// "Invalid database type %s, expected %s\n" on stdout.
 fn invalid_database_type(have: &str, expected: &str) {
     let mut out = std::io::stdout();
-    let _ = write!(out, "Invalid database type {}, expected {}\n", have, expected);
+    let _ = writeln!(out, "Invalid database type {}, expected {}", have, expected);
     let _ = out.flush();
 }
 

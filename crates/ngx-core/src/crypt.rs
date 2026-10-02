@@ -833,7 +833,7 @@ fn muffet_coin_toss(prev_digest: &[u8; 16], round_count: u32) -> bool {
     let mut y = 0u32;
 
     for i in 0..8u32 {
-        let a = prev_digest[((i + 0) % 16) as usize] as u32;
+        let a = prev_digest[(i % 16) as usize] as u32;
         let b = prev_digest[((i + 3) % 16) as usize] as u32;
         let r = a >> (b % 5);
         let mut v = prev_digest[(r % 16) as usize] as u32;

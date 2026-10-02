@@ -26,7 +26,7 @@ const YESCRYPT_PREHASH: u32 = 0x10000000;
 const YESCRYPT_KNOWN_FLAGS: u32 = YESCRYPT_MODE_MASK | YESCRYPT_RW_FLAVOR_MASK | YESCRYPT_SHARED_PREALLOCATED | YESCRYPT_INIT_SHARED | YESCRYPT_ALLOC_ONLY | YESCRYPT_PREHASH;
 
 /// HASH_LEN: the characters of the 32 bytes of the hash
-const HASH_LEN: usize = (32 * 8 + 5) / 6;
+const HASH_LEN: usize = (32 * 8usize).div_ceil(6);
 
 // pwxform: Swidth 8, PWXsimple 2, PWXgather 4
 
@@ -653,6 +653,7 @@ fn smix1(b: &mut [u8], r: usize, n: u32, flags: u32, v: &mut [Block], xy: &mut [
 }
 
 /// smix2(B, r, N, Nloop, flags, V, NROM, VROM, XY, ctx) without ROM
+#[allow(clippy::too_many_arguments)]
 fn smix2(b: &mut [u8], r: usize, n: u32, mut nloop: u64, flags: u32, v: &mut [Block], xy: &mut [Block], mut ctx: Option<&mut Pwxform>) {
     let s = 2 * r;
 
@@ -681,7 +682,7 @@ fn smix2(b: &mut [u8], r: usize, n: u32, mut nloop: u64, flags: u32, v: &mut [Bl
                 break;
             }
         }
-    } else if let Some(ctx) = ctx.as_deref_mut() {
+    } else if let Some(ctx) = ctx {
         loop {
             j = blockmix_xor(None, &v[chunk(j)], x, r, ctx) & (n - 1);
             j = blockmix_xor(None, &v[chunk(j)], x, r, ctx) & (n - 1);
