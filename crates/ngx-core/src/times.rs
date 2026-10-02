@@ -140,7 +140,12 @@ fn now_raw() -> (i64, u64) {
     (d.as_secs() as i64, (d.subsec_millis()) as u64)
 }
 
-/// Refresh the cached time (call at least once per event-loop iteration; cheap).
+/// ngx_time_update(): the cached time (and its strings, once a second)
+/// read again from the clock. The event loop does it once per iteration
+/// (event.rs: when the driver returns and before the tasks it woke run),
+/// the master once a signal woke it, and the code that calls it in C (the
+/// cache manager and loader, ngx_init_cycle(), ...) as C does; the readers
+/// below read the cache only.
 pub fn update() {
     let (sec, msec) = now_raw();
     CACHED.with(|c| {
@@ -153,10 +158,27 @@ pub fn update() {
     });
 }
 
-/// Current cached time in seconds (updates the cache first).
+/// The cached time, as of the last update(); the clock is read only if
+/// it never was (a process or thread that runs no event loop yet).
+fn read<R>(f: impl FnOnce(&CachedTime) -> R) -> R {
+    CACHED.with(|c| {
+        {
+            let c = c.borrow();
+
+            if c.sec != 0 {
+                return f(&c);
+            }
+        }
+
+        update();
+
+        f(&c.borrow())
+    })
+}
+
+/// ngx_time(): the cached time in seconds.
 pub fn time() -> i64 {
-    update();
-    CACHED.with(|c| c.borrow().sec)
+    read(|c| c.sec)
 }
 
 /// ngx_timezone_update(): the zone read again, as localtime() of glibc
@@ -207,13 +229,9 @@ pub fn next_time(when: i64) -> i64 {
     -1
 }
 
-/// Current time in milliseconds since epoch (wall clock).
+/// The cached time in milliseconds since the epoch (wall clock).
 pub fn msec() -> u64 {
-    update();
-    CACHED.with(|c| {
-        let c = c.borrow();
-        c.sec as u64 * 1000 + c.msec
-    })
+    read(|c| c.sec as u64 * 1000 + c.msec)
 }
 
 /// Monotonic milliseconds, like ngx_current_msec.
@@ -246,14 +264,14 @@ pub fn update_event_msec() -> u64 {
     t
 }
 
+/// A copy of the cached time (its strings are shared).
 pub fn cached() -> CachedTime {
-    update();
-    CACHED.with(|c| c.borrow().clone())
+    read(|c| c.clone())
 }
 
+/// The cached time, borrowed.
 pub fn with_cached<R>(f: impl FnOnce(&CachedTime) -> R) -> R {
-    update();
-    CACHED.with(|c| f(&c.borrow()))
+    read(f)
 }
 
 pub fn cached_http_time() -> Rc<str> {
@@ -300,6 +318,31 @@ mod tests {
             let local = next + gmtoff(next) * 60;
             assert_eq!(local.rem_euclid(86400), when % 86400, "{when}");
         }
+    }
+
+    #[test]
+    fn cached_until_updated() {
+        // a thread with no update yet reads the clock once
+        let sys = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let first = time();
+        assert!((first - sys).abs() <= 1, "{first} {sys}");
+
+        // the readers read the cache only: ngx_time_update() moves it
+        update();
+        let (s, m) = (time(), msec());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!((time(), msec()), (s, m));
+        assert_eq!(cached().msec, m % 1000);
+        assert_eq!(with_cached(|c| c.sec), s);
+
+        update();
+        assert!(msec() >= m + 20, "{} {}", msec(), m);
+        assert!(time() >= s);
+
+        // the strings are those of the cached second
+        let t = time();
+        assert_eq!(&*cached_http_time(), http_time(t));
+        assert!(with_cached(|c| c.http_time.clone()) == cached().http_time);
     }
 
     #[test]

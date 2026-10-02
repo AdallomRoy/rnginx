@@ -619,7 +619,7 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
     let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
-    local.block_on(&rt, async move {
+    block_on_events(&rt, &local, async move {
         spawn(control_task(c2.clone(), false));
         let notify = flags_notify();
         // ngx_add_timer(&ev, ctx->delay): the manager at once, the loader
@@ -1271,6 +1271,32 @@ fn start_accepting(cycle: &Rc<Cycle>) {
     }
 }
 
+thread_local! {
+    /// The cached time was updated by the driver's park (events_unparked)
+    /// since the tasks last ran.
+    static TIME_UPDATED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// LocalSet::block_on() with ngx_time_update() before each run of the
+/// tasks: the cached time is that of the event loop's iteration (the
+/// driver's turn which woke the tasks), as C updates it once epoll_wait()
+/// returns, and the clock is read once per iteration rather than by each
+/// reader. A park of the driver updates it already (events_unparked); the
+/// driver's turns without a park (when tasks yielded) do not.
+fn block_on_events<F: std::future::Future>(rt: &tokio::runtime::Runtime, local: &LocalSet, f: F) -> F::Output {
+    use std::future::Future;
+
+    let mut run = std::pin::pin!(local.run_until(f));
+
+    rt.block_on(std::future::poll_fn(move |cx| {
+        if !TIME_UPDATED.with(|t| t.replace(false)) {
+            crate::times::update();
+        }
+
+        run.as_mut().poll(cx)
+    }))
+}
+
 /// The runtime of a process running ngx_process_events_and_timers(): its
 /// park is the epoll_wait() of ngx_epoll_process_events()
 fn event_runtime() -> tokio::runtime::Runtime {
@@ -1289,6 +1315,10 @@ fn event_runtime() -> tokio::runtime::Runtime {
 /// ngx_process_events_and_timers()
 fn events_unparked() {
     let interrupted = events_interrupted();
+
+    // ngx_time_update()
+    crate::times::update();
+    TIME_UPDATED.with(|t| t.set(true));
 
     crate::times::update_event_msec();
 
@@ -1345,7 +1375,7 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
     let rt = event_runtime();
     let local = LocalSet::new();
     let c2 = cycle.clone();
-    local.block_on(&rt, async move {
+    block_on_events(&rt, &local, async move {
         let mut cycle = c2;
         spawn(control_task(cycle.clone(), single));
         spawn_posted_tasks();
@@ -1357,7 +1387,6 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
         // the cycle checks the flags at least once a second
         let tick = EventTimer::new();
         loop {
-            crate::times::update();
             if SIG_TERMINATE.load(Ordering::SeqCst) {
                 if single {
                     for m in cycle.modules.iter() {
