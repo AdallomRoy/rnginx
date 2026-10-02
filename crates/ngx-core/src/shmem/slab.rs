@@ -226,7 +226,7 @@ impl<'a> SlabPool<'a> {
 
         h.set(PoolHeader::end, mem.len());
         h.set(PoolHeader::min_shift, 3);
-        h.set(PoolHeader::addr, mem.addr() as usize);
+        h.set(PoolHeader::addr, mem.addr());
 
         pool.init();
 
@@ -423,7 +423,7 @@ impl<'a> SlabPool<'a> {
     }
 
     fn addr_of(&self, p: usize) -> usize {
-        self.mem.addr() as usize + p
+        self.mem.addr() + p
     }
 
     /// ngx_slab_alloc_locked: the offset of the chunk, 0 if none

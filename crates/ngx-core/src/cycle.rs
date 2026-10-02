@@ -566,7 +566,7 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
                 break;
             }
             if z.tag == oz.tag && z.shm.size.get() == oz.shm.size.get() {
-                z.shm.addr.set(oz.shm.addr.get());
+                z.shm.share(&oz.shm);
                 let init = z.init.borrow().clone().expect("zone init");
                 if init(z, oz.data.borrow().clone()).is_err() {
                     return Err(());

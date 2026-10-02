@@ -72,10 +72,10 @@ impl ShmMem {
         self.len() == 0
     }
 
-    /// The address of the mapping, for messages (and, during the
-    /// conversion, for the code still using pointers).
-    pub fn addr(&self) -> *mut u8 {
-        self.region.as_ptr()
+    /// The address of the mapping, for messages (the pointers C prints
+    /// with %p).
+    pub fn addr(&self) -> usize {
+        self.region.as_ptr() as usize
     }
 
     /// The word at `off` (a multiple of the word size).

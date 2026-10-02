@@ -936,7 +936,7 @@ impl PeerBalancer for RrPeerData {
 
 /// The address of a peer for messages (%p).
 pub fn peer_ptr(mem: &ShmMem, peer: usize) -> usize {
-    mem.addr() as usize + peer
+    mem.addr() + peer
 }
 
 /// pc->sockaddr, pc->name and pc->sid of a chosen peer.

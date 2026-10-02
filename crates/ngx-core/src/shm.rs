@@ -9,18 +9,14 @@ use crate::ngx_log_error;
 use crate::shmem::ShmMem;
 
 pub struct Shm {
-    pub addr: Cell<*mut u8>,
+    /// the mapping, once allocated (the zone of a new cycle shares it with
+    /// the one it reuses)
+    pub mem: RefCell<Option<Rc<ShmMem>>>,
     pub size: Cell<usize>,
     pub name: Vec<u8>,
     pub exists: Cell<bool>,
     /// the cycle's log, set when the zone is created or reused
     pub log: RefCell<Option<Log>>,
-}
-
-thread_local! {
-    /// The zones' mappings of the process, found by their addresses
-    /// (shm.addr): a zone reused by a new cycle gets the address only.
-    static MAPPINGS: RefCell<Vec<Rc<ShmMem>>> = const { RefCell::new(Vec::new()) };
 }
 
 impl Shm {
@@ -33,35 +29,30 @@ impl Shm {
                 return Err(());
             }
         };
-        self.addr.set(mem.addr());
-        MAPPINGS.with(|m| m.borrow_mut().push(mem));
+        *self.mem.borrow_mut() = Some(mem);
         Ok(())
     }
 
     /// ngx_shm_free: the mapping goes (munmap()) when the last user of it
     /// in the process drops it.
     pub fn free(&self, _log: &Log) {
-        let p = self.addr.get();
-        if p.is_null() {
-            return;
-        }
-        MAPPINGS.with(|m| m.borrow_mut().retain(|mem| mem.addr() != p));
-        self.addr.set(std::ptr::null_mut());
+        self.mem.borrow_mut().take();
+    }
+
+    /// The zone of a new cycle reusing the memory of the old cycle's zone
+    /// (shm_zone[i].shm.addr = oshm_zone[n].shm.addr).
+    pub fn share(&self, old: &Shm) {
+        *self.mem.borrow_mut() = old.mem.borrow().clone();
     }
 
     /// Makes `mem` the zone's memory (tests: a private mapping).
     pub fn attach(&self, mem: Rc<ShmMem>) {
-        self.addr.set(mem.addr());
-        MAPPINGS.with(|m| m.borrow_mut().push(mem));
+        *self.mem.borrow_mut() = Some(mem);
     }
 
     /// The memory of the zone, once allocated.
     pub fn mem(&self) -> Option<Rc<ShmMem>> {
-        let p = self.addr.get();
-        if p.is_null() {
-            return None;
-        }
-        MAPPINGS.with(|m| m.borrow().iter().find(|mem| mem.addr() == p).cloned())
+        self.mem.borrow().clone()
     }
 }
 
@@ -84,7 +75,7 @@ pub struct ShmZone {
 impl ShmZone {
     pub fn new(name: Vec<u8>, size: usize, tag: &'static str) -> Rc<ShmZone> {
         Rc::new(ShmZone {
-            shm: Shm { addr: Cell::new(std::ptr::null_mut()), size: Cell::new(size), name, exists: Cell::new(false), log: RefCell::new(None) },
+            shm: Shm { mem: RefCell::new(None), size: Cell::new(size), name, exists: Cell::new(false), log: RefCell::new(None) },
             init: RefCell::new(None),
             data: RefCell::new(None),
             tag,
