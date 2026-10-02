@@ -1186,8 +1186,7 @@ fn tcp_push(u: &Upstream) -> Result<(), ()> {
 
 /// ngx_event_connect_peer to the chosen peer, the connect timer
 /// (u->conf->connect_timeout) and, on the connection,
-/// ngx_http_upstream_ssl_init_connection, or the ngx_http_upstream_test_connect
-/// of ngx_http_upstream_send_request.
+/// ngx_http_upstream_ssl_init_connection.
 async fn connect_peer(r: &R, u: &mut Upstream, sockaddr: &SockAddr, opts: &PeerOpts, ssl: Option<&SslSetup>) -> Result<UpstreamSock, Failure> {
     let log = r.connection.log.clone();
 
@@ -1240,20 +1239,15 @@ async fn connect_peer(r: &R, u: &mut Upstream, sockaddr: &SockAddr, opts: &PeerO
         deadline = Some(d);
     }
 
+    // the plain connection's connect() is tested by
+    // ngx_http_upstream_send_request (ngx_http_upstream_test_connect)
     let rc = match ssl {
         Some(ssl) => {
             let g = u.peer.as_mut().expect("peer");
             crate::upstream_ssl::ssl_init_connection(r, &mut g.u, &c, ssl, deadline, u.conf.connect_timeout).await
         }
 
-        None => {
-            // ngx_http_upstream_send_request: ngx_http_upstream_test_connect
-            if crate::upstream_ssl::test_connect(&c) != NGX_OK {
-                Err(crate::proxy::ConnectError::Error)
-            } else {
-                Ok(())
-            }
-        }
+        None => Ok(()),
     };
 
     match rc {
@@ -2155,6 +2149,54 @@ fn set_log_peer(u: &Upstream) {
     }
 }
 
+/// ngx_http_upstream_test_connect of ngx_http_upstream_send_request, before
+/// the request is sent: the connect() of a new connection, or the pending
+/// error of a cached keepalive one (getsockopt(SO_ERROR) either way).
+/// Logged as ngx_connection_error does, on r->connection->log: the log
+/// ngx_http_upstream_connect gives the connection (c->log), a cached one too.
+fn test_connect(r: &R, u: &Upstream) -> Result<(), Failure> {
+    use ngx_core::connection::{NGX_ERROR_IGNORE_ECONNRESET, NGX_ERROR_IGNORE_EINVAL, NGX_ERROR_IGNORE_EMSGSIZE, NGX_ERROR_INFO};
+
+    if u.request_sent {
+        return Ok(());
+    }
+
+    let c = match u.sock.as_ref().and_then(sock_conn) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    let err = ngx_core::event_connect::connect_error(c);
+
+    if err == 0 {
+        return Ok(());
+    }
+
+    let log = &r.connection.log;
+
+    log.set_action(Some("connecting to upstream"));
+
+    // ngx_connection_error(c, err, "connect() failed")
+    let log_error = c.log_error.get();
+
+    let ignored = (err == libc::ECONNRESET && log_error == NGX_ERROR_IGNORE_ECONNRESET) || (err == libc::EMSGSIZE && log_error == NGX_ERROR_IGNORE_EMSGSIZE);
+
+    if !ignored {
+        let level = if [libc::ECONNRESET, libc::EPIPE, libc::ENOTCONN, libc::ETIMEDOUT, libc::ECONNREFUSED, libc::ENETDOWN, libc::ENETUNREACH, libc::EHOSTDOWN, libc::EHOSTUNREACH].contains(&err) {
+            match log_error {
+                NGX_ERROR_IGNORE_EMSGSIZE | NGX_ERROR_IGNORE_EINVAL | NGX_ERROR_IGNORE_ECONNRESET | NGX_ERROR_INFO => NGX_LOG_INFO,
+                _ => NGX_LOG_ERR,
+            }
+        } else {
+            NGX_LOG_ALERT
+        };
+
+        ngx_log_error!(level, log, Some(err), "connect() failed");
+    }
+
+    Err(Failure::Next(NGX_HTTP_UPSTREAM_FT_ERROR))
+}
+
 /// ngx_http_upstream_reinit
 fn reinit(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i64 {
     if m.reinit_request(r, u) != NGX_OK {
@@ -2186,6 +2228,8 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
             st.connect_time = ngx_core::times::event_msec().saturating_sub(start_time);
         }
     });
+
+    test_connect(r, u)?;
 
     r.connection.log.set_action(Some("sending request to upstream"));
 
@@ -3734,6 +3778,8 @@ async fn send_request_event(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule,
             st.connect_time = ngx_core::times::event_msec().saturating_sub(start_time);
         }
     });
+
+    test_connect(r, u)?;
 
     r.connection.log.set_action(Some("sending request to upstream"));
 
