@@ -6,9 +6,14 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use ngx_core::conf::*;
 use ngx_core::rc::*;
@@ -34,6 +39,14 @@ pub struct KeepaliveConf {
     cache: RefCell<VecDeque<CacheItem>>,
     next_id: Cell<u64>,
 
+    /// the reaper of the cache (ngx_http_upstream_keepalive_close_handler
+    /// for all its connections): the waker of its task, once it runs, and
+    /// whether its timer is armed for a deadline at least as early as that
+    /// of any connection cached since
+    reaper: RefCell<Option<Waker>>,
+    reaper_spawned: Cell<bool>,
+    reaper_armed: Cell<bool>,
+
     original_init_peer: RefCell<Option<InitPeer>>,
 }
 
@@ -43,9 +56,29 @@ struct CacheItem {
     conn: UpstreamConn,
     sockaddr: SockAddr,
     tag: usize,
-    /// closes the connection when the upstream closes it, sends data, or
-    /// keepalive_timeout passes (ngx_http_upstream_keepalive_close_handler)
-    watch: tokio::task::JoinHandle<()>,
+    /// keepalive_timeout from the time the connection was saved (the timer
+    /// of c->read)
+    deadline: Instant,
+    /// c->close of an idle connection (ngx_close_idle_connections() at the
+    /// worker's shutdown): the wait on its notification, registered with
+    /// the reaper's waker
+    close: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl CacheItem {
+    /// What ngx_http_upstream_keepalive_close_handler closes: the
+    /// connection was closed by the worker (c->close), the upstream sent
+    /// data or closed it, or an error. The read event and c->close are
+    /// waited for with the waker of `cx`.
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> bool {
+        if let Some(close) = self.close.as_mut() {
+            if close.as_mut().poll(cx).is_ready() {
+                return true;
+            }
+        }
+
+        self.conn.sock.poll_idle_close(cx).is_ready()
+    }
 }
 
 impl KeepaliveConf {
@@ -58,6 +91,9 @@ impl KeepaliveConf {
             local: Cell::new(false),
             cache: RefCell::new(VecDeque::new()),
             next_id: Cell::new(0),
+            reaper: RefCell::new(None),
+            reaper_spawned: Cell::new(false),
+            reaper_armed: Cell::new(false),
             original_init_peer: RefCell::new(None),
         }
     }
@@ -137,8 +173,6 @@ fn get_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData) -> i6
 
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get keepalive peer: using connection {}", item.id);
 
-    item.watch.abort();
-
     // c->idle = 0; c->sent = 0; c->data = NULL
     if let UpstreamSock::Conn(c) = &item.conn.sock {
         c.set_idle(false);
@@ -203,18 +237,35 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "free keepalive peer: saving connection {}", id);
 
-        // an https connection is closed when the worker shuts down (c->close)
-        let c = match &conn.sock {
-            UpstreamSock::Conn(c) => Some(c.c.clone()),
+        // c->close at the worker's shutdown (ngx_close_idle_connections)
+        let close: Option<Pin<Box<dyn Future<Output = ()>>>> = match &conn.sock {
+            UpstreamSock::Conn(c) => {
+                let c = c.c.clone();
+
+                Some(Box::pin(async move {
+                    loop {
+                        let notified = c.close_notify.notified();
+
+                        if c.close.get() {
+                            return;
+                        }
+
+                        notified.await;
+                    }
+                }))
+            }
             _ => None,
         };
 
-        let watch = spawn_close_handler(Rc::downgrade(&kp.conf), id, kp.conf.timeout.get().unwrap_or(60000), c);
+        // ngx_add_timer(c->read, kp->conf->timeout)
+        let deadline = Instant::now() + Duration::from_millis(kp.conf.timeout.get().unwrap_or(60000));
 
         // c->idle = 1
         if let UpstreamSock::Conn(c) = &conn.sock {
             c.set_idle(true);
         }
+
+        let item = CacheItem { id, conn, sockaddr, tag: pc.tag, deadline, close };
 
         let old = {
             let mut cache = kp.conf.cache.borrow_mut();
@@ -222,18 +273,56 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
             // the least recently used one is closed
             let old = if cache.len() >= kp.conf.max_cached.get().unwrap_or(32) { cache.pop_back() } else { None };
 
-            cache.push_front(CacheItem { id, conn, sockaddr, tag: pc.tag, watch });
+            cache.push_front(item);
 
             old
         };
 
         if let Some(old) = old {
-            old.watch.abort();
             keepalive_close(old);
+        }
+
+        // c->read->handler = ngx_http_upstream_keepalive_close_handler,
+        // run at once if c->read->ready: the read event and c->close are
+        // waited for with the waker of the reaper of the cache
+        let waker = kp.conf.reaper.borrow().clone();
+
+        let closed = {
+            let mut cx = Context::from_waker(waker.as_ref().unwrap_or(Waker::noop()));
+            let mut cache = kp.conf.cache.borrow_mut();
+
+            let ready = cache.front_mut().is_some_and(|item| item.poll_close(&mut cx));
+
+            if ready {
+                cache.pop_front()
+            } else {
+                None
+            }
+        };
+
+        match closed {
+            Some(item) => keepalive_close(item),
+            None => reaper_wake(&kp.conf, waker.as_ref()),
         }
     }
 
     kp.original.free(pc, state, us);
+}
+
+/// The reaper of the cache sees a connection saved: spawned on the first
+/// one; woken if its timer is not armed (the cache was empty).
+fn reaper_wake(conf: &Rc<KeepaliveConf>, waker: Option<&Waker>) {
+    if !conf.reaper_spawned.get() {
+        conf.reaper_spawned.set(true);
+        tokio::task::spawn_local(reaper(Rc::downgrade(conf)));
+        return;
+    }
+
+    if !conf.reaper_armed.get() {
+        if let Some(w) = waker {
+            w.wake_by_ref();
+        }
+    }
 }
 
 fn raw_fd(sock: &UpstreamSock) -> Option<RawFd> {
@@ -251,66 +340,93 @@ fn keepalive_close(item: CacheItem) {
     drop(item);
 }
 
-/// ngx_http_upstream_keepalive_close_handler, as a task: the connection is
-/// closed when data or the end of it arrives (a peek that does not return
-/// EAGAIN), or on keepalive_timeout. It waits on the read event of the
-/// connection's own registration, which stays as it is while the connection
-/// is cached, as in C (no descriptor or epoll registration of its own); the
-/// item is looked up in the cache at each wakeup, and taking it out of the
-/// cache aborts the task.
-fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Option<Rc<ngx_core::connection::Connection>>) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_local(async move {
-        // c->close: ngx_close_idle_connections() at the worker's shutdown
-        let close = async {
-            match &c {
-                Some(c) => loop {
-                    let notified = c.close_notify.notified();
+/// ngx_http_upstream_keepalive_close_handler of the connections of a
+/// cache, as one task: a connection is closed when data or the end of it
+/// arrives (a peek that does not return EAGAIN), when the worker closes it
+/// (c->close), or on keepalive_timeout. Each waits on the read event of
+/// the connection's own registration, which stays as it is while the
+/// connection is cached, as in C (no descriptor or epoll registration of
+/// its own), and on its c->close notification, both with the waker of this
+/// task; the timer is that of the earliest deadline of the cache. The task
+/// lives as long as the cache.
+async fn reaper(conf: Weak<KeepaliveConf>) {
+    let sleep = tokio::time::sleep_until(Instant::now());
+    tokio::pin!(sleep);
 
-                    if c.close.get() {
-                        return;
-                    }
+    // the deadline the timer is armed for
+    let mut armed: Option<Instant> = None;
 
-                    notified.await;
-                },
-                None => std::future::pending().await,
-            }
+    std::future::poll_fn(|cx| {
+        let conf = match conf.upgrade() {
+            Some(conf) => conf,
+            None => return Poll::Ready(()),
         };
 
-        tokio::pin!(close);
+        {
+            let mut w = conf.reaper.borrow_mut();
 
-        let watch = std::future::poll_fn(|cx| {
-            let conf = match conf.upgrade() {
-                Some(conf) => conf,
-                None => return std::task::Poll::Ready(()),
-            };
-
-            let cache = conf.cache.borrow();
-
-            match cache.iter().find(|it| it.id == id) {
-                Some(it) => it.conn.sock.poll_idle_close(cx),
-                // given to a request: this task is being aborted
-                None => std::task::Poll::Ready(()),
+            if !w.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *w = Some(cx.waker().clone());
             }
-        });
-
-        tokio::select! {
-            _ = tokio::time::timeout(Duration::from_millis(timeout), watch) => {}
-            _ = &mut close => {}
         }
 
-        // close: the item leaves the cache and its connection is closed
-        if let Some(conf) = conf.upgrade() {
-            let item = {
+        loop {
+            let now = Instant::now();
+
+            // the connections to close: timed out, or the close handler's
+            let closed: Vec<CacheItem> = {
                 let mut cache = conf.cache.borrow_mut();
-                cache.iter().position(|it| it.id == id).and_then(|i| cache.remove(i))
+
+                let mut closed = Vec::new();
+                let mut i = 0;
+
+                while i < cache.len() {
+                    let item = &mut cache[i];
+
+                    if item.deadline <= now || item.poll_close(cx) {
+                        closed.extend(cache.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                closed
             };
 
-            // the watch handle is this task's own: dropping it detaches
-            if let Some(item) = item {
+            for item in closed {
                 keepalive_close(item);
+            }
+
+            // the timer of the earliest deadline (the least recently saved
+            // connection's: they all have the same timeout)
+            let earliest = conf.cache.borrow().back().map(|item| item.deadline);
+
+            match earliest {
+                None => {
+                    armed = None;
+                    conf.reaper_armed.set(false);
+                    return Poll::Pending;
+                }
+
+                Some(deadline) => {
+                    if armed != Some(deadline) {
+                        sleep.as_mut().reset(deadline);
+                        armed = Some(deadline);
+                    }
+
+                    conf.reaper_armed.set(true);
+
+                    if sleep.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+
+                    // expired meanwhile: once more
+                    armed = None;
+                }
             }
         }
     })
+    .await
 }
 
 /// ngx_http_upstream_keepalive
