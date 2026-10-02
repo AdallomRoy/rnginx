@@ -1356,9 +1356,10 @@ async fn finalize_connection(r: &R) -> End {
     End::Close
 }
 
-/// r->connection->read->ready: data to read, or on an SSL connection the
-/// last SSL_read() of ngx_ssl_recv() did not want to read (the data came
-/// with the peer's close_notify or an error, or filled the buffer)
+/// r->connection->read->ready: a read event since the last read found the
+/// socket drained, or on an SSL connection the last SSL_read() of
+/// ngx_ssl_recv() did not want to read (the data came with the peer's
+/// close_notify or an error, or filled the buffer)
 fn read_ready(c: &Connection) -> bool {
     if let Some(sc) = c.ssl.borrow().as_ref() {
         if sc.state.ngx.get() && sc.state.last.get() != NGX_AGAIN {
@@ -1368,9 +1369,10 @@ fn read_ready(c: &Connection) -> bool {
     socket_has_data(c)
 }
 
+/// rev->ready of the socket: the readiness kept since the last read event,
+/// without a syscall
 fn socket_has_data(c: &Connection) -> bool {
-    let mut b = [0u8; 1];
-    matches!(nix::sys::socket::recv(c.fd.get(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT), Ok(n) if n > 0)
+    c.read_ready()
 }
 
 /// ngx_http_close_request for fatal paths before a response is produced.

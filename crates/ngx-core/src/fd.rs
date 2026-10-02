@@ -10,19 +10,81 @@
 //! keeps it open while it lives), close() takes it out of the table and
 //! closes it, reporting close() errors as nginx does.
 //!
+//! The processes run a single thread (fork() refuses to fork any other),
+//! so the table is the thread's: a lookup is an index into a vector, and a
+//! handle a reference count, with no lock or atomic operation. A
+//! connection keeps the handle of its socket (its AsyncFd's), so its I/O
+//! does not look the number up at all. The owners of closed descriptors
+//! are kept for the next ones registered, so a descriptor opened and
+//! closed again (a connection, a file) allocates nothing. The table is
+//! never dropped: at exit, the kernel closes what is left, as for C's
+//! processes.
+//!
 //! Descriptors are closed by close() only; a number closed behind the
 //! table's back (a nix close() of a registered descriptor) leaves a stale
 //! entry, which register() leaks when the kernel hands the number out
 //! again rather than closing the new descriptor with it.
 
+use std::cell::RefCell;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::rc::Rc;
 
-static TABLE: Mutex<Vec<Option<Arc<OwnedFd>>>> = Mutex::new(Vec::new());
+/// The owner of a descriptor, shared with the handles lent of it. None
+/// only in an owner kept for reuse, which nobody else holds: an owner is
+/// emptied only when nobody else holds it.
+type Owner = Rc<Option<OwnedFd>>;
 
-fn table() -> MutexGuard<'static, Vec<Option<Arc<OwnedFd>>>> {
-    TABLE.lock().unwrap_or_else(|e| e.into_inner())
+struct Table {
+    /// the descriptors by number
+    fds: Vec<Option<Owner>>,
+    /// the owners of closed descriptors, for the next ones registered
+    free: Vec<Owner>,
+}
+
+/// The owners kept for reuse at most.
+const FREE_MAX: usize = 256;
+
+thread_local! {
+    /// ManuallyDrop: the thread-local has no destructor, which exit() would
+    /// run, closing every descriptor.
+    static TABLE: ManuallyDrop<RefCell<Table>> = const { ManuallyDrop::new(RefCell::new(Table { fds: Vec::new(), free: Vec::new() })) };
+}
+
+fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
+    TABLE.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// An owner of `fd`: one kept for reuse, or a new one.
+fn new_owner(t: &mut Table, fd: OwnedFd) -> Owner {
+    if let Some(mut owner) = t.free.pop() {
+        if let Some(slot) = Rc::get_mut(&mut owner) {
+            *slot = Some(fd);
+            return owner;
+        }
+    }
+
+    Rc::new(Some(fd))
+}
+
+/// The descriptor of an owner nobody else holds, taken out of it (the
+/// owner is kept for reuse); the owner back if handles of it live.
+fn unique_fd(mut owner: Owner) -> Result<OwnedFd, Owner> {
+    let fd = Rc::get_mut(&mut owner).and_then(|slot| slot.take());
+
+    match fd {
+        Some(fd) => {
+            with_table(|t| {
+                if t.free.len() < FREE_MAX {
+                    t.free.push(owner);
+                }
+            });
+
+            Ok(fd)
+        }
+        None => Err(owner),
+    }
 }
 
 fn ebadf() -> io::Error {
@@ -35,7 +97,8 @@ pub struct Fd(Inner);
 
 #[derive(Debug)]
 enum Inner {
-    Owned(Arc<OwnedFd>),
+    /// never empty: an owner is emptied only when no handle holds it
+    Owned(Owner),
     /// the standard descriptors, which std owns
     Stdin(std::io::Stdin),
     Stdout(std::io::Stdout),
@@ -56,7 +119,7 @@ impl Clone for Fd {
 impl AsFd for Fd {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match &self.0 {
-            Inner::Owned(o) => o.as_fd(),
+            Inner::Owned(o) => o.as_ref().as_ref().expect("the descriptor of a handle is open").as_fd(),
             Inner::Stdin(s) => s.as_fd(),
             Inner::Stdout(s) => s.as_fd(),
             Inner::Stderr(s) => s.as_fd(),
@@ -74,13 +137,18 @@ impl AsRawFd for Fd {
 pub fn register(fd: OwnedFd) -> RawFd {
     let n = fd.as_raw_fd();
     let i = n as usize;
-    let mut t = table();
 
-    if t.len() <= i {
-        t.resize(i + 1, None);
-    }
+    let stale = with_table(|t| {
+        if t.fds.len() <= i {
+            t.fds.resize(i + 1, None);
+        }
 
-    if let Some(stale) = t[i].replace(Arc::new(fd)) {
+        let owner = new_owner(t, fd);
+
+        t.fds[i].replace(owner)
+    });
+
+    if let Some(stale) = stale {
         // the number was closed behind the table's back and handed out
         // again: dropping the stale owner would close the new descriptor
         std::mem::forget(stale);
@@ -97,7 +165,7 @@ pub fn get(fd: RawFd) -> io::Result<Fd> {
         return Err(ebadf());
     }
 
-    if let Some(owner) = table().get(fd as usize).and_then(|e| e.clone()) {
+    if let Some(owner) = with_table(|t| t.fds.get(fd as usize).and_then(|e| e.clone())) {
         return Ok(Fd(Inner::Owned(owner)));
     }
 
@@ -123,40 +191,49 @@ pub fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
 
 /// Whether the table has the descriptor `fd`.
 pub fn contains(fd: RawFd) -> bool {
-    fd >= 0 && table().get(fd as usize).is_some_and(|e| e.is_some())
+    fd >= 0 && with_table(|t| t.fds.get(fd as usize).is_some_and(|e| e.is_some()))
 }
 
-/// close(): the descriptor is taken out of the table and closed, or, if a
-/// handle of it still lives, closed when the last one is dropped.
-pub fn close(fd: RawFd) -> io::Result<()> {
+/// The table's owner of `fd`, taken out of it.
+fn take_owner(fd: RawFd) -> Option<Owner> {
     if fd < 0 {
-        return Err(ebadf());
+        return None;
     }
 
-    let owner = table().get_mut(fd as usize).and_then(|e| e.take()).ok_or_else(ebadf)?;
+    with_table(|t| t.fds.get_mut(fd as usize).and_then(|e| e.take()))
+}
 
-    match Arc::try_unwrap(owner) {
+/// close() of the owner taken out of the table: now, or, if a handle of it
+/// still lives, when the last one is dropped.
+fn close_owner(owner: Owner) -> io::Result<()> {
+    match unique_fd(owner) {
         // nix's close() reports the error OwnedFd's drop ignores
         Ok(owned) => nix::unistd::close(owned.into_raw_fd()).map_err(io::Error::from),
         Err(_) => Ok(()),
     }
 }
 
+/// close(): the descriptor is taken out of the table and closed, or, if a
+/// handle of it still lives, closed when the last one is dropped.
+pub fn close(fd: RawFd) -> io::Result<()> {
+    close_owner(take_owner(fd).ok_or_else(ebadf)?)
+}
+
+/// close() of the number `fd` in one lookup: the table's descriptor as
+/// close() closes it, None if the table does not have the number.
+pub fn close_registered(fd: RawFd) -> Option<io::Result<()>> {
+    take_owner(fd).map(close_owner)
+}
+
 /// Takes the descriptor `fd` out of the table, to make a File or a socket
 /// of it; EBUSY while a handle of it lives (it is left in the table then).
 pub fn take(fd: RawFd) -> io::Result<OwnedFd> {
-    if fd < 0 {
-        return Err(ebadf());
-    }
+    let owner = take_owner(fd).ok_or_else(ebadf)?;
 
-    let mut t = table();
-    let entry = t.get_mut(fd as usize).ok_or_else(ebadf)?;
-    let owner = entry.take().ok_or_else(ebadf)?;
-
-    match Arc::try_unwrap(owner) {
+    match unique_fd(owner) {
         Ok(owned) => Ok(owned),
         Err(owner) => {
-            *entry = Some(owner);
+            with_table(|t| t.fds[fd as usize] = Some(owner));
             Err(io::Error::from_raw_os_error(libc::EBUSY))
         }
     }
@@ -195,15 +272,41 @@ mod tests {
         close(wn).unwrap();
         assert!(!contains(wn));
         assert_eq!(nix::unistd::write(&h, b"y").unwrap(), 1);
+        let h2 = h.clone();
         drop(h);
+        assert_eq!(nix::unistd::write(&h2, b"z").unwrap(), 1, "a clone keeps it open too");
+        drop(h2);
 
         let mut buf = [0u8; 4];
-        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 2);
+        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 3);
         assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 0, "the write end is closed");
 
         close(rn).unwrap();
         assert_eq!(close(1 << 20).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+        assert_eq!(close(-1).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
         assert!(get(-1).is_err());
+    }
+
+    #[test]
+    fn close_registered_once() {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let rn = register(r);
+        let wn = register(w);
+
+        assert!(close_registered(wn).unwrap().is_ok());
+        assert!(close_registered(wn).is_none(), "not in the table any more");
+        assert!(close_registered(-1).is_none());
+        assert!(close_registered(1 << 20).is_none());
+
+        // the descriptor was closed: the read end sees the end
+        let mut buf = [0u8; 1];
+        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 0);
+
+        // with a handle alive, closed when it goes
+        let h = get(rn).unwrap();
+        assert!(close_registered(rn).unwrap().is_ok());
+        assert!(!contains(rn));
+        assert_eq!(nix::unistd::read(h.as_raw_fd(), &mut buf).unwrap(), 0, "still open");
     }
 
     #[test]
@@ -214,11 +317,13 @@ mod tests {
 
         let h = get(rn).unwrap();
         assert_eq!(take(rn).err().and_then(|e| e.raw_os_error()), Some(libc::EBUSY));
+        assert!(contains(rn), "left in the table");
         drop(h);
 
         let owned = take(rn).unwrap();
         assert!(!contains(rn));
         drop(owned);
+        assert_eq!(take(rn).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
     }
 
     #[test]
@@ -232,6 +337,88 @@ mod tests {
         let _ = nix::unistd::close(raw);
 
         assert_eq!(get(1 << 20).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn stale_entry_left_open() {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let rn = register(r);
+        drop(w);
+
+        // closed behind the table's back, the number handed out again
+        let raw = get(rn).unwrap().as_raw_fd();
+        nix::unistd::close(raw).unwrap();
+        let (r2, w2) = nix::unistd::pipe().unwrap();
+        let (n2, wn2) = (register(r2), register(w2));
+        if n2 == rn {
+            // the new descriptor replaced the stale entry, which was not
+            // closed with it
+            assert_eq!(nix::unistd::write(get(wn2).unwrap(), b"x").unwrap(), 1);
+            let mut buf = [0u8; 1];
+            assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 1);
+        }
+        close(n2).unwrap();
+        close(wn2).unwrap();
+    }
+
+    #[test]
+    fn owners_reused() {
+        let free = || with_table(|t| t.free.len());
+        let before = free();
+
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let rn = register(r);
+        let wn = register(w);
+        let kept = free();
+
+        // closed: the owner is kept, and given to the next descriptor
+        close(wn).unwrap();
+        assert_eq!(free(), kept + 1);
+        let (r2, w2) = nix::unistd::pipe().unwrap();
+        let rn2 = register(r2);
+        assert_eq!(free(), kept);
+        let wn2 = register(w2);
+        assert_eq!(nix::unistd::write(get(wn2).unwrap(), b"x").unwrap(), 1);
+        let mut buf = [0u8; 1];
+        assert_eq!(nix::unistd::read(rn2, &mut buf).unwrap(), 1);
+
+        // lent when closed: not kept, closed with the last handle
+        let f = free();
+        let h = get(rn).unwrap();
+        let h2 = h.clone();
+        close(rn).unwrap();
+        assert_eq!(free(), f);
+        drop(h);
+        assert_eq!(h2.as_fd().as_raw_fd(), rn, "still open");
+        drop(h2);
+
+        // taken: the owner is kept, the descriptor given back
+        let owned = take(rn2).unwrap();
+        assert_eq!(free(), f + 1);
+        drop(owned);
+
+        close(wn2).unwrap();
+        assert_eq!(free(), f + 2);
+        assert!(before <= FREE_MAX);
+    }
+
+    #[test]
+    fn the_threads_table() {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let rn = register(r);
+        let wn = register(w);
+
+        // another thread has a table of its own
+        std::thread::spawn(move || {
+            assert!(!contains(rn));
+            assert_eq!(get(wn).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
+        })
+        .join()
+        .unwrap();
+
+        assert!(contains(rn) && contains(wn));
+        close(rn).unwrap();
+        close(wn).unwrap();
     }
 
     #[test]
