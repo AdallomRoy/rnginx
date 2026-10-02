@@ -85,6 +85,8 @@ pub struct GzipCtx {
     /// deflateEnd()
     zstream: Option<Compress>,
 
+    /// the level and window of the stream (kept for reuse once it ends)
+    level: u32,
     wbits: i32,
 
     flush: i32,
@@ -115,6 +117,7 @@ impl GzipCtx {
             out_buf: None,
             bufs: 0,
             zstream: None,
+            level: 0,
             wbits: 0,
             flush: Z_NO_FLUSH,
             redo: false,
@@ -206,9 +209,58 @@ fn buf_shell(b: &Buf) -> Buf {
     }
 }
 
-/// ngx_create_temp_buf()
+/// The free output buffers kept, and the ended deflate streams kept
+const FREE_OUT_BUFS: usize = 16;
+const FREE_STREAMS: usize = 2;
+
+thread_local! {
+    /// The memory of the output buffers sent, as C's ctx->free keeps the
+    /// buffers of the request, for the next ones of the same size
+    static FREE_OUT: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Deflate streams ended and reset (deflateReset() is deflateEnd()
+    /// followed by deflateInit() without freeing the state), for the next
+    /// response of the same level and window, as C allocates the zlib
+    /// state from the request's pool
+    static FREE_ZSTREAMS: std::cell::RefCell<Vec<(u32, i32, Compress)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// ngx_create_temp_buf(): an empty buffer of `size` bytes of memory, not
+/// initialized (deflate writes it)
 fn create_temp_buf(size: usize) -> Buf {
-    Buf { data: BufData::Memory(vec![0u8; size]), pos: 0, last: 0, temporary: true, ..Default::default() }
+    Buf { data: BufData::Memory(take_out_buf(size)), pos: 0, last: 0, temporary: true, ..Default::default() }
+}
+
+/// The memory of an output buffer: a free one of that size, or a new one
+/// with exactly that capacity
+fn take_out_buf(size: usize) -> Vec<u8> {
+    let free = FREE_OUT.with(|f| {
+        let mut f = f.borrow_mut();
+        let i = f.iter().rposition(|v| v.capacity() == size)?;
+        Some(f.swap_remove(i))
+    });
+
+    match free {
+        Some(mut v) => {
+            v.clear();
+            v
+        }
+        None => Vec::with_capacity(size),
+    }
+}
+
+/// An output buffer of the module (its tag)
+pub fn is_out_buf(b: &Buf) -> bool {
+    b.tag == gzip_tag()
+}
+
+/// The memory of an output buffer sent is free for the next ones
+pub fn free_out_buf(v: Vec<u8>) {
+    FREE_OUT.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() < FREE_OUT_BUFS {
+            f.push(v);
+        }
+    });
 }
 
 /// ngx_http_gzip_header_filter
@@ -502,7 +554,16 @@ fn gzip_filter_deflate_start(r: &R, ctx: &mut GzipCtx) -> i64 {
     // deflateInit2(level, Z_DEFLATED, wbits + 16, memLevel 8,
     // Z_DEFAULT_STRATEGY); with valid parameters it fails only when out of
     // memory, which flate2 does not survive ("deflateInit2() failed")
-    ctx.zstream = Some(Compress::new_gzip(Compression::new(level as u32), ctx.wbits as u8));
+    let (level, wbits) = (level as u32, ctx.wbits);
+
+    let kept = FREE_ZSTREAMS.with(|f| {
+        let mut f = f.borrow_mut();
+        let i = f.iter().position(|(l, w, _)| *l == level && *w == wbits)?;
+        Some(f.swap_remove(i).2)
+    });
+
+    ctx.zstream = Some(kept.unwrap_or_else(|| Compress::new_gzip(Compression::new(level), wbits as u8)));
+    ctx.level = level;
 
     ctx.flush = Z_NO_FLUSH;
 
@@ -528,7 +589,9 @@ fn gzip_filter_add_data(r: &R, ctx: &mut GzipCtx) -> i64 {
     // the buffer before is consumed: a copy buffer's memory is free for
     // the next copies
     if let Some(consumed) = ctx.in_buf.replace(buf) {
-        crate::copy_filter::recycle(consumed);
+        if !is_out_buf(&consumed) {
+            crate::copy_filter::recycle(consumed);
+        }
     }
 
     let in_buf = ctx.in_buf.as_ref().expect("in_buf");
@@ -565,7 +628,7 @@ fn gzip_filter_get_buf(r: &R, ctx: &mut GzipCtx) -> i64 {
     if !ctx.free.is_empty() {
         let mut b = ctx.free.remove(0);
 
-        b.data = BufData::Memory(vec![0u8; bufs.size]);
+        b.data = BufData::Memory(take_out_buf(bufs.size));
 
         ctx.out_buf = Some(b);
     } else if ctx.bufs < bufs.num {
@@ -611,16 +674,20 @@ fn deflate(ctx: &mut GzipCtx) -> i32 {
     };
 
     let out_buf = out_buf.as_mut().expect("out_buf");
-    let last = out_buf.last;
-
-    let output: &mut [u8] = match &mut out_buf.data {
-        BufData::Memory(v) => &mut v[last..last + *avail_out],
-        _ => &mut [],
-    };
 
     let (total_in, total_out) = (z.total_in(), z.total_out());
 
-    let rc = match z.compress(input, output, flush) {
+    // the output appended to the buffer's data, into its avail_out bytes of
+    // spare capacity (not initialized before)
+    let status = match &mut out_buf.data {
+        BufData::Memory(v) => {
+            debug_assert!(v.len() == out_buf.last && v.capacity() - v.len() == *avail_out);
+            z.compress_vec(input, v, flush)
+        }
+        _ => z.compress(input, &mut [], flush),
+    };
+
+    let rc = match status {
         Ok(Status::Ok) => Z_OK,
         Ok(Status::StreamEnd) => Z_STREAM_END,
         Ok(Status::BufError) => Z_BUF_ERROR,
@@ -733,18 +800,28 @@ fn gzip_filter_deflate(r: &R, ctx: &mut GzipCtx) -> i64 {
 
 /// ngx_http_gzip_filter_deflate_end
 fn gzip_filter_deflate_end(r: &R, ctx: &mut GzipCtx) -> i64 {
-    let z = ctx.zstream.take().expect("deflate stream");
+    let mut z = ctx.zstream.take().expect("deflate stream");
 
     ctx.zin = z.total_in() as usize;
     ctx.zout = z.total_out() as usize;
 
     // deflateEnd() (Z_OK after Z_STREAM_END: the "deflateEnd() failed"
-    // alert cannot happen) and ngx_pfree(r->pool, ctx->preallocated)
-    drop(z);
+    // alert cannot happen) and ngx_pfree(r->pool, ctx->preallocated): the
+    // stream reset and kept for the next response
+    z.reset();
+
+    FREE_ZSTREAMS.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() < FREE_STREAMS {
+            f.push((ctx.level, ctx.wbits, z));
+        }
+    });
 
     // the last buffer is consumed
     if let Some(consumed) = ctx.in_buf.take() {
-        crate::copy_filter::recycle(consumed);
+        if !is_out_buf(&consumed) {
+            crate::copy_filter::recycle(consumed);
+        }
     }
 
     let mut b = ctx.out_buf.take().expect("out_buf");
@@ -1000,6 +1077,35 @@ mod tests {
         assert_eq!(&out[..10], &[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0x04, 0x03]);
         assert_eq!(n, 24);
         assert_eq!(z.total_in() as usize, input.len());
+    }
+
+    /// A stream ended, reset and used again writes the bytes a new one
+    /// writes (deflateReset: deflateEnd and deflateInit without freeing)
+    #[test]
+    fn reset_stream_as_new() {
+        let gzip = |z: &mut Compress, data: &[u8]| {
+            let mut out = Vec::with_capacity(64 * 1024);
+            assert!(matches!(z.compress_vec(data, &mut out, FlushCompress::Finish), Ok(Status::StreamEnd)));
+            out
+        };
+
+        let a = b"<html>first response, compressed once</html>".repeat(300);
+        let b = b"<p>the second one, with other text</p>".repeat(500);
+
+        let mut kept = Compress::new_gzip(Compression::new(1), 15);
+        gzip(&mut kept, &a);
+        kept.reset();
+        assert_eq!(kept.total_in(), 0);
+
+        let mut new = Compress::new_gzip(Compression::new(1), 15);
+        assert_eq!(gzip(&mut kept, &b), gzip(&mut new, &b));
+
+        // an output buffer sent is taken again for one of its size only
+        let v = take_out_buf(100);
+        assert_eq!(v.capacity(), 100);
+        free_out_buf(Vec::with_capacity(200));
+        assert_eq!(take_out_buf(100).capacity(), 100);
+        assert_eq!(take_out_buf(200).capacity(), 200);
     }
 
     /// The bookkeeping of deflate(): the input consumed from in_buf, the

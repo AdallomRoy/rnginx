@@ -483,6 +483,14 @@ pub fn recycle(b: Buf) {
         return;
     }
 
+    if crate::gzip_filter::is_out_buf(&b) {
+        // a gzip output buffer sent
+        if let BufData::Memory(v) = b.data {
+            crate::gzip_filter::free_out_buf(v);
+        }
+        return;
+    }
+
     if b.tag != COPY_BUF_TAG {
         return;
     }
