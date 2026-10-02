@@ -881,10 +881,7 @@ impl Connection {
     pub fn try_write_io<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
         self.fake_io_error()?;
         let afd = self.afd()?;
-        afd.try_io(Interest::WRITABLE, |inner| {
-            let s = fd::get(inner.0)?;
-            op(s.as_fd())
-        })
+        afd.try_io(Interest::WRITABLE, |inner| op(inner.as_fd()))
     }
 
     /// Drive a non-blocking operation that does its own socket I/O (an
