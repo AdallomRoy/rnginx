@@ -1,5 +1,7 @@
 //! ngx-core: core runtime of the Rust nginx port.
 
+#![forbid(unsafe_code)]
+
 pub mod buf;
 pub mod fd;
 pub mod file;

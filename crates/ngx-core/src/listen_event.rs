@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! The read event of a listening socket in a worker process: added by
 //! ngx_event_process_init with ngx_add_event(rev, NGX_READ_EVENT, 0) or,
 //! with several worker processes and no accept mutex, with

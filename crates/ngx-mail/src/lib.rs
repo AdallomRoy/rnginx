@@ -1,5 +1,7 @@
 //! ngx-mail: Mail proxy module - POP3, IMAP, SMTP
 
+#![forbid(unsafe_code)]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;

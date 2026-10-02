@@ -13,8 +13,8 @@ const SUN_PATH_LEN: usize = 108;
 const SUN_PATH_OFFSET: usize = std::mem::size_of::<libc::sa_family_t>();
 
 /// The address as the socket calls of nix take it (bind, connect, sendmsg):
-/// the sockaddr of SockAddr::to_libc(), its unix path given up to where the
-/// kernel reads it.
+/// the struct sockaddr nginx makes of it, its unix path given up to where
+/// the kernel reads it.
 pub enum NixSockAddr {
     V4(SockaddrIn),
     V6(SockaddrIn6),
@@ -32,7 +32,7 @@ impl NixSockAddr {
     }
 }
 
-/// The sockaddr_un of to_libc(): the first 107 bytes of the path, NUL
+/// The sockaddr_un nginx makes: the first 107 bytes of the path, NUL
 /// terminated in the 108 of sun_path, with the length of the whole
 /// structure. The kernel reads a path up to its NUL, and a name starting
 /// with a NUL (none: an empty path) as an abstract name taking all of
@@ -155,80 +155,7 @@ impl SockAddr {
         self.to_text(false)
     }
 
-    /// Convert to libc sockaddr_storage + length.
-    pub fn to_libc(&self) -> (libc::sockaddr_storage, libc::socklen_t) {
-        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        match self {
-            SockAddr::V4(a) => {
-                let sin = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in) };
-                sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                sin.sin_port = a.port().to_be();
-                sin.sin_addr.s_addr = u32::from(*a.ip()).to_be();
-                (ss, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
-            }
-            SockAddr::V6(a) => {
-                let sin6 = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in6) };
-                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                sin6.sin6_port = a.port().to_be();
-                sin6.sin6_addr.s6_addr = a.ip().octets();
-                sin6.sin6_flowinfo = a.flowinfo();
-                sin6.sin6_scope_id = a.scope_id();
-                (ss, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
-            }
-            SockAddr::Unix(p) => {
-                let sun = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_un) };
-                sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-                let n = p.len().min(sun.sun_path.len() - 1);
-                for i in 0..n {
-                    sun.sun_path[i] = p[i] as libc::c_char;
-                }
-                (ss, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t)
-            }
-        }
-    }
-
-    /// Convert from libc sockaddr.
-    pub fn from_libc(sa: *const libc::sockaddr, len: libc::socklen_t) -> Option<SockAddr> {
-        if sa.is_null() {
-            return None;
-        }
-        let family = unsafe { (*sa).sa_family } as i32;
-        match family {
-            libc::AF_INET => {
-                let sin = unsafe { &*(sa as *const libc::sockaddr_in) };
-                Some(SockAddr::V4(SocketAddrV4::new(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)), u16::from_be(sin.sin_port))))
-            }
-            libc::AF_INET6 => {
-                let sin6 = unsafe { &*(sa as *const libc::sockaddr_in6) };
-                Some(SockAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(sin6.sin6_addr.s6_addr),
-                    u16::from_be(sin6.sin6_port),
-                    sin6.sin6_flowinfo,
-                    sin6.sin6_scope_id,
-                )))
-            }
-            libc::AF_UNIX => {
-                let sun = unsafe { &*(sa as *const libc::sockaddr_un) };
-                let off = std::mem::size_of::<libc::sa_family_t>();
-                if (len as usize) <= off {
-                    return Some(SockAddr::Unix(Vec::new()));
-                }
-                let max = (len as usize - off).min(sun.sun_path.len());
-                let mut p = Vec::new();
-                for i in 0..max {
-                    let c = sun.sun_path[i] as u8;
-                    if c == 0 {
-                        break;
-                    }
-                    p.push(c);
-                }
-                Some(SockAddr::Unix(p))
-            }
-            _ => None,
-        }
-    }
-
-    /// The address for the socket calls of nix (to_libc() made safe).
+    /// The address for the socket calls of nix (the struct sockaddr of C).
     pub fn to_nix(&self) -> NixSockAddr {
         match self {
             SockAddr::V4(a) => NixSockAddr::V4(SockaddrIn::from(*a)),
@@ -237,9 +164,9 @@ impl SockAddr {
         }
     }
 
-    /// The address nix returned (getsockname(), recvmsg()), as from_libc()
-    /// reads the sockaddr: None for a family other than AF_INET, AF_INET6
-    /// and AF_UNIX.
+    /// The address nix returned (getsockname(), recvmsg()), as nginx reads
+    /// the sockaddr: None for a family other than AF_INET, AF_INET6 and
+    /// AF_UNIX.
     pub fn from_nix(ss: &SockaddrStorage) -> Option<SockAddr> {
         if let Some(sin) = ss.as_sockaddr_in() {
             return Some(SockAddr::V4(SocketAddrV4::from(*sin)));
@@ -261,9 +188,9 @@ impl SockAddr {
         None
     }
 
-    /// A unix address nix returned, as from_libc() reads it: the path up to
-    /// its first NUL within the address length (an abstract or unnamed
-    /// address has none).
+    /// A unix address nix returned, as nginx reads it: the path up to its
+    /// first NUL within the address length (an abstract or unnamed address
+    /// has none).
     pub fn from_unix_addr(sun: &UnixAddr) -> SockAddr {
         let len = sun.len() as usize;
 
@@ -277,8 +204,8 @@ impl SockAddr {
         SockAddr::Unix(raw.sun_path[..max].iter().map(|&c| c as u8).take_while(|&c| c != 0).collect())
     }
 
-    /// The bytes of the sockaddr to_libc() makes, as long as the length it
-    /// returns (ngx_quic_address_hash hashes c->sockaddr).
+    /// The bytes of the struct sockaddr of the address, as long as its
+    /// socklen (ngx_quic_address_hash hashes c->sockaddr).
     pub fn raw_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(SUN_PATH_OFFSET + SUN_PATH_LEN);
 
@@ -314,7 +241,7 @@ impl SockAddr {
     }
 
     /// The address in the bytes of a sockaddr (raw_bytes(), or a copy of
-    /// one kept in shared memory), read as from_libc() reads the structure:
+    /// one kept in shared memory), read as nginx reads the structure:
     /// None for another family, or bytes too short for the family's
     /// structure (an inet one), an empty path for a unix address of no
     /// more than its family.
@@ -1283,7 +1210,7 @@ mod tests {
             _ => panic!("unix"),
         }
 
-        // no path: the all-zero sun_path of to_libc(), an abstract name
+        // no path: an all-zero sun_path, an abstract name
         match SockAddr::Unix(Vec::new()).to_nix() {
             NixSockAddr::Unix(u) => {
                 assert_eq!(u.len() as usize, std::mem::size_of::<libc::sockaddr_un>());

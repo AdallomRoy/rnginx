@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! Event module (events {} block) and the per-worker tokio runtime.
 
 use std::any::Any;

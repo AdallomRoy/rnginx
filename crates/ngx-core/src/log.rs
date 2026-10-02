@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! Error logging, ported from ngx_log.c.
 
 use std::cell::{Cell, RefCell};

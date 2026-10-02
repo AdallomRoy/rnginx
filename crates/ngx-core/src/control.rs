@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! ngx_control.c: the control API of "-l addr". The master process serves
 //! it: a small HTTP/1.x server of JSON endpoints ("/1/nginx",
 //! "/1/control/processes", "/1/control/config" and a PATCH of it reloading

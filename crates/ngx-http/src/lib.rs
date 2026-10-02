@@ -1,5 +1,7 @@
 //! ngx-http: HTTP core and modules.
 
+#![forbid(unsafe_code)]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;

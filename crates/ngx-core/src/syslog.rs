@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! Syslog logging (ngx_syslog.c).
 
 use std::cell::{Cell, RefCell};

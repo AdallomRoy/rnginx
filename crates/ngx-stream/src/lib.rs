@@ -3,6 +3,8 @@
 //! ngx_stream.c: the stream{} block, the phase engine set up, and the
 //! listening sockets of the servers' addresses.
 
+#![forbid(unsafe_code)]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
