@@ -441,7 +441,7 @@ thread_local! {
 }
 
 /// An empty header buffer of at least `len` bytes: a free one, or a new one
-fn take_header_buf(len: usize) -> Vec<u8> {
+pub fn take_header_buf(len: usize) -> Vec<u8> {
     let free = FREE_HEADERS.with(|f| {
         let mut f = f.borrow_mut();
         let i = f.iter().rposition(|v| v.capacity() >= len)?;

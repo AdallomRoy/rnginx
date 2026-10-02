@@ -367,8 +367,8 @@ fn sub_copy_buf(buf: &Buf, start: usize, end: usize) -> Buf {
         last: len,
         file_pos: 0,
         file_last: 0,
-        // the copy has its own memory, not that of a copy buffer
-        tag: if buf.tag == crate::copy_filter::COPY_BUF_TAG { 0 } else { buf.tag },
+        // the copy has its own memory, not that of a buffer kept for reuse
+        tag: if buf.tag == crate::copy_filter::COPY_BUF_TAG || buf.tag == crate::header_filter::HEADER_BUF_TAG { 0 } else { buf.tag },
         num: buf.num,
         data: BufData::Memory(data),
         temporary: buf.temporary,

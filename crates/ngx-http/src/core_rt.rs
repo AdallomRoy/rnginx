@@ -897,11 +897,20 @@ fn send_response_discarded(r: &R, rc: i64, status: i64, ct: Option<&[u8]>, cv: &
         return Step::Ready(rc);
     }
     r.headers_out.borrow_mut().status = status;
-    let val = match complex_value(r, cv) {
-        Ok(v) => v,
-        Err(_) => return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR),
+    let redirect = status == NGX_HTTP_MOVED_PERMANENTLY || status == NGX_HTTP_MOVED_TEMPORARILY || status == NGX_HTTP_SEE_OTHER || status == NGX_HTTP_TEMPORARY_REDIRECT || status == NGX_HTTP_PERMANENT_REDIRECT;
+    // the body of a constant is copied into a header-sized buffer kept
+    // for reuse once sent; any other value is evaluated into its own
+    let (val, tag) = if cv.parts.is_none() && !redirect {
+        let mut body = crate::header_filter::take_header_buf(cv.value.len());
+        body.extend_from_slice(&cv.value);
+        (body, crate::header_filter::HEADER_BUF_TAG)
+    } else {
+        match complex_value(r, cv) {
+            Ok(v) => (v, 0),
+            Err(_) => return Step::Ready(NGX_HTTP_INTERNAL_SERVER_ERROR),
+        }
     };
-    if status == NGX_HTTP_MOVED_PERMANENTLY || status == NGX_HTTP_MOVED_TEMPORARILY || status == NGX_HTTP_SEE_OTHER || status == NGX_HTTP_TEMPORARY_REDIRECT || status == NGX_HTTP_PERMANENT_REDIRECT {
+    if redirect {
         r.clear_location();
         let h = r.headers_out.borrow_mut().add_generated(b"Location", val);
         r.headers_out.borrow_mut().location = Some(h);
@@ -923,6 +932,7 @@ fn send_response_discarded(r: &R, rc: i64, status: i64, ct: Option<&[u8]>, cv: &
     // the value is the response body: the buffer takes it
     let memory = !val.is_empty();
     let mut b = Buf::from_vec(val);
+    b.tag = tag;
     b.memory = memory;
     b.last_buf = r.is_main();
     b.last_in_chain = true;
