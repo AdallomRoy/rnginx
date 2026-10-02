@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -244,15 +244,6 @@ fn raw_fd(sock: &UpstreamSock) -> Option<RawFd> {
     }
 }
 
-/// A dup() of the socket of a cached connection, owned by the OwnedFd.
-fn dup_sock(sock: &UpstreamSock) -> Option<OwnedFd> {
-    match sock {
-        UpstreamSock::Tcp(s) => rustix::io::fcntl_dupfd_cloexec(s, 0).ok(),
-        UpstreamSock::Unix(s) => rustix::io::fcntl_dupfd_cloexec(s, 0).ok(),
-        UpstreamSock::Conn(c) => ngx_core::fd::get(c.fd()).ok().and_then(|s| rustix::io::fcntl_dupfd_cloexec(&s, 0).ok()),
-    }
-}
-
 /// ngx_http_upstream_keepalive_close: an https connection is closed
 /// without "close notify".
 fn keepalive_close(item: CacheItem) {
@@ -260,28 +251,15 @@ fn keepalive_close(item: CacheItem) {
     drop(item);
 }
 
-/// ngx_http_upstream_keepalive_close_handler, as a task on a duplicate of
-/// the socket: the connection is closed when data or the end of it arrives
-/// (a peek that does not return EAGAIN), or on keepalive_timeout.
-///
-/// The duplicate is made when the task first runs, from the item still in
-/// the cache (taking the item out of the cache aborts the task), and is
-/// owned at once: a connection reused before then aborts the task unpolled,
-/// and a descriptor duplicated up front would leak with the dropped future.
+/// ngx_http_upstream_keepalive_close_handler, as a task: the connection is
+/// closed when data or the end of it arrives (a peek that does not return
+/// EAGAIN), or on keepalive_timeout. It waits on the read event of the
+/// connection's own registration, which stays as it is while the connection
+/// is cached, as in C (no descriptor or epoll registration of its own); the
+/// item is looked up in the cache at each wakeup, and taking it out of the
+/// cache aborts the task.
 fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Option<Rc<ngx_core::connection::Connection>>) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let dup = match conf.upgrade() {
-            Some(conf) => {
-                let cache = conf.cache.borrow();
-
-                match cache.iter().find(|it| it.id == id) {
-                    Some(it) => dup_sock(&it.conn.sock),
-                    None => return,
-                }
-            }
-            None => return,
-        };
-
         // c->close: ngx_close_idle_connections() at the worker's shutdown
         let close = async {
             match &c {
@@ -300,33 +278,24 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Opti
 
         tokio::pin!(close);
 
-        if let Some(owned) = dup {
-            if let Ok(afd) = tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE) {
-                let watch = async {
-                    loop {
-                        let mut guard = match afd.readable().await {
-                            Ok(g) => g,
-                            Err(_) => return,
-                        };
+        let watch = std::future::poll_fn(|cx| {
+            let conf = match conf.upgrade() {
+                Some(conf) => conf,
+                None => return std::task::Poll::Ready(()),
+            };
 
-                        let mut b = [0u8; 1];
+            let cache = conf.cache.borrow();
 
-                        let n = nix::sys::socket::recv(afd.as_raw_fd(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT);
-
-                        if n == Err(nix::errno::Errno::EAGAIN) {
-                            guard.clear_ready();
-                            continue;
-                        }
-
-                        return;
-                    }
-                };
-
-                tokio::select! {
-                    _ = tokio::time::timeout(Duration::from_millis(timeout), watch) => {}
-                    _ = &mut close => {}
-                }
+            match cache.iter().find(|it| it.id == id) {
+                Some(it) => it.conn.sock.poll_idle_close(cx),
+                // given to a request: this task is being aborted
+                None => std::task::Poll::Ready(()),
             }
+        });
+
+        tokio::select! {
+            _ = tokio::time::timeout(Duration::from_millis(timeout), watch) => {}
+            _ = &mut close => {}
         }
 
         // close: the item leaves the cache and its connection is closed

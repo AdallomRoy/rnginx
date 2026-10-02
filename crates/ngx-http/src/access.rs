@@ -130,12 +130,19 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_ACCESS_PHASE,
-        Rc::new(|r| Box::pin(access_handler(r))),
+        crate::core::phase_handler(access_idle, access_handler),
     );
     Ok(())
 }
 
 /// ngx_http_access_handler
+/// access_handler declines at once: no allow/deny rules for the location
+fn access_idle(r: &R) -> bool {
+    let conf = r.loc_conf::<AccessLocConf>(ctx_index());
+    let c = conf.borrow();
+    c.rules_v4.is_none() && c.rules_v6.is_none() && c.rules_unix.is_none()
+}
+
 async fn access_handler(r: R) -> i64 {
     let conf = r.loc_conf::<AccessLocConf>(ctx_index());
     let alcf = conf.borrow();

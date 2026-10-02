@@ -16,9 +16,24 @@ pub fn chunked_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { chunked_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { chunked_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(chunked_header_idle, chunked_header_filter);
+    crate::install_body_filter_idle(chunked_body_idle, chunked_body_filter);
     Ok(())
+}
+
+/// chunked_header_filter passes the response on as it is: no body, a
+/// subrequest, or a known length without trailers
+fn chunked_header_idle(r: &R) -> bool {
+    let ho = r.headers_out.borrow();
+    let status = ho.status;
+
+    status == NGX_HTTP_NOT_MODIFIED
+        || status == NGX_HTTP_NO_CONTENT
+        || status < NGX_HTTP_OK
+        || !r.is_main()
+        || r.method.get() == NGX_HTTP_HEAD
+        || (r.method.get() == NGX_HTTP_CONNECT && status < NGX_HTTP_SPECIAL_RESPONSE)
+        || (ho.content_length_n != -1 && !r.expect_trailers.get())
 }
 
 async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
@@ -51,6 +66,11 @@ async fn chunked_header_filter(r: R, next: HeaderFilter) -> i64 {
 
 pub struct ChunkedCtx {
     pub done: bool,
+}
+
+/// chunked_body_filter passes the chain on as it is
+fn chunked_body_idle(r: &R, input: &Chain) -> bool {
+    !r.chunked.get() || input.is_empty() || !r.has_ctx(ctx_index())
 }
 
 async fn chunked_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {

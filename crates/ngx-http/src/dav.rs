@@ -96,7 +96,7 @@ fn dav_methods_handler(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>) 
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(dav_handler(r))));
+    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(dav_idle, dav_handler));
     Ok(())
 }
 
@@ -107,6 +107,11 @@ fn has_body(r: &R) -> bool {
 
 fn uri_is_collection(r: &R) -> bool {
     r.uri.borrow().last() == Some(&b'/')
+}
+
+/// dav_handler declines at once: not one of the dav_methods
+fn dav_idle(r: &R) -> bool {
+    r.method.get() & r.loc_conf::<DavLocConf>(ctx_index()).borrow().methods == 0
 }
 
 async fn dav_handler(r: R) -> i64 {

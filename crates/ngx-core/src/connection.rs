@@ -694,6 +694,30 @@ impl Connection {
         Ok(())
     }
 
+    /// c->read->ready = 0: a read found the socket drained, either a read
+    /// shorter than asked (ngx_unix_recv with EPOLLRDHUP) or EAGAIN inside
+    /// OpenSSL (SSL_ERROR_WANT_READ). The readiness kept since the last
+    /// event is cleared, so the next wait blocks for a new event instead of
+    /// trying a recv() that fails with EAGAIN. An operation that reports
+    /// WouldBlock clears the readiness it was tried under; nothing is read,
+    /// and tokio keeps the closed bits, so a pending EOF still wakes the
+    /// reader.
+    pub fn read_drained(&self) {
+        if let Some(afd) = self.afd.borrow().as_ref() {
+            let _ = afd.try_io(Interest::READABLE, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
+        }
+    }
+
+    /// Wait for a read event (data or the end of the stream) and return
+    /// what it reports, leaving the readiness to the connection's readers:
+    /// a handler that only looks at the event, as
+    /// ngx_http_upstream_check_broken_connection does at rev->pending_eof
+    pub async fn read_event(&self) -> io::Result<tokio::io::Ready> {
+        let afd = self.afd()?;
+        let guard = afd.readable().await?;
+        Ok(guard.ready())
+    }
+
     /// Wait until the socket is writable.
     pub async fn writable(&self) -> io::Result<()> {
         if self.is_quic_stream() {
@@ -730,25 +754,27 @@ impl Connection {
     }
 
     /// Drive a non-blocking operation that does its own socket I/O (an
-    /// OpenSSL call) until it completes. The first attempt runs at once; on
-    /// WantRead/WantWrite it is retried after the socket becomes ready, while
-    /// the readiness guard is held. If the retry still wants the same
-    /// readiness, the socket was drained (EAGAIN), so the retained readiness
-    /// is cleared and the next wait blocks for a new event, as epoll ET
-    /// re-arming does after NGX_AGAIN in C. Waiting with readable() /
-    /// writable() instead keeps the stale readiness and spins.
+    /// OpenSSL call) until it completes. The first attempt runs at once.
+    /// An attempt that wants reading found the socket drained (EAGAIN), so
+    /// the readiness kept since the last event is cleared, as C sets
+    /// c->read->ready = 0, and the next attempt waits for a new event. On
+    /// WantWrite it is retried after the socket becomes writable, while the
+    /// readiness guard is held; if the retry still wants writing, the
+    /// retained readiness is cleared and the next wait blocks for a new
+    /// event, as epoll ET re-arming does after NGX_AGAIN in C. Waiting with
+    /// readable() / writable() alone keeps the stale readiness and spins.
     pub async fn drive_io<T>(&self, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
         let mut step = op();
         loop {
             match step {
                 IoStep::Done(v) => return Ok(v),
                 IoStep::WantRead => {
+                    // WantRead is EAGAIN on the socket: c->read->ready = 0,
+                    // whether this was the first attempt or a retry
+                    self.read_drained();
                     let afd = self.afd()?;
-                    let mut guard = afd.readable().await?;
+                    let _guard = afd.readable().await?;
                     step = op();
-                    if matches!(step, IoStep::WantRead) {
-                        guard.clear_ready();
-                    }
                 }
                 IoStep::WantWrite => {
                     let afd = self.afd()?;
@@ -770,30 +796,21 @@ impl Connection {
     pub async fn drive_io_from<T>(&self, mut step: IoStep<T>, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
-        match step {
-            IoStep::WantRead => {
-                if let std::task::Poll::Ready(Ok(mut guard)) = self.afd()?.poll_read_ready(&mut cx) {
-                    guard.clear_ready();
-                }
+        // (the read side is cleared in the loop)
+        if let IoStep::WantWrite = step {
+            if let std::task::Poll::Ready(Ok(mut guard)) = self.afd()?.poll_write_ready(&mut cx) {
+                guard.clear_ready();
             }
-            IoStep::WantWrite => {
-                if let std::task::Poll::Ready(Ok(mut guard)) = self.afd()?.poll_write_ready(&mut cx) {
-                    guard.clear_ready();
-                }
-            }
-            IoStep::Done(_) => {}
         }
 
         loop {
             match step {
                 IoStep::Done(v) => return Ok(v),
                 IoStep::WantRead => {
+                    self.read_drained();
                     let afd = self.afd()?;
-                    let mut guard = afd.readable().await?;
+                    let _guard = afd.readable().await?;
                     step = op();
-                    if matches!(step, IoStep::WantRead) {
-                        guard.clear_ready();
-                    }
                 }
                 IoStep::WantWrite => {
                     let afd = self.afd()?;
@@ -809,9 +826,10 @@ impl Connection {
 
     /// The poll form of drive_io(), for AsyncRead / AsyncWrite adapters of
     /// a connection: attempts until the operation completes or waits for
-    /// the socket. An attempt made under the readiness that still wants it
-    /// found the socket drained, so the retained readiness is cleared and
-    /// the task is woken by the next event (as drive_io does).
+    /// the socket. An attempt that wants reading, or a write attempt made
+    /// under the readiness that still wants it, found the socket drained,
+    /// so the retained readiness is cleared and the task is woken by the
+    /// next event (as drive_io does).
     pub fn poll_io<T>(&self, cx: &mut std::task::Context<'_>, mut op: impl FnMut() -> IoStep<T>) -> std::task::Poll<io::Result<T>> {
         use std::task::Poll;
 
@@ -821,19 +839,17 @@ impl Connection {
             match step {
                 IoStep::Done(v) => return Poll::Ready(Ok(v)),
                 IoStep::WantRead => {
+                    self.read_drained();
                     let afd = match self.afd() {
                         Ok(a) => a,
                         Err(e) => return Poll::Ready(Err(e)),
                     };
-                    let mut guard = match afd.poll_read_ready(cx) {
+                    let _guard = match afd.poll_read_ready(cx) {
                         Poll::Ready(Ok(g)) => g,
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     };
                     step = op();
-                    if matches!(step, IoStep::WantRead) {
-                        guard.clear_ready();
-                    }
                 }
                 IoStep::WantWrite => {
                     let afd = match self.afd() {
@@ -852,6 +868,30 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// poll_io() of a read that is attempted only while the socket is
+    /// read-ready, as C reads only when c->read->ready (and
+    /// ngx_http_upstream_send_request processes the response at once only
+    /// then): after a read that found the socket drained, the next one
+    /// waits for an event instead of trying a recv() that fails with EAGAIN.
+    /// For TLS only after a read that ended with SSL_ERROR_WANT_READ: else
+    /// OpenSSL may hold records the socket no longer shows.
+    pub fn poll_read_io<T>(&self, cx: &mut std::task::Context<'_>, op: impl FnMut() -> IoStep<T>) -> std::task::Poll<io::Result<T>> {
+        use std::task::Poll;
+
+        let afd = match self.afd() {
+            Ok(a) => a,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+
+        match afd.poll_read_ready(cx) {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        self.poll_io(cx, op)
     }
 
     /// One non-blocking recv attempt (plain or TLS), without waiting:
@@ -876,9 +916,13 @@ impl Connection {
         }
         let afd = self.afd()?;
         if let Some(ssl) = self.ssl.borrow().clone() {
-            match ssl.try_recv(self, buf) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                r => return r,
+            // OpenSSL may hold records the socket no longer shows, unless
+            // its last read found the socket drained (c->read->ready = 0)
+            if !(ssl.state.recv_drained.get() && ssl.state.ngx.get() && !ssl.state.in_early.get()) {
+                match ssl.try_recv(self, buf) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    r => return r,
+                }
             }
             // retried while the socket is read-ready: nothing again clears
             // the readiness
@@ -901,6 +945,9 @@ impl Connection {
         let n = afd.try_io(Interest::READABLE, |_| recv())?;
         if n == 0 {
             self.read_eof.set(true);
+        } else if n < buf.len() {
+            // ngx_unix_recv: a short read emptied the socket
+            self.read_drained();
         }
         Ok(n)
     }
@@ -964,10 +1011,48 @@ impl Connection {
                     let r = r?;
                     if r == 0 && self.ty != libc::SOCK_DGRAM {
                         self.read_eof.set(true);
+                    } else if r < buf.len() {
+                        // ngx_unix_recv: with EPOLLRDHUP a read shorter than
+                        // asked emptied the socket (rev->ready = 0; the
+                        // closed bits stay for a pending EOF)
+                        guard.clear_ready();
                     }
                     return Ok(r);
                 }
                 Err(_) => continue,
+            }
+        }
+    }
+
+    /// The close handler of an idle connection (as
+    /// ngx_http_upstream_keepalive_close_handler) on the read event of the
+    /// connection's own registration: Ready when a peek at the socket finds
+    /// data, the end of the stream or an error, Pending until the next read
+    /// event. A peek that finds nothing clears the readiness (ev->ready = 0).
+    pub fn poll_peek_close(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+
+        let afd = match self.afd() {
+            Ok(a) => a,
+            Err(_) => return Poll::Ready(()),
+        };
+
+        loop {
+            let mut guard = match afd.poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(()),
+                Poll::Ready(Ok(g)) => g,
+            };
+
+            let peek = guard.try_io(|inner| {
+                let mut b = [0u8; 1];
+                nix::sys::socket::recv(inner.get_ref().0, &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
+            });
+
+            match peek {
+                // EAGAIN: the readiness was cleared, wait for the next event
+                Err(_) => continue,
+                Ok(_) => return Poll::Ready(()),
             }
         }
     }

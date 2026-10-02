@@ -107,6 +107,11 @@ fn memory_buf(data: Vec<u8>) -> Buf {
 }
 
 /// ngx_http_sub_header_filter
+/// sub_header_filter passes the response on as it is: no sub_filter
+fn sub_header_idle(r: &R) -> bool {
+    r.loc_conf::<SubLocConf>(ctx_index()).borrow().pairs.is_none()
+}
+
 async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
     let slcf = r.loc_conf::<SubLocConf>(ctx_index());
 
@@ -198,6 +203,11 @@ async fn sub_header_filter(r: R, next: HeaderFilter) -> i64 {
 }
 
 /// ngx_http_sub_body_filter
+/// sub_body_filter passes the chain on as it is
+fn sub_body_idle(r: &R, _input: &Chain) -> bool {
+    !r.has_ctx(ctx_index())
+}
+
 async fn sub_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let ctx = match r.get_ctx::<SubCtx>(ctx_index()) {
         Some(ctx) => ctx,
@@ -699,8 +709,8 @@ fn sub_init_tables(matches: &mut [SubMatch]) -> SubTables {
 
 /// ngx_http_sub_filter_init
 fn sub_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { sub_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { sub_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(sub_header_idle, sub_header_filter);
+    crate::install_body_filter_idle(sub_body_idle, sub_body_filter);
     Ok(())
 }
 

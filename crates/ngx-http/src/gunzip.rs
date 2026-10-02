@@ -177,6 +177,21 @@ fn buf_shell(b: &Buf) -> Buf {
 }
 
 /// ngx_http_gunzip_header_filter
+/// gunzip_header_filter passes the response on as it is: gunzip off, or a
+/// response not gzipped
+fn gunzip_header_idle(r: &R) -> bool {
+    if !*r.loc_conf::<GunzipConf>(ctx_index()).borrow().enable {
+        return true;
+    }
+
+    let ho = r.headers_out.borrow();
+
+    !ho.content_encoding.as_ref().is_some_and(|h| {
+        let v = h.value.borrow();
+        v.len() == 4 && v.eq_ignore_ascii_case(b"gzip")
+    })
+}
+
 async fn gunzip_header_filter(r: R, next: HeaderFilter) -> i64 {
     let conf = r.loc_conf::<GunzipConf>(ctx_index());
 
@@ -220,6 +235,11 @@ async fn gunzip_header_filter(r: R, next: HeaderFilter) -> i64 {
 }
 
 /// ngx_http_gunzip_body_filter
+/// gunzip_body_filter passes the chain on as it is
+fn gunzip_body_idle(r: &R, _input: &Chain) -> bool {
+    r.get_ctx::<GunzipCtx>(ctx_index()).is_none_or(|c| c.borrow().done)
+}
+
 async fn gunzip_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let ctx = match r.get_ctx::<GunzipCtx>(ctx_index()) {
         Some(ctx) => ctx,
@@ -625,8 +645,8 @@ fn gunzip_merge_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) 
 
 /// ngx_http_gunzip_filter_init
 fn gunzip_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { gunzip_header_filter(r, next).await });
-    install_body_filter(|r, input, next| async move { gunzip_body_filter(r, input, next).await });
+    crate::install_header_filter_idle(gunzip_header_idle, gunzip_header_filter);
+    crate::install_body_filter_idle(gunzip_body_idle, gunzip_body_filter);
     Ok(())
 }
 

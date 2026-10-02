@@ -70,8 +70,13 @@ fn set_degradation(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> 
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    crate::core::add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, Rc::new(|r| Box::pin(degradation_handler(r))));
+    crate::core::add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler(degradation_idle, degradation_handler));
     Ok(())
+}
+
+/// degradation_handler declines at once: no "degrade" for the location
+fn degradation_idle(r: &R) -> bool {
+    *r.loc_conf::<DegradationLocConf>(ctx_index()).borrow().degrade.get() == 0
 }
 
 async fn degradation_handler(r: R) -> i64 {

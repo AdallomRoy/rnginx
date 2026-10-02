@@ -43,8 +43,16 @@ pub fn random_index_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(random_index_handler(r))));
+    crate::core::add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(random_index_idle, random_index_handler));
     Ok(())
+}
+
+/// random_index_handler declines at once: not a directory URI, a method
+/// it does not handle, or random_index off
+fn random_index_idle(r: &R) -> bool {
+    r.uri.borrow().last() != Some(&b'/')
+        || r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD | NGX_HTTP_POST) == 0
+        || !*r.loc_conf::<RandomIndexConf>(ctx_index()).borrow().enable.get()
 }
 
 async fn random_index_handler(r: R) -> i64 {

@@ -69,6 +69,11 @@ fn slice_size(r: &R) -> i64 {
 }
 
 /// ngx_http_slice_header_filter
+/// slice_header_filter passes the response on as it is: not a slice
+fn slice_header_idle(r: &R) -> bool {
+    !r.has_ctx(ctx_index())
+}
+
 async fn slice_header_filter(r: R, next: HeaderFilter) -> i64 {
     let ctx = match r.get_ctx::<SliceCtx>(ctx_index()) {
         Some(ctx) => ctx,
@@ -184,6 +189,11 @@ async fn slice_header_filter(r: R, next: HeaderFilter) -> i64 {
 }
 
 /// ngx_http_slice_body_filter
+/// slice_body_filter passes the chain on as it is
+fn slice_body_idle(r: &R, _input: &Chain) -> bool {
+    !r.is_main() || !r.has_ctx(ctx_index())
+}
+
 async fn slice_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     let ctx = match r.get_ctx::<SliceCtx>(ctx_index()) {
         Some(ctx) if r.is_main() => ctx,
@@ -495,7 +505,7 @@ fn slice_add_variables(cf: &mut Conf) -> ConfResult {
 
 /// ngx_http_slice_init
 fn slice_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { slice_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { slice_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(slice_header_idle, slice_header_filter);
+    crate::install_body_filter_idle(slice_body_idle, slice_body_filter);
     Ok(())
 }

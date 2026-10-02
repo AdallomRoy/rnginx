@@ -146,12 +146,19 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_ACCESS_PHASE,
-        Rc::new(|r| Box::pin(auth_request_handler(r))),
+        crate::core::phase_handler(auth_request_idle, auth_request_handler),
     );
     Ok(())
 }
 
 /// ngx_http_auth_request_handler
+/// auth_request_handler declines at once: no auth_request uri, or "off"
+fn auth_request_idle(r: &R) -> bool {
+    let conf = r.loc_conf::<AuthRequestLocConf>(ctx_index());
+    let c = conf.borrow();
+    c.uri.0.as_ref().is_none_or(|u| u.is_empty() || u == b"off")
+}
+
 async fn auth_request_handler(r: R) -> i64 {
     let conf = r.loc_conf::<AuthRequestLocConf>(ctx_index());
     let conf = conf.borrow();

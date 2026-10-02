@@ -123,10 +123,7 @@ async fn find_config_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
     }
     update_location_config(r);
     let clcf = r.clcf();
-    let (max_body, name) = {
-        let c = clcf.borrow();
-        (*c.client_max_body_size, c.escaped_name.clone())
-    };
+    let max_body = *clcf.borrow().client_max_body_size;
     let cl = r.headers_in.borrow().content_length_n;
     http_debug!(r, "http cl:{} max:{}", cl, max_body);
     if cl != -1 && !r.discard_body.get() && max_body != 0 && max_body < cl {
@@ -136,6 +133,7 @@ async fn find_config_phase(r: &R, _ph: &PhaseHandler) -> PhaseStep {
         return PhaseStep::Finalize(NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
     }
     if rc == NGX_DONE {
+        let name = clcf.borrow().escaped_name.clone();
         r.clear_location();
         let args = r.args.borrow().clone();
         let value = if args.is_empty() {
@@ -399,7 +397,8 @@ pub fn find_location(r: &R) -> i64 {
 }
 
 fn find_static_location(r: &R, mut node: Option<&LocationTreeNode>) -> i64 {
-    let uri_full = r.uri.borrow().clone();
+    // only r->loc_conf changes here
+    let uri_full = r.uri.borrow();
     let mut uri: &[u8] = &uri_full;
     let mut rv = NGX_DECLINED;
     loop {

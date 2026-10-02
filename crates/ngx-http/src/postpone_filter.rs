@@ -52,7 +52,7 @@ pub fn postpone_filter_module() -> ModuleDef {
 fn postpone_filter_init(_cf: &mut Conf) -> ConfResult {
     let next = top_body_filter();
     NEXT_BODY_FILTER.with(|n| *n.borrow_mut() = Some(next));
-    install_body_filter(|r, chain, next| async move { postpone_filter(r, chain, next).await });
+    crate::install_body_filter_idle(postpone_idle, postpone_filter);
     Ok(())
 }
 
@@ -428,6 +428,18 @@ impl Future for LogRequest {
 // the filter
 
 /// ngx_http_postpone_filter
+/// postpone_filter passes the chain on as it is: the output of the active
+/// main request, with nothing postponed (it logs first: not with the debug
+/// log on)
+fn postpone_idle(r: &R, input: &Chain) -> bool {
+    !input.is_empty()
+        && !r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP)
+        && !r.subrequest_in_memory.get()
+        && r.is_main()
+        && r.postponed.borrow().is_empty()
+        && is_active(r)
+}
+
 async fn postpone_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     http_debug!(r, "http postpone filter \"{}?{}\" {:p}", B(&r.uri.borrow()), B(&r.args.borrow()), chain_ptr(&input));
 

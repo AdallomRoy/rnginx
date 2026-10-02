@@ -504,6 +504,11 @@ fn hash_strlow(s: &mut [u8]) -> usize {
 // the filters
 
 /// ngx_http_ssi_header_filter
+/// ssi_header_filter passes the response on as it is: ssi off
+fn ssi_header_idle(r: &R) -> bool {
+    !*r.loc_conf::<SsiLocConf>(ctx_index()).borrow().enable
+}
+
 async fn ssi_header_filter(r: R, next: HeaderFilter) -> i64 {
     let slcf = r.loc_conf::<SsiLocConf>(ctx_index());
 
@@ -574,6 +579,11 @@ enum SsiCommandRc {
 }
 
 /// ngx_http_ssi_body_filter
+/// ssi_body_filter passes the chain on as it is
+fn ssi_body_idle(r: &R, _input: &Chain) -> bool {
+    !r.has_ctx(ctx_index())
+}
+
 async fn ssi_body_filter(r: R, input: Chain, next: BodyFilter) -> i64 {
     let ctx = match ssi_get_ctx(&r) {
         Some(ctx) => ctx,
@@ -2296,8 +2306,8 @@ fn ssi_preconfiguration(cf: &mut Conf) -> ConfResult {
 
 /// ngx_http_ssi_filter_init
 fn ssi_filter_init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { ssi_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { ssi_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(ssi_header_idle, ssi_header_filter);
+    crate::install_body_filter_idle(ssi_body_idle, ssi_body_filter);
     Ok(())
 }
 

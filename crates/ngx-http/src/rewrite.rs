@@ -114,6 +114,10 @@ pub enum IfCondition {
 
 pub struct RewriteConf {
     pub codes: Vec<Code>,
+    /// the codes as the handler runs them, shared by all requests (the
+    /// handler cannot hold the conf borrowed across its awaits): made once,
+    /// from the codes of the read configuration
+    shared: std::cell::OnceCell<Rc<[Code]>>,
     pub stack_size: Val<i64>,
     pub log: Val<bool>,
     pub uninitialized_variable_warn: Val<bool>,
@@ -400,6 +404,7 @@ fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> Result<bool, 
 fn create_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(RewriteConf {
         codes: Vec::new(),
+        shared: std::cell::OnceCell::new(),
         stack_size: Val::unset(),
         log: Val::unset(),
         uninitialized_variable_warn: Val::unset(),
@@ -875,16 +880,8 @@ pub fn rewrite_module() -> ModuleDef {
 }
 
 fn init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(
-        cf,
-        NGX_HTTP_SERVER_REWRITE_PHASE,
-        Rc::new(|r| Box::pin(rewrite_handler(r))),
-    );
-    add_phase_handler(
-        cf,
-        NGX_HTTP_REWRITE_PHASE,
-        Rc::new(|r| Box::pin(rewrite_handler(r))),
-    );
+    add_phase_handler(cf, NGX_HTTP_SERVER_REWRITE_PHASE, crate::core::phase_handler(rewrite_idle, rewrite_handler));
+    add_phase_handler(cf, NGX_HTTP_REWRITE_PHASE, crate::core::phase_handler(rewrite_idle, rewrite_handler));
     Ok(())
 }
 
@@ -892,6 +889,11 @@ fn init(cf: &mut Conf) -> ConfResult {
 enum Flow {
     Next,
     Exit(i64),
+}
+
+/// rewrite_handler declines at once: no codes for the location
+fn rewrite_idle(r: &R) -> bool {
+    r.loc_conf::<RewriteConf>(ctx_index()).borrow().codes.is_empty()
 }
 
 /// ngx_http_rewrite_handler
@@ -918,7 +920,7 @@ async fn rewrite_handler(r: R) -> i64 {
             return NGX_DECLINED;
         }
 
-        (c.codes.clone(), c.log.get_or(false))
+        (c.shared.get_or_init(|| c.codes.clone().into()).clone(), c.log.get_or(false))
     };
 
     match run_codes(&r, &codes, log).await {

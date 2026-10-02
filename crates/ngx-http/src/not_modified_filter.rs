@@ -14,8 +14,19 @@ pub fn not_modified_filter_module() -> ModuleDef {
 }
 
 fn init(_cf: &mut Conf) -> ConfResult {
-    install_header_filter(|r, next| async move { not_modified_header_filter(r, next).await });
+    crate::install_header_filter_idle(not_modified_idle, not_modified_header_filter);
     Ok(())
+}
+
+/// not_modified_header_filter passes the response on as it is: not a 200
+/// of the main request, or no conditional headers
+fn not_modified_idle(r: &R) -> bool {
+    if r.headers_out.borrow().status != NGX_HTTP_OK || !r.is_main() || r.disable_not_modified.get() {
+        return true;
+    }
+
+    let hin = r.headers_in.borrow();
+    hin.if_unmodified_since.is_none() && hin.if_match.is_none() && hin.if_modified_since.is_none() && hin.if_none_match.is_none()
 }
 
 async fn not_modified_header_filter(r: R, next: HeaderFilter) -> i64 {

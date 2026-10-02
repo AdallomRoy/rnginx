@@ -179,6 +179,13 @@ fn zone_ctx(limit: &LimitReqLimit) -> Rc<LimitReqCtx> {
 }
 
 /// ngx_http_limit_req_handler
+/// limit_req_handler declines at once: a status set before, or no
+/// limit_req for the location
+fn limit_req_idle(r: &R) -> bool {
+    r.main().limit_req_status.get() != 0
+        || r.loc_conf::<LimitReqConf>(ctx_index()).borrow().limits.as_deref().is_none_or(|l| l.is_empty())
+}
+
 async fn limit_req_handler(r: R) -> i64 {
     let main = r.main();
 
@@ -918,7 +925,7 @@ fn limit_req_add_variables(cf: &mut Conf) -> ConfResult {
 
 /// ngx_http_limit_req_init
 fn limit_req_init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, Rc::new(|r| Box::pin(limit_req_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler(limit_req_idle, limit_req_handler));
     Ok(())
 }
 

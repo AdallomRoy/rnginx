@@ -136,12 +136,17 @@ fn init(cf: &mut Conf) -> ConfResult {
     add_phase_handler(
         cf,
         NGX_HTTP_PRECONTENT_PHASE,
-        Rc::new(|r| Box::pin(try_files_handler(r))),
+        crate::core::phase_handler(try_files_idle, try_files_handler),
     );
     Ok(())
 }
 
 /// ngx_http_try_files_handler
+/// try_files_handler declines at once: no try_files for the location
+fn try_files_idle(r: &R) -> bool {
+    r.loc_conf::<TryFilesConf>(ctx_index()).borrow().try_files.as_ref().is_none_or(|f| f.is_empty())
+}
+
 async fn try_files_handler(r: R) -> i64 {
     let conf = r.loc_conf::<TryFilesConf>(ctx_index());
     let files = match &conf.borrow().try_files {

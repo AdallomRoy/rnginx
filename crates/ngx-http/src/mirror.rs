@@ -90,11 +90,17 @@ fn mirror_add(mlcf: &mut MirrorLocConf, value: Vec<u8>) -> Result<(), &'static s
 
 /// ngx_http_mirror_init
 fn init(cf: &mut Conf) -> ConfResult {
-    crate::core::add_phase_handler(cf, NGX_HTTP_PRECONTENT_PHASE, Rc::new(|r| Box::pin(mirror_handler(r))));
+    crate::core::add_phase_handler(cf, NGX_HTTP_PRECONTENT_PHASE, crate::core::phase_handler(mirror_idle, mirror_handler));
     Ok(())
 }
 
 /// ngx_http_mirror_handler
+/// mirror_handler declines at once: a subrequest, or no mirror for the
+/// location
+fn mirror_idle(r: &R) -> bool {
+    !r.is_main() || r.loc_conf::<MirrorLocConf>(ctx_index()).borrow().mirror.as_option().is_none_or(|m| m.is_empty())
+}
+
 async fn mirror_handler(r: R) -> i64 {
     if !r.is_main() {
         return NGX_DECLINED;

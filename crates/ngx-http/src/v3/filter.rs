@@ -49,13 +49,17 @@ pub fn v3_filter_module() -> ModuleDef {
 
 /// ngx_http_v3_filter_init
 fn filter_init(_cf: &mut ngx_core::conf::Conf) -> ngx_core::conf::ConfResult {
-    install_header_filter(|r: R, next: HeaderFilter| async move {
-        if r.http_version.get() != NGX_HTTP_VERSION_30 {
-            return next(r).await;
-        }
+    // not an HTTP/3 request: passed on as it is
+    crate::install_header_filter_idle(
+        |r| r.http_version.get() != NGX_HTTP_VERSION_30,
+        |r: R, next: HeaderFilter| async move {
+            if r.http_version.get() != NGX_HTTP_VERSION_30 {
+                return next(r).await;
+            }
 
-        header_filter(&r).await
-    });
+            header_filter(&r).await
+        },
+    );
 
     install_early_hints_filter(|r: R, next: HeaderFilter| async move {
         if r.http_version.get() != NGX_HTTP_VERSION_30 {
@@ -65,7 +69,7 @@ fn filter_init(_cf: &mut ngx_core::conf::Conf) -> ngx_core::conf::ConfResult {
         early_hints_filter(&r).await
     });
 
-    install_body_filter(|r: R, chain: Chain, next: BodyFilter| async move { body_filter(r, chain, next).await });
+    crate::install_body_filter_idle(|r, chain| chain.is_empty() || !r.has_ctx(ctx_index()), body_filter);
 
     Ok(())
 }

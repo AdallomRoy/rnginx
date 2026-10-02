@@ -33,6 +33,14 @@ pub struct GzipStaticConf {
 }
 
 /// ngx_http_gzip_static_handler
+/// gzip_static_handler declines at once: a method it does not handle, a
+/// directory URI, or gzip_static off
+fn gzip_static_idle(r: &R) -> bool {
+    r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD) == 0
+        || r.uri.borrow().last() == Some(&b'/')
+        || *r.loc_conf::<GzipStaticConf>(ctx_index()).borrow().enable == NGX_HTTP_GZIP_STATIC_OFF
+}
+
 async fn gzip_static_handler(r: R) -> i64 {
     if r.method.get() & (NGX_HTTP_GET | NGX_HTTP_HEAD) == 0 {
         return NGX_DECLINED;
@@ -203,7 +211,7 @@ fn gzip_static_merge_conf(_cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn A
 
 /// ngx_http_gzip_static_init
 fn gzip_static_init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, Rc::new(|r| Box::pin(gzip_static_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_CONTENT_PHASE, crate::core::phase_handler(gzip_static_idle, gzip_static_handler));
 
     Ok(())
 }

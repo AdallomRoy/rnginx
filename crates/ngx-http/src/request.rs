@@ -622,6 +622,11 @@ impl Request {
         c
     }
 
+    /// A module context is set (ngx_http_get_module_ctx() != NULL)
+    pub fn has_ctx(&self, idx: usize) -> bool {
+        self.ctx.borrow()[idx].is_some()
+    }
+
     pub fn clear_ctx(&self, idx: usize) {
         self.ctx.borrow_mut()[idx] = None;
     }

@@ -110,6 +110,29 @@ pub fn charset_filter_module() -> ModuleDef {
 }
 
 /// ngx_http_charset_header_filter
+/// charset_header_filter passes the response of the main request on as it
+/// is: ngx_http_destination_charset() declines at once, without a content
+/// type, or with charset off and no charset to override
+fn charset_header_idle(r: &R) -> bool {
+    if !r.is_main() {
+        return false;
+    }
+
+    {
+        let ho = r.headers_out.borrow();
+
+        if ho.content_type.is_empty() {
+            return true;
+        }
+
+        if ho.override_charset.as_ref().is_some_and(|o| !o.is_empty()) {
+            return false;
+        }
+    }
+
+    r.loc_conf::<CharsetLocConf>(ctx_index()).borrow().charset == NGX_HTTP_CHARSET_OFF
+}
+
 async fn charset_header_filter(r: R, next: HeaderFilter) -> i64 {
     let mut dst = Vec::new();
 
@@ -394,6 +417,11 @@ async fn charset_ctx(r: R, next: HeaderFilter, mcf: &Rc<RefCell<CharsetMainConf>
 }
 
 /// ngx_http_charset_body_filter
+/// charset_body_filter passes the chain on as it is: no recoding
+fn charset_body_idle(r: &R, _input: &Chain) -> bool {
+    r.get_ctx::<CharsetCtx>(ctx_index()).is_none_or(|c| c.borrow().table.is_none())
+}
+
 async fn charset_body_filter(r: R, mut input: Chain, next: BodyFilter) -> i64 {
     let ctx = match r.get_ctx::<CharsetCtx>(ctx_index()) {
         Some(c) => c,
@@ -1114,8 +1142,8 @@ fn charset_postconfiguration(cf: &mut Conf) -> ConfResult {
         }
     }
 
-    install_header_filter(|r, next| async move { charset_header_filter(r, next).await });
-    install_body_filter(|r, chain, next| async move { charset_body_filter(r, chain, next).await });
+    crate::install_header_filter_idle(charset_header_idle, charset_header_filter);
+    crate::install_body_filter_idle(charset_body_idle, charset_body_filter);
 
     Ok(())
 }

@@ -154,6 +154,13 @@ fn zone_ctx(shm_zone: &ShmZone) -> Rc<LimitConnCtx> {
 }
 
 /// ngx_http_limit_conn_handler
+/// limit_conn_handler declines at once: a status set before, or no
+/// limit_conn for the location
+fn limit_conn_idle(r: &R) -> bool {
+    r.main().limit_conn_status.get() != 0
+        || r.loc_conf::<LimitConnConf>(ctx_index()).borrow().limits.as_deref().is_none_or(|l| l.is_empty())
+}
+
 async fn limit_conn_handler(r: R) -> i64 {
     let main = r.main();
 
@@ -565,7 +572,7 @@ fn limit_conn_add_variables(cf: &mut Conf) -> ConfResult {
 
 /// ngx_http_limit_conn_init
 fn limit_conn_init(cf: &mut Conf) -> ConfResult {
-    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, Rc::new(|r| Box::pin(limit_conn_handler(r))));
+    add_phase_handler(cf, NGX_HTTP_PREACCESS_PHASE, crate::core::phase_handler(limit_conn_idle, limit_conn_handler));
     Ok(())
 }
 

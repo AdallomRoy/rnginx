@@ -137,10 +137,11 @@ async fn start_read_client_request_body(r: &R) -> i64 {
         b.unread().to_vec()
     };
     let mut in_header = false;
+    let preread_len = preread.len();
     if !preread.is_empty() {
         http_debug!(r, "http client request body preread {}", preread.len());
         let mut chain = Chain::new();
-        chain.push_back(Buf::from_vec(preread.clone()));
+        chain.push_back(Buf::from_vec(preread));
         let (rc, consumed) = request_body_filter(r, &rb, chain).await;
         {
             let mut b = hc.buffer.borrow_mut();
@@ -194,7 +195,7 @@ async fn start_read_client_request_body(r: &R) -> i64 {
         if !chunked && b.rest < size {
             size = b.rest;
             if r.request_body_in_single_buf.get() {
-                size += preread.len() as i64;
+                size += preread_len as i64;
             }
             if size == 0 {
                 size = 1;
@@ -451,7 +452,20 @@ async fn do_read_client_request_body(r: &R, rb: &Rc<RefCell<RequestBody>>) -> i6
 /// Leftover bytes (pipelined requests) are appended back to the connection buffer.
 async fn request_body_filter(r: &R, rb: &Rc<RefCell<RequestBody>>, input: Chain) -> (i64, usize) {
     let chunked = r.headers_in.borrow().chunked;
-    let data: Vec<u8> = input.iter().filter_map(|b| if let BufData::Memory(v) = &b.data { Some(&v[b.pos..b.last]) } else { None }).flatten().copied().collect();
+    // the input bytes: ngx_http_request_body_length_filter links the input
+    // buffers instead of copying them, so a whole buffer (the readers pass
+    // one) moves as it is; parts of buffers are joined
+    let mut data: Vec<u8> = Vec::new();
+    for mut b in input.into_iter() {
+        let (pos, last) = (b.pos, b.last);
+        if let BufData::Memory(v) = &mut b.data {
+            if data.is_empty() && pos == 0 && last == v.len() {
+                data = std::mem::take(v);
+            } else {
+                data.extend_from_slice(&v[pos..last]);
+            }
+        }
+    }
     let total = data.len();
     let mut out = Chain::new();
     let mut consumed = 0usize;
@@ -468,7 +482,9 @@ async fn request_body_filter(r: &R, rb: &Rc<RefCell<RequestBody>>, input: Chain)
         }
         if b.rest > 0 && total > 0 {
             let take = (b.rest as usize).min(total);
-            let mut nb = Buf::from_vec(data[..take].to_vec());
+            // the bytes after the body (pipelined) stay in data
+            let body = if take == total { std::mem::take(&mut data) } else { data[..take].to_vec() };
+            let mut nb = Buf::from_vec(body);
             nb.temporary = true;
             nb.flush = r.request_body_no_buffering.get();
             b.rest -= take as i64;
