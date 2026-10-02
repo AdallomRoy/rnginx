@@ -2549,6 +2549,7 @@ fn ngx_ssl_write_early(c: &Connection, sc: &SslConnection, data: &[u8]) -> IoSte
 /// A buffer of the chain passed to ngx_ssl_send_chain(): pos..last of a
 /// buffer in memory, or file_pos..file_last of a buffer in a file
 /// (in_file); a buffer with neither is special (flush, last_buf, sync).
+#[derive(Clone, Copy)]
 pub struct SslChainBuf<'a> {
     pub mem: &'a [u8],
     pub file: Option<SslChainFile<'a>>,
@@ -2556,7 +2557,62 @@ pub struct SslChainBuf<'a> {
     pub last_buf: bool,
 }
 
+/// The chain ngx_ssl_send_chain() walks: its buffers by position, each
+/// made when it is looked at, as C follows the links of the chain, so no
+/// list of them is built per send.
+pub trait SslChainLinks {
+    /// the number of buffers
+    fn links(&self) -> usize;
+    /// the buffer at `i`
+    fn link(&self, i: usize) -> SslChainBuf<'_>;
+}
+
+impl SslChainLinks for [SslChainBuf<'_>] {
+    fn links(&self) -> usize {
+        self.len()
+    }
+
+    fn link(&self, i: usize) -> SslChainBuf<'_> {
+        self[i]
+    }
+}
+
+/// Buffers in memory, each with the flush flag (the buffers of a read the
+/// stream proxy sends).
+pub struct SslFlushedBufs<'a>(pub &'a [&'a [u8]]);
+
+impl SslChainLinks for SslFlushedBufs<'_> {
+    fn links(&self) -> usize {
+        self.0.len()
+    }
+
+    fn link(&self, i: usize) -> SslChainBuf<'_> {
+        SslChainBuf { mem: self.0[i], file: None, flush: true, last_buf: false }
+    }
+}
+
+/// A chain of buffers: in memory (pos..last), in a file (file_pos..
+/// file_last), or special.
+impl SslChainLinks for crate::buf::Chain {
+    fn links(&self) -> usize {
+        self.len()
+    }
+
+    fn link(&self, i: usize) -> SslChainBuf<'_> {
+        let b = &self[i];
+
+        let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
+            crate::buf::BufData::Memory(v) if b.in_memory() => (&v[b.pos..b.last], None),
+            crate::buf::BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos, last: b.file_last })),
+            _ => (&[], None),
+        };
+
+        SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf }
+    }
+}
+
 /// file->fd, file->name, file_pos, file_last
+#[derive(Clone, Copy)]
 pub struct SslChainFile<'a> {
     pub fd: i32,
     pub name: &'a [u8],
@@ -2587,20 +2643,77 @@ pub struct SslChainPos {
     pub off: i64,
 }
 
-/// c->ssl->buf of NGX_SSL_BUFFER: allocated on the first use, freed by
-/// ngx_ssl_free_buffer().
+/// c->ssl->buf of NGX_SSL_BUFFER: memory taken on the first use (C
+/// allocates it, uninitialised, from the connection's pool) and given
+/// back by ngx_ssl_free_buffer() or with the connection, so an idle
+/// connection holds none. The data not written yet are data[pos..]:
+/// data.len() is buf->last, as the copies append to it, so the memory is
+/// never zero-filled; `end` is buf->end, the buffer size it was taken for.
 #[derive(Default)]
 pub struct SslBuf {
     data: Vec<u8>,
     pos: usize,
-    last: usize,
+    end: usize,
     flush: bool,
+}
+
+impl SslBuf {
+    /// buf->last - buf->pos
+    fn pending(&self) -> usize {
+        self.data.len() - self.pos
+    }
+}
+
+impl Drop for SslBuf {
+    fn drop(&mut self) {
+        ssl_buf_free(std::mem::take(&mut self.data));
+    }
+}
+
+/// The most free c->ssl->buf memory a worker keeps.
+const SSL_BUFS_MAX: usize = 32;
+
+thread_local! {
+    /// The free c->ssl->buf memory of the worker, empty Vecs with their
+    /// capacity: what C's ngx_pfree() gives back to malloc for the next
+    /// connection that sends.
+    static SSL_BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An empty Vec of at least `size` bytes of capacity for c->ssl->buf.
+fn ssl_buf_alloc(size: usize) -> Vec<u8> {
+    let free = SSL_BUFS
+        .try_with(|bufs| {
+            let mut bufs = bufs.try_borrow_mut().ok()?;
+            let i = bufs.iter().rposition(|b| b.capacity() >= size)?;
+            Some(bufs.swap_remove(i))
+        })
+        .ok()
+        .flatten();
+
+    free.unwrap_or_else(|| Vec::with_capacity(size))
+}
+
+/// c->ssl->buf memory back to the worker's free list.
+fn ssl_buf_free(mut data: Vec<u8>) {
+    if data.capacity() == 0 {
+        return;
+    }
+
+    data.clear();
+
+    let _ = SSL_BUFS.try_with(|bufs| {
+        if let Ok(mut bufs) = bufs.try_borrow_mut() {
+            if bufs.len() < SSL_BUFS_MAX {
+                bufs.push(data);
+            }
+        }
+    });
 }
 
 /// NGX_SSL_BUFFERED in c->buffered: data not written from c->ssl->buf.
 pub fn ngx_ssl_buffered(sc: &SslConnection) -> bool {
-    let buf = sc.state.buf.borrow();
-    buf.pos < buf.last
+    sc.state.buf.borrow().pending() != 0
 }
 
 /// ngx_ssl_send_chain: one pass over the chain from `pos`, moving it past
@@ -2612,14 +2725,26 @@ pub fn ngx_ssl_buffered(sc: &SslConnection) -> bool {
 /// WantWrite is NGX_AGAIN; the chain is not all taken, or c->ssl->buf not
 /// all written, on Done when `limit` is reached or a write was partial.
 pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut SslChainPos, limit: i64) -> IoStep<Result<(), ()>> {
+    ngx_ssl_send_chain_links(c, links, pos, limit)
+}
+
+/// ngx_ssl_send_chain() of a chain of buffers, walked in place.
+pub fn ngx_ssl_send_chain_chain(c: &Connection, chain: &crate::buf::Chain, pos: &mut SslChainPos, limit: i64) -> IoStep<Result<(), ()>> {
+    ngx_ssl_send_chain_links(c, chain, pos, limit)
+}
+
+/// ngx_ssl_send_chain() over any chain.
+pub fn ngx_ssl_send_chain_links<L: SslChainLinks + ?Sized>(c: &Connection, links: &L, pos: &mut SslChainPos, limit: i64) -> IoStep<Result<(), ()>> {
     let sc = match c.ssl.borrow().clone() {
         Some(sc) => sc,
         None => return IoStep::Done(Err(())),
     };
 
+    let nlinks = links.links();
+
     if !sc.state.buffer.get() {
-        while pos.link < links.len() {
-            let b = &links[pos.link];
+        while pos.link < nlinks {
+            let b = &links.link(pos.link);
 
             if b.special() || b.mem.is_empty() {
                 pos.link += 1;
@@ -2653,22 +2778,24 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
 
     let mut buf = sc.state.buf.borrow_mut();
 
-    if buf.data.is_empty() {
-        buf.data = vec![0; sc.buffer_size.get()];
+    if buf.data.capacity() == 0 {
+        let size = sc.buffer_size.get();
+
+        buf.data = ssl_buf_alloc(size);
         buf.pos = 0;
-        buf.last = 0;
+        buf.end = size;
     }
 
-    let end = buf.data.len();
+    let end = buf.end;
 
-    let mut send = (buf.last - buf.pos) as i64;
-    let mut flush = pos.link >= links.len() || buf.flush;
+    let mut send = buf.pending() as i64;
+    let mut flush = pos.link >= nlinks || buf.flush;
 
     let mut again = None;
 
     loop {
-        while pos.link < links.len() && buf.last < end && send < limit {
-            let b = &links[pos.link];
+        while pos.link < nlinks && buf.data.len() < end && send < limit {
+            let b = &links.link(pos.link);
 
             if b.last_buf || b.flush {
                 flush = true;
@@ -2687,7 +2814,7 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
 
             let rest = &b.mem[pos.off as usize..];
 
-            let mut size = rest.len().min(end - buf.last);
+            let mut size = rest.len().min(end - buf.data.len());
 
             if send + size as i64 > limit {
                 size = (limit - send) as usize;
@@ -2695,10 +2822,8 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
 
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL buf copy: {}", size);
 
-            let last = buf.last;
-            buf.data[last..last + size].copy_from_slice(&rest[..size]);
+            buf.data.extend_from_slice(&rest[..size]);
 
-            buf.last += size;
             pos.off += size as i64;
             send += size as i64;
 
@@ -2708,19 +2833,19 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
             }
         }
 
-        if !flush && send < limit && buf.last < end {
+        if !flush && send < limit && buf.data.len() < end {
             break;
         }
 
-        let size = buf.last - buf.pos;
+        let size = buf.pending();
 
         if size == 0 {
-            if pos.link < links.len() && links[pos.link].file.is_some() && send < limit {
+            if pos.link < nlinks && links.link(pos.link).file.is_some() && send < limit {
                 /* coalesce the neighbouring file bufs */
 
                 let file_size = ngx_ssl_chain_coalesce_file(links, *pos, limit - send);
 
-                match ngx_ssl_sendfile(c, &sc, &links[pos.link], pos.off, file_size) {
+                match ngx_ssl_sendfile(c, &sc, &links.link(pos.link), pos.off, file_size) {
                     IoStep::Done(Err(())) => return IoStep::Done(Err(())),
                     IoStep::WantWrite => {
                         again = Some(IoStep::WantWrite);
@@ -2746,9 +2871,9 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
             return IoStep::Done(Ok(()));
         }
 
-        let (p, l) = (buf.pos, buf.last);
+        let p = buf.pos;
 
-        match ngx_ssl_write_step(c, &sc, &buf.data[p..l]) {
+        match ngx_ssl_write_step(c, &sc, &buf.data[p..]) {
             IoStep::Done(Err(_)) => return IoStep::Done(Err(())),
             IoStep::WantWrite => {
                 again = Some(IoStep::WantWrite);
@@ -2768,9 +2893,9 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
                 flush = false;
 
                 buf.pos = 0;
-                buf.last = 0;
+                buf.data.clear();
 
-                if pos.link >= links.len() || send >= limit {
+                if pos.link >= nlinks || send >= limit {
                     break;
                 }
             }
@@ -2787,8 +2912,8 @@ pub fn ngx_ssl_send_chain(c: &Connection, links: &[SslChainBuf<'_>], pos: &mut S
 
 /// ngx_chain_coalesce_file: the size of the file buffer at `pos` and of
 /// the following buffers of the same file which continue it, up to `limit`.
-fn ngx_ssl_chain_coalesce_file(links: &[SslChainBuf<'_>], pos: SslChainPos, limit: i64) -> i64 {
-    let first = links[pos.link].file.as_ref().expect("file buf");
+fn ngx_ssl_chain_coalesce_file<L: SslChainLinks + ?Sized>(links: &L, pos: SslChainPos, limit: i64) -> i64 {
+    let first = links.link(pos.link).file.expect("file buf");
 
     let fd = first.fd;
     let mut fprev = first.pos + pos.off;
@@ -2796,8 +2921,8 @@ fn ngx_ssl_chain_coalesce_file(links: &[SslChainBuf<'_>], pos: SslChainPos, limi
     let mut i = pos.link;
     let mut off = pos.off;
 
-    while i < links.len() {
-        let f = match &links[i].file {
+    while i < links.links() {
+        let f = match links.link(i).file {
             Some(f) => f,
             None => break,
         };
@@ -2832,9 +2957,9 @@ fn ngx_ssl_chain_coalesce_file(links: &[SslChainBuf<'_>], pos: SslChainPos, limi
 
 /// ngx_chain_update_sent: `sent` bytes of the chain from `pos` are taken;
 /// the special buffers after them too.
-fn ngx_ssl_chain_update_sent(links: &[SslChainBuf<'_>], pos: &mut SslChainPos, mut sent: i64) {
-    while pos.link < links.len() {
-        let b = &links[pos.link];
+fn ngx_ssl_chain_update_sent<L: SslChainLinks + ?Sized>(links: &L, pos: &mut SslChainPos, mut sent: i64) {
+    while pos.link < links.links() {
+        let b = links.link(pos.link);
 
         if b.special() {
             pos.link += 1;
@@ -2960,46 +3085,63 @@ fn ngx_ssl_sendfile(c: &Connection, sc: &SslConnection, b: &SslChainBuf<'_>, off
 /// limit of a pass counts the data it finds in c->ssl->buf, which a pass
 /// after NGX_AGAIN finds again). Returns the bytes of the chain taken.
 pub async fn ngx_ssl_send_chain_wait(c: &Connection, links: &[SslChainBuf<'_>], limit: i64) -> io::Result<i64> {
-    let taken = |pos: SslChainPos| -> i64 { links[..pos.link.min(links.len())].iter().map(|b| b.rest(0)).sum::<i64>() + pos.off };
+    ngx_ssl_send_chain_wait_links(c, links, limit).await
+}
 
+/// ngx_ssl_send_chain_wait() of a chain of buffers, walked in place.
+pub async fn ngx_ssl_send_chain_wait_chain(c: &Connection, chain: &crate::buf::Chain, limit: i64) -> io::Result<i64> {
+    ngx_ssl_send_chain_wait_links(c, chain, limit).await
+}
+
+/// ngx_ssl_send_chain_wait() of any chain.
+pub async fn ngx_ssl_send_chain_wait_links<L: SslChainLinks + ?Sized>(c: &Connection, links: &L, limit: i64) -> io::Result<i64> {
     let mut pos = SslChainPos::default();
 
-    let r = c
-        .drive_io(|| {
-            if limit <= 0 {
-                return ngx_ssl_send_chain(c, links, &mut pos, 0);
-            }
-
-            let left = limit - taken(pos);
-
-            let buffered = match c.ssl.borrow().as_ref() {
-                Some(sc) => {
-                    let buf = sc.state.buf.borrow();
-                    (buf.last - buf.pos) as i64
-                }
-                None => 0,
-            };
-
-            if left <= 0 && buffered == 0 {
-                return IoStep::Done(Ok(()));
-            }
-
-            ngx_ssl_send_chain(c, links, &mut pos, left.max(0) + buffered)
-        })
-        .await?;
+    let r = c.drive_io(|| ngx_ssl_send_chain_wait_step(c, links, &mut pos, limit)).await?;
 
     match r {
-        Ok(()) => Ok(taken(pos)),
+        Ok(()) => Ok(ngx_ssl_chain_taken(links, pos)),
         Err(()) => Err(ssl_error_logged()),
     }
 }
 
-/// ngx_ssl_free_buffer: c->ssl->buf of an idle connection is freed.
+/// One pass of ngx_ssl_send_chain_wait() from `pos` (started at
+/// SslChainPos::default()): ngx_ssl_send_chain() up to what is left of
+/// `limit` (0: none) besides the data in c->ssl->buf. After Done the bytes
+/// of the chain taken are ngx_ssl_chain_taken(); WantRead / WantWrite are
+/// to be followed by the same pass with the same `pos` on the event.
+pub fn ngx_ssl_send_chain_wait_step<L: SslChainLinks + ?Sized>(c: &Connection, links: &L, pos: &mut SslChainPos, limit: i64) -> IoStep<Result<(), ()>> {
+    if limit <= 0 {
+        return ngx_ssl_send_chain_links(c, links, pos, 0);
+    }
+
+    let left = limit - ngx_ssl_chain_taken(links, *pos);
+
+    let buffered = match c.ssl.borrow().as_ref() {
+        Some(sc) => sc.state.buf.borrow().pending() as i64,
+        None => 0,
+    };
+
+    if left <= 0 && buffered == 0 {
+        return IoStep::Done(Ok(()));
+    }
+
+    ngx_ssl_send_chain_links(c, links, pos, left.max(0) + buffered)
+}
+
+/// The bytes of the chain before `pos` (the buffers passed and the part
+/// of the one at `pos` taken).
+pub fn ngx_ssl_chain_taken<L: SslChainLinks + ?Sized>(links: &L, pos: SslChainPos) -> i64 {
+    (0..pos.link.min(links.links())).map(|i| links.link(i).rest(0)).sum::<i64>() + pos.off
+}
+
+/// ngx_ssl_free_buffer: c->ssl->buf of an idle connection is freed (its
+/// memory goes back to the worker's free list).
 pub fn ngx_ssl_free_buffer(c: &Connection) {
     if let Some(sc) = c.ssl.borrow().as_ref() {
         let mut buf = sc.state.buf.borrow_mut();
 
-        if buf.pos == buf.last {
+        if buf.pending() == 0 {
             *buf = SslBuf::default();
         }
     }
@@ -5379,6 +5521,114 @@ mod tests {
             assert_eq!(ngx_ssl_send_chain_wait(&s, &[mem(b"one", false), mem(b"two", false)], 0).await.unwrap(), 6);
             assert_eq!(records(&c).await.len(), 2);
             assert_eq!(recv_all(&c, 6).await, b"onetwo");
+        });
+    }
+
+    fn free_bufs() -> Vec<usize> {
+        SSL_BUFS.with(|b| b.borrow().iter().map(|v| v.capacity()).collect())
+    }
+
+    #[test]
+    fn ssl_buf_free_list() {
+        SSL_BUFS.with(|b| b.borrow_mut().clear());
+
+        let a = ssl_buf_alloc(100);
+        assert!(a.is_empty() && a.capacity() >= 100);
+        let p = a.as_ptr();
+
+        // given back empty, reused for a size it holds
+        let mut a = a;
+        a.extend_from_slice(b"data");
+        ssl_buf_free(a);
+        assert_eq!(free_bufs().len(), 1);
+
+        let b = ssl_buf_alloc(50);
+        assert!(b.is_empty());
+        assert_eq!(b.as_ptr(), p);
+        assert!(free_bufs().is_empty());
+
+        // a larger size is not taken from smaller memory
+        ssl_buf_free(b);
+        let c = ssl_buf_alloc(1000);
+        assert!(c.capacity() >= 1000);
+        assert_eq!(free_bufs().len(), 1);
+        drop(c);
+
+        // bounded
+        let all: Vec<Vec<u8>> = (0..SSL_BUFS_MAX + 5).map(|_| ssl_buf_alloc(10)).collect();
+        all.into_iter().for_each(ssl_buf_free);
+        assert_eq!(free_bufs().len(), SSL_BUFS_MAX);
+
+        // an SslBuf gives its memory back when dropped, an unused one none
+        SSL_BUFS.with(|b| b.borrow_mut().clear());
+        drop(SslBuf::default());
+        assert!(free_bufs().is_empty());
+        drop(SslBuf { data: ssl_buf_alloc(64), pos: 0, end: 64, flush: false });
+        assert_eq!(free_bufs().len(), 1);
+    }
+
+    #[test]
+    fn send_chain_of_bufs() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        local.block_on(&rt, async {
+            let log = Log::stderr(NGX_LOG_EMERG);
+
+            let server = server_ssl(&log);
+
+            let mut client = NgxSsl::new(log.clone());
+            assert_eq!(ngx_ssl_create(&mut client, NGX_SSL_DEFAULT_PROTOCOLS, None), NGX_OK);
+
+            let (s, c) = pair(&log);
+
+            assert_eq!(ngx_ssl_create_connection(&server, &s, 0), NGX_OK);
+            assert_eq!(ngx_ssl_create_connection(&client, &c, NGX_SSL_BUFFER | NGX_SSL_CLIENT), NGX_OK);
+
+            let (rs, rc) = tokio::join!(handshake(&s), handshake(&c));
+            assert_eq!((rs, rc), (NGX_OK, NGX_OK));
+
+            s.send_all(b"x").await.unwrap();
+            assert_eq!(recv_all(&c, 1).await, b"x");
+
+            SSL_BUFS.with(|b| b.borrow_mut().clear());
+
+            // the buffers of a chain, pos..last of each, kept until the
+            // flush buffer, then one record
+
+            let mut chain = crate::buf::Chain::new();
+            let mut b = crate::buf::Buf::from_vec(b"--head--".to_vec());
+            b.pos = 2;
+            b.last = 6;
+            chain.push_back(b);
+            chain.push_back(crate::buf::Buf::from_vec(b"body".to_vec()));
+
+            assert_eq!(ngx_ssl_send_chain_wait_chain(&c, &chain, 0).await.unwrap(), 8);
+            assert!(ngx_ssl_buffered(c.ssl.borrow().as_ref().unwrap()));
+            assert!(records(&s).await.is_empty());
+
+            let mut flush = crate::buf::Buf::special();
+            flush.flush = true;
+            let chain: crate::buf::Chain = [flush].into_iter().collect();
+
+            assert_eq!(ngx_ssl_send_chain_wait_chain(&c, &chain, 0).await.unwrap(), 0);
+            assert!(!ngx_ssl_buffered(c.ssl.borrow().as_ref().unwrap()));
+            assert_eq!(records(&s).await.len(), 1);
+            assert_eq!(recv_all(&s, 8).await, b"headbody");
+
+            // an idle connection gives the buffer back, the next send
+            // takes it again
+
+            assert!(free_bufs().is_empty());
+            ngx_ssl_free_buffer(&c);
+            let free = free_bufs();
+            assert!(free.len() == 1 && free[0] >= 16384, "{:?}", free);
+
+            let bufs: [&[u8]; 2] = [b"one", b"two"];
+            assert_eq!(ngx_ssl_send_chain_wait_links(&c, &SslFlushedBufs(&bufs), 0).await.unwrap(), 6);
+            assert!(free_bufs().is_empty());
+            assert_eq!(records(&s).await.len(), 1);
+            assert_eq!(recv_all(&s, 6).await, b"onetwo");
         });
     }
 }

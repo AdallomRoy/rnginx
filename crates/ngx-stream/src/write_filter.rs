@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use ngx_core::connection::Connection;
-use ngx_core::event_openssl::{ngx_ssl_send_chain_wait, SslChainBuf};
+use ngx_core::event_openssl::{ngx_ssl_send_chain_wait_links, SslFlushedBufs};
 use ngx_core::log::*;
 use ngx_core::module::*;
 use ngx_core::ngx_log_debug;
@@ -82,14 +82,14 @@ pub async fn top_filter(s: &Session, c: &Connection, bufs: &[&[u8]], from_upstre
         // c->send_chain: ngx_ssl_send_chain, the buffers of a read are
         // flushed (or last)
 
-        let links: Vec<SslChainBuf> = bufs.iter().map(|b| SslChainBuf { mem: b, file: None, flush: true, last_buf: false }).collect();
+        let links = SslFlushedBufs(bufs);
 
         let r = match timeout {
-            Some(t) => match tokio::time::timeout(t, ngx_ssl_send_chain_wait(c, &links, 0)).await {
+            Some(t) => match tokio::time::timeout(t, ngx_ssl_send_chain_wait_links(c, &links, 0)).await {
                 Ok(r) => r,
                 Err(_) => return Err(WriteError::TimedOut),
             },
-            None => ngx_ssl_send_chain_wait(c, &links, 0).await,
+            None => ngx_ssl_send_chain_wait_links(c, &links, 0).await,
         };
 
         if let Err(e) = r {
