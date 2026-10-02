@@ -178,11 +178,18 @@ async fn connection_task(c: Rc<Connection>) {
         c.set_reusable(false);
         let keepalive = {
             let r = create_request(&c, &hc, &log_ctx);
+            // ngx_http_request_handler: c->close (the shutdown timer)
+            // terminates the request, tested before the request runs on
+            // an event. In this order a request done in one poll never
+            // waits for the close notification (no waiter registered).
             let end = tokio::select! {
+                biased;
+                _ = std::future::poll_fn(|_| if c.close.get() { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }) => {
+                    terminate_request(&r, 0);
+                    End::Close
+                }
                 end = run_request(&r) => end,
                 _ = connection_close(&c) => {
-                    // ngx_http_request_handler: c->close (the shutdown timer)
-                    // terminates the request
                     terminate_request(&r, 0);
                     End::Close
                 }
