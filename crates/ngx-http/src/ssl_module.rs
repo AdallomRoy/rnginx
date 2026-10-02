@@ -773,7 +773,6 @@ fn ngx_http_ssl_session_cache(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn
 
             let zone = ngx_core::cycle::shared_memory_add(cf, &name, n, "ngx_http_ssl_module")?;
 
-            zone.safe_pool.set(true);
             *zone.init.borrow_mut() = Some(Rc::new(ngx_ssl_session_cache_init));
 
             sscf.borrow_mut().shm_zone = Some(zone);
@@ -819,7 +818,6 @@ fn ngx_http_ssl_ocsp_cache(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn An
 
     let zone = ngx_core::cycle::shared_memory_add(cf, &name, n, "ngx_http_ssl_module_ctx")?;
 
-    zone.safe_pool.set(true);
     *zone.init.borrow_mut() = Some(Rc::new(ngx_ssl_ocsp_cache_init));
 
     sscf.borrow_mut().ocsp_cache_zone = Val::set(Some(zone));

@@ -834,7 +834,6 @@ fn limit_req_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> C
 
     let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: RefCell::new(None), rate, key, node: Cell::new(0) });
 
-    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_req_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
 

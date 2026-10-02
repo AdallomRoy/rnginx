@@ -1733,7 +1733,7 @@ pub fn init_hooks() -> InitHooks {
     InitHooks {
         open_listening_sockets,
         configure_listening_sockets,
-        init_zone_pool: crate::slab::init_zone_pool,
+        init_zone_pool: crate::shm::init_zone_pool,
         cmp_sockaddr: cmp_listening,
     }
 }

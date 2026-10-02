@@ -998,7 +998,6 @@ fn sticky_learn(cf: &mut Conf, stcf: &mut StickySrvConf, us: &Rc<UpstreamSrvConf
 
     let shm_zone = ngx_core::cycle::shared_memory_add(cf, &name, zone_size, "ngx_http_upstream_sticky_module")?;
 
-    shm_zone.safe_pool.set(true);
 
     if let Some(sess) = shm_zone.data::<StickySess>() {
         return Err(cf.emerg(format_args!("sticky zone \"{}\" is already used in upstream \"{}\"", B(&name), B(&sess.host))));

@@ -511,7 +511,6 @@ fn limit_conn_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
 
     let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key });
 
-    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_conn_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
 

@@ -3042,7 +3042,6 @@ pub fn file_cache_set_slot(cf: &mut Conf, cmd: &Command, caches: &mut Vec<Rc<Fil
 
     *path.data.borrow_mut() = Some(Rc::new(PathData(Rc::downgrade(&cache))));
 
-    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(file_cache_init));
     *shm_zone.data.borrow_mut() = Some(cache.clone());
 
