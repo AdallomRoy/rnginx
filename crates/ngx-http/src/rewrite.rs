@@ -315,11 +315,14 @@ fn file_code(r: &R, file: &ComplexValue, op: FileOp) -> Result<bool, i64> {
 /// code->test): the variable's value (empty if not found, as
 /// ngx_http_script_var_code) is matched with ngx_http_regex_exec, which
 /// makes the captures of a match the request's, and a mismatch resets them.
+///
+/// The value is matched where r->variables caches it, taken out for the
+/// match (ngx_http_regex_exec() sets the named captures there) and put back,
+/// unless a named capture of the regex is the variable itself.
 fn regex_test(r: &R, idx: usize, regex: &Rc<HttpRegex>, negative_test: bool, log: bool) -> Result<bool, i64> {
-    let line = match crate::variables::get_flushed_variable(r, idx) {
-        Some(vv) if !vv.not_found => vv.data,
-        _ => Vec::new(),
-    };
+    let found = with_flushed_variable(r, idx, |vv| matches!(vv, Some(vv) if !vv.not_found));
+
+    let line = if found { std::mem::take(&mut r.variables.borrow_mut()[idx].data) } else { Vec::new() };
 
     http_debug!(r, "http script regex: \"{}\"", B(&regex.name));
 
@@ -331,7 +334,15 @@ fn regex_test(r: &R, idx: usize, regex: &Rc<HttpRegex>, negative_test: bool, log
         if log {
             ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&regex.name), B(&line));
         }
+    } else if rc != NGX_ERROR && log {
+        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&regex.name), B(&line));
+    }
 
+    if found && !regex.variables.iter().any(|&(_, vi)| vi == idx) {
+        r.variables.borrow_mut()[idx].data = line;
+    }
+
+    if rc == NGX_DECLINED {
         r.ncaptures.set(0);
 
         return Ok(negative_test);
@@ -341,48 +352,58 @@ fn regex_test(r: &R, idx: usize, regex: &Rc<HttpRegex>, negative_test: bool, log
         return Err(NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
 
-    if log {
-        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&regex.name), B(&line));
-    }
-
     Ok(!negative_test)
 }
 
 /// The value of the variable of a condition, empty when not found
-/// (ngx_http_script_var_code).
-fn condition_variable(r: &R, idx: usize) -> Vec<u8> {
-    match crate::variables::get_flushed_variable(r, idx) {
-        Some(vv) if !vv.not_found => vv.data,
-        _ => Vec::new(),
+/// (ngx_http_script_var_code), lent to `f`.
+fn with_condition_variable<T>(r: &R, idx: usize, f: impl FnOnce(&[u8]) -> T) -> T {
+    with_flushed_variable(r, idx, |vv| match vv {
+        Some(vv) if !vv.not_found => f(&vv.data),
+        _ => f(b""),
+    })
+}
+
+/// The equal and not equal codes of a condition: the variable, then the
+/// value (ngx_http_rewrite_value) compared with it. A constant value is
+/// compared with the variable where it is cached; else the variable's
+/// value is copied before the value is evaluated, as C pushes it first.
+/// Returns whether they are equal, and the evaluated value (empty for a
+/// constant).
+fn condition_equal(r: &R, idx: usize, value: &ComplexValue) -> (bool, Vec<u8>) {
+    if value.is_constant() {
+        return (with_condition_variable(r, idx, |v| v == &value.value[..]), Vec::new());
     }
+
+    let v = with_condition_variable(r, idx, |v| v.to_vec());
+    let value = crate::script::complex_value(r, value).unwrap_or_default();
+
+    (v == value, value)
 }
 
 /// The value of the condition of an if code; Err(status) ends the codes.
 fn eval_if_condition(r: &R, condition: &IfCondition, log: bool) -> Result<bool, i64> {
     match condition {
         IfCondition::Variable(idx) => {
-            let v = condition_variable(r, *idx);
-            Ok(!v.is_empty() && !(v.len() == 1 && v[0] == b'0'))
+            Ok(with_condition_variable(r, *idx, |v| !v.is_empty() && !(v.len() == 1 && v[0] == b'0')))
         }
         IfCondition::Equal(idx, value) => {
             // ngx_http_script_equal_code
-            let v = condition_variable(r, *idx);
-            let value = crate::script::complex_value(r, value).unwrap_or_default();
+            let (equal, evaluated) = condition_equal(r, *idx, value);
             http_debug!(r, "http script equal");
-            if v != value {
-                http_debug!(r, "http script equal: no \"{}\"", B(&value));
+            if !equal {
+                http_debug!(r, "http script equal: no \"{}\"", B(if value.is_constant() { &value.value } else { &evaluated }));
             }
-            Ok(v == value)
+            Ok(equal)
         }
         IfCondition::NotEqual(idx, value) => {
             // ngx_http_script_not_equal_code
-            let v = condition_variable(r, *idx);
-            let value = crate::script::complex_value(r, value).unwrap_or_default();
+            let (equal, _) = condition_equal(r, *idx, value);
             http_debug!(r, "http script not equal");
-            if v == value {
+            if equal {
                 http_debug!(r, "http script not equal: no");
             }
-            Ok(v != value)
+            Ok(!equal)
         }
         IfCondition::RegexMatch(idx, regex) | IfCondition::RegexMatchCaseInsensitive(idx, regex) => {
             regex_test(r, *idx, regex, false, log)
@@ -1012,6 +1033,9 @@ fn break_code(r: &R) -> Flow {
     Flow::Exit(NGX_DECLINED)
 }
 
+/// The empty text of a "return" without one
+static EMPTY_TEXT: ComplexValue = ComplexValue { value: Vec::new(), parts: None, flags: 0 };
+
 /// ngx_http_script_return_code
 async fn return_code(r: &R, status: i64, text: &Option<ComplexValue>) -> Flow {
     // an error status without text (or with an empty one) is the special
@@ -1024,12 +1048,13 @@ async fn return_code(r: &R, status: i64, text: &Option<ComplexValue>) -> Flow {
         return Flow::Exit(status);
     }
 
-    // Always send a response with explicit text or empty body
-    let text_val = text.clone().unwrap_or_else(|| ComplexValue::constant(b""));
+    // Always send a response with explicit text or empty body: the value
+    // of the code, borrowed (the codes are shared by the requests)
+    let text_val = text.as_ref().unwrap_or(&EMPTY_TEXT);
 
     // Match C: `return NNN "text"` passes ct=NULL, so
     // set_content_type applies from the extension/types_hash.
-    let rc = send_response(r, status, None, &text_val).await;
+    let rc = send_response(r, status, None, text_val).await;
     if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
         return Flow::Exit(NGX_DONE);
     }
@@ -1088,29 +1113,48 @@ fn redirect_location(buf: &[u8], add_args: bool, args: bool, orig_args: &[u8]) -
     location
 }
 
-/// The URI and the arguments of an internal rewrite in
-/// ngx_http_script_regex_end_code: with the start args code (e->args at
-/// `args_pos`) the arguments of the replacement, then "&" and the original
-/// ones if add_args; else the original arguments if add_args, or none.
-fn rewritten_uri_args(mut buf: Vec<u8>, args_pos: Option<usize>, add_args: bool, orig_args: &[u8]) -> (Vec<u8>, Vec<u8>) {
+/// The arguments of an internal rewrite in ngx_http_script_regex_end_code,
+/// what precedes them in the buffer being the URI: with the start args code
+/// (e->args at `args_pos`) the arguments of the replacement, then "&" and
+/// the original ones if add_args; else none, or with add_args the original
+/// arguments as they are (None: r->args is left unchanged).
+fn rewritten_args(buf: &mut Vec<u8>, args_pos: Option<usize>, add_args: bool, orig_args: &[u8]) -> Option<Vec<u8>> {
     match args_pos {
         Some(pos) => {
-            let mut args = buf.split_off(pos);
+            let add = add_args && !orig_args.is_empty();
 
-            if add_args && !orig_args.is_empty() {
+            let mut args = Vec::with_capacity(buf.len() - pos + if add { 1 + orig_args.len() } else { 0 });
+
+            args.extend_from_slice(&buf[pos..]);
+            buf.truncate(pos);
+
+            if add {
                 args.push(b'&');
                 args.extend_from_slice(orig_args);
             }
 
-            (buf, args)
+            Some(args)
         }
 
-        None => {
-            let args = if add_args { orig_args.to_vec() } else { Vec::new() };
+        None if add_args => None,
 
-            (buf, args)
-        }
+        None => Some(Vec::new()),
     }
+}
+
+/// The length of the capture n (2 * $n) of the request, without escaping
+fn capture_len(r: &R, n: usize) -> usize {
+    if n >= r.ncaptures.get() {
+        return 0;
+    }
+
+    let cap = r.captures.borrow();
+
+    if n + 1 >= cap.len() || cap[n] < 0 || cap[n + 1] < cap[n] {
+        return 0;
+    }
+
+    (cap[n + 1] - cap[n]) as usize
 }
 
 /// ngx_http_script_regex_start_code and ngx_http_script_regex_end_code of
@@ -1163,9 +1207,17 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
     }
 
     // the values codes: e->quote = code->redirect, e->is_args after the
-    // start args code, e->args the position of the arguments
+    // start args code, e->args the position of the arguments; the buffer
+    // is sized for the copies and the captures (the lengths codes, but for
+    // the variables, which only the values codes evaluate here)
 
-    let mut buf = Vec::new();
+    let len = rule.values.iter().map(|code| match code {
+        ReplacementCode::Copy(data) => data.len(),
+        ReplacementCode::Capture(n) => capture_len(r, *n),
+        ReplacementCode::Var(_) | ReplacementCode::StartArgs => 0,
+    }).sum();
+
+    let mut buf = Vec::with_capacity(len);
     let mut is_args = false;
     let mut args_pos = None;
 
@@ -1180,11 +1232,13 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
             ReplacementCode::Var(index) => {
                 let pos = buf.len();
 
-                if let Some(value) = crate::variables::get_flushed_variable(r, *index) {
-                    if !value.not_found {
-                        buf.extend_from_slice(&value.data);
+                with_flushed_variable(r, *index, |value| {
+                    if let Some(value) = value {
+                        if !value.not_found {
+                            buf.extend_from_slice(&value.data);
+                        }
                     }
-                }
+                });
 
                 http_debug!(r, "http script var: \"{}\"", B(&buf[pos..]));
             }
@@ -1211,9 +1265,7 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
     http_debug!(r, "http script regex end");
 
     if rule.flags.redirect {
-        let orig_args = r.args.borrow().clone();
-
-        let location = redirect_location(&buf, rule.add_args, rule.args, &orig_args);
+        let location = redirect_location(&buf, rule.add_args, rule.args, &r.args.borrow());
 
         if log {
             ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten redirect: \"{}\"", B(&location));
@@ -1221,7 +1273,7 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
 
         // the Location header and e->status = code->status, which the
         // NULL code after the end code returns
-        let cv = ComplexValue::constant(&location);
+        let cv = ComplexValue { value: location, parts: None, flags: 0 };
         let rc = send_response(r, rule.flags.redirect_status, None, &cv).await;
         if rc == NGX_OK || rc == NGX_AGAIN || rc == NGX_DONE {
             return Flow::Exit(NGX_DONE);
@@ -1229,19 +1281,22 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
         return Flow::Exit(rc);
     }
 
-    let orig_args = r.args.borrow().clone();
-
-    let (rewritten_uri, rewritten_args) = rewritten_uri_args(buf, args_pos, rule.add_args, &orig_args);
+    let args = rewritten_args(&mut buf, args_pos, rule.add_args, &r.args.borrow());
 
     if log {
-        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten data: \"{}\", args: \"{}\"", B(&rewritten_uri), B(&rewritten_args));
+        match &args {
+            Some(args) => ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten data: \"{}\", args: \"{}\"", B(&buf), B(args)),
+            None => ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "rewritten data: \"{}\", args: \"{}\"", B(&buf), B(&r.args.borrow())),
+        }
     }
 
-    *r.args.borrow_mut() = rewritten_args;
+    if let Some(args) = args {
+        *r.args.borrow_mut() = args;
+    }
 
-    let zero_length = rewritten_uri.is_empty();
+    let zero_length = buf.is_empty();
 
-    *r.uri.borrow_mut() = rewritten_uri;
+    *r.uri.borrow_mut() = buf;
 
     if zero_length {
         ngx_core::ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "the rewritten URI has a zero length");
@@ -1290,19 +1345,27 @@ mod tests {
         assert_eq!(redirect_location(b"http://x/a%41%20%3F?c=%41", true, true, b""), b"http://x/aA%20??c=%41".to_vec());
     }
 
+    /// rewritten_args() on `buf`: the URI left in the buffer and the
+    /// arguments (None: unchanged)
+    fn uri_args(buf: &[u8], args_pos: Option<usize>, add_args: bool, orig_args: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut buf = buf.to_vec();
+        let args = rewritten_args(&mut buf, args_pos, add_args, orig_args);
+        (buf, args)
+    }
+
     #[test]
-    fn test_rewritten_uri_args() {
+    fn test_rewritten_args() {
         // e->args: the arguments of the replacement, then the original ones
-        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), true, b"q=2"), (b"/x".to_vec(), b"a=1&q=2".to_vec()));
-        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), false, b"q=2"), (b"/x".to_vec(), b"a=1".to_vec()));
-        assert_eq!(rewritten_uri_args(b"/xa=1".to_vec(), Some(2), true, b""), (b"/x".to_vec(), b"a=1".to_vec()));
+        assert_eq!(uri_args(b"/xa=1", Some(2), true, b"q=2"), (b"/x".to_vec(), Some(b"a=1&q=2".to_vec())));
+        assert_eq!(uri_args(b"/xa=1", Some(2), false, b"q=2"), (b"/x".to_vec(), Some(b"a=1".to_vec())));
+        assert_eq!(uri_args(b"/xa=1", Some(2), true, b""), (b"/x".to_vec(), Some(b"a=1".to_vec())));
 
         // "?" at the end of the replacement: empty arguments of the
         // replacement
-        assert_eq!(rewritten_uri_args(b"/x".to_vec(), Some(2), true, b"q=2"), (b"/x".to_vec(), b"&q=2".to_vec()));
+        assert_eq!(uri_args(b"/x", Some(2), true, b"q=2"), (b"/x".to_vec(), Some(b"&q=2".to_vec())));
 
-        // no arguments in the replacement
-        assert_eq!(rewritten_uri_args(b"/x".to_vec(), None, true, b"q=2"), (b"/x".to_vec(), b"q=2".to_vec()));
-        assert_eq!(rewritten_uri_args(b"/x".to_vec(), None, false, b"q=2"), (b"/x".to_vec(), Vec::new()));
+        // no arguments in the replacement: the original ones stay, or none
+        assert_eq!(uri_args(b"/x", None, true, b"q=2"), (b"/x".to_vec(), None));
+        assert_eq!(uri_args(b"/x", None, false, b"q=2"), (b"/x".to_vec(), Some(Vec::new())));
     }
 }

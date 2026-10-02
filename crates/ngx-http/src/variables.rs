@@ -135,12 +135,43 @@ pub fn get_variable_index(cf: &mut Conf, name: &[u8]) -> Result<usize, ConfError
 
 /// ngx_http_get_indexed_variable
 pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
+    with_indexed_variable(r, index, |v| v.cloned())
+}
+
+/// ngx_http_get_indexed_variable without a copy of the value: it is
+/// evaluated if not cached yet, cached in r->variables, and lent to `f`
+/// (None when it cannot be evaluated, where C returns NULL).
+///
+/// r->variables stays borrowed while `f` runs: `f` must not evaluate
+/// variables (nor set them).
+pub fn with_indexed_variable<T>(r: &R, index: usize, f: impl FnOnce(Option<&VariableValue>) -> T) -> T {
+    if !index_variable(r, index) {
+        return f(None);
+    }
+    let vars = r.variables.borrow();
+    f(vars.get(index))
+}
+
+/// The evaluation of ngx_http_get_indexed_variable: true when
+/// r->variables[index] holds the value (valid or not found), false when
+/// the variable cannot be evaluated.
+fn index_variable(r: &R, index: usize) -> bool {
+    {
+        // r->variables has an element for each indexed variable (no more
+        // than cmcf->variables.nelts), so a cached value is a known index
+        let vars = r.variables.borrow();
+        if let Some(v) = vars.get(index) {
+            if v.not_found || v.valid {
+                return true;
+            }
+        }
+    }
     let cmcf = r.cmcf();
     let (var, nvars) = {
         let m = cmcf.borrow();
         if index >= m.variables.len() {
             ngx_log_error!(NGX_LOG_ALERT, r.connection.log, None, "unknown variable index: {}", index);
-            return None;
+            return false;
         }
         (m.variables[index].clone(), m.variables.len())
     };
@@ -149,14 +180,10 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         if vars.len() < nvars {
             vars.resize(nvars, VariableValue::default());
         }
-        let v = &vars[index];
-        if v.not_found || v.valid {
-            return Some(v.clone());
-        }
     }
     if VARIABLE_DEPTH.with(|d| d.get()) == 0 {
         ngx_log_error!(NGX_LOG_ERR, r.connection.log, None, "cycle while evaluating variable \"{}\"", B(&var.name));
-        return None;
+        return false;
     }
     VARIABLE_DEPTH.with(|d| d.set(d.get() - 1));
     let mut vv = VariableValue::default();
@@ -166,6 +193,7 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         None => NGX_ERROR,
     };
     VARIABLE_DEPTH.with(|d| d.set(d.get() + 1));
+    let mut vars = r.variables.borrow_mut();
     if rc == NGX_OK {
         if !vv.not_found {
             vv.valid = true;
@@ -176,39 +204,40 @@ pub fn get_indexed_variable(r: &R, index: usize) -> Option<VariableValue> {
         if var.flags.get() & NGX_HTTP_VAR_NOCACHEABLE != 0 {
             vv.no_cacheable = true;
         }
-        let mut vars = r.variables.borrow_mut();
-        vars[index] = vv.clone();
-        return Some(vv);
+        vars[index] = vv;
+        return true;
     }
     // the get handler fills r->variables[index] itself in C: what it has
     // set before failing (e.g. no_cacheable) stays
-    let mut vars = r.variables.borrow_mut();
     vars[index] = vv;
     vars[index].valid = false;
     vars[index].not_found = true;
-    None
+    false
 }
 
 /// ngx_http_get_flushed_variable
 pub fn get_flushed_variable(r: &R, index: usize) -> Option<VariableValue> {
-    {
-        let vars = r.variables.borrow();
-        if let Some(v) = vars.get(index) {
-            if v.valid || v.not_found {
-                if !v.no_cacheable {
-                    return Some(v.clone());
-                }
-            }
-        }
-    }
-    {
-        let mut vars = r.variables.borrow_mut();
-        if let Some(v) = vars.get_mut(index) {
+    with_flushed_variable(r, index, |v| v.cloned())
+}
+
+/// ngx_http_get_flushed_variable without a copy of the value, as
+/// with_indexed_variable(): a non-cacheable value is evaluated again.
+pub fn with_flushed_variable<T>(r: &R, index: usize, f: impl FnOnce(Option<&VariableValue>) -> T) -> T {
+    flush_variable(r, index);
+    with_indexed_variable(r, index, f)
+}
+
+/// The cached value of a non-cacheable variable dropped, as
+/// ngx_http_get_flushed_variable() does before ngx_http_get_indexed_variable()
+/// (and ngx_http_script_flush_complex_value() for the variables of a value).
+pub fn flush_variable(r: &R, index: usize) {
+    let mut vars = r.variables.borrow_mut();
+    if let Some(v) = vars.get_mut(index) {
+        if (v.valid || v.not_found) && v.no_cacheable {
             v.valid = false;
             v.not_found = false;
         }
     }
-    get_indexed_variable(r, index)
 }
 
 /// ngx_http_get_variable (by name at runtime).
@@ -1295,7 +1324,7 @@ pub static CORE_VARIABLES: &[VarDef] = &[
 /// ngx_http_variable_set_args: the arguments, and the request line's URI no
 /// longer valid for them
 fn set_args(r: &R, v: &mut VariableValue, _d: usize) {
-    *r.args.borrow_mut() = v.data.clone();
+    *r.args.borrow_mut() = std::mem::take(&mut v.data);
     r.valid_unparsed_uri.set(false);
 }
 
