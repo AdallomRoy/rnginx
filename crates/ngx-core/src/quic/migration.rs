@@ -4,10 +4,11 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use openssl::rand::rand_bytes;
+
 use crate::connection::{Connection, NGX_ERROR_IGNORE_EMSGSIZE};
 use crate::inet::{cmp_sockaddr, SockAddr};
 use crate::log::*;
-use crate::openssl_ffi::RAND_bytes;
 use crate::rc::*;
 use crate::times;
 use crate::string::B;
@@ -464,8 +465,10 @@ fn ngx_quic_validate_path(c: &Rc<Connection>, path: &Rc<QuicPath>) -> i64 {
     {
         let mut challenge = path.challenge.borrow_mut();
 
-        // SAFETY: the challenge is 16 bytes
-        if unsafe { RAND_bytes(challenge.as_mut_ptr() as *mut u8, 16) } != 1 {
+        /* the two challenges: 16 bytes */
+        if let Err(e) = rand_bytes(challenge.as_flattened_mut()) {
+            /* the C leaves the errors on OpenSSL's queue */
+            e.put();
             return NGX_ERROR;
         }
     }

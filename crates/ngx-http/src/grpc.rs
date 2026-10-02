@@ -2041,7 +2041,7 @@ fn grpc_set_ssl(cf: &mut Conf, glcf: &mut NgxHttpGrpcLocConf) -> ConfResult {
         return Ok(());
     }
 
-    if ngx_ssl_create(&mut ssl, glcf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+    if ngx_ssl_create(&mut ssl, glcf.ssl_protocols, None) != NGX_OK {
         return Err(ConfError::Logged);
     }
 
@@ -2103,9 +2103,8 @@ fn grpc_set_ssl(cf: &mut Conf, glcf: &mut NgxHttpGrpcLocConf) -> ConfResult {
 
     // TLSEXT_TYPE_application_layer_protocol_negotiation
 
-    // SAFETY: the context was created above; the protocol list is copied
-    // by OpenSSL
-    if unsafe { openssl_sys::SSL_CTX_set_alpn_protos(ssl.ctx, NGX_HTTP_V2_ALPN_PROTO.as_ptr(), NGX_HTTP_V2_ALPN_PROTO.len() as u32) } != 0 {
+    if let Some(Err(e)) = ssl.ctx.builder_mut().map(|ctx| ctx.set_alpn_protos(NGX_HTTP_V2_ALPN_PROTO)) {
+        e.put();
         ngx_core::event_openssl::ngx_ssl_error(NGX_LOG_EMERG, &cf.log, 0, format_args!("SSL_CTX_set_alpn_protos() failed"));
         return Err(ConfError::Logged);
     }

@@ -79,10 +79,6 @@ pub struct ShmZone {
     pub conf: RefCell<Option<Rc<dyn Any>>>,
     pub noreuse: Cell<bool>,
     pub sync: Cell<bool>,
-    /// The zone's users work on the safe pool (shmem::slab::SlabPool):
-    /// ngx_init_zone_pool makes that one (set by converted modules when
-    /// they add the zone; the zones of the others get the old pool).
-    pub safe_pool: Cell<bool>,
 }
 
 impl ShmZone {
@@ -95,7 +91,6 @@ impl ShmZone {
             conf: RefCell::new(None),
             noreuse: Cell::new(false),
             sync: Cell::new(false),
-            safe_pool: Cell::new(false),
         })
     }
 
@@ -116,9 +111,12 @@ impl ShmZone {
     pub fn mem(&self) -> Rc<ShmMem> {
         self.shm.mem().unwrap_or_else(|| panic!("shared zone \"{}\" has no memory", crate::string::B(&self.shm.name)))
     }
+}
 
-    /// Slab pool at the start of the zone.
-    pub fn pool(&self) -> &crate::slab::SlabPool {
-        unsafe { &*(self.shm.addr.get() as *const crate::slab::SlabPool) }
-    }
+/// ngx_init_zone_pool: the slab pool of a new zone (the "shared zone has
+/// no equal addresses" check of a zone that already existed is for
+/// Windows only: zones are always new here).
+pub fn init_zone_pool(_cycle: &crate::cycle::Cycle, zone: &Rc<ShmZone>) -> Result<(), ()> {
+    crate::shmem::slab::SlabPool::init_zone(&zone.mem());
+    Ok(())
 }

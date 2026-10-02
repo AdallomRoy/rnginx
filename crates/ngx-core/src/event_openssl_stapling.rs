@@ -10,9 +10,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
 use std::rc::Rc;
 use std::time::Duration;
+
+use ngx_sys::ssl as sys;
+use openssl::error::ErrorStack;
+use openssl::hash::MessageDigest;
+use openssl::ocsp::{OcspCertId, OcspFlag, OcspRequest, OcspResponse};
+use openssl::ssl::{SslContext, SslRef};
+use openssl::stack::Stack;
+use openssl::x509::{X509Ref, X509StoreContext, X509};
 
 use crate::conf::Conf;
 use crate::connection::{Connection, NGX_ERROR_ERR};
@@ -20,39 +27,63 @@ use crate::event_connect::{event_connect_peer, PeerConnect, PeerSocket};
 use crate::event_openssl::*;
 use crate::inet::{parse_url, Addr, Url};
 use crate::log::*;
-use crate::openssl_ffi::*;
-use crate::queue::Queue;
-use crate::rbtree::*;
 use crate::rc::*;
 use crate::resolver::{Resolved, Resolver};
 use crate::shm::ShmZone;
-use crate::slab::SlabPool;
+use crate::shmem::rbtree::{self as rb, RbTree, ShmRbtree};
+use crate::shmem::slab::SlabPool;
+use crate::shmem::{queue, ShmMem};
 use crate::string::B;
-use crate::{ngx_log_debug, ngx_log_error};
+use crate::{ngx_log_debug, ngx_log_error, shm_struct};
 
 const NGX_MAX_TIME_T_VALUE: i64 = i64::MAX;
 
-const V_OCSP_CERTSTATUS_GOOD: c_int = 0;
-const V_OCSP_CERTSTATUS_REVOKED: c_int = 1;
+const V_OCSP_CERTSTATUS_GOOD: i32 = 0;
+const V_OCSP_CERTSTATUS_REVOKED: i32 = 1;
 
-const OCSP_RESPONSE_STATUS_SUCCESSFUL: c_int = 0;
+const OCSP_RESPONSE_STATUS_SUCCESSFUL: i32 = 0;
 
-const OCSP_NOVERIFY: c_ulong = 0x10;
-const OCSP_TRUSTOTHER: c_ulong = 0x200;
+const OCSP_NOVERIFY: u64 = 0x10;
+const OCSP_TRUSTOTHER: u64 = 0x200;
 
-unsafe fn cstr<'a>(p: *const c_char) -> &'a [u8] {
-    if p.is_null() {
-        return b"";
+/// OCSP_cert_status_str()
+fn status_str(s: i32) -> &'static str {
+    match s {
+        0 => "good",
+        1 => "revoked",
+        2 => "unknown",
+        _ => "(UNKNOWN)",
     }
-    std::ffi::CStr::from_ptr(p).to_bytes()
 }
 
-fn status_str(s: c_int) -> &'static str {
-    // OCSP_cert_status_str()
-    unsafe {
-        let p = OCSP_cert_status_str(s as c_long);
-        std::str::from_utf8(cstr(p)).unwrap_or("")
+/// OCSP_response_status_str()
+fn response_status_str(s: i32) -> &'static str {
+    match s {
+        0 => "successful",
+        1 => "malformedrequest",
+        2 => "internalerror",
+        3 => "trylater",
+        5 => "sigrequired",
+        6 => "unauthorized",
+        _ => "(UNKNOWN)",
     }
+}
+
+/// An openssl crate call failed: its errors go back to the queue, which
+/// ngx_ssl_error() prints.
+fn put(e: ErrorStack) {
+    e.put();
+}
+
+/// A stack of references to the certificates.
+fn stack_of(certs: &[X509]) -> Option<Stack<X509>> {
+    let mut s = Stack::new().ok()?;
+
+    for x in certs {
+        s.push(x.clone()).ok()?;
+    }
+
+    Some(s)
 }
 
 /// ngx_ssl_stapling_t
@@ -69,12 +100,12 @@ pub struct SslStapling {
     uri: RefCell<Vec<u8>>,
     port: Cell<u16>,
 
-    ssl_ctx: *mut SSL_CTX,
-
-    /// the certificate of the context (key of the lookup)
-    cert: *mut X509,
-    issuer: Cell<*mut X509>,
-    chain: Cell<*mut OPENSSL_STACK>,
+    /// the certificate of the context (the key of the lookup: the same
+    /// object as SSL_get_certificate() gives)
+    cert: X509,
+    issuer: RefCell<Option<X509>>,
+    /// SSL_CTX_get_extra_chain_certs() of the certificate
+    chain: Vec<X509>,
 
     name: Vec<u8>,
 
@@ -83,17 +114,6 @@ pub struct SslStapling {
 
     verify: bool,
     loading: Cell<bool>,
-}
-
-impl Drop for SslStapling {
-    /// ngx_ssl_stapling_cleanup
-    fn drop(&mut self) {
-        let issuer = self.issuer.get();
-
-        if !issuer.is_null() {
-            unsafe { X509_free(issuer) };
-        }
-    }
 }
 
 /// ngx_ssl_ocsp_conf_t
@@ -113,26 +133,20 @@ pub struct SslOcspConf {
 
 /// ngx_ssl_ocsp_t: the OCSP validation of a connection
 pub struct SslOcsp {
-    certs: Cell<*mut OPENSSL_STACK>,
+    /// the verified chain of the peer
+    certs: RefCell<Vec<X509>>,
     ncert: Cell<usize>,
 
-    cert_status: Cell<c_int>,
+    cert_status: Cell<i32>,
     status: Cell<i64>,
 
-    conf: *const SslOcspConf,
+    conf: Rc<SslOcspConf>,
+
+    /// the context of the connection (SSL_get_SSL_CTX())
+    ssl_ctx: SslContext,
 
     /// the request in progress
     ctx: RefCell<Option<Box<OcspCtx>>>,
-}
-
-impl Drop for SslOcsp {
-    fn drop(&mut self) {
-        let certs = self.certs.replace(std::ptr::null_mut());
-
-        if !certs.is_null() {
-            unsafe { sk_X509_pop_free(certs) };
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,13 +185,13 @@ impl LogContext for OcspLogCtx {
 
 /// ngx_ssl_ocsp_ctx_t
 pub struct OcspCtx {
-    ssl_ctx: *mut SSL_CTX,
+    ssl_ctx: Option<SslContext>,
 
-    cert: *mut X509,
-    issuer: *mut X509,
-    chain: *mut OPENSSL_STACK,
+    cert: Option<X509>,
+    issuer: Option<X509>,
+    chain: Vec<X509>,
 
-    status: c_int,
+    status: i32,
     valid: i64,
 
     naddr: usize,
@@ -208,7 +222,7 @@ pub struct OcspCtx {
 
     code: u32,
     count: u32,
-    flags: c_ulong,
+    flags: u64,
     done: bool,
 
     header_name_start: usize,
@@ -230,38 +244,30 @@ impl Drop for OcspCtx {
 
 /// ngx_ssl_stapling
 pub fn ngx_ssl_stapling(cf: &mut Conf, ssl: &mut NgxSsl, file: &mut Vec<u8>, responder: &mut Vec<u8>, verify: bool) -> i64 {
-    let certs = ssl.certs.clone();
+    let certs: Vec<(X509, Vec<u8>)> = ssl.certs.iter().cloned().zip(ssl.cert_names.iter().cloned()).collect();
 
-    for cert in certs {
-        if ngx_ssl_stapling_certificate(cf, ssl, cert, file, responder, verify) != NGX_OK {
+    for (cert, name) in certs {
+        if ngx_ssl_stapling_certificate(cf, ssl, cert, name, file, responder, verify) != NGX_OK {
             return NGX_ERROR;
         }
     }
 
-    unsafe {
-        SSL_CTX_set_tlsext_status_cb(ssl.ctx, ngx_ssl_certificate_status_callback);
+    if let Some(ctx) = ssl.ctx.builder_mut() {
+        let _ = ctx.set_status_callback(ngx_ssl_certificate_status_callback);
     }
 
     NGX_OK
 }
 
-const SSL_CTRL_SELECT_CURRENT_CERT_: c_int = SSL_CTRL_SELECT_CURRENT_CERT;
-
 /// ngx_ssl_stapling_certificate
-fn ngx_ssl_stapling_certificate(cf: &mut Conf, ssl: &mut NgxSsl, cert: *mut X509, file: &mut Vec<u8>, responder: &mut Vec<u8>, verify: bool) -> i64 {
-    let mut chain: *mut OPENSSL_STACK = std::ptr::null_mut();
+fn ngx_ssl_stapling_certificate(cf: &mut Conf, ssl: &mut NgxSsl, cert: X509, name: Vec<u8>, file: &mut Vec<u8>, responder: &mut Vec<u8>, verify: bool) -> i64 {
+    // SSL_CTX_select_current_cert() and SSL_CTX_get_extra_chain_certs()
+    let chain = match ssl.ctx.builder_mut() {
+        Some(ctx) => sys::ctx_select_cert_chain(ctx, &cert).map(|s| s.iter().map(|x| x.to_owned()).collect()).unwrap_or_default(),
+        None => return NGX_ERROR,
+    };
 
-    unsafe {
-        /* OpenSSL 1.0.2+ */
-        SSL_CTX_ctrl(ssl.ctx, SSL_CTRL_SELECT_CURRENT_CERT_, 0, cert as *mut c_void);
-
-        /* OpenSSL 1.0.1+ */
-        SSL_CTX_ctrl(ssl.ctx, SSL_CTRL_GET_EXTRA_CHAIN_CERTS, 0, &mut chain as *mut *mut OPENSSL_STACK as *mut c_void);
-    }
-
-    let name = unsafe { cstr(X509_get_ex_data(cert, ngx_ssl_certificate_name_index()) as *const c_char).to_vec() };
-
-    let staple = Rc::new(SslStapling {
+    let mut staple = SslStapling {
         staple: RefCell::new(Vec::new()),
         timeout: 60000,
         resolver: RefCell::new(None),
@@ -270,195 +276,149 @@ fn ngx_ssl_stapling_certificate(cf: &mut Conf, ssl: &mut NgxSsl, cert: *mut X509
         host: RefCell::new(Vec::new()),
         uri: RefCell::new(Vec::new()),
         port: Cell::new(0),
-        ssl_ctx: ssl.ctx,
         cert,
-        issuer: Cell::new(std::ptr::null_mut()),
-        chain: Cell::new(chain),
+        issuer: RefCell::new(None),
+        chain,
         name,
         valid: Cell::new(0),
         refresh: Cell::new(0),
         verify,
         loading: Cell::new(false),
-    });
+    };
 
-    ssl.staples.borrow_mut().push(staple.clone());
+    let rc = 'done: {
+        if !file.is_empty() {
+            /* use OCSP response from the file */
 
-    if !file.is_empty() {
-        /* use OCSP response from the file */
-
-        if ngx_ssl_stapling_file(cf, ssl, &staple, file) != NGX_OK {
-            return NGX_ERROR;
+            break 'done ngx_ssl_stapling_file(cf, ssl, &mut staple, file);
         }
 
-        return NGX_OK;
-    }
+        let rc = ngx_ssl_stapling_issuer(cf, ssl, &mut staple);
 
-    let rc = ngx_ssl_stapling_issuer(cf, ssl, &staple);
+        if rc == NGX_DECLINED {
+            break 'done NGX_OK;
+        }
 
-    if rc == NGX_DECLINED {
-        return NGX_OK;
-    }
+        if rc != NGX_OK {
+            break 'done NGX_ERROR;
+        }
 
-    if rc != NGX_OK {
-        return NGX_ERROR;
-    }
+        let rc = ngx_ssl_stapling_responder(cf, ssl, &mut staple, responder);
 
-    let rc = ngx_ssl_stapling_responder(cf, ssl, &staple, responder);
+        if rc == NGX_DECLINED {
+            break 'done NGX_OK;
+        }
 
-    if rc == NGX_DECLINED {
-        return NGX_OK;
-    }
+        if rc != NGX_OK {
+            break 'done NGX_ERROR;
+        }
 
-    if rc != NGX_OK {
-        return NGX_ERROR;
-    }
+        NGX_OK
+    };
 
-    NGX_OK
+    // the staple is in ssl->staple_rbtree from its creation on
+    ssl.data.staples.borrow_mut().push(Rc::new(staple));
+
+    rc
 }
 
 /// ngx_ssl_stapling_file
-fn ngx_ssl_stapling_file(cf: &mut Conf, ssl: &mut NgxSsl, staple: &SslStapling, file: &mut Vec<u8>) -> i64 {
+fn ngx_ssl_stapling_file(cf: &mut Conf, ssl: &mut NgxSsl, staple: &mut SslStapling, file: &mut Vec<u8>) -> i64 {
     *file = cf.full_name(file, true);
 
-    unsafe {
-        let name = CString::new(file.clone()).unwrap_or_default();
+    let name = CString::new(file.clone()).unwrap_or_default();
 
-        let bio = BIO_new_file(name.as_ptr(), b"rb\0".as_ptr() as *const c_char);
-        if bio.is_null() {
+    let mut bio = match sys::Bio::new_file(&name, c"rb") {
+        Some(b) => b,
+        None => {
             ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("BIO_new_file(\"{}\") failed", B(file)));
             return NGX_ERROR;
         }
+    };
 
-        /* d2i_OCSP_RESPONSE_bio() */
-        let response = ASN1_d2i_bio(OCSP_RESPONSE_new, d2i_OCSP_RESPONSE as *const c_void, bio, std::ptr::null_mut());
-        if response.is_null() {
+    let response = match sys::d2i_ocsp_response_bio(&mut bio) {
+        Some(r) => r,
+        None => {
             ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("d2i_OCSP_RESPONSE_bio(\"{}\") failed", B(file)));
-            BIO_free(bio);
             return NGX_ERROR;
         }
+    };
 
-        let len = i2d_OCSP_RESPONSE(response, std::ptr::null_mut());
-        if len <= 0 {
+    let buf = match response.to_der() {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
             ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("i2d_OCSP_RESPONSE(\"{}\") failed", B(file)));
-            OCSP_RESPONSE_free(response);
-            BIO_free(bio);
             return NGX_ERROR;
         }
-
-        let mut buf = vec![0u8; len as usize];
-
-        let mut p = buf.as_mut_ptr();
-        let len = i2d_OCSP_RESPONSE(response, &mut p);
-        if len <= 0 {
+        Err(e) => {
+            put(e);
             ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("i2d_OCSP_RESPONSE(\"{}\") failed", B(file)));
-            OCSP_RESPONSE_free(response);
-            BIO_free(bio);
             return NGX_ERROR;
         }
+    };
 
-        OCSP_RESPONSE_free(response);
-        BIO_free(bio);
-
-        buf.truncate(len as usize);
-
-        *staple.staple.borrow_mut() = buf;
-        staple.valid.set(NGX_MAX_TIME_T_VALUE);
-    }
+    *staple.staple.borrow_mut() = buf;
+    staple.valid.set(NGX_MAX_TIME_T_VALUE);
 
     NGX_OK
 }
 
 /// ngx_ssl_stapling_issuer
-fn ngx_ssl_stapling_issuer(_cf: &mut Conf, ssl: &mut NgxSsl, staple: &SslStapling) -> i64 {
-    let cert = staple.cert;
+fn ngx_ssl_stapling_issuer(_cf: &mut Conf, ssl: &mut NgxSsl, staple: &mut SslStapling) -> i64 {
+    let cert = &staple.cert;
 
-    unsafe {
-        let chain = staple.chain.get();
+    let n = staple.chain.len();
 
-        let n = if chain.is_null() { 0 } else { OPENSSL_sk_num(chain) };
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: {} extra certs", n);
 
-        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: {} extra certs", n);
+    for issuer in staple.chain.iter() {
+        if issuer.issued(cert).as_raw() as i64 == X509_V_OK {
+            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: found {:p} in extra certs", &**issuer);
 
-        for i in 0..n {
-            let issuer = OPENSSL_sk_value(chain, i) as *mut X509;
+            *staple.issuer.borrow_mut() = Some(issuer.clone());
 
-            if X509_check_issued(issuer, cert) == X509_V_OK as c_int {
-                X509_up_ref(issuer);
-
-                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: found {:p} in extra certs", issuer);
-
-                staple.issuer.set(issuer);
-
-                return NGX_OK;
-            }
+            return NGX_OK;
         }
+    }
 
-        let store = SSL_CTX_get_cert_store(ssl.ctx);
-        if store.is_null() {
-            ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("SSL_CTX_get_cert_store() failed"));
-            return NGX_ERROR;
-        }
+    let ctx = match ssl.ctx.builder_mut() {
+        Some(ctx) => ctx,
+        None => return NGX_ERROR,
+    };
 
-        let store_ctx = X509_STORE_CTX_new();
-        if store_ctx.is_null() {
-            ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("X509_STORE_CTX_new() failed"));
-            return NGX_ERROR;
-        }
+    let issuer = match sys::store_get1_issuer(ctx.cert_store(), cert) {
+        Ok(Some(issuer)) => issuer,
 
-        if X509_STORE_CTX_init(store_ctx, store, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
-            ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("X509_STORE_CTX_init() failed"));
-            X509_STORE_CTX_free(store_ctx);
-            return NGX_ERROR;
-        }
-
-        let mut issuer: *mut X509 = std::ptr::null_mut();
-
-        let rc = X509_STORE_CTX_get1_issuer(&mut issuer, store_ctx, cert);
-
-        if rc == -1 {
-            ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("X509_STORE_CTX_get1_issuer() failed"));
-            X509_STORE_CTX_free(store_ctx);
-            return NGX_ERROR;
-        }
-
-        if rc == 0 {
+        Ok(None) => {
             ngx_log_error!(NGX_LOG_WARN, ssl.log, None, "\"ssl_stapling\" ignored, issuer certificate not found for certificate \"{}\"", B(&staple.name));
-            X509_STORE_CTX_free(store_ctx);
             return NGX_DECLINED;
         }
 
-        X509_STORE_CTX_free(store_ctx);
+        Err(e) => {
+            let what = match e {
+                sys::IssuerError::New => "X509_STORE_CTX_new() failed",
+                sys::IssuerError::Init => "X509_STORE_CTX_init() failed",
+                sys::IssuerError::Get => "X509_STORE_CTX_get1_issuer() failed",
+            };
 
-        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: found {:p} in cert store", issuer);
+            ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("{}", what));
+            return NGX_ERROR;
+        }
+    };
 
-        staple.issuer.set(issuer);
-    }
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ssl.log, "SSL get issuer: found {:p} in cert store", &*issuer);
+
+    *staple.issuer.borrow_mut() = Some(issuer);
 
     NGX_OK
 }
 
-/// The first OCSP responder URL of a certificate (X509_get1_ocsp()).
-unsafe fn cert_ocsp_url(cert: *mut X509) -> Option<Vec<u8>> {
-    let aia = X509_get1_ocsp(cert);
-    if aia.is_null() {
-        return None;
-    }
-
-    let s = OPENSSL_sk_value(aia, 0) as *const c_char;
-
-    let url = if s.is_null() { None } else { Some(cstr(s).to_vec()) };
-
-    X509_email_free(aia);
-
-    url
-}
-
 /// ngx_ssl_stapling_responder
-fn ngx_ssl_stapling_responder(_cf: &mut Conf, ssl: &mut NgxSsl, staple: &SslStapling, responder: &[u8]) -> i64 {
+fn ngx_ssl_stapling_responder(_cf: &mut Conf, ssl: &mut NgxSsl, staple: &mut SslStapling, responder: &[u8]) -> i64 {
     let responder = if responder.is_empty() {
         /* extract OCSP responder URL from certificate */
 
-        match unsafe { cert_ocsp_url(staple.cert) } {
+        match sys::x509_ocsp_url(&staple.cert) {
             Some(url) => url,
             None => {
                 ngx_log_error!(NGX_LOG_WARN, ssl.log, None, "\"ssl_stapling\" ignored, no OCSP responder URL in the certificate \"{}\"", B(&staple.name));
@@ -499,7 +459,7 @@ fn ngx_ssl_stapling_responder(_cf: &mut Conf, ssl: &mut NgxSsl, staple: &SslStap
 
 /// ngx_ssl_stapling_resolver
 pub fn ngx_ssl_stapling_resolver(_cf: &mut Conf, ssl: &mut NgxSsl, resolver: Option<Rc<Resolver>>, resolver_timeout: u64) -> i64 {
-    for staple in ssl.staples.borrow().iter() {
+    for staple in ssl.data.staples.borrow().iter() {
         *staple.resolver.borrow_mut() = resolver.clone();
         staple.resolver_timeout.set(resolver_timeout);
     }
@@ -508,66 +468,57 @@ pub fn ngx_ssl_stapling_resolver(_cf: &mut Conf, ssl: &mut NgxSsl, resolver: Opt
 }
 
 /// ngx_ssl_certificate_status_callback: the staple of the certificate
-unsafe extern "C" fn ngx_ssl_certificate_status_callback(ssl_conn: *mut SSL, _data: *mut c_void) -> c_int {
+/// (Ok(true): SSL_TLSEXT_ERR_OK, Ok(false): SSL_TLSEXT_ERR_NOACK)
+fn ngx_ssl_certificate_status_callback(ssl_conn: &mut SslRef) -> Result<bool, ErrorStack> {
     let c = match ngx_ssl_get_connection(ssl_conn) {
         Some(c) => c,
-        None => return SSL_TLSEXT_ERR_NOACK,
+        None => return Ok(false),
     };
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL certificate status callback");
 
-    let mut rc = SSL_TLSEXT_ERR_NOACK;
+    let ssl_ctx = ssl_conn.ssl_context().to_owned();
 
-    let cert = SSL_get_certificate(ssl_conn);
+    let staple = {
+        let cert = match ssl_conn.certificate() {
+            Some(cert) => cert,
+            None => return Ok(false),
+        };
 
-    if cert.is_null() {
-        return rc;
-    }
-
-    let ssl_ctx = SSL_get_SSL_CTX(ssl_conn);
-    let ssl = SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_index()) as *const NgxSsl;
-
-    if ssl.is_null() {
-        return rc;
-    }
-
-    let staple = match ngx_ssl_stapling_lookup(&*ssl, cert) {
-        Some(s) => s,
-        None => return rc,
+        match ngx_ssl_ctx_data(&ssl_ctx).and_then(|d| ngx_ssl_stapling_lookup(&d, cert)) {
+            Some(s) => s,
+            None => return Ok(false),
+        }
     };
 
-    {
-        let data = staple.staple.borrow();
+    let mut rc = false;
 
-        if !data.is_empty() && staple.valid.get() >= crate::times::time() {
-            /* we have to copy ocsp response as OpenSSL will free it by itself */
+    let data = staple.staple.borrow().clone();
 
-            let p = CRYPTO_malloc(data.len(), std::ptr::null(), 0) as *mut u8;
-            if p.is_null() {
-                ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("OPENSSL_malloc() failed"));
-                return SSL_TLSEXT_ERR_NOACK;
-            }
+    if !data.is_empty() && staple.valid.get() >= crate::times::time() {
+        /* we have to copy ocsp response as OpenSSL will free it by itself */
 
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
-
-            SSL_ctrl(ssl_conn, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP, data.len() as c_long, p as *mut c_void);
-
-            rc = SSL_TLSEXT_ERR_OK;
+        if let Err(e) = ssl_conn.set_ocsp_status(&data) {
+            put(e);
+            ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("OPENSSL_malloc() failed"));
+            return Ok(false);
         }
+
+        rc = true;
     }
 
-    ngx_ssl_stapling_update(&staple);
+    ngx_ssl_stapling_update(&staple, ssl_ctx);
 
-    rc
+    Ok(rc)
 }
 
-/// ngx_ssl_stapling_lookup
-fn ngx_ssl_stapling_lookup(ssl: &NgxSsl, cert: *mut X509) -> Option<Rc<SslStapling>> {
-    ssl.staples.borrow().iter().find(|s| s.cert == cert).cloned()
+/// ngx_ssl_stapling_lookup: the staple of the certificate object
+fn ngx_ssl_stapling_lookup(data: &SslCtxData, cert: &X509Ref) -> Option<Rc<SslStapling>> {
+    data.staples.borrow().iter().find(|s| std::ptr::eq::<X509Ref>(&*s.cert, cert)).cloned()
 }
 
 /// ngx_ssl_stapling_update: a new OCSP response, in the background
-fn ngx_ssl_stapling_update(staple: &Rc<SslStapling>) {
+fn ngx_ssl_stapling_update(staple: &Rc<SslStapling>, ssl_ctx: SslContext) {
     if staple.host.borrow().is_empty() || staple.loading.get() || staple.refresh.get() >= crate::times::time() {
         return;
     }
@@ -581,10 +532,10 @@ fn ngx_ssl_stapling_update(staple: &Rc<SslStapling>) {
 
     let mut ctx = ngx_ssl_ocsp_start(&log);
 
-    ctx.ssl_ctx = staple.ssl_ctx;
-    ctx.cert = staple.cert;
-    ctx.issuer = staple.issuer.get();
-    ctx.chain = staple.chain.get();
+    ctx.ssl_ctx = Some(ssl_ctx);
+    ctx.cert = Some(staple.cert.clone());
+    ctx.issuer = staple.issuer.borrow().clone();
+    ctx.chain = staple.chain.clone();
     *ctx.logctx.name.borrow_mut() = Some(staple.name.clone());
     ctx.flags = if staple.verify { OCSP_TRUSTOTHER } else { OCSP_NOVERIFY };
 
@@ -648,25 +599,15 @@ fn ngx_ssl_stapling_ocsp_handler(ctx: &mut OcspCtx, staple: &SslStapling) {
 
 /// ngx_ssl_stapling_time: ASN1_GENERALIZEDTIME_print() parsed as an
 /// asctime() date
-unsafe fn ngx_ssl_stapling_time(asn1time: *mut ASN1_GENERALIZEDTIME) -> Option<i64> {
-    let bio = BIO_new(BIO_s_mem());
-    if bio.is_null() {
-        return None;
-    }
+fn ngx_ssl_stapling_time(asn1time: &openssl::asn1::Asn1GeneralizedTimeRef) -> Option<i64> {
+    let printed = sys::asn1_generalizedtime_print(asn1time)?;
 
     /* fake weekday prepended to match C asctime() format */
 
-    BIO_write(bio, b"Tue ".as_ptr() as *const c_void, 4);
-    ASN1_GENERALIZEDTIME_print(bio, asn1time);
+    let mut value = b"Tue ".to_vec();
+    value.extend_from_slice(&printed);
 
-    let mut value: *mut c_char = std::ptr::null_mut();
-    let len = BIO_get_mem_data(bio, &mut value);
-
-    let time = if value.is_null() || len <= 0 { None } else { crate::parse::parse_http_time(std::slice::from_raw_parts(value as *const u8, len as usize)) };
-
-    BIO_free(bio);
-
-    time
+    crate::parse::parse_http_time(&value)
 }
 
 /// ngx_ssl_ocsp
@@ -708,22 +649,15 @@ pub fn ngx_ssl_ocsp(cf: &mut Conf, ssl: &mut NgxSsl, responder: &[u8], depth: us
         ocf.port = u.port;
     }
 
-    let ocf = Box::new(ocf);
-    let p = &*ocf as *const SslOcspConf as *mut c_void;
-
-    *ssl.ocsp_conf.borrow_mut() = Some(ocf);
-
-    if unsafe { SSL_CTX_set_ex_data(ssl.ctx, ngx_ssl_ocsp_index(), p) } == 0 {
-        ngx_ssl_error(NGX_LOG_EMERG, &ssl.log, 0, format_args!("SSL_CTX_set_ex_data() failed"));
-        return NGX_ERROR;
-    }
+    // SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_ocsp_index, ocf)
+    *ssl.data.ocsp_conf.borrow_mut() = Some(Rc::new(ocf));
 
     NGX_OK
 }
 
 /// ngx_ssl_ocsp_resolver
 pub fn ngx_ssl_ocsp_resolver(_cf: &mut Conf, ssl: &mut NgxSsl, resolver: Option<Rc<Resolver>>, resolver_timeout: u64) -> i64 {
-    if let Some(ocf) = ssl.ocsp_conf.borrow().as_ref() {
+    if let Some(ocf) = ssl.data.ocsp_conf.borrow().as_ref() {
         *ocf.resolver.borrow_mut() = resolver;
         ocf.resolver_timeout.set(resolver_timeout);
     }
@@ -731,9 +665,14 @@ pub fn ngx_ssl_ocsp_resolver(_cf: &mut Conf, ssl: &mut NgxSsl, resolver: Option<
     NGX_OK
 }
 
-/// The OCSP configuration of the context of a connection.
-unsafe fn ocsp_conf_of(ssl_ctx: *const SSL_CTX) -> *const SslOcspConf {
-    SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_ocsp_index()) as *const SslOcspConf
+/// What ngx_ssl_ocsp_validate() needs of the SSL object.
+struct PeerChain {
+    ssl_ctx: SslContext,
+    ocf: Option<Rc<SslOcspConf>>,
+    verify_ok: bool,
+    cert: Option<X509>,
+    verified: Option<Vec<X509>>,
+    peer_chain: Vec<X509>,
 }
 
 /// ngx_ssl_ocsp_validate: NGX_AGAIN when requests to the responders are
@@ -748,94 +687,130 @@ pub fn ngx_ssl_ocsp_validate(c: &Connection) -> i64 {
         return NGX_AGAIN;
     }
 
-    let ssl = ssl_ptr(&sc);
+    let p = match sc.with(|ssl| {
+        let ssl_ctx = ssl.ssl_context().to_owned();
+        let ocf = ngx_ssl_ctx_data(&ssl_ctx).and_then(|d| d.ocsp_conf.borrow().clone());
 
-    unsafe {
-        let ssl_ctx = SSL_get_SSL_CTX(ssl);
-
-        let ocf = ocsp_conf_of(ssl_ctx);
-        if ocf.is_null() {
-            return NGX_OK;
+        PeerChain {
+            ocf,
+            verify_ok: ssl.verify_result().as_raw() as i64 == X509_V_OK,
+            cert: ssl.peer_certificate(),
+            verified: ssl.verified_chain().map(|s| s.iter().map(|x| x.to_owned()).collect()),
+            peer_chain: ssl.peer_cert_chain().map(|s| s.iter().map(|x| x.to_owned()).collect()).unwrap_or_default(),
+            ssl_ctx,
         }
+    }) {
+        Some(p) => p,
+        None => return NGX_OK,
+    };
 
-        if SSL_get_verify_result(ssl) != X509_V_OK {
-            return NGX_OK;
-        }
+    let ocf = match p.ocf {
+        Some(ocf) => ocf,
+        None => return NGX_OK,
+    };
 
-        let cert = SSL_get1_peer_certificate(ssl);
-        if cert.is_null() {
-            return NGX_OK;
-        }
+    if !p.verify_ok {
+        return NGX_OK;
+    }
 
-        let ocsp = Rc::new(SslOcsp { certs: Cell::new(std::ptr::null_mut()), ncert: Cell::new(0), cert_status: Cell::new(V_OCSP_CERTSTATUS_GOOD), status: Cell::new(NGX_AGAIN), conf: ocf, ctx: RefCell::new(None) });
+    let cert = match p.cert {
+        Some(cert) => cert,
+        None => return NGX_OK,
+    };
 
-        *sc.state.ocsp.borrow_mut() = Some(ocsp.clone());
+    let ocsp = Rc::new(SslOcsp {
+        certs: RefCell::new(Vec::new()),
+        ncert: Cell::new(0),
+        cert_status: Cell::new(V_OCSP_CERTSTATUS_GOOD),
+        status: Cell::new(NGX_AGAIN),
+        conf: ocf,
+        ssl_ctx: p.ssl_ctx.clone(),
+        ctx: RefCell::new(None),
+    });
 
-        let mut certs = SSL_get0_verified_chain(ssl);
+    *sc.state.ocsp.borrow_mut() = Some(ocsp.clone());
 
-        if !certs.is_null() {
-            certs = X509_chain_up_ref(certs);
-            if certs.is_null() {
-                X509_free(cert);
-                return NGX_ERROR;
+    // SSL_get0_verified_chain(), X509_chain_up_ref()
+    let certs = match p.verified {
+        Some(certs) => certs,
+
+        None => {
+            let store = p.ssl_ctx.cert_store();
+
+            let mut store_ctx = match X509StoreContext::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    put(e);
+                    ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("X509_STORE_CTX_new() failed"));
+                    return NGX_ERROR;
+                }
+            };
+
+            let chain = match stack_of(&p.peer_chain) {
+                Some(s) => s,
+                None => return NGX_ERROR,
+            };
+
+            // the failed call, and its errors
+            let mut failed: Option<(&'static str, Option<ErrorStack>)> = Some(("X509_STORE_CTX_init() failed", None));
+
+            let r = store_ctx.init(store, &cert, &chain, |ctx| {
+                match ctx.verify_cert() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        failed = Some(("X509_verify_cert() failed", None));
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        failed = Some(("X509_verify_cert() failed", Some(e)));
+                        return Ok(None);
+                    }
+                }
+
+                // X509_STORE_CTX_get1_chain()
+                match ctx.chain() {
+                    Some(chain) => {
+                        failed = None;
+                        Ok(Some(chain.iter().map(|x| x.to_owned()).collect::<Vec<X509>>()))
+                    }
+                    None => {
+                        failed = Some(("X509_STORE_CTX_get1_chain() failed", None));
+                        Ok(None)
+                    }
+                }
+            });
+
+            match (r, failed) {
+                (Ok(Some(certs)), None) => certs,
+
+                (Err(e), Some((what, _))) => {
+                    put(e);
+                    ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("{}", what));
+                    return NGX_ERROR;
+                }
+
+                (_, Some((what, e))) => {
+                    if let Some(e) = e {
+                        put(e);
+                    }
+                    ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("{}", what));
+                    return NGX_ERROR;
+                }
+
+                (_, None) => return NGX_ERROR,
             }
         }
+    };
 
-        if certs.is_null() {
-            let store = SSL_CTX_get_cert_store(ssl_ctx);
-            if store.is_null() {
-                ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("SSL_CTX_get_cert_store() failed"));
-                X509_free(cert);
-                return NGX_ERROR;
-            }
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "ssl ocsp validate, certs:{}", certs.len());
 
-            let store_ctx = X509_STORE_CTX_new();
-            if store_ctx.is_null() {
-                ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("X509_STORE_CTX_new() failed"));
-                X509_free(cert);
-                return NGX_ERROR;
-            }
+    *ocsp.certs.borrow_mut() = certs;
 
-            let chain = SSL_get_peer_cert_chain(ssl);
+    ngx_ssl_ocsp_validate_next(c, &ocsp);
 
-            if X509_STORE_CTX_init(store_ctx, store, cert, chain) == 0 {
-                ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("X509_STORE_CTX_init() failed"));
-                X509_STORE_CTX_free(store_ctx);
-                X509_free(cert);
-                return NGX_ERROR;
-            }
-
-            let rc = X509_verify_cert(store_ctx);
-            if rc <= 0 {
-                ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("X509_verify_cert() failed"));
-                X509_STORE_CTX_free(store_ctx);
-                X509_free(cert);
-                return NGX_ERROR;
-            }
-
-            certs = X509_STORE_CTX_get1_chain(store_ctx);
-            if certs.is_null() {
-                ngx_ssl_error(NGX_LOG_ERR, &c.log, 0, format_args!("X509_STORE_CTX_get1_chain() failed"));
-                X509_STORE_CTX_free(store_ctx);
-                X509_free(cert);
-                return NGX_ERROR;
-            }
-
-            X509_STORE_CTX_free(store_ctx);
-        }
-
-        ocsp.certs.set(certs);
-
-        X509_free(cert);
-
-        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "ssl ocsp validate, certs:{}", OPENSSL_sk_num(certs));
-
-        ngx_ssl_ocsp_validate_next(c, &ocsp);
-
-        if ocsp.status.get() == NGX_AGAIN {
-            sc.state.in_ocsp.set(true);
-            return NGX_AGAIN;
-        }
+    if ocsp.status.get() == NGX_AGAIN {
+        sc.state.in_ocsp.set(true);
+        return NGX_AGAIN;
     }
 
     NGX_OK
@@ -845,10 +820,10 @@ pub fn ngx_ssl_ocsp_validate(c: &Connection) -> i64 {
 /// cache; the context of the request needed for the next one is left in
 /// ocsp->ctx
 fn ngx_ssl_ocsp_validate_next(c: &Connection, ocsp: &Rc<SslOcsp>) {
-    let ocf = unsafe { &*ocsp.conf };
+    let ocf = ocsp.conf.clone();
 
-    let certs = ocsp.certs.get();
-    let n = unsafe { OPENSSL_sk_num(certs) } as usize;
+    let certs = ocsp.certs.borrow().clone();
+    let n = certs.len();
 
     let rc = 'done: loop {
         let ncert = ocsp.ncert.get();
@@ -862,12 +837,10 @@ fn ngx_ssl_ocsp_validate_next(c: &Connection, ocsp: &Rc<SslOcsp>) {
 
         let mut ctx = ngx_ssl_ocsp_start(&c.log);
 
-        unsafe {
-            ctx.ssl_ctx = SSL_get_SSL_CTX(ngx_ssl_conn(c));
-            ctx.cert = OPENSSL_sk_value(certs, ncert as c_int) as *mut X509;
-            ctx.issuer = OPENSSL_sk_value(certs, ncert as c_int + 1) as *mut X509;
-        }
-        ctx.chain = certs;
+        ctx.ssl_ctx = Some(ocsp.ssl_ctx.clone());
+        ctx.cert = certs.get(ncert).cloned();
+        ctx.issuer = certs.get(ncert + 1).cloned();
+        ctx.chain = certs.clone();
 
         ctx.resolver = ocf.resolver.borrow().clone();
         ctx.resolver_timeout = ocf.resolver_timeout.get();
@@ -991,7 +964,7 @@ fn ngx_ssl_ocsp_responder(c: &Connection, ctx: &mut OcspCtx) -> i64 {
 
     /* extract OCSP responder URL from certificate */
 
-    let responder = match unsafe { cert_ocsp_url(ctx.cert) } {
+    let responder = match ctx.cert.as_ref().and_then(|cert| sys::x509_ocsp_url(cert)) {
         Some(url) => url,
         None => {
             ngx_log_error!(NGX_LOG_ERR, c.log, None, "no OCSP responder URL in certificate");
@@ -1063,11 +1036,8 @@ pub fn ngx_ssl_ocsp_cleanup(c: &Connection) {
     // ngx_ssl_ocsp_done()
     ocsp.ctx.borrow_mut().take();
 
-    let certs = ocsp.certs.replace(std::ptr::null_mut());
-
-    if !certs.is_null() {
-        unsafe { sk_X509_pop_free(certs) };
-    }
+    // sk_X509_pop_free(ocsp->certs, X509_free)
+    ocsp.certs.borrow_mut().clear();
 }
 
 impl OcspCtx {
@@ -1088,10 +1058,10 @@ fn ngx_ssl_ocsp_start(log: &Log) -> Box<OcspCtx> {
     l.set_context(Some(logctx.clone()));
 
     Box::new(OcspCtx {
-        ssl_ctx: std::ptr::null_mut(),
-        cert: std::ptr::null_mut(),
-        issuer: std::ptr::null_mut(),
-        chain: std::ptr::null_mut(),
+        ssl_ctx: None,
+        cert: None,
+        issuer: None,
+        chain: Vec::new(),
         status: 0,
         valid: 0,
         naddr: 0,
@@ -1438,82 +1408,81 @@ fn ngx_ssl_ocsp_process(ctx: &mut OcspCtx) -> i64 {
 
 /// ngx_ssl_ocsp_create_request: "GET <uri>/<base64 request> HTTP/1.0"
 fn ngx_ssl_ocsp_create_request(ctx: &mut OcspCtx) -> i64 {
-    unsafe {
-        let ocsp = OCSP_REQUEST_new();
-        if ocsp.is_null() {
+    let mut ocsp = match OcspRequest::new() {
+        Ok(r) => r,
+        Err(e) => {
+            put(e);
             ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_REQUEST_new() failed"));
             return NGX_ERROR;
         }
+    };
 
-        let rc = 'failed: {
-            let id = OCSP_cert_to_id(std::ptr::null(), ctx.cert, ctx.issuer);
-            if id.is_null() {
-                ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_cert_to_id() failed"));
-                break 'failed NGX_ERROR;
-            }
+    let id = match (ctx.cert.as_ref(), ctx.issuer.as_ref()) {
+        (Some(cert), Some(issuer)) => OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer),
+        _ => Err(ErrorStack::get()),
+    };
 
-            if OCSP_request_add0_id(ocsp, id).is_null() {
-                ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_request_add0_id() failed"));
-                OCSP_CERTID_free(id);
-                break 'failed NGX_ERROR;
-            }
+    let id = match id {
+        Ok(id) => id,
+        Err(e) => {
+            put(e);
+            ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_cert_to_id() failed"));
+            return NGX_ERROR;
+        }
+    };
 
-            let len = i2d_OCSP_REQUEST(ocsp, std::ptr::null_mut());
-            if len <= 0 {
-                ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("i2d_OCSP_REQUEST() failed"));
-                break 'failed NGX_ERROR;
-            }
-
-            let mut binary = vec![0u8; len as usize];
-
-            let mut p = binary.as_mut_ptr();
-            let len = i2d_OCSP_REQUEST(ocsp, &mut p);
-            if len <= 0 {
-                ngx_ssl_error(NGX_LOG_EMERG, &ctx.log, 0, format_args!("i2d_OCSP_REQUEST() failed"));
-                break 'failed NGX_ERROR;
-            }
-
-            binary.truncate(len as usize);
-
-            let base64 = crate::string::encode_base64(&binary);
-
-            let escape = crate::string::escape_uri_count(&base64, crate::string::NGX_ESCAPE_URI_COMPONENT);
-
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp request length {}, escape {}", base64.len(), escape);
-
-            let mut b = Vec::with_capacity(4 + ctx.uri.len() + 1 + base64.len() + 2 * escape + 11 + 6 + ctx.host.len() + 4);
-
-            b.extend_from_slice(b"GET ");
-            b.extend_from_slice(&ctx.uri);
-
-            if ctx.uri.last() != Some(&b'/') {
-                b.push(b'/');
-            }
-
-            if escape == 0 {
-                b.extend_from_slice(&base64);
-            } else {
-                crate::string::escape_uri_into(&mut b, &base64, crate::string::NGX_ESCAPE_URI_COMPONENT);
-            }
-
-            b.extend_from_slice(b" HTTP/1.0\r\n");
-            b.extend_from_slice(b"Host: ");
-            b.extend_from_slice(&ctx.host);
-            b.extend_from_slice(b"\r\n");
-
-            /* add "\r\n" at the header end */
-            b.extend_from_slice(b"\r\n");
-
-            ctx.request = b;
-            ctx.request_pos = 0;
-
-            NGX_OK
-        };
-
-        OCSP_REQUEST_free(ocsp);
-
-        rc
+    if let Err(e) = ocsp.add_id(id) {
+        put(e);
+        ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_request_add0_id() failed"));
+        return NGX_ERROR;
     }
+
+    let binary = match ocsp.to_der() {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("i2d_OCSP_REQUEST() failed"));
+            return NGX_ERROR;
+        }
+        Err(e) => {
+            put(e);
+            ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("i2d_OCSP_REQUEST() failed"));
+            return NGX_ERROR;
+        }
+    };
+
+    let base64 = crate::string::encode_base64(&binary);
+
+    let escape = crate::string::escape_uri_count(&base64, crate::string::NGX_ESCAPE_URI_COMPONENT);
+
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp request length {}, escape {}", base64.len(), escape);
+
+    let mut b = Vec::with_capacity(4 + ctx.uri.len() + 1 + base64.len() + 2 * escape + 11 + 6 + ctx.host.len() + 4);
+
+    b.extend_from_slice(b"GET ");
+    b.extend_from_slice(&ctx.uri);
+
+    if ctx.uri.last() != Some(&b'/') {
+        b.push(b'/');
+    }
+
+    if escape == 0 {
+        b.extend_from_slice(&base64);
+    } else {
+        crate::string::escape_uri_into(&mut b, &base64, crate::string::NGX_ESCAPE_URI_COMPONENT);
+    }
+
+    b.extend_from_slice(b" HTTP/1.0\r\n");
+    b.extend_from_slice(b"Host: ");
+    b.extend_from_slice(&ctx.host);
+    b.extend_from_slice(b"\r\n");
+
+    /* add "\r\n" at the header end */
+    b.extend_from_slice(b"\r\n");
+
+    ctx.request = b;
+    ctx.request_pos = 0;
+
+    NGX_OK
 }
 
 /// ngx_ssl_ocsp_process_status_line
@@ -1901,213 +1870,154 @@ fn ngx_ssl_ocsp_process_body(ctx: &mut OcspCtx) -> i64 {
 
 /// ngx_ssl_ocsp_verify: the status of the certificate in the response
 fn ngx_ssl_ocsp_verify(ctx: &mut OcspCtx) -> i64 {
-    let mut ocsp: *mut OCSP_RESPONSE = std::ptr::null_mut();
-    let mut basic: *mut OCSP_BASICRESP = std::ptr::null_mut();
-    let mut id: *mut OCSP_CERTID = std::ptr::null_mut();
-
-    let rc = 'error: {
-        if ctx.code != 200 {
-            break 'error NGX_ERROR;
-        }
-
-        unsafe {
-            /* check the response */
-
-            let data = match ctx.response.as_ref() {
-                Some(r) => &r[ctx.response_pos..ctx.response_last],
-                None => break 'error NGX_ERROR,
-            };
-
-            let len = data.len();
-            let mut p = data.as_ptr();
-
-            ocsp = d2i_OCSP_RESPONSE(std::ptr::null_mut(), &mut p, len as c_long);
-            if ocsp.is_null() {
-                ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("d2i_OCSP_RESPONSE() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            let n = OCSP_response_status(ocsp);
-
-            if n != OCSP_RESPONSE_STATUS_SUCCESSFUL {
-                ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "OCSP response not successful ({}: {})", n, B(cstr(OCSP_response_status_str(n as c_long))));
-                break 'error NGX_ERROR;
-            }
-
-            basic = OCSP_response_get1_basic(ocsp);
-            if basic.is_null() {
-                ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_response_get1_basic() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            let store = SSL_CTX_get_cert_store(ctx.ssl_ctx);
-            if store.is_null() {
-                ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("SSL_CTX_get_cert_store() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            if OCSP_basic_verify(basic, ctx.chain, store, ctx.flags) != 1 {
-                ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_basic_verify() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            id = OCSP_cert_to_id(std::ptr::null(), ctx.cert, ctx.issuer);
-            if id.is_null() {
-                ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_cert_to_id() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            let mut thisupdate: *mut ASN1_GENERALIZEDTIME = std::ptr::null_mut();
-            let mut nextupdate: *mut ASN1_GENERALIZEDTIME = std::ptr::null_mut();
-
-            if OCSP_resp_find_status(basic, id, &mut ctx.status, std::ptr::null_mut(), std::ptr::null_mut(), &mut thisupdate, &mut nextupdate) != 1 {
-                ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "certificate status not found in the OCSP response");
-                break 'error NGX_ERROR;
-            }
-
-            if OCSP_check_validity(thisupdate, nextupdate, 300, -1) != 1 {
-                ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_check_validity() failed"));
-                break 'error NGX_ERROR;
-            }
-
-            if !nextupdate.is_null() {
-                match ngx_ssl_stapling_time(nextupdate) {
-                    Some(t) => ctx.valid = t,
-                    None => {
-                        ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "invalid nextUpdate time in certificate status");
-                        break 'error NGX_ERROR;
-                    }
-                }
-            } else {
-                ctx.valid = NGX_MAX_TIME_T_VALUE;
-            }
-
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp response, {}, {}", status_str(ctx.status), len);
-        }
-
-        NGX_OK
-    };
-
-    unsafe {
-        if !id.is_null() {
-            OCSP_CERTID_free(id);
-        }
-
-        if !basic.is_null() {
-            OCSP_BASICRESP_free(basic);
-        }
-
-        if !ocsp.is_null() {
-            OCSP_RESPONSE_free(ocsp);
-        }
+    if ctx.code != 200 {
+        return NGX_ERROR;
     }
 
-    rc
+    /* check the response */
+
+    let data = match ctx.response.as_ref() {
+        Some(r) => r[ctx.response_pos..ctx.response_last].to_vec(),
+        None => return NGX_ERROR,
+    };
+
+    let len = data.len();
+
+    let ocsp = match OcspResponse::from_der(&data) {
+        Ok(o) => o,
+        Err(e) => {
+            put(e);
+            ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("d2i_OCSP_RESPONSE() failed"));
+            return NGX_ERROR;
+        }
+    };
+
+    let n = ocsp.status().as_raw();
+
+    if n != OCSP_RESPONSE_STATUS_SUCCESSFUL {
+        ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "OCSP response not successful ({}: {})", n, response_status_str(n));
+        return NGX_ERROR;
+    }
+
+    let basic = match ocsp.basic() {
+        Ok(b) => b,
+        Err(e) => {
+            put(e);
+            ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_response_get1_basic() failed"));
+            return NGX_ERROR;
+        }
+    };
+
+    let ssl_ctx = match ctx.ssl_ctx.clone() {
+        Some(c) => c,
+        None => {
+            ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("SSL_CTX_get_cert_store() failed"));
+            return NGX_ERROR;
+        }
+    };
+
+    let chain = match stack_of(&ctx.chain) {
+        Some(s) => s,
+        None => return NGX_ERROR,
+    };
+
+    if let Err(e) = basic.verify(&chain, ssl_ctx.cert_store(), OcspFlag::from_bits_retain(ctx.flags as _)) {
+        put(e);
+        ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_basic_verify() failed"));
+        return NGX_ERROR;
+    }
+
+    let id = match (ctx.cert.as_ref(), ctx.issuer.as_ref()) {
+        (Some(cert), Some(issuer)) => OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer),
+        _ => Err(ErrorStack::get()),
+    };
+
+    let id = match id {
+        Ok(id) => id,
+        Err(e) => {
+            put(e);
+            ngx_ssl_error(NGX_LOG_CRIT, &ctx.log, 0, format_args!("OCSP_cert_to_id() failed"));
+            return NGX_ERROR;
+        }
+    };
+
+    let status = match basic.find_status(&id) {
+        Some(s) => s,
+        None => {
+            ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "certificate status not found in the OCSP response");
+            return NGX_ERROR;
+        }
+    };
+
+    ctx.status = status.status.as_raw();
+
+    if let Err(e) = status.check_validity(300, None) {
+        put(e);
+        ngx_ssl_error(NGX_LOG_ERR, &ctx.log, 0, format_args!("OCSP_check_validity() failed"));
+        return NGX_ERROR;
+    }
+
+    match status.next_update() {
+        Some(nextupdate) => match ngx_ssl_stapling_time(nextupdate) {
+            Some(t) => ctx.valid = t,
+            None => {
+                ngx_log_error!(NGX_LOG_ERR, ctx.log, None, "invalid nextUpdate time in certificate status");
+                return NGX_ERROR;
+            }
+        },
+
+        None => ctx.valid = NGX_MAX_TIME_T_VALUE,
+    }
+
+    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp response, {}, {}", status_str(ctx.status), len);
+
+    NGX_OK
 }
 
 // --- the OCSP cache ---
 
-/// ngx_ssl_ocsp_cache_t
-#[repr(C)]
-struct SslOcspCache {
-    rbtree: Rbtree,
-    sentinel: RbtreeNode,
-    expire_queue: Queue,
+shm_struct! {
+    /// ngx_ssl_ocsp_cache_t: the rbtree, its sentinel node and the expire
+    /// queue
+    struct OcspCache {
+        rbtree_root: usize,
+        rbtree_sentinel: usize,
+        rbtree_insert: usize,
+        sentinel_key: usize,
+        sentinel_left: usize,
+        sentinel_right: usize,
+        sentinel_parent: usize,
+        sentinel_color: u8,
+        sentinel_data: u8,
+        queue_prev: usize,
+        queue_next: usize,
+    }
 }
 
-/// ngx_ssl_ocsp_cache_node_t (ngx_str_node_t, then the key)
-#[repr(C)]
-struct SslOcspCacheNode {
-    node: RbtreeNode,
-    str_len: usize,
-    str_data: *mut u8,
-    queue: Queue,
-    status: c_int,
-    valid: i64,
+shm_struct! {
+    /// ngx_ssl_ocsp_cache_node_t: an ngx_str_node_t, then its queue link,
+    /// status and validity; the key follows it
+    struct OcspCacheNode {
+        key: usize,
+        left: usize,
+        right: usize,
+        parent: usize,
+        color: u8,
+        data: u8,
+        str_len: usize,
+        str_data: usize,
+        queue_prev: usize,
+        queue_next: usize,
+        status: i32,
+        valid: i64,
+    }
 }
 
-/// shm_zone->data of an OCSP cache zone
+/// shm_zone->data of an OCSP cache zone: the zone's memory and the offset
+/// of its ngx_ssl_ocsp_cache_t
 pub struct SslOcspCacheData {
-    cache: Cell<*mut SslOcspCache>,
-}
-
-unsafe fn node_str<'a>(node: *const RbtreeNode) -> &'a [u8] {
-    let n = node as *const SslOcspCacheNode;
-    std::slice::from_raw_parts((*n).str_data, (*n).str_len)
-}
-
-fn memn2cmp(s1: &[u8], s2: &[u8]) -> i32 {
-    let n = s1.len().min(s2.len());
-    for i in 0..n {
-        if s1[i] != s2[i] {
-            return s1[i] as i32 - s2[i] as i32;
-        }
-    }
-    if s1.len() == s2.len() {
-        0
-    } else if s1.len() < s2.len() {
-        -1
-    } else {
-        1
-    }
-}
-
-/// ngx_str_rbtree_insert_value
-unsafe fn str_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let mut p: *mut *mut RbtreeNode;
-
-    loop {
-        if (*node).key != (*temp).key {
-            p = if (*node).key < (*temp).key { &mut (*temp).left } else { &mut (*temp).right };
-        } else {
-            let a = node_str(node);
-            let b = node_str(temp);
-            p = if memn2cmp(a, b) < 0 { &mut (*temp).left } else { &mut (*temp).right };
-        }
-
-        if *p == sentinel {
-            break;
-        }
-
-        temp = *p;
-    }
-
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
-}
-
-/// ngx_str_rbtree_lookup
-unsafe fn str_rbtree_lookup(rbtree: &Rbtree, name: &[u8], hash: u32) -> *mut SslOcspCacheNode {
-    let mut node = rbtree.root;
-    let sentinel = rbtree.sentinel;
-
-    while node != sentinel {
-        let n = node as *mut SslOcspCacheNode;
-
-        if (hash as usize) != (*node).key {
-            node = if (hash as usize) < (*node).key { (*node).left } else { (*node).right };
-            continue;
-        }
-
-        let rc = memn2cmp(name, node_str(node));
-
-        if rc < 0 {
-            node = (*node).left;
-            continue;
-        }
-
-        if rc > 0 {
-            node = (*node).right;
-            continue;
-        }
-
-        return n;
-    }
-
-    std::ptr::null_mut()
+    mem: RefCell<Option<Rc<ShmMem>>>,
+    cache: Cell<usize>,
 }
 
 /// ngx_ssl_ocsp_cache_init
@@ -2117,46 +2027,55 @@ pub fn ngx_ssl_ocsp_cache_init(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn std::
         return Ok(());
     }
 
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
+    let mem = shm_zone.mem();
+    let shpool = SlabPool::of(&mem);
 
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            let d: Rc<dyn std::any::Any> = Rc::new(SslOcspCacheData { cache: Cell::new((*shpool).data as *mut SslOcspCache) });
-            *shm_zone.data.borrow_mut() = Some(d);
-            return Ok(());
-        }
-
-        let cache = (*shpool).alloc(std::mem::size_of::<SslOcspCache>()) as *mut SslOcspCache;
-        if cache.is_null() {
-            return Err(());
-        }
-
-        (*shpool).data = cache as *mut u8;
-
-        let d: Rc<dyn std::any::Any> = Rc::new(SslOcspCacheData { cache: Cell::new(cache) });
+    if shm_zone.shm.exists.get() {
+        let d: Rc<dyn std::any::Any> = Rc::new(SslOcspCacheData { mem: RefCell::new(Some(mem.clone())), cache: Cell::new(shpool.data()) });
         *shm_zone.data.borrow_mut() = Some(d);
-
-        (*cache).rbtree.init(&mut (*cache).sentinel, str_rbtree_insert_value);
-
-        crate::queue::queue_init(std::ptr::addr_of_mut!((*cache).expire_queue));
-
-        let ctx = format!(" in OCSP cache \"{}\"", B(&shm_zone.shm.name));
-
-        (*shpool).set_log_ctx(ctx.as_bytes())?;
-
-        (*shpool).log_nomem = false;
+        return Ok(());
     }
+
+    let cache = shpool.alloc(OcspCache::SIZE);
+    if cache == 0 {
+        return Err(());
+    }
+
+    shpool.set_data(cache);
+
+    let d: Rc<dyn std::any::Any> = Rc::new(SslOcspCacheData { mem: RefCell::new(Some(mem.clone())), cache: Cell::new(cache) });
+    *shm_zone.data.borrow_mut() = Some(d);
+
+    let c = OcspCache::at(&mem, cache);
+
+    ShmRbtree::at(&mem, c.field(OcspCache::rbtree_root)).init(c.field(OcspCache::sentinel_key));
+
+    queue::init(&mem, c.field(OcspCache::queue_prev));
+
+    let ctx = format!(" in OCSP cache \"{}\"", B(shm_zone.name()));
+
+    shpool.set_log_ctx(ctx.as_bytes())?;
+
+    shpool.set_log_nomem(false);
 
     Ok(())
 }
 
-fn cache_of(zone: &ShmZone) -> Option<(*mut SslOcspCache, *mut SlabPool)> {
-    let cache = zone.data::<SslOcspCacheData>()?.cache.get();
-    Some((cache, zone.shm.addr.get() as *mut SlabPool))
+/// The memory and the offset of the OCSP cache of a zone.
+fn cache_of(zone: &ShmZone) -> Option<(Rc<ShmMem>, usize)> {
+    let d = zone.data::<SslOcspCacheData>()?;
+    let mem = d.mem.borrow().clone()?;
+    Some((mem, d.cache.get()))
 }
 
-unsafe fn cache_node_of_queue(q: *mut Queue) -> *mut SslOcspCacheNode {
-    (q as *mut u8).sub(std::mem::offset_of!(SslOcspCacheNode, queue)) as *mut SslOcspCacheNode
+/// &cache->rbtree
+fn ocsp_rbtree(mem: &ShmMem, cache: usize) -> ShmRbtree<'_> {
+    ShmRbtree::at(mem, OcspCache::at(mem, cache).field(OcspCache::rbtree_root))
+}
+
+/// ngx_str_rbtree_insert_value
+fn str_rbtree_insert_value(tree: &ShmRbtree<'_>, temp: usize, node: usize, sentinel: usize) {
+    tree.str_insert_value(temp, node, sentinel);
 }
 
 /// ngx_ssl_ocsp_cache_lookup
@@ -2172,41 +2091,45 @@ fn ngx_ssl_ocsp_cache_lookup(ctx: &mut OcspCtx) -> i64 {
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache lookup");
 
-    let (cache, shpool) = match cache_of(&shm_zone) {
+    let (mem, cache) = match cache_of(&shm_zone) {
         Some(c) => c,
         None => return NGX_ERROR,
     };
 
+    let shpool = SlabPool::of(&mem);
+
     let hash = crate::hash::hash_key(&ctx.key) as u32;
 
-    unsafe {
-        (*shpool).lock();
+    shpool.lock();
 
-        let node = str_rbtree_lookup(&(*cache).rbtree, &ctx.key, hash);
+    let tree = ocsp_rbtree(&mem, cache);
 
-        if !node.is_null() {
-            if (*node).valid > crate::times::time() {
-                ctx.status = (*node).status;
-                (*shpool).unlock();
+    let node = tree.str_lookup(&ctx.key, hash as usize);
 
-                ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache hit, {}", status_str(ctx.status));
+    if node != 0 {
+        let n = OcspCacheNode::at(&mem, node);
 
-                return NGX_OK;
-            }
+        if n.get(OcspCacheNode::valid) > crate::times::time() {
+            ctx.status = n.get(OcspCacheNode::status);
+            shpool.unlock();
 
-            crate::queue::queue_remove(std::ptr::addr_of_mut!((*node).queue));
-            (*cache).rbtree.delete(&mut (*node).node);
-            (*shpool).free_locked(node as *mut u8);
+            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache hit, {}", status_str(ctx.status));
 
-            (*shpool).unlock();
-
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache expired");
-
-            return NGX_DECLINED;
+            return NGX_OK;
         }
 
-        (*shpool).unlock();
+        queue::remove(&mem, n.field(OcspCacheNode::queue_prev));
+        rb::delete(&tree, node);
+        shpool.free_locked(node);
+
+        shpool.unlock();
+
+        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache expired");
+
+        return NGX_DECLINED;
     }
+
+    shpool.unlock();
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache miss");
 
@@ -2234,51 +2157,56 @@ fn ngx_ssl_ocsp_cache_store(ctx: &mut OcspCtx) -> i64 {
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, ctx.log, "ssl ocsp cache store, valid:{}", valid - now);
 
-    let (cache, shpool) = match cache_of(&shm_zone) {
+    let (mem, cache) = match cache_of(&shm_zone) {
         Some(c) => c,
         None => return NGX_ERROR,
     };
 
+    let shpool = SlabPool::of(&mem);
+
     let hash = crate::hash::hash_key(&ctx.key) as u32;
 
-    let size = std::mem::size_of::<SslOcspCacheNode>() + ctx.key.len();
+    let size = OcspCacheNode::SIZE + ctx.key.len();
 
-    unsafe {
-        (*shpool).lock();
+    let head = OcspCache::at(&mem, cache).field(OcspCache::queue_prev);
+    let tree = ocsp_rbtree(&mem, cache);
 
-        let mut node = (*shpool).calloc_locked(size) as *mut SslOcspCacheNode;
+    shpool.lock();
 
-        if node.is_null() {
-            if !crate::queue::queue_empty(std::ptr::addr_of!((*cache).expire_queue)) {
-                let q = crate::queue::queue_last(std::ptr::addr_of!((*cache).expire_queue));
-                let old = cache_node_of_queue(q);
+    let mut node = shpool.calloc_locked(size);
 
-                (*cache).rbtree.delete(&mut (*old).node);
-                crate::queue::queue_remove(q);
-                (*shpool).free_locked(old as *mut u8);
+    if node == 0 {
+        if !queue::empty(&mem, head) {
+            let q = queue::last(&mem, head);
+            let old = q - OcspCacheNode::queue_prev.off;
 
-                node = (*shpool).alloc_locked(size) as *mut SslOcspCacheNode;
-            }
+            rb::delete(&tree, old);
+            queue::remove(&mem, q);
+            shpool.free_locked(old);
 
-            if node.is_null() {
-                (*shpool).unlock();
-                ngx_log_error!(NGX_LOG_ALERT, ctx.log, None, "could not allocate new entry{}", B((*shpool).log_ctx()));
-                return NGX_ERROR;
-            }
+            node = shpool.alloc_locked(size);
         }
 
-        (*node).str_len = ctx.key.len();
-        (*node).str_data = (node as *mut u8).add(std::mem::size_of::<SslOcspCacheNode>());
-        std::ptr::copy_nonoverlapping(ctx.key.as_ptr(), (*node).str_data, ctx.key.len());
-        (*node).node.key = hash as usize;
-        (*node).status = ctx.status;
-        (*node).valid = valid;
-
-        (*cache).rbtree.insert(&mut (*node).node);
-        crate::queue::queue_insert_head(std::ptr::addr_of_mut!((*cache).expire_queue), std::ptr::addr_of_mut!((*node).queue));
-
-        (*shpool).unlock();
+        if node == 0 {
+            shpool.unlock();
+            ngx_log_error!(NGX_LOG_ALERT, ctx.log, None, "could not allocate new entry{}", B(&shpool.log_ctx()));
+            return NGX_ERROR;
+        }
     }
+
+    let n = OcspCacheNode::at(&mem, node);
+
+    n.set(OcspCacheNode::str_len, ctx.key.len());
+    n.set(OcspCacheNode::str_data, node + OcspCacheNode::SIZE);
+    mem.write(node + OcspCacheNode::SIZE, &ctx.key);
+    tree.set_key(node, hash as usize);
+    n.set(OcspCacheNode::status, ctx.status);
+    n.set(OcspCacheNode::valid, valid);
+
+    rb::insert(&tree, node, str_rbtree_insert_value);
+    queue::insert_head(&mem, head, n.field(OcspCacheNode::queue_prev));
+
+    shpool.unlock();
 
     NGX_OK
 }
@@ -2286,29 +2214,34 @@ fn ngx_ssl_ocsp_cache_store(ctx: &mut OcspCtx) -> i64 {
 /// ngx_ssl_ocsp_create_key: the issuer name and key hashes and the serial
 /// number of the certificate
 fn ngx_ssl_ocsp_create_key(ctx: &mut OcspCtx) -> i64 {
+    let (cert, issuer) = match (ctx.cert.as_ref(), ctx.issuer.as_ref()) {
+        (Some(c), Some(i)) => (c, i),
+        _ => return NGX_ERROR,
+    };
+
     let mut key = vec![0u8; 60];
 
-    unsafe {
-        let name = X509_get_subject_name(ctx.issuer);
-        if X509_NAME_digest(name, EVP_sha1(), key.as_mut_ptr(), std::ptr::null_mut()) == 0 {
-            return NGX_ERROR;
-        }
-
-        if X509_pubkey_digest(ctx.issuer, EVP_sha1(), key[20..].as_mut_ptr(), std::ptr::null_mut()) == 0 {
-            return NGX_ERROR;
-        }
-
-        let serial = X509_get_serialNumber(ctx.cert) as *const c_void;
-        let length = ASN1_STRING_length(serial);
-
-        if length > 20 || length < 0 {
-            return NGX_ERROR;
-        }
-
-        let data = std::slice::from_raw_parts(ASN1_STRING_get0_data(serial), length as usize);
-
-        key[40..40 + data.len()].copy_from_slice(data);
+    match sys::x509_name_digest(issuer.subject_name(), MessageDigest::sha1()) {
+        Some(d) if d.len() == 20 => key[..20].copy_from_slice(&d),
+        _ => return NGX_ERROR,
     }
+
+    match sys::x509_pubkey_digest(issuer, MessageDigest::sha1()) {
+        Some(d) if d.len() == 20 => key[20..40].copy_from_slice(&d),
+        _ => return NGX_ERROR,
+    }
+
+    // ASN1_STRING_get0_data() of the serial number: the bytes of its value
+    let serial = match cert.serial_number().to_bn() {
+        Ok(bn) => bn.to_vec(),
+        Err(_) => return NGX_ERROR,
+    };
+
+    if serial.len() > 20 {
+        return NGX_ERROR;
+    }
+
+    key[40..40 + serial.len()].copy_from_slice(&serial);
 
     if ctx.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
         let mut hex = Vec::new();
@@ -2326,6 +2259,110 @@ fn ngx_ssl_ocsp_create_key(ctx: &mut OcspCtx) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A certificate of the name, signed by the issuer's key (self-signed
+    /// without), with the serial given.
+    fn cert(name: &str, serial: u32, issuer: Option<(&X509, &openssl::pkey::PKey<openssl::pkey::Private>)>) -> (X509, openssl::pkey::PKey<openssl::pkey::Private>) {
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509Builder, X509NameBuilder};
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+
+        let mut n = X509NameBuilder::new().unwrap();
+        n.append_entry_by_text("CN", name).unwrap();
+        let n = n.build();
+
+        let mut b = X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        b.set_serial_number(&openssl::bn::BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap()).unwrap();
+        b.set_subject_name(&n).unwrap();
+        b.set_issuer_name(issuer.map(|(c, _)| c.subject_name()).unwrap_or(&n)).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap()).unwrap();
+        b.sign(issuer.map(|(_, k)| k).unwrap_or(&key), openssl::hash::MessageDigest::sha256()).unwrap();
+
+        (b.build(), key)
+    }
+
+    /// An OCSP cache zone, its slab pool initialized and the cache made by
+    /// the zone init.
+    fn ocsp_zone() -> Rc<ShmZone> {
+        let mem = Rc::new(ShmMem::private(1 << 19).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"OCSP".to_vec(), mem.len(), "ngx_http_ssl_module_ctx");
+        zone.shm.attach(mem);
+
+        ngx_ssl_ocsp_cache_init(&zone, None).unwrap();
+
+        zone
+    }
+
+    #[test]
+    fn ocsp_cache() {
+        let (ca, ca_key) = cert("CA", 1, None);
+        let (leaf, _) = cert("leaf", 0x1234, Some((&ca, &ca_key)));
+        let (other, _) = cert("other", 0x1235, Some((&ca, &ca_key)));
+
+        let zone = ocsp_zone();
+
+        let mut ctx = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));
+        ctx.cert = Some(leaf.clone());
+        ctx.issuer = Some(ca.clone());
+        ctx.shm_zone = Some(zone.clone());
+
+        // the key: the issuer name and key hashes, the serial
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_DECLINED);
+        assert_eq!(ctx.key.len(), 60);
+        assert_eq!(&ctx.key[40..42], &[0x12, 0x34]);
+        assert!(ctx.key[42..].iter().all(|&b| b == 0));
+
+        ctx.status = V_OCSP_CERTSTATUS_REVOKED;
+        ctx.valid = crate::times::time() + 100;
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx), NGX_OK);
+
+        ctx.status = V_OCSP_CERTSTATUS_GOOD;
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_OK);
+        assert_eq!(ctx.status, V_OCSP_CERTSTATUS_REVOKED);
+
+        // another certificate of the issuer
+        let mut ctx2 = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));
+        ctx2.cert = Some(other);
+        ctx2.issuer = Some(ca);
+        ctx2.shm_zone = Some(zone.clone());
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx2), NGX_DECLINED);
+
+        // an expired entry is removed
+        ctx2.status = V_OCSP_CERTSTATUS_GOOD;
+        ctx2.valid = crate::times::time();
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx2), NGX_OK);
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx2), NGX_DECLINED);
+
+        let (mem, cache) = cache_of(&zone).unwrap();
+        assert_eq!(rb::walk(&ocsp_rbtree(&mem, cache)).len(), 1);
+
+        // still found
+        assert_eq!(ngx_ssl_ocsp_cache_lookup(&mut ctx), NGX_OK);
+
+        // past responses are not stored
+        ctx2.valid = crate::times::time() - 1;
+        assert_eq!(ngx_ssl_ocsp_cache_store(&mut ctx2), NGX_OK);
+        assert_eq!(rb::walk(&ocsp_rbtree(&mem, cache)).len(), 1);
+    }
+
+    #[test]
+    fn status_strings() {
+        assert_eq!(status_str(0), "good");
+        assert_eq!(status_str(1), "revoked");
+        assert_eq!(status_str(2), "unknown");
+        assert_eq!(status_str(7), "(UNKNOWN)");
+        assert_eq!(response_status_str(5), "sigrequired");
+        assert_eq!(response_status_str(4), "(UNKNOWN)");
+    }
 
     fn ctx_with(data: &[u8]) -> Box<OcspCtx> {
         let mut ctx = ngx_ssl_ocsp_start(&Log::stderr(NGX_LOG_EMERG));

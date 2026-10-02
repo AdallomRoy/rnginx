@@ -814,14 +814,10 @@ async fn ssl_init_connection(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>,
                     None => return,
                 };
 
-                let sess = ngx_ssl_get_session(pc);
-
-                if sess.is_null() {
-                    return;
-                }
-
-                // the reference of ngx_ssl_get_session() is the session's
-                let session = unsafe { <openssl::ssl::SslSession as foreign_types::ForeignType>::from_ptr(sess) };
+                let session = match ngx_ssl_get_session(pc) {
+                    Some(s) => s,
+                    None => return,
+                };
 
                 let mut balancer = u.balancer.borrow_mut();
 
@@ -835,7 +831,7 @@ async fn ssl_init_connection(s: &S, u: &Rc<StreamUpstream>, pc: &Rc<Connection>,
         let session = u.balancer.borrow_mut().as_mut().and_then(|b| b.set_session());
 
         if let Some(session) = session {
-            let rc = ngx_ssl_set_session(pc, <openssl::ssl::SslSession as foreign_types::ForeignType>::as_ptr(&session));
+            let rc = ngx_ssl_set_session(pc, Some(&session));
 
             if rc != NGX_OK {
                 proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR).await;
@@ -2013,7 +2009,7 @@ fn set_ssl(cf: &mut Conf, pscf: &mut ProxySrvConf) -> ConfResult {
         return Ok(());
     }
 
-    if ngx_ssl_create(&mut ssl, pscf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+    if ngx_ssl_create(&mut ssl, pscf.ssl_protocols, None) != NGX_OK {
         return Err(ConfError::Logged);
     }
 

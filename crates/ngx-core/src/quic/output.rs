@@ -15,7 +15,7 @@ use crate::connection::Connection;
 use crate::event_udp::{sendmsg_to, set_srcaddr_cmsg, SrcAddrCmsg};
 use crate::inet::{NixSockAddr, SockAddr};
 use crate::log::*;
-use crate::openssl_ffi::RAND_bytes;
+use openssl::rand::rand_bytes;
 use crate::rc::*;
 use crate::times;
 use crate::{ngx_log_debug, ngx_log_error};
@@ -684,8 +684,8 @@ pub fn ngx_quic_send_stateless_reset(c: &Connection, conf: &QuicConf, pkt: &Quic
 
         let mut rndbytes = [0u8; 2];
 
-        // SAFETY: two bytes
-        if unsafe { RAND_bytes(rndbytes.as_mut_ptr(), 2) } != 1 {
+        /* the C leaves the errors on OpenSSL's queue */
+        if rand_bytes(&mut rndbytes).map_err(|e| e.put()).is_err() {
             return NGX_ERROR;
         }
 
@@ -694,8 +694,7 @@ pub fn ngx_quic_send_stateless_reset(c: &Connection, conf: &QuicConf, pkt: &Quic
 
     let mut buf = vec![0u8; len];
 
-    // SAFETY: the buffer has len bytes
-    if unsafe { RAND_bytes(buf.as_mut_ptr(), (len - NGX_QUIC_SR_TOKEN_LEN) as i32) } != 1 {
+    if rand_bytes(&mut buf[..len - NGX_QUIC_SR_TOKEN_LEN]).map_err(|e| e.put()).is_err() {
         return NGX_ERROR;
     }
 
@@ -733,8 +732,7 @@ fn ngx_quic_stateless_reset_filter(c: &Connection) -> i64 {
         if *t != now {
             *t = now;
 
-            // SAFETY: one byte
-            if unsafe { RAND_bytes(rndbyte, 1) } != 1 {
+            if rand_bytes(std::slice::from_mut(rndbyte)).map_err(|e| e.put()).is_err() {
                 return NGX_ERROR;
             }
 
@@ -880,8 +878,7 @@ pub fn ngx_quic_send_retry(c: &Connection, conf: &QuicConf, inpkt: &QuicHeader<'
     /* TODO: generate routable dcid */
     let mut dcid = [0u8; NGX_QUIC_SERVER_CID_LEN];
 
-    // SAFETY: the buffer has NGX_QUIC_SERVER_CID_LEN bytes
-    if unsafe { RAND_bytes(dcid.as_mut_ptr(), NGX_QUIC_SERVER_CID_LEN as i32) } != 1 {
+    if rand_bytes(&mut dcid).map_err(|e| e.put()).is_err() {
         return NGX_ERROR;
     }
 

@@ -2,13 +2,22 @@
 //! the encryption levels, AEAD, header protection, the Retry integrity tag
 //! and the key update.
 
+use std::cell::RefCell;
 use std::os::raw::c_int;
 use std::rc::Rc;
+
+use openssl::cipher::{Cipher, CipherRef};
+use openssl::cipher_ctx::{CipherCtx as EvpCipherCtx, CipherCtxRef};
+use openssl::error::ErrorStack;
+use openssl::md::{Md, MdRef};
+use openssl::nid::Nid;
+use openssl::pkey::Id;
+use openssl::pkey_ctx::{HkdfMode, PkeyCtx};
+use openssl::ssl::SslCipherRef;
 
 use crate::connection::Connection;
 use crate::event_openssl::{explicit_memzero, ngx_ssl_error};
 use crate::log::*;
-use crate::openssl_ffi::*;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
@@ -27,41 +36,30 @@ const NGX_QUIC_HP_LEN: usize = 5;
 
 const NGX_QUIC_AES_128_KEY_LEN: usize = 16;
 
+/* the TLS 1.3 cipher suites as SSL_CIPHER_get_id() has them (openssl/tls1.h) */
+const TLS1_3_CK_AES_128_GCM_SHA256: u32 = 0x0300_1301;
+const TLS1_3_CK_AES_256_GCM_SHA384: u32 = 0x0300_1302;
+const TLS1_3_CK_CHACHA20_POLY1305_SHA256: u32 = 0x0300_1303;
+const TLS1_3_CK_AES_128_CCM_SHA256: u32 = 0x0300_1304;
+
 const NGX_QUIC_INITIAL_CIPHER: u32 = TLS1_3_CK_AES_128_GCM_SHA256;
 
 const SHA256_DIGEST_LENGTH: usize = 32;
 
-/// An EVP_CIPHER_CTX (ngx_quic_crypto_ctx_t), freed when dropped.
-pub struct CipherCtx(*mut EVP_CIPHER_CTX);
-
-impl CipherCtx {
-    /// EVP_CIPHER_CTX_new()
-    pub fn new() -> Option<CipherCtx> {
-        // SAFETY: a new context, owned by the value returned
-        let ctx = unsafe { EVP_CIPHER_CTX_new() };
-
-        if ctx.is_null() {
-            return None;
-        }
-
-        Some(CipherCtx(ctx))
-    }
-
-    pub fn as_ptr(&self) -> *mut EVP_CIPHER_CTX {
-        self.0
-    }
-}
-
-impl Drop for CipherCtx {
-    fn drop(&mut self) {
-        // SAFETY: the context was made by EVP_CIPHER_CTX_new() and is owned
-        unsafe { EVP_CIPHER_CTX_free(self.0) }
-    }
+/// An EVP_CIPHER_CTX (ngx_quic_crypto_ctx_t), freed when dropped, with what
+/// the C asks the context for: EVP_CIPHER_CTX_encrypting() and whether its
+/// cipher is in CCM mode. The packets are protected through a shared
+/// reference to the secret, as the C does through its pointer: the context
+/// is in a RefCell.
+pub struct CipherCtx {
+    ctx: RefCell<EvpCipherCtx>,
+    enc: bool,
+    ccm: bool,
 }
 
 impl std::fmt::Debug for CipherCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CipherCtx({:p})", self.0)
+        f.debug_struct("CipherCtx").field("enc", &self.enc).field("ccm", &self.ccm).finish()
     }
 }
 
@@ -125,53 +123,82 @@ pub struct QuicKeys {
 }
 
 /// ngx_quic_ciphers_t
+#[derive(Clone, Copy)]
 pub struct QuicCiphers {
-    pub c: *const EVP_CIPHER,
-    pub hp: *const EVP_CIPHER,
-    pub d: *const EVP_MD,
+    pub c: &'static CipherRef,
+    pub hp: &'static CipherRef,
+    pub d: &'static MdRef,
+}
+
+impl Default for QuicCiphers {
+    /// Those of the Initial packets, until ngx_quic_ciphers() sets them.
+    fn default() -> Self {
+        QuicCiphers { c: Cipher::aes_128_gcm(), hp: Cipher::aes_128_ctr(), d: Md::sha256() }
+    }
 }
 
 /// ngx_quic_ciphers: the ciphers of a TLS 1.3 cipher suite; the key
 /// length, or NGX_ERROR
 pub fn ngx_quic_ciphers(id: u32, ciphers: &mut QuicCiphers) -> i64 {
-    // SAFETY: the EVP_*() functions return static objects
-    unsafe {
-        match id {
-            TLS1_3_CK_AES_128_GCM_SHA256 => {
-                ciphers.c = EVP_aes_128_gcm();
-                ciphers.hp = EVP_aes_128_ctr();
-                ciphers.d = EVP_sha256();
-                16
-            }
-
-            TLS1_3_CK_AES_256_GCM_SHA384 => {
-                ciphers.c = EVP_aes_256_gcm();
-                ciphers.hp = EVP_aes_256_ctr();
-                ciphers.d = EVP_sha384();
-                32
-            }
-
-            TLS1_3_CK_CHACHA20_POLY1305_SHA256 => {
-                ciphers.c = EVP_chacha20_poly1305();
-                ciphers.hp = EVP_chacha20();
-                ciphers.d = EVP_sha256();
-                32
-            }
-
-            TLS1_3_CK_AES_128_CCM_SHA256 => {
-                ciphers.c = EVP_aes_128_ccm();
-                ciphers.hp = EVP_aes_128_ctr();
-                ciphers.d = EVP_sha256();
-                16
-            }
-
-            _ => NGX_ERROR,
+    match id {
+        TLS1_3_CK_AES_128_GCM_SHA256 => {
+            ciphers.c = Cipher::aes_128_gcm();
+            ciphers.hp = Cipher::aes_128_ctr();
+            ciphers.d = Md::sha256();
+            16
         }
+
+        TLS1_3_CK_AES_256_GCM_SHA384 => {
+            ciphers.c = Cipher::aes_256_gcm();
+            ciphers.hp = Cipher::aes_256_ctr();
+            ciphers.d = Md::sha384();
+            32
+        }
+
+        TLS1_3_CK_CHACHA20_POLY1305_SHA256 => {
+            ciphers.c = Cipher::chacha20_poly1305();
+            ciphers.hp = Cipher::chacha20();
+            ciphers.d = Md::sha256();
+            32
+        }
+
+        TLS1_3_CK_AES_128_CCM_SHA256 => {
+            ciphers.c = Cipher::aes_128_ccm();
+            ciphers.hp = Cipher::aes_128_ctr();
+            ciphers.d = Md::sha256();
+            16
+        }
+
+        _ => NGX_ERROR,
     }
 }
 
-fn new_ciphers() -> QuicCiphers {
-    QuicCiphers { c: std::ptr::null(), hp: std::ptr::null(), d: std::ptr::null() }
+/// SSL_CIPHER_get_id() of a cipher suite: its protocol id with the 0x0300
+/// prefix of the TLS ones (TLS1_3_CK_*)
+pub fn ngx_quic_cipher_id(cipher: &SslCipherRef) -> u32 {
+    0x0300_0000 | u16::from_be_bytes(cipher.protocol_id()) as u32
+}
+
+/// ngx_ssl_error() of a failed call of the openssl crate, which takes the
+/// errors off OpenSSL's queue: they are put back for ngx_ssl_error() to
+/// report them, as the C does.
+fn ssl_error(e: ErrorStack, log: &Log, args: std::fmt::Arguments<'_>) {
+    e.put();
+    ngx_ssl_error(NGX_LOG_INFO, log, 0, args);
+}
+
+/// EVP_CipherInit_ex(): EVP_EncryptInit_ex() or EVP_DecryptInit_ex()
+fn cipher_init(ctx: &mut CipherCtxRef, cipher: Option<&CipherRef>, key: Option<&[u8]>, iv: Option<&[u8]>, enc: bool) -> Result<(), ErrorStack> {
+    if enc {
+        ctx.encrypt_init(cipher, key, iv)
+    } else {
+        ctx.decrypt_init(cipher, key, iv)
+    }
+}
+
+/// EVP_CIPHER_mode(cipher) == EVP_CIPH_CCM_MODE
+fn cipher_is_ccm(cipher: &CipherRef) -> bool {
+    matches!(cipher.nid(), Nid::AES_128_CCM | Nid::AES_192_CCM | Nid::AES_256_CCM)
 }
 
 /// ngx_quic_keys_set_initial_secret
@@ -183,12 +210,13 @@ pub fn ngx_quic_keys_set_initial_secret(keys: &mut QuicKeys, secret: &[u8], log:
     // Initial packets use AEAD_AES_128_GCM.  The hash function
     // for HKDF when deriving initial secrets and keys is SHA-256.
 
-    // SAFETY: a static object
-    let digest = unsafe { EVP_sha256() };
+    let digest = Md::sha256();
     let mut is = [0u8; SHA256_DIGEST_LENGTH];
     let mut is_len = SHA256_DIGEST_LENGTH;
 
-    if ngx_hkdf_extract(&mut is, &mut is_len, digest, secret, &SALT) != NGX_OK {
+    if let Err(e) = ngx_hkdf_extract(&mut is, &mut is_len, digest, secret, &SALT) {
+        /* the C leaves the errors on the queue */
+        e.put();
         return NGX_ERROR;
     }
 
@@ -252,7 +280,7 @@ pub fn ngx_quic_keys_set_initial_secret(keys: &mut QuicKeys, secret: &[u8], log:
         return NGX_ERROR;
     }
 
-    let mut ciphers = new_ciphers();
+    let mut ciphers = QuicCiphers::default();
 
     if ngx_quic_ciphers(NGX_QUIC_INITIAL_CIPHER, &mut ciphers) == NGX_ERROR {
         return NGX_ERROR;
@@ -276,7 +304,7 @@ pub fn ngx_quic_keys_set_initial_secret(keys: &mut QuicKeys, secret: &[u8], log:
 }
 
 /// ngx_quic_hkdf_expand: HKDF-Expand-Label of `label` from `prk` into `out`
-pub fn ngx_quic_hkdf_expand(out: &mut [u8], label: &[u8], prk: &[u8], digest: *const EVP_MD, log: &Log) -> i64 {
+pub fn ngx_quic_hkdf_expand(out: &mut [u8], label: &[u8], prk: &[u8], digest: &MdRef, log: &Log) -> i64 {
     let mut info = Vec::with_capacity(20);
 
     info.push(0);
@@ -285,8 +313,8 @@ pub fn ngx_quic_hkdf_expand(out: &mut [u8], label: &[u8], prk: &[u8], digest: *c
     info.extend_from_slice(label);
     info.push(0);
 
-    if ngx_hkdf_expand(out, digest, prk, &info) != NGX_OK {
-        ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("ngx_hkdf_expand({}) failed", String::from_utf8_lossy(label)));
+    if let Err(e) = ngx_hkdf_expand(out, digest, prk, &info) {
+        ssl_error(e, log, format_args!("ngx_hkdf_expand({}) failed", String::from_utf8_lossy(label)));
         return NGX_ERROR;
     }
 
@@ -294,95 +322,71 @@ pub fn ngx_quic_hkdf_expand(out: &mut [u8], label: &[u8], prk: &[u8], digest: *c
 }
 
 /// ngx_hkdf_expand
-fn ngx_hkdf_expand(out: &mut [u8], digest: *const EVP_MD, prk: &[u8], info: &[u8]) -> i64 {
-    // SAFETY: the context is created, used and freed here; the buffers are
-    // valid for the lengths passed
-    unsafe {
-        let pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, std::ptr::null_mut());
-        if pctx.is_null() {
-            return NGX_ERROR;
-        }
+fn ngx_hkdf_expand(out: &mut [u8], digest: &MdRef, prk: &[u8], info: &[u8]) -> Result<(), ErrorStack> {
+    let mut pctx = PkeyCtx::new_id(Id::HKDF)?;
 
-        let mut out_len = out.len();
+    pctx.derive_init()?;
+    pctx.set_hkdf_mode(HkdfMode::EXPAND_ONLY)?;
+    pctx.set_hkdf_md(digest)?;
+    pctx.set_hkdf_key(prk)?;
+    pctx.add_hkdf_info(info)?;
+    pctx.derive(Some(out))?;
 
-        let ok = EVP_PKEY_derive_init(pctx) > 0
-            && EVP_PKEY_CTX_set_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) > 0
-            && EVP_PKEY_CTX_set_hkdf_md(pctx, digest) > 0
-            && EVP_PKEY_CTX_set1_hkdf_key(pctx, prk.as_ptr(), prk.len() as c_int) > 0
-            && EVP_PKEY_CTX_add1_hkdf_info(pctx, info.as_ptr(), info.len() as c_int) > 0
-            && EVP_PKEY_derive(pctx, out.as_mut_ptr(), &mut out_len) > 0;
-
-        EVP_PKEY_CTX_free(pctx);
-
-        if ok {
-            NGX_OK
-        } else {
-            NGX_ERROR
-        }
-    }
+    Ok(())
 }
 
 /// ngx_hkdf_extract
-fn ngx_hkdf_extract(out: &mut [u8], out_len: &mut usize, digest: *const EVP_MD, secret: &[u8], salt: &[u8]) -> i64 {
-    // SAFETY: as in ngx_hkdf_expand()
-    unsafe {
-        let pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, std::ptr::null_mut());
-        if pctx.is_null() {
-            return NGX_ERROR;
-        }
+fn ngx_hkdf_extract(out: &mut [u8], out_len: &mut usize, digest: &MdRef, secret: &[u8], salt: &[u8]) -> Result<(), ErrorStack> {
+    let mut pctx = PkeyCtx::new_id(Id::HKDF)?;
 
-        let ok = EVP_PKEY_derive_init(pctx) > 0
-            && EVP_PKEY_CTX_set_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY) > 0
-            && EVP_PKEY_CTX_set_hkdf_md(pctx, digest) > 0
-            && EVP_PKEY_CTX_set1_hkdf_key(pctx, secret.as_ptr(), secret.len() as c_int) > 0
-            && EVP_PKEY_CTX_set1_hkdf_salt(pctx, salt.as_ptr(), salt.len() as c_int) > 0
-            && EVP_PKEY_derive(pctx, out.as_mut_ptr(), out_len) > 0;
+    pctx.derive_init()?;
+    pctx.set_hkdf_mode(HkdfMode::EXTRACT_ONLY)?;
+    pctx.set_hkdf_md(digest)?;
+    pctx.set_hkdf_key(secret)?;
+    pctx.set_hkdf_salt(salt)?;
+    *out_len = pctx.derive(Some(&mut out[..*out_len]))?;
 
-        EVP_PKEY_CTX_free(pctx);
-
-        if ok {
-            NGX_OK
-        } else {
-            NGX_ERROR
-        }
-    }
+    Ok(())
 }
 
 /// ngx_quic_crypto_init
-pub fn ngx_quic_crypto_init(cipher: *const EVP_CIPHER, s: &mut QuicSecret, key: &QuicMd, enc: c_int, log: &Log) -> i64 {
-    // SAFETY: the context is made here and freed on failure; the key is
-    // valid for the cipher's key length
-    unsafe {
-        let ctx = EVP_CIPHER_CTX_new();
-        if ctx.is_null() {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_new() failed"));
+pub fn ngx_quic_crypto_init(cipher: &CipherRef, s: &mut QuicSecret, key: &QuicMd, enc: c_int, log: &Log) -> i64 {
+    let mut ctx = match EvpCipherCtx::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            ssl_error(e, log, format_args!("EVP_CIPHER_CTX_new() failed"));
             return NGX_ERROR;
         }
+    };
 
-        let ctx = CipherCtx(ctx);
+    let enc = enc != 0;
 
-        if EVP_CipherInit_ex(ctx.0, cipher, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), enc) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherInit_ex() failed"));
-            return NGX_ERROR;
-        }
-
-        if EVP_CIPHER_get_mode(cipher) == EVP_CIPH_CCM_MODE && EVP_CIPHER_CTX_ctrl(ctx.0, EVP_CTRL_AEAD_SET_TAG, NGX_QUIC_TAG_LEN as c_int, std::ptr::null_mut()) == 0 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) failed"));
-            return NGX_ERROR;
-        }
-
-        if EVP_CIPHER_CTX_ctrl(ctx.0, EVP_CTRL_AEAD_SET_IVLEN, s.iv.len as c_int, std::ptr::null_mut()) == 0 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_IVLEN) failed"));
-            return NGX_ERROR;
-        }
-
-        if EVP_CipherInit_ex(ctx.0, std::ptr::null(), std::ptr::null_mut(), key.data.as_ptr(), std::ptr::null(), enc) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherInit_ex() failed"));
-            return NGX_ERROR;
-        }
-
-        s.ctx = Some(ctx);
+    if let Err(e) = cipher_init(&mut ctx, Some(cipher), None, None, enc) {
+        ssl_error(e, log, format_args!("EVP_CipherInit_ex() failed"));
+        return NGX_ERROR;
     }
+
+    let ccm = cipher_is_ccm(cipher);
+
+    if ccm {
+        if let Err(e) = ctx.set_tag_length(NGX_QUIC_TAG_LEN) {
+            ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) failed"));
+            return NGX_ERROR;
+        }
+    }
+
+    if let Err(e) = ctx.set_iv_length(s.iv.len) {
+        ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_IVLEN) failed"));
+        return NGX_ERROR;
+    }
+
+    /* the key buffer, of which the cipher takes its key length */
+    if let Err(e) = cipher_init(&mut ctx, None, Some(&key.data), None, enc) {
+        ssl_error(e, log, format_args!("EVP_CipherInit_ex() failed"));
+        return NGX_ERROR;
+    }
+
+    s.ctx = Some(CipherCtx { ctx: RefCell::new(ctx), enc, ccm });
 
     NGX_OK
 }
@@ -402,79 +406,78 @@ pub fn ngx_quic_crypto_seal(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], inp
 /// ngx_quic_crypto_common
 fn ngx_quic_crypto_common(s: &QuicSecret, out: &mut Vec<u8>, nonce: &[u8], input: &[u8], ad: &[u8], log: &Log) -> i64 {
     let ctx = match &s.ctx {
-        Some(ctx) => ctx.0,
+        Some(ctx) => ctx,
         None => return NGX_ERROR,
     };
 
-    // SAFETY: the context is initialized; the buffers are valid for the
-    // lengths passed, `out` has room for the input and the tag
-    unsafe {
-        let enc = EVP_CIPHER_CTX_is_encrypting(ctx);
+    let enc = ctx.enc;
+    let mut evp = ctx.ctx.borrow_mut();
 
-        if EVP_CipherInit_ex(ctx, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), nonce.as_ptr(), enc) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherInit_ex() failed"));
-            return NGX_ERROR;
-        }
-
-        let mut input = input;
-
-        if enc == 0 {
-            if input.len() < NGX_QUIC_TAG_LEN {
-                return NGX_ERROR;
-            }
-
-            let (data, tag) = input.split_at(input.len() - NGX_QUIC_TAG_LEN);
-            input = data;
-
-            if EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, NGX_QUIC_TAG_LEN as c_int, tag.as_ptr() as *mut _) == 0 {
-                ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) failed"));
-                return NGX_ERROR;
-            }
-        }
-
-        let mut len: c_int = 0;
-
-        if EVP_CIPHER_get_mode(EVP_CIPHER_CTX_get0_cipher(ctx)) == EVP_CIPH_CCM_MODE && EVP_CipherUpdate(ctx, std::ptr::null_mut(), &mut len, std::ptr::null(), input.len() as c_int) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherUpdate() failed"));
-            return NGX_ERROR;
-        }
-
-        if EVP_CipherUpdate(ctx, std::ptr::null_mut(), &mut len, ad.as_ptr(), ad.len() as c_int) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherUpdate() failed"));
-            return NGX_ERROR;
-        }
-
-        let base = out.len();
-        out.resize(base + input.len() + NGX_QUIC_TAG_LEN + 16, 0);
-
-        if EVP_CipherUpdate(ctx, out.as_mut_ptr().add(base), &mut len, input.as_ptr(), input.len() as c_int) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherUpdate() failed"));
-            out.truncate(base);
-            return NGX_ERROR;
-        }
-
-        let mut olen = len as usize;
-
-        if EVP_CipherFinal_ex(ctx, out.as_mut_ptr().add(base + olen), &mut len) <= 0 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CipherFinal_ex failed"));
-            out.truncate(base);
-            return NGX_ERROR;
-        }
-
-        olen += len as usize;
-
-        if enc == 1 {
-            if EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, NGX_QUIC_TAG_LEN as c_int, out.as_mut_ptr().add(base + olen) as *mut _) == 0 {
-                ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_GET_TAG) failed"));
-                out.truncate(base);
-                return NGX_ERROR;
-            }
-
-            olen += NGX_QUIC_TAG_LEN;
-        }
-
-        out.truncate(base + olen);
+    if let Err(e) = cipher_init(&mut evp, None, None, Some(nonce), enc) {
+        ssl_error(e, log, format_args!("EVP_CipherInit_ex() failed"));
+        return NGX_ERROR;
     }
+
+    let mut input = input;
+
+    if !enc {
+        if input.len() < NGX_QUIC_TAG_LEN {
+            return NGX_ERROR;
+        }
+
+        let (data, tag) = input.split_at(input.len() - NGX_QUIC_TAG_LEN);
+        input = data;
+
+        if let Err(e) = evp.set_tag(tag) {
+            ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG) failed"));
+            return NGX_ERROR;
+        }
+    }
+
+    if ctx.ccm {
+        if let Err(e) = evp.set_data_len(input.len()) {
+            ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
+            return NGX_ERROR;
+        }
+    }
+
+    if let Err(e) = evp.cipher_update(ad, None) {
+        ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
+        return NGX_ERROR;
+    }
+
+    let base = out.len();
+    out.resize(base + input.len() + NGX_QUIC_TAG_LEN + 16, 0);
+
+    let mut olen = match evp.cipher_update(input, Some(&mut out[base..])) {
+        Ok(n) => n,
+        Err(e) => {
+            ssl_error(e, log, format_args!("EVP_CipherUpdate() failed"));
+            out.truncate(base);
+            return NGX_ERROR;
+        }
+    };
+
+    match evp.cipher_final(&mut out[base + olen..]) {
+        Ok(n) => olen += n,
+        Err(e) => {
+            ssl_error(e, log, format_args!("EVP_CipherFinal_ex failed"));
+            out.truncate(base);
+            return NGX_ERROR;
+        }
+    }
+
+    if enc {
+        if let Err(e) = evp.tag(&mut out[base + olen..base + olen + NGX_QUIC_TAG_LEN]) {
+            ssl_error(e, log, format_args!("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_GET_TAG) failed"));
+            out.truncate(base);
+            return NGX_ERROR;
+        }
+
+        olen += NGX_QUIC_TAG_LEN;
+    }
+
+    out.truncate(base + olen);
 
     NGX_OK
 }
@@ -485,24 +488,22 @@ pub fn ngx_quic_crypto_cleanup(s: &mut QuicSecret) {
 }
 
 /// ngx_quic_crypto_hp_init
-fn ngx_quic_crypto_hp_init(cipher: *const EVP_CIPHER, s: &mut QuicSecret, log: &Log) -> i64 {
-    // SAFETY: the context is made here and freed on failure
-    unsafe {
-        let ctx = EVP_CIPHER_CTX_new();
-        if ctx.is_null() {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_CIPHER_CTX_new() failed"));
+fn ngx_quic_crypto_hp_init(cipher: &CipherRef, s: &mut QuicSecret, log: &Log) -> i64 {
+    let mut ctx = match EvpCipherCtx::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            ssl_error(e, log, format_args!("EVP_CIPHER_CTX_new() failed"));
             return NGX_ERROR;
         }
+    };
 
-        let ctx = CipherCtx(ctx);
-
-        if EVP_EncryptInit_ex(ctx.0, cipher, std::ptr::null_mut(), s.hp.data.as_ptr(), std::ptr::null()) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_EncryptInit_ex() failed"));
-            return NGX_ERROR;
-        }
-
-        s.hp_ctx = Some(Rc::new(ctx));
+    /* the key buffer, of which the cipher takes its key length */
+    if let Err(e) = ctx.encrypt_init(Some(cipher), Some(&s.hp.data), None) {
+        ssl_error(e, log, format_args!("EVP_EncryptInit_ex() failed"));
+        return NGX_ERROR;
     }
+
+    s.hp_ctx = Some(Rc::new(CipherCtx { ctx: RefCell::new(ctx), enc: true, ccm: false }));
 
     NGX_OK
 }
@@ -512,29 +513,25 @@ fn ngx_quic_crypto_hp(s: &QuicSecret, out: &mut [u8; 32], input: &[u8], log: &Lo
     static ZERO: [u8; NGX_QUIC_HP_LEN] = [0; NGX_QUIC_HP_LEN];
 
     let ctx = match &s.hp_ctx {
-        Some(ctx) => ctx.0,
+        Some(ctx) => ctx,
         None => return NGX_ERROR,
     };
 
-    // SAFETY: the context is initialized; the sample is 16 bytes, the
-    // output has room for the mask and a block
-    unsafe {
-        let mut outlen: c_int = 0;
+    let mut evp = ctx.ctx.borrow_mut();
 
-        if EVP_EncryptInit_ex(ctx, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), input.as_ptr()) != 1 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_EncryptInit_ex() failed"));
-            return NGX_ERROR;
-        }
+    if let Err(e) = evp.encrypt_init(None, None, Some(input)) {
+        ssl_error(e, log, format_args!("EVP_EncryptInit_ex() failed"));
+        return NGX_ERROR;
+    }
 
-        if EVP_EncryptUpdate(ctx, out.as_mut_ptr(), &mut outlen, ZERO.as_ptr(), NGX_QUIC_HP_LEN as c_int) == 0 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_EncryptUpdate() failed"));
-            return NGX_ERROR;
-        }
+    if let Err(e) = evp.cipher_update(&ZERO, Some(&mut out[..])) {
+        ssl_error(e, log, format_args!("EVP_EncryptUpdate() failed"));
+        return NGX_ERROR;
+    }
 
-        if EVP_EncryptFinal_ex(ctx, out.as_mut_ptr().add(NGX_QUIC_HP_LEN), &mut outlen) == 0 {
-            ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("EVP_EncryptFinal_Ex() failed"));
-            return NGX_ERROR;
-        }
+    if let Err(e) = evp.cipher_final(&mut out[NGX_QUIC_HP_LEN..]) {
+        ssl_error(e, log, format_args!("EVP_EncryptFinal_Ex() failed"));
+        return NGX_ERROR;
     }
 
     NGX_OK
@@ -546,11 +543,10 @@ fn ngx_quic_crypto_hp_cleanup(s: &mut QuicSecret) {
 }
 
 /// ngx_quic_keys_set_encryption_secret
-pub fn ngx_quic_keys_set_encryption_secret(log: &Log, is_write: bool, keys: &mut QuicKeys, level: usize, cipher: *const SSL_CIPHER, secret: &[u8]) -> i64 {
-    // SAFETY: the cipher is the current one of the SSL connection
-    keys.cipher = unsafe { SSL_CIPHER_get_id(cipher) };
+pub fn ngx_quic_keys_set_encryption_secret(log: &Log, is_write: bool, keys: &mut QuicKeys, level: usize, cipher: &SslCipherRef, secret: &[u8]) -> i64 {
+    keys.cipher = ngx_quic_cipher_id(cipher);
 
-    let mut ciphers = new_ciphers();
+    let mut ciphers = QuicCiphers::default();
 
     let key_len = ngx_quic_ciphers(keys.cipher, &mut ciphers);
 
@@ -654,7 +650,7 @@ pub fn ngx_quic_keys_update(c: &Rc<Connection>) {
 /// The body of ngx_quic_keys_update: the next keys derived from the
 /// current ones.
 pub fn keys_update_impl(keys: &mut QuicKeys, log: &Log) -> i64 {
-    let mut ciphers = new_ciphers();
+    let mut ciphers = QuicCiphers::default();
 
     let key_len = ngx_quic_ciphers(keys.cipher, &mut ciphers);
 
@@ -802,7 +798,7 @@ fn ngx_quic_create_retry_packet(pkt: &QuicHeader<'_>, res: &mut Vec<u8>) -> i64 
     let mut ad = Vec::new();
     let (_, start) = ngx_quic_create_retry_itag(pkt, &mut ad);
 
-    let mut ciphers = new_ciphers();
+    let mut ciphers = QuicCiphers::default();
 
     if ngx_quic_ciphers(NGX_QUIC_INITIAL_CIPHER, &mut ciphers) == NGX_ERROR {
         return NGX_ERROR;
@@ -834,14 +830,13 @@ fn ngx_quic_create_retry_packet(pkt: &QuicHeader<'_>, res: &mut Vec<u8>) -> i64 
 
 /// ngx_quic_derive_key
 pub fn ngx_quic_derive_key(log: &Log, label: &str, secret: &[u8], salt: &[u8], out: &mut [u8]) -> i64 {
-    // SAFETY: a static object
-    let digest = unsafe { EVP_sha256() };
+    let digest = Md::sha256();
 
     let mut is = [0u8; SHA256_DIGEST_LENGTH];
     let mut is_len = SHA256_DIGEST_LENGTH;
 
-    if ngx_hkdf_extract(&mut is, &mut is_len, digest, secret, salt) != NGX_OK {
-        ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("ngx_hkdf_extract({}) failed", label));
+    if let Err(e) = ngx_hkdf_extract(&mut is, &mut is_len, digest, secret, salt) {
+        ssl_error(e, log, format_args!("ngx_hkdf_extract({}) failed", label));
         return NGX_ERROR;
     }
 
@@ -859,8 +854,8 @@ pub fn ngx_quic_derive_key(log: &Log, label: &str, secret: &[u8], salt: &[u8], o
     info.extend_from_slice(label.as_bytes());
     info.push(0);
 
-    if ngx_hkdf_expand(out, digest, &is[..is_len], &info) != NGX_OK {
-        ngx_ssl_error(NGX_LOG_INFO, log, 0, format_args!("ngx_hkdf_expand({}) failed", label));
+    if let Err(e) = ngx_hkdf_expand(out, digest, &is[..is_len], &info) {
+        ssl_error(e, log, format_args!("ngx_hkdf_expand({}) failed", label));
         return NGX_ERROR;
     }
 
@@ -1074,6 +1069,286 @@ mod tests {
         Log::stderr(0)
     }
 
+    /// The TLS 1.3 cipher suites of the protocol ids, as the SSL library has
+    /// them.
+    fn tls13_ciphers(ids: &[u8]) -> openssl::ssl::CipherLists {
+        let ctx = openssl::ssl::SslContext::builder(openssl::ssl::SslMethod::tls()).unwrap().build();
+        let ssl = openssl::ssl::Ssl::new(&ctx).unwrap();
+
+        ssl.bytes_to_cipher_list(ids, false).unwrap()
+    }
+
+    const ALL_SUITES: [u8; 8] = [0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0x13, 0x04];
+
+    /// AES-128-CCM with a 12-byte nonce and an `m`-byte tag (RFC 3610, made
+    /// of AES-ECB): the ciphertext and the tag. The one-shot encrypt_aead()
+    /// of the openssl crate sets the tag length after the key, which
+    /// OpenSSL's CCM ignores (M is fixed with the key): nginx sets it before.
+    fn aes_128_ccm_reference(key: &[u8], nonce: &[u8; 12], ad: &[u8], data: &[u8], m: usize) -> (Vec<u8>, Vec<u8>) {
+        use openssl::symm;
+
+        let aes = |block: &[u8; 16]| -> [u8; 16] {
+            let mut c = symm::Crypter::new(symm::Cipher::aes_128_ecb(), symm::Mode::Encrypt, key, None).unwrap();
+            c.pad(false);
+            let mut out = [0u8; 32];
+            let n = c.update(block, &mut out).unwrap();
+            assert_eq!(n, 16);
+            out[..16].try_into().unwrap()
+        };
+
+        const L: usize = 3; /* 15 - the nonce length */
+
+        /* CBC-MAC of B_0, the encoded AAD and the data, zero padded */
+        let mut b = Vec::new();
+        b.push(if ad.is_empty() { 0 } else { 0x40 } | (((m - 2) / 2) << 3) as u8 | (L - 1) as u8);
+        b.extend_from_slice(nonce);
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes()[4 - L..]);
+
+        if !ad.is_empty() {
+            b.extend_from_slice(&(ad.len() as u16).to_be_bytes());
+            b.extend_from_slice(ad);
+            b.resize(b.len().div_ceil(16) * 16, 0);
+        }
+
+        b.extend_from_slice(data);
+        b.resize(b.len().div_ceil(16) * 16, 0);
+
+        let mut x = [0u8; 16];
+
+        for block in b.chunks(16) {
+            for i in 0..16 {
+                x[i] ^= block[i];
+            }
+
+            x = aes(&x);
+        }
+
+        /* CTR: A_i = L - 1, the nonce, the counter i */
+        let ctr = |i: u32| {
+            let mut a = [0u8; 16];
+            a[0] = (L - 1) as u8;
+            a[1..13].copy_from_slice(nonce);
+            a[13..].copy_from_slice(&i.to_be_bytes()[1..]);
+            aes(&a)
+        };
+
+        let mut out = data.to_vec();
+
+        for (n, chunk) in out.chunks_mut(16).enumerate() {
+            let s = ctr(n as u32 + 1);
+
+            for (i, byte) in chunk.iter_mut().enumerate() {
+                *byte ^= s[i];
+            }
+        }
+
+        let s0 = ctr(0);
+        let tag = (0..m).map(|i| x[i] ^ s0[i]).collect();
+
+        (out, tag)
+    }
+
+    /// The CCM of the test as NIST SP 800-38C, C.3 (Example 3)
+    #[test]
+    fn ccm_reference_as_sp800_38c() {
+        let key = unhex("404142434445464748494a4b4c4d4e4f");
+        let nonce: [u8; 12] = unhex("101112131415161718191a1b").try_into().unwrap();
+        let ad = unhex("000102030405060708090a0b0c0d0e0f10111213");
+        let data = unhex("202122232425262728292a2b2c2d2e2f3031323334353637");
+
+        let (c, t) = aes_128_ccm_reference(&key, &nonce, &ad, &data, 8);
+
+        assert_eq!(c, unhex("e3b201a9f5b71a7a9b1ceaeccd97e70b6176aad9a4428aa5"));
+        assert_eq!(t, unhex("484392fbc1b09951"));
+    }
+
+    #[test]
+    fn cipher_ids_as_ssl_cipher_get_id() {
+        let lists = tls13_ciphers(&ALL_SUITES);
+        let ids: Vec<u32> = lists.suites.iter().map(ngx_quic_cipher_id).collect();
+
+        assert_eq!(ids, [TLS1_3_CK_AES_128_GCM_SHA256, TLS1_3_CK_AES_256_GCM_SHA384, TLS1_3_CK_CHACHA20_POLY1305_SHA256, TLS1_3_CK_AES_128_CCM_SHA256]);
+
+        let mut ciphers = QuicCiphers::default();
+        assert_eq!(ngx_quic_ciphers(0x0300_1305, &mut ciphers), NGX_ERROR);
+    }
+
+    /// The packets of each cipher suite protected as OpenSSL's one-shot AEAD
+    /// functions do it, with a context reused from packet to packet, and the
+    /// header protection masks as AES-ECB or ChaCha20 of the sample.
+    #[test]
+    fn suites_as_one_shot_aead() {
+        use openssl::symm;
+
+        let secret = unhex("9ac312a7f877468ebe69422748ad00a1 5443f18203a07d6060f688f30f21632b");
+        let lists = tls13_ciphers(&ALL_SUITES);
+
+        for cipher in lists.suites.iter() {
+            let mut keys = QuicKeys::default();
+
+            assert_eq!(ngx_quic_keys_set_encryption_secret(&log(), true, &mut keys, NGX_QUIC_ENCRYPTION_APPLICATION, cipher, &secret), NGX_OK);
+            assert_eq!(ngx_quic_keys_set_encryption_secret(&log(), false, &mut keys, NGX_QUIC_ENCRYPTION_APPLICATION, cipher, &secret), NGX_OK);
+
+            let (aead, hp) = match keys.cipher {
+                TLS1_3_CK_AES_128_GCM_SHA256 => (symm::Cipher::aes_128_gcm(), Some(symm::Cipher::aes_128_ecb())),
+                TLS1_3_CK_AES_256_GCM_SHA384 => (symm::Cipher::aes_256_gcm(), Some(symm::Cipher::aes_256_ecb())),
+                TLS1_3_CK_CHACHA20_POLY1305_SHA256 => (symm::Cipher::chacha20_poly1305(), None),
+                TLS1_3_CK_AES_128_CCM_SHA256 => (symm::Cipher::aes_128_ccm(), Some(symm::Cipher::aes_128_ecb())),
+                id => panic!("cipher {:x}", id),
+            };
+
+            let mut ciphers = QuicCiphers::default();
+            let key_len = ngx_quic_ciphers(keys.cipher, &mut ciphers);
+            assert_eq!(key_len as usize, aead.key_len());
+
+            let mut key = vec![0u8; key_len as usize];
+            assert_eq!(ngx_quic_hkdf_expand(&mut key, b"tls13 quic key", &secret, ciphers.d, &log()), NGX_OK);
+
+            let current = &keys.secrets[NGX_QUIC_ENCRYPTION_APPLICATION];
+            let ad = b"the packet header";
+            let payload = b"the frames of the packet, longer than a block of the cipher";
+
+            for pn in [0u64, 77, 1 << 40] {
+                let mut nonce = current.server.iv.data;
+                ngx_quic_compute_nonce(&mut nonce, pn);
+
+                let mut out = b"prefix".to_vec();
+                assert_eq!(ngx_quic_crypto_seal(&current.server, &mut out, &nonce, payload, ad, &log()), NGX_OK);
+
+                let mut tag = [0u8; NGX_QUIC_TAG_LEN];
+
+                let expected = if keys.cipher == TLS1_3_CK_AES_128_CCM_SHA256 {
+                    let (data, t) = aes_128_ccm_reference(&key, &nonce, ad, payload, NGX_QUIC_TAG_LEN);
+                    tag.copy_from_slice(&t);
+                    data
+                } else {
+                    symm::encrypt_aead(aead, &key, Some(&nonce), ad, payload, &mut tag).unwrap_or_else(|e| panic!("cipher {:x}: {:?}", keys.cipher, e))
+                };
+
+                assert_eq!(&out[..6], b"prefix");
+                assert_eq!(&out[6..6 + payload.len()], &expected[..]);
+                assert_eq!(&out[6 + payload.len()..], &tag[..]);
+
+                // the client's keys are those of the same secret here
+                let mut plain = b"x".to_vec();
+                assert_eq!(ngx_quic_crypto_open(&current.client, &mut plain, &nonce, &out[6..], ad, &log()), NGX_OK);
+                assert_eq!(&plain[1..], &payload[..]);
+
+                let mut bad = out[6..].to_vec();
+                bad[3] ^= 0x10;
+                let mut plain = Vec::new();
+                assert_eq!(ngx_quic_crypto_open(&current.client, &mut plain, &nonce, &bad, ad, &log()), NGX_ERROR);
+                assert!(plain.is_empty());
+
+                // the tag alone, and less than a tag
+                assert_eq!(ngx_quic_crypto_open(&current.client, &mut plain, &nonce, &out[6 + payload.len()..], ad, &log()), NGX_ERROR);
+                assert_eq!(ngx_quic_crypto_open(&current.client, &mut plain, &nonce, &out[6..6 + NGX_QUIC_TAG_LEN - 1], ad, &log()), NGX_ERROR);
+                assert!(plain.is_empty());
+            }
+
+            let sample = unhex("5e5cd55c41f69080575d7999c25a5bfb");
+            let mut mask = [0u8; 32];
+            assert_eq!(ngx_quic_crypto_hp(&current.server, &mut mask, &sample, &log()), NGX_OK);
+
+            let expected = match hp {
+                Some(ecb) => symm::encrypt(ecb, current.server.hp.as_slice(), None, &sample).unwrap(),
+                None => symm::encrypt(symm::Cipher::chacha20(), current.server.hp.as_slice(), Some(&sample), &[0; NGX_QUIC_HP_LEN]).unwrap(),
+            };
+
+            assert_eq!(&mask[..NGX_QUIC_HP_LEN], &expected[..NGX_QUIC_HP_LEN]);
+        }
+    }
+
+    /// A log keeping its lines (info and above).
+    fn memory_log() -> (Log, Rc<std::cell::RefCell<Vec<String>>>) {
+        let lines = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keep = lines.clone();
+        let chain = LogChain::new();
+
+        chain.insert(LogEntry::new(NGX_LOG_INFO, LogWriter::Custom(Rc::new(move |_, line: &[u8]| keep.borrow_mut().push(String::from_utf8_lossy(line).trim_end().to_string())))));
+
+        (Log::new(chain), lines)
+    }
+
+    /// The errors the openssl crate takes off OpenSSL's queue are reported
+    /// by ngx_ssl_error() as in the C, and none are made up.
+    #[test]
+    fn errors_as_ngx_ssl_error() {
+        let _ = ErrorStack::get();
+        let (log, lines) = memory_log();
+
+        // EVP_CTRL_AEAD_SET_IVLEN 0: the provider queues "invalid iv length"
+        let mut s = QuicSecret::default();
+        let key = QuicMd::from(&[1; 16]);
+        assert_eq!(ngx_quic_crypto_init(Cipher::aes_128_gcm(), &mut s, &key, 1, &log), NGX_ERROR);
+        assert!(s.ctx.is_none());
+
+        {
+            let lines = lines.borrow();
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("[info] "), "{}", lines[0]);
+            assert!(lines[0].contains("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_IVLEN) failed (SSL: error:"), "{}", lines[0]);
+            assert!(lines[0].ends_with("invalid iv length)"), "{}", lines[0]);
+        }
+
+        assert_eq!(ErrorStack::get().errors().len(), 0, "the queue is emptied as by the C");
+
+        // a tag that does not match: GCM queues no error
+        lines.borrow_mut().clear();
+        s.iv.len = NGX_QUIC_IV_LEN;
+        assert_eq!(ngx_quic_crypto_init(Cipher::aes_128_gcm(), &mut s, &key, 0, &log), NGX_OK);
+
+        let mut out = Vec::new();
+        assert_eq!(ngx_quic_crypto_open(&s, &mut out, &[0; NGX_QUIC_IV_LEN], &[0; 20], b"ad", &log), NGX_ERROR);
+
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("[info] EVP_CipherFinal_ex failed") || lines[0].ends_with(": EVP_CipherFinal_ex failed"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn no_keys() {
+        let s = QuicSecret::default();
+        let mut out = Vec::new();
+        let mut mask = [0u8; 32];
+
+        assert_eq!(ngx_quic_crypto_seal(&s, &mut out, &[0; NGX_QUIC_IV_LEN], b"data", b"ad", &log()), NGX_ERROR);
+        assert_eq!(ngx_quic_crypto_hp(&s, &mut mask, &[0; 16], &log()), NGX_ERROR);
+    }
+
+    /// RFC 5869, A.1.  Test Case 1 (HKDF-SHA256), the extract and the expand
+    /// of ngx_quic_derive_key()
+    #[test]
+    fn hkdf_as_rfc5869() {
+        let ikm = [0x0bu8; 22];
+        let salt = unhex("000102030405060708090a0b0c");
+        let info = unhex("f0f1f2f3f4f5f6f7f8f9");
+
+        let mut prk = [0u8; SHA256_DIGEST_LENGTH];
+        let mut prk_len = prk.len();
+        ngx_hkdf_extract(&mut prk, &mut prk_len, Md::sha256(), &ikm, &salt).unwrap();
+        assert_eq!(prk_len, 32);
+        assert_eq!(&prk[..], unhex("077709362c2e32df0ddc3f0dc47bba63 90b6c73bb50f9c3122ec844ad7c2b3e5").as_slice());
+
+        let mut okm = [0u8; 42];
+        ngx_hkdf_expand(&mut okm, Md::sha256(), &prk, &info).unwrap();
+        assert_eq!(&okm[..], unhex("3cb25f25faacd57a90434f64d0362f2a 2d2d0a90cf1a5a4c5db02d56ecc4c5bf 34007208d5b887185865").as_slice());
+
+        // ngx_quic_derive_key: the HKDF-Expand-Label "tls13 <label>" info
+        let mut out = [0u8; 16];
+        assert_eq!(ngx_quic_derive_key(&log(), "sr_token_key", &ikm, &salt, &mut out), NGX_OK);
+
+        let mut info = vec![0, 16, 12];
+        info.extend_from_slice(b"sr_token_key");
+        info.push(0);
+        let mut expected = [0u8; 16];
+        ngx_hkdf_expand(&mut expected, Md::sha256(), &prk, &info).unwrap();
+        assert_eq!(out, expected);
+
+        let mut out = [0u8; 16];
+        assert_eq!(ngx_quic_derive_key(&log(), "a label that is too long", &ikm, &salt, &mut out), NGX_ERROR);
+    }
+
     /// RFC 9001, A.1.  Keys
     #[test]
     fn initial_keys_as_rfc9001() {
@@ -1145,9 +1420,7 @@ mod tests {
             std::mem::swap(&mut init.client, &mut init.server);
 
             let key = QuicMd::from(&unhex("cf3a5331653c364c88f0f379b6067e37"));
-            // SAFETY: a static cipher
-            let cipher = unsafe { EVP_aes_128_gcm() };
-            assert_eq!(ngx_quic_crypto_init(cipher, &mut init.client, &key, 0, &log()), NGX_OK);
+            assert_eq!(ngx_quic_crypto_init(Cipher::aes_128_gcm(), &mut init.client, &key, 0, &log()), NGX_OK);
         }
 
         let mut rpkt = QuicHeader {
@@ -1221,17 +1494,11 @@ mod tests {
 
         let mut keys = QuicKeys::default();
 
-        // SAFETY: a cipher of the SSL library, looked up by its protocol id
-        let cipher = unsafe {
-            let ctx = SSL_CTX_new(TLS_method());
-            let ssl = SSL_new(ctx);
-            let c = SSL_CIPHER_find(ssl, [0x13, 0x03].as_ptr());
-            SSL_free(ssl);
-            SSL_CTX_free(ctx);
-            c
-        };
+        // the cipher of the SSL library, looked up by its protocol id
+        let lists = tls13_ciphers(&[0x13, 0x03]);
+        let cipher = lists.suites.get(0).expect("TLS_CHACHA20_POLY1305_SHA256");
 
-        assert!(!cipher.is_null());
+        assert_eq!(ngx_quic_cipher_id(cipher), TLS1_3_CK_CHACHA20_POLY1305_SHA256);
 
         assert_eq!(ngx_quic_keys_set_encryption_secret(&log(), true, &mut keys, NGX_QUIC_ENCRYPTION_APPLICATION, cipher, &secret), NGX_OK);
 

@@ -51,7 +51,6 @@ fn zone_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> Co
 
     let shm_zone = ngx_core::cycle::shared_memory_add(cf, &value[1], size, "ngx_http_upstream_module")?;
 
-    shm_zone.safe_pool.set(true);
 
     *shm_zone.init.borrow_mut() = Some(Rc::new(init_zone));
     *shm_zone.data.borrow_mut() = Some(umcf);

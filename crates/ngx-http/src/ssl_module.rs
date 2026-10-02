@@ -8,7 +8,6 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::os::raw::{c_int, c_uint, c_void};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -19,8 +18,9 @@ use ngx_core::event_openssl_cache::*;
 use ngx_core::event_openssl_stapling::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
-use ngx_core::openssl_ffi::*;
 use ngx_core::rc::*;
+use ngx_sys::ssl as sys;
+use openssl::ssl::{AlpnError, NameType, SslRef};
 use ngx_core::shm::ShmZone;
 use ngx_core::string::B;
 use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error};
@@ -43,9 +43,6 @@ const NGX_HTTP_V2_ALPN_PROTOS: &[u8] = b"\x02h2\x08http/1.1\x08http/1.0\x08http/
 
 /// NGX_HTTP_V3_ALPN_PROTO NGX_HTTP_V3_HQ_ALPN_PROTO
 const NGX_HTTP_V3_ALPN_PROTOS: &[u8] = b"\x02h3\x0Ahq-interop";
-
-/// SSL_OP_ENABLE_MIDDLEBOX_COMPAT
-const SSL_OP_ENABLE_MIDDLEBOX_COMPAT: u64 = 0x00100000;
 
 /// ngx_http_ssl_srv_conf_t
 pub struct HttpSslSrvConf {
@@ -204,12 +201,11 @@ fn http_connection_of(c: &Connection) -> Option<Rc<HttpConnection>> {
 // --- ngx_http_ssl_module.c ---
 
 /// ngx_http_ssl_alpn_select
-unsafe extern "C" fn ngx_http_ssl_alpn_select(ssl_conn: *mut SSL, out: *mut *const u8, outlen: *mut u8, inp: *const u8, inlen: c_uint, _arg: *mut c_void) -> c_int {
+fn ngx_http_ssl_alpn_select<'a>(ssl_conn: &mut SslRef, client: &'a [u8]) -> Result<&'a [u8], AlpnError> {
     let c = ngx_ssl_get_connection(ssl_conn);
 
-    if let Some(c) = c {
+    if let Some(c) = c.as_ref() {
         if c.log.debug_enabled(NGX_LOG_DEBUG_HTTP) {
-            let client = std::slice::from_raw_parts(inp, inlen as usize);
             let mut i = 0;
 
             while i < client.len() {
@@ -223,9 +219,9 @@ unsafe extern "C" fn ngx_http_ssl_alpn_select(ssl_conn: *mut SSL, out: *mut *con
         }
     }
 
-    let hc = c.and_then(http_connection_of);
+    let hc = c.as_deref().and_then(http_connection_of);
 
-    let srv: &[u8] = match hc {
+    let srv: &'static [u8] = match hc {
         Some(hc) if hc.addr_conf.quic => {
             let h3scf = crate::v3::module::srv_conf_of(&hc);
 
@@ -236,22 +232,24 @@ unsafe extern "C" fn ngx_http_ssl_alpn_select(ssl_conn: *mut SSL, out: *mut *con
             } else if h3scf.enable {
                 crate::v3::NGX_HTTP_V3_ALPN_PROTO
             } else {
-                return SSL_TLSEXT_ERR_ALERT_FATAL;
+                return Err(AlpnError::ALERT_FATAL);
             }
         }
         Some(hc) if crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2 => NGX_HTTP_V2_ALPN_PROTOS,
         _ => NGX_HTTP_ALPN_PROTOS,
     };
 
-    if SSL_select_next_proto(out as *mut *mut u8, outlen, srv.as_ptr(), srv.len() as c_uint, inp, inlen) != OPENSSL_NPN_NEGOTIATED {
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    // SSL_select_next_proto()
+    let out = match openssl::ssl::select_next_proto(srv, client) {
+        Some(out) => out,
+        None => return Err(AlpnError::ALERT_FATAL),
+    };
+
+    if let Some(c) = c.as_ref() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL ALPN selected: {}", B(out));
     }
 
-    if let Some(c) = c {
-        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL ALPN selected: {}", B(std::slice::from_raw_parts(*out, *outlen as usize)));
-    }
-
-    SSL_TLSEXT_ERR_OK
+    Ok(out)
 }
 
 /// ngx_http_ssl_static_variable: the value of a handler returning a static
@@ -366,7 +364,7 @@ fn ngx_http_ssl_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<d
     let prev_rc = conf_rc::<HttpSslSrvConf>(parent);
     let conf_rc = conf_rc::<HttpSslSrvConf>(child);
 
-    let conf_ptr = Rc::as_ptr(&conf_rc) as *mut c_void;
+    let conf_any: Rc<dyn Any> = conf_rc.clone();
 
     let prev = prev_rc.borrow();
     let mut conf_ref = conf_rc.borrow_mut();
@@ -433,7 +431,7 @@ fn ngx_http_ssl_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<d
         return Ok(());
     }
 
-    if ngx_ssl_create(&mut conf.ssl, conf.protocols, conf_ptr) != NGX_OK {
+    if ngx_ssl_create(&mut conf.ssl, conf.protocols, Some(conf_any)) != NGX_OK {
         return Err(ConfError::Logged);
     }
 
@@ -443,17 +441,17 @@ fn ngx_http_ssl_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<d
         return Err(ConfError::Logged);
     }
 
-    unsafe {
-        if SSL_CTX_set_tlsext_servername_callback(conf.ssl.ctx, ngx_http_ssl_servername) == 0 {
-            ngx_log_error!(
-                NGX_LOG_WARN,
-                cf.log,
-                None,
-                "nginx was built with SNI support, however, now it is linked dynamically to an OpenSSL library which has no tlsext support, therefore SNI is not available"
-            );
-        }
+    if !ngx_ssl_set_servername_callback(&mut conf.ssl, ngx_http_ssl_servername) {
+        ngx_log_error!(
+            NGX_LOG_WARN,
+            cf.log,
+            None,
+            "nginx was built with SNI support, however, now it is linked dynamically to an OpenSSL library which has no tlsext support, therefore SNI is not available"
+        );
+    }
 
-        SSL_CTX_set_alpn_select_cb(conf.ssl.ctx, Some(ngx_http_ssl_alpn_select), std::ptr::null_mut());
+    if let Some(ctx) = conf.ssl.ctx.builder_mut() {
+        ctx.set_alpn_select_callback(ngx_http_ssl_alpn_select);
     }
 
     if ngx_ssl_ciphers(cf, &mut conf.ssl, &conf.ciphers, *conf.prefer_server_ciphers) != NGX_OK {
@@ -465,9 +463,7 @@ fn ngx_http_ssl_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<d
     if conf.certificate_values.is_some() {
         /* install callback to lookup certificates */
 
-        unsafe {
-            SSL_CTX_set_cert_cb(conf.ssl.ctx, Some(ngx_http_ssl_certificate), conf_ptr);
-        }
+        ngx_ssl_set_cert_callback(&mut conf.ssl, ngx_http_ssl_certificate);
     } else if conf.certificates.is_set() {
         /* configure certificates */
 
@@ -549,9 +545,7 @@ fn ngx_http_ssl_merge_srv_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<d
     conf.session_tickets.merge(&prev.session_tickets, true);
 
     if !*conf.session_tickets {
-        unsafe {
-            SSL_CTX_set_options(conf.ssl.ctx, SSL_OP_NO_TICKET);
-        }
+        ngx_ssl_set_options(&mut conf.ssl, sys::SSL_OP_NO_TICKET);
     }
 
     merge_ptr(&mut conf.session_ticket_keys, &prev.session_ticket_keys);
@@ -979,18 +973,20 @@ fn ngx_http_ssl_quic_compat_init(cf: &mut Conf, addr: &crate::core::ConfAddr) ->
     for cscf in addr.servers.iter() {
         let sscf = sscf_of_ctx(&cscf.borrow().ctx);
 
-        let (certificates, reject_handshake, ctx) = {
+        let (certificates, reject_handshake) = {
             let s = sscf.borrow();
-            (s.certificates.is_set(), s.reject_handshake.as_option().copied().unwrap_or(false), s.ssl.ctx)
+            (s.certificates.is_set(), s.reject_handshake.as_option().copied().unwrap_or(false))
         };
 
         if certificates || reject_handshake {
-            if ngx_core::quic::openssl_compat::ngx_quic_compat_ext_init(&cf.log, ctx) != NGX_OK {
+            let mut s = sscf.borrow_mut();
+
+            if ngx_core::quic::openssl_compat::ngx_quic_compat_ext_init(&cf.log, &mut s.ssl) != NGX_OK {
                 return Err(ConfError::Logged);
             }
 
             if addr.opt.quic {
-                ngx_core::quic::openssl_compat::ngx_quic_compat_keylog_init(ctx);
+                ngx_core::quic::openssl_compat::ngx_quic_compat_keylog_init(&mut s.ssl);
             }
         }
     }
@@ -1214,15 +1210,8 @@ fn ngx_http_ssl_handshake_handler(c: &Rc<Connection>, hc: &Rc<HttpConnection>, t
 
         let h2 = crate::v2::module::srv_enabled(&hc.conf_ctx.borrow()) || hc.addr_conf.http2;
 
-        if h2 {
-            let mut data: *const u8 = std::ptr::null();
-            let mut len: c_uint = 0;
-
-            unsafe { SSL_get0_alpn_selected(ssl_ptr(&sc), &mut data, &mut len) };
-
-            if len == 2 && unsafe { std::slice::from_raw_parts(data, 2) } == b"h2" {
-                return SslHandshakeNext::Http2;
-            }
+        if h2 && sc.with(|ssl| ssl.selected_alpn_protocol() == Some(&b"h2"[..])).unwrap_or(false) {
+            return SslHandshakeNext::Http2;
         }
 
         c.log.set_action(Some("waiting for request"));
@@ -1274,60 +1263,52 @@ fn ngx_http_find_virtual_server_ssl(c: &Connection, hc: &HttpConnection, host: &
 }
 
 /// ngx_http_ssl_servername: the server of the connection by the server name
-/// (from ngx_ssl_client_hello_callback() with the name as arg, or as the
-/// tlsext servername callback with no arg)
-unsafe extern "C" fn ngx_http_ssl_servername(ssl_conn: *mut SSL, ad: *mut c_int, arg: *mut c_void) -> c_int {
-    let c = match ngx_ssl_get_connection(ssl_conn) {
-        Some(c) => c,
-        None => return SSL_TLSEXT_ERR_OK,
-    };
-
+/// (from ngx_ssl_client_hello_callback() with the name, or as the tlsext
+/// servername callback)
+fn ngx_http_ssl_servername(c: &Rc<Connection>, ssl_conn: &mut SslRef, ad: &mut i32, arg: SniArg<'_>) -> i32 {
     let sc = match c.ssl.borrow().clone() {
         Some(sc) => sc,
-        None => return SSL_TLSEXT_ERR_OK,
+        None => return sys::SSL_TLSEXT_ERR_OK,
     };
 
     if sc.handshaked.get() {
-        *ad = SSL_AD_NO_RENEGOTIATION;
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+        *ad = sys::SSL_AD_NO_RENEGOTIATION;
+        return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
     if sc.state.sni_accepted.get() {
-        return SSL_TLSEXT_ERR_OK;
+        return sys::SSL_TLSEXT_ERR_OK;
     }
 
     if sc.state.handshake_rejected.get() {
-        *ad = SSL_AD_UNRECOGNIZED_NAME;
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+        *ad = sys::SSL_AD_UNRECOGNIZED_NAME;
+        return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
     let hc = match http_connection_of(c) {
         Some(hc) => hc,
         None => {
-            *ad = SSL_AD_INTERNAL_ERROR;
-            return SSL_TLSEXT_ERR_ALERT_FATAL;
+            *ad = sys::SSL_AD_INTERNAL_ERROR;
+            return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
         }
     };
 
     let error = 'done: {
-        let host: Vec<u8> = if !arg.is_null() {
-            let h = &*(arg as *const SslStr);
+        let host: Vec<u8> = match arg {
+            SniArg::Hello(Some(h)) => h.to_vec(),
 
-            if h.data.is_null() {
+            SniArg::Hello(None) => {
                 ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL server name: null");
                 break 'done false;
             }
 
-            std::slice::from_raw_parts(h.data, h.len).to_vec()
-        } else {
-            let servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
-
-            if servername.is_null() {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL server name: null");
-                break 'done false;
-            }
-
-            std::ffi::CStr::from_ptr(servername).to_bytes().to_vec()
+            SniArg::Callback => match ssl_conn.servername_raw(NameType::HOST_NAME) {
+                Some(name) => name.to_vec(),
+                None => {
+                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL server name: null");
+                    break 'done false;
+                }
+            },
         };
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "SSL server name: \"{}\"", B(&host));
@@ -1364,33 +1345,23 @@ unsafe extern "C" fn ngx_http_ssl_servername(ssl_conn: *mut SSL, ad: *mut c_int,
 
         let (buffer_size, sctx) = {
             let s = sscf.borrow();
-            (s.buffer_size.as_option().copied().unwrap_or(NGX_SSL_BUFSIZE), s.ssl.ctx)
+            (s.buffer_size.as_option().copied().unwrap_or(NGX_SSL_BUFSIZE), s.ssl.ctx.get())
         };
 
         sc.buffer_size.set(buffer_size);
 
-        if !sctx.is_null() {
-            if SSL_set_SSL_CTX(ssl_conn, sctx).is_null() {
-                break 'done true;
-            }
-
+        if let Some(sctx) = sctx {
             /*
              * SSL_set_SSL_CTX() only changes certs as of 1.0.0d
              * adjust other things we care about
              */
 
-            SSL_set_verify(ssl_conn, SSL_CTX_get_verify_mode(sctx), SSL_CTX_get_verify_callback(sctx));
-
-            SSL_set_verify_depth(ssl_conn, SSL_CTX_get_verify_depth(sctx));
-
-            SSL_clear_options(ssl_conn, SSL_get_options(ssl_conn) & !SSL_CTX_get_options(sctx));
-
-            SSL_set_options(ssl_conn, SSL_CTX_get_options(sctx));
-
-            SSL_set_options(ssl_conn, SSL_OP_NO_RENEGOTIATION);
+            if !ngx_ssl_set_ssl_ctx(ssl_conn, &sctx) {
+                break 'done true;
+            }
 
             if c.listening().is_some_and(|ls| ls.quic.get()) {
-                SSL_clear_options(ssl_conn, SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
+                sys::clear_options(ssl_conn, sys::SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
             }
         }
 
@@ -1398,8 +1369,8 @@ unsafe extern "C" fn ngx_http_ssl_servername(ssl_conn: *mut SSL, ad: *mut c_int,
     };
 
     if error {
-        *ad = SSL_AD_INTERNAL_ERROR;
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+        *ad = sys::SSL_AD_INTERNAL_ERROR;
+        return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
     // done:
@@ -1412,24 +1383,19 @@ unsafe extern "C" fn ngx_http_ssl_servername(ssl_conn: *mut SSL, ad: *mut c_int,
 
     if reject {
         sc.state.handshake_rejected.set(true);
-        *ad = SSL_AD_UNRECOGNIZED_NAME;
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
+        *ad = sys::SSL_AD_UNRECOGNIZED_NAME;
+        return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
     sc.state.sni_accepted.set(true);
 
-    SSL_TLSEXT_ERR_OK
+    sys::SSL_TLSEXT_ERR_OK
 }
 
 /// ngx_http_ssl_certificate: the certificate callback loading the
-/// certificates with variables, evaluated in a request made for it; arg is
-/// the configuration of the server of the context
-unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_void) -> c_int {
-    let c = match ngx_ssl_get_connection(ssl_conn) {
-        Some(c) => c,
-        None => return 0,
-    };
-
+/// certificates with variables, evaluated in a request made for it; conf
+/// is the configuration of the server of the context
+fn ngx_http_ssl_certificate(c: &Rc<Connection>, ssl_conn: &mut SslRef, conf: Option<Rc<dyn Any>>) -> i32 {
     let handshaked = c.ssl.borrow().as_ref().map(|sc| sc.handshaked.get()).unwrap_or(true);
 
     if handshaked {
@@ -1438,18 +1404,21 @@ unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_vo
 
     // r = ngx_http_alloc_request(c)
 
-    let (crc, hc) = match (ngx_core::connection::connection_rc(c), http_connection_of(c)) {
-        (Some(crc), Some(hc)) => (crc, hc),
-        _ => return 0,
+    let hc = match http_connection_of(c) {
+        Some(hc) => hc,
+        None => return 0,
     };
 
-    let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(&crc), request: RefCell::new(None), current_request: RefCell::new(None) });
+    let sscf = match conf.and_then(|conf| conf.downcast::<RefCell<HttpSslSrvConf>>().ok()) {
+        Some(s) => s,
+        None => return 0,
+    };
 
-    let r = alloc_request(&crc, &hc, &log_ctx);
+    let log_ctx = Rc::new(HttpLogCtx { connection: Rc::downgrade(c), request: RefCell::new(None), current_request: RefCell::new(None) });
+
+    let r = alloc_request(c, &hc, &log_ctx);
 
     r.logged.set(true);
-
-    let sscf = &*(arg as *const RefCell<HttpSslSrvConf>);
 
     let (certs, keys, cache, passwords) = {
         let sscf = sscf.borrow();
@@ -1464,7 +1433,9 @@ unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_vo
     let mut rc = 1;
 
     for i in 0..certs.len() {
-        let mut cert = match complex_value(&r, &certs[i]) {
+        // the variables read the SSL object of the connection, which the
+        // callback has
+        let mut cert = match sys::with_current(ssl_conn, || complex_value(&r, &certs[i])) {
             Ok(v) => v,
             Err(_) => {
                 rc = 0;
@@ -1474,7 +1445,7 @@ unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_vo
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "ssl cert: \"{}\"", B(&cert));
 
-        let mut key = match complex_value(&r, &keys[i]) {
+        let mut key = match sys::with_current(ssl_conn, || complex_value(&r, &keys[i])) {
             Ok(v) => v,
             Err(_) => {
                 rc = 0;
@@ -1484,7 +1455,7 @@ unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_vo
 
         ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "ssl key: \"{}\"", B(&key));
 
-        if ngx_ssl_connection_certificate(c, &mut cert, &mut key, cache.as_ref(), passwords.as_ref()) != NGX_OK {
+        if ngx_ssl_connection_certificate_ssl(c, ssl_conn, &mut cert, &mut key, cache.as_ref(), passwords.as_ref()) != NGX_OK {
             rc = 0;
             break;
         }
@@ -1499,14 +1470,7 @@ unsafe extern "C" fn ngx_http_ssl_certificate(ssl_conn: *mut SSL, arg: *mut c_vo
 
 /// ngx_ssl_remove_cached_session(c->ssl->session_ctx, SSL_get0_session())
 fn remove_cached_session(c: &Connection) {
-    let sc = match c.ssl.borrow().clone() {
-        Some(sc) => sc,
-        None => return,
-    };
-
-    let sess = unsafe { SSL_get0_session(ssl_ptr(&sc)) };
-
-    ngx_ssl_remove_cached_session(sc.state.session_ctx.get(), sess);
+    ngx_ssl_remove_cached_session(c);
 }
 
 /// The SSL checks of ngx_http_process_request(): NGX_OK, or the status the
@@ -1530,9 +1494,7 @@ pub fn ngx_http_process_request_ssl(r: &R) -> i64 {
     };
 
     if verify != 0 {
-        let ssl = ngx_ssl_conn(c);
-
-        let rc = unsafe { SSL_get_verify_result(ssl) };
+        let rc = ngx_ssl_get_verify_result(c);
 
         if rc != X509_V_OK && (verify != 3 || !ngx_ssl_verify_error_optional(rc)) {
             ngx_log_error!(NGX_LOG_INFO, c.log, None, "client SSL certificate verify error: ({}:{})", rc, B(&ngx_ssl_verify_error_string(rc)));
@@ -1542,18 +1504,12 @@ pub fn ngx_http_process_request_ssl(r: &R) -> i64 {
             return NGX_HTTPS_CERT_ERROR;
         }
 
-        if verify == 1 {
-            let cert = unsafe { SSL_get1_peer_certificate(ssl) };
+        if verify == 1 && ngx_ssl_with(c, |ssl| ssl.peer_certificate().is_none()).unwrap_or(true) {
+            ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent no required SSL certificate");
 
-            if cert.is_null() {
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent no required SSL certificate");
+            remove_cached_session(c);
 
-                remove_cached_session(c);
-
-                return NGX_HTTPS_NO_CERT;
-            }
-
-            unsafe { X509_free(cert) };
+            return NGX_HTTPS_NO_CERT;
         }
 
         if let Err(s) = ngx_ssl_ocsp_get_status(c) {

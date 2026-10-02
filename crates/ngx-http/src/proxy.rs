@@ -882,7 +882,7 @@ fn proxy_set_ssl(cf: &mut Conf, plcf: &mut NgxHttpProxyLocConf) -> ConfResult {
         return Ok(());
     }
 
-    if ngx_ssl_create(&mut ssl, plcf.ssl_protocols, std::ptr::null_mut()) != NGX_OK {
+    if ngx_ssl_create(&mut ssl, plcf.ssl_protocols, None) != NGX_OK {
         return Err(ConfError::Logged);
     }
 

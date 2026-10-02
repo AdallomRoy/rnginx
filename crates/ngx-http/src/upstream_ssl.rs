@@ -12,12 +12,11 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::os::raw::c_void;
 use std::rc::{Rc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use foreign_types::ForeignType;
+use ngx_sys::ssl as sys;
 use tokio::io::ReadBuf;
 use tokio::time::Instant;
 
@@ -231,21 +230,18 @@ impl PeerConn {
 
         match sc {
             Some(sc) => {
-                let ssl = ssl_ptr(&sc);
-
-                if !ssl.is_null() && sc.handshaked.get() {
-                    // SAFETY: the SSL object is alive while c->ssl holds it
-                    unsafe {
-                        if openssl_sys::SSL_get_shutdown(ssl) & openssl_sys::SSL_SENT_SHUTDOWN == 0 {
+                if sc.handshaked.get() {
+                    sc.with_mut(|ssl| {
+                        if sys::get_shutdown(ssl) & sys::SSL_SENT_SHUTDOWN == 0 {
                             ngx_ssl_clear_error(&c.log);
 
-                            let n = openssl_sys::SSL_shutdown(ssl);
+                            let io = sys::shutdown(ssl);
 
-                            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL_shutdown: {}", n);
+                            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "SSL_shutdown: {}", io.rc);
 
-                            openssl_sys::ERR_clear_error();
+                            sys::err_clear_error();
                         }
-                    }
+                    });
                 }
             }
 
@@ -316,21 +312,24 @@ fn recv_step(c: &Connection, buf: &mut [u8]) -> IoStep<io::Result<usize>> {
 
 /// A send() attempt on a connection without c->ssl.
 fn send_step(c: &Connection, data: &[u8]) -> IoStep<io::Result<usize>> {
-    let n = unsafe { libc::send(c.fd.get(), data.as_ptr() as *const c_void, data.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+    use nix::sys::socket::MsgFlags;
 
-    if n < 0 {
-        let e = io::Error::last_os_error();
+    let n = match nix::sys::socket::send(c.fd.get(), data, MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT) {
+        Ok(n) => n,
+        Err(errno) => {
+            let e = io::Error::from_raw_os_error(errno as i32);
 
-        if e.kind() == io::ErrorKind::WouldBlock {
-            return IoStep::WantWrite;
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return IoStep::WantWrite;
+            }
+
+            return IoStep::Done(Err(e));
         }
-
-        return IoStep::Done(Err(e));
-    }
+    };
 
     c.sent.set(c.sent.get() + n as u64);
 
-    IoStep::Done(Ok(n as usize))
+    IoStep::Done(Ok(n))
 }
 
 /// SSL_peek() for a byte: done when application data is there, the
@@ -340,9 +339,7 @@ fn ssl_peek_step(c: &Connection, sc: &SslConnection) -> IoStep<()> {
         return IoStep::Done(());
     }
 
-    let ssl = ssl_ptr(sc);
-
-    if ssl.is_null() {
+    if sc.inner.borrow().is_none() {
         return IoStep::Done(());
     }
 
@@ -350,21 +347,21 @@ fn ssl_peek_step(c: &Connection, sc: &SslConnection) -> IoStep<()> {
 
     let mut b = [0u8; 1];
 
-    // SAFETY: the SSL object is alive while c->ssl holds it
-    unsafe {
-        let n = openssl_sys::SSL_peek(ssl, b.as_mut_ptr() as *mut c_void, 1);
+    let io = match sc.with_mut(|ssl| sys::peek(ssl, &mut b)) {
+        Some(io) => io,
+        None => return IoStep::Done(()),
+    };
 
-        if n > 0 {
-            return IoStep::Done(());
-        }
+    if io.rc > 0 {
+        return IoStep::Done(());
+    }
 
-        match openssl_sys::SSL_get_error(ssl, n) {
-            openssl_sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
-            openssl_sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
-            _ => {
-                openssl_sys::ERR_clear_error();
-                IoStep::Done(())
-            }
+    match io.error {
+        sys::SSL_ERROR_WANT_READ => IoStep::WantRead,
+        sys::SSL_ERROR_WANT_WRITE => IoStep::WantWrite,
+        _ => {
+            sys::err_clear_error();
+            IoStep::Done(())
         }
     }
 }
@@ -431,9 +428,9 @@ pub(crate) async fn ssl_init_connection(r: &R, u: &mut UpstreamPeer, c: &Rc<Conn
         // u->peer.set_session
 
         if let Some(session) = u.set_session() {
-            let rc = ngx_ssl_set_session(c, session.as_ptr());
+            let rc = ngx_ssl_set_session(c, Some(&session));
 
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, u.pc.log, "set session: {:p}", session.as_ptr());
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, u.pc.log, "set session: {:p}", &*session);
 
             if rc != NGX_OK {
                 return Err(ConnectError::Internal);
@@ -537,15 +534,10 @@ fn ssl_save_session(c: &Connection) {
         None => return,
     };
 
-    let sess = ngx_ssl_get_session(c);
-
-    if sess.is_null() {
-        return;
-    }
-
-    // SAFETY: ngx_ssl_get_session() returned a reference of the session,
-    // which the SslSession owns from now on
-    let session = unsafe { openssl::ssl::SslSession::from_ptr(sess) };
+    let session = match ngx_ssl_get_session(c) {
+        Some(s) => s,
+        None => return,
+    };
 
     let mut b = match balancer.try_borrow_mut() {
         Ok(b) => b,

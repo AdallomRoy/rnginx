@@ -1,6 +1,6 @@
 //! Stream variables (ngx_stream_variables.c).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use ngx_core::conf::*;
@@ -104,6 +104,24 @@ pub fn add_variables(cf: &mut Conf, vars: &[VarDef]) -> ConfResult {
 
 thread_local! {
     static VARIABLE_DEPTH: Cell<usize> = const { Cell::new(100) };
+    /// The name a prefix variable is looked up by in get_variable() (the
+    /// data of the handler is then usize::MAX)
+    static PREFIX_NAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The full name of the variable of a prefix variable handler: the data C
+/// passes is a pointer to the name (&v[i].name for the indexed ones, the
+/// name looked up in ngx_stream_get_variable()); here it is the index of
+/// the variable, usize::MAX for a lookup by name.
+pub fn prefix_var_name(s: &Session, data: usize) -> Vec<u8> {
+    if data == usize::MAX {
+        return PREFIX_NAME.with(|n| n.borrow().clone());
+    }
+
+    let cmcf = s.cmcf();
+    let m = cmcf.borrow();
+
+    m.variables.get(data).map(|v| v.name.clone()).unwrap_or_default()
 }
 
 /// ngx_stream_add_variable
@@ -352,10 +370,10 @@ pub fn get_variable(s: &Session, name: &[u8], key: usize) -> Option<VariableValu
     };
 
     if let Some(v) = prefix {
-        let name = name.to_vec();
+        PREFIX_NAME.with(|n| *n.borrow_mut() = name.to_vec());
 
         let rc = match v.get_handler.get() {
-            Some(get) => get(s, &mut vv, &name as *const Vec<u8> as usize),
+            Some(get) => get(s, &mut vv, usize::MAX),
             None => NGX_ERROR,
         };
 
@@ -453,7 +471,7 @@ fn variable_proxy_protocol_port(s: &Session, v: &mut VariableValue, data: usize)
 
 fn variable_proxy_protocol_tlv(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
     // data: the variable name (ngx_str_t *)
-    let name = unsafe { &*(data as *const Vec<u8>) };
+    let name = prefix_var_name(s, data);
 
     let tlv = &name[b"proxy_protocol_tlv_".len()..];
 
@@ -782,7 +800,8 @@ pub fn init_vars(cf: &mut Conf) -> ConfResult {
 
         if let Some(av) = found {
             v.get_handler.set(av.get_handler.get());
-            v.data.set(&v.name as *const Vec<u8> as usize);
+            // v[i].data = (uintptr_t) &v[i].name: prefix_var_name()
+            v.data.set(i);
             v.flags.set(av.flags.get());
 
             continue 'next;

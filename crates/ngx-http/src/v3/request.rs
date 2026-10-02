@@ -179,25 +179,7 @@ pub fn init(c: &Rc<Connection>) -> i64 {
 
 /// SSL_get0_alpn_selected()
 fn alpn_selected(c: &Connection) -> Vec<u8> {
-    let ssl = ngx_core::event_openssl::ngx_ssl_conn(c);
-
-    if ssl.is_null() {
-        return Vec::new();
-    }
-
-    let mut data: *const u8 = std::ptr::null();
-    let mut len: std::os::raw::c_uint = 0;
-
-    // SAFETY: the SSL object of the connection; the protocol stays with it
-    unsafe {
-        ngx_core::openssl_ffi::SSL_get0_alpn_selected(ssl, &mut data, &mut len);
-
-        if data.is_null() || len == 0 {
-            return Vec::new();
-        }
-
-        std::slice::from_raw_parts(data, len as usize).to_vec()
-    }
+    ngx_core::event_openssl::ngx_ssl_with(c, |ssl| ssl.selected_alpn_protocol().map(|p| p.to_vec())).flatten().unwrap_or_default()
 }
 
 /// ngx_http_v3_shutdown: the shutdown handler of the QUIC connection
