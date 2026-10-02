@@ -4338,9 +4338,58 @@ async fn duplex_failure(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, f: 
     }
 }
 
-/// The in-flight output of the event pipe: the output filter's future and
-/// the raw buffers of its memory buffers.
-type PipeWriter<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = i64> + 'a>>;
+/// The output of the event pipe to the client (the output filter's future
+/// of a batch), in a slot allocated once for the pipe and refilled for each
+/// batch: Option<F> of the output filter's future F.
+trait PipeOut {
+    /// a batch is being sent
+    fn in_flight(&self) -> bool;
+    /// the batch's output, once in flight
+    fn poll_out(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64>;
+    /// the batch's output done: no longer in flight
+    fn clear(self: std::pin::Pin<&mut Self>);
+}
+
+impl<F: std::future::Future<Output = i64>> PipeOut for Option<F> {
+    fn in_flight(&self) -> bool {
+        self.is_some()
+    }
+
+    fn poll_out(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<i64> {
+        match self.as_pin_mut() {
+            Some(f) => f.poll(cx),
+            None => std::task::Poll::Ready(NGX_OK),
+        }
+    }
+
+    fn clear(mut self: std::pin::Pin<&mut Self>) {
+        self.set(None);
+    }
+}
+
+/// The in-flight output of the event pipe when it stops: the slot of the
+/// pipe (PipeOut), with a batch in flight.
+type PipeWriter<'a> = std::pin::Pin<Box<dyn PipeOut + 'a>>;
+
+/// The output slot of a pipe, not allocated yet, for the futures `make`
+/// makes of the batches.
+fn pipe_out_slot<F>(_make: &impl Fn(Chain) -> F) -> Option<std::pin::Pin<Box<Option<F>>>> {
+    None
+}
+
+/// The output slot of a pipe, if a batch is in flight.
+fn pipe_in_flight<W: PipeOut + ?Sized>(out: &Option<std::pin::Pin<Box<W>>>) -> bool {
+    out.as_ref().is_some_and(|w| w.in_flight())
+}
+
+/// The slot of a pipe that stops, as the caller takes it: only if a batch
+/// is in flight.
+fn pipe_writer<'a, W: PipeOut + 'a>(out: Option<std::pin::Pin<Box<W>>>) -> Option<PipeWriter<'a>> {
+    match out {
+        Some(w) if w.in_flight() => Some(w),
+        _ => None,
+    }
+}
 
 /// How the event pipe stopped.
 enum PipeEnd {
@@ -4522,8 +4571,8 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
     // the upstream is done)
     r.connection.log.set_action(Some("sending to client"));
 
-    if let Some(fut) = inflight {
-        if fut.await == NGX_ERROR {
+    if let Some(mut out) = inflight {
+        if std::future::poll_fn(|cx| out.as_mut().poll_out(cx)).await == NGX_ERROR {
             p.downstream_error = true;
         }
 
@@ -4585,7 +4634,9 @@ async fn finalize_tail(r: &R, u: &mut Upstream, rc: i64) -> i64 {
 /// cannot (and, cacheable, all of it). Returns the output still being
 /// sent when the upstream is done.
 async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p: &mut crate::event_pipe::EventPipe) -> (PipeEnd, Option<PipeWriter<'a>>) {
-    let mut writer: Option<PipeWriter<'a>> = None;
+    // the output slot (PipeOut), allocated with the first batch
+    let output = |batch: Chain| crate::core_rt::output_filter(r, batch);
+    let mut writer = pipe_out_slot(&output);
     let mut delayed: Option<Instant> = None;
 
     // the pre-read part of the body (p->preread_bufs)
@@ -4675,11 +4726,17 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
         }
 
         // ngx_event_pipe_write_to_downstream: what can be written now
-        while writer.is_none() && !p.upstream_finished() {
+        while !pipe_in_flight(&writer) && !p.upstream_finished() {
             match p.write_batch() {
                 Some(batch) => {
                     p.begin_send(&batch);
-                    writer = Some(Box::pin(crate::core_rt::output_filter(r, batch)));
+
+                    let out = output(batch);
+
+                    match writer.as_mut() {
+                        Some(w) => std::pin::Pin::as_mut(w).set(Some(out)),
+                        None => writer = Some(Box::pin(Some(out))),
+                    }
 
                     poll_writer(&mut writer, p);
                 }
@@ -4688,7 +4745,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
         }
 
         if p.upstream_finished() {
-            return (PipeEnd::Upstream, writer);
+            return (PipeEnd::Upstream, pipe_writer(writer));
         }
 
         // ngx_http_upstream_process_request: a client error, the response
@@ -4714,7 +4771,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 }
             }
 
-            if delayed.is_none() && p.read_chain(&mut chain, writer.is_none()).is_err() {
+            if delayed.is_none() && p.read_chain(&mut chain, !pipe_in_flight(&writer)).is_err() {
                 return (PipeEnd::Finalize(NGX_ERROR), None);
             }
         }
@@ -4751,19 +4808,17 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
             let upstream_writer = &mut u.writer;
             let reading_body = r.reading_body.get();
             let send_timer = u.send_timer;
-            let downstream = writer.is_some();
+            let downstream = pipe_in_flight(&writer);
             let read_chain = &mut chain;
             let (timer, mut sleep) = (&mut read_timer, read_sleep.as_mut());
 
             tokio::select! {
                 biased;
 
-                rc = async {
-                    match writer.as_mut() {
-                        Some(fut) => fut.as_mut().await,
-                        None => std::future::pending().await,
-                    }
-                }, if downstream => Ev::Written(rc),
+                rc = std::future::poll_fn(|cx| match writer.as_mut() {
+                    Some(w) => std::pin::Pin::as_mut(w).poll_out(cx),
+                    None => std::task::Poll::Pending,
+                }), if downstream => Ev::Written(rc),
 
                 res = std::future::poll_fn(|cx| timer.poll(sleep.as_mut(), cx, |cx| poll_pipe_recv_conn(pc, cx, read_chain, limit))), if reading => Ev::Read(Some(res)),
 
@@ -4796,11 +4851,20 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                 }
             };
 
+            let downstream = pipe_in_flight(&writer);
+
             let write = async {
-                match writer.as_mut() {
-                    Some(fut) => Ev::Written(fut.as_mut().await),
-                    None => std::future::pending().await,
+                if !downstream {
+                    return std::future::pending().await;
                 }
+
+                Ev::Written(
+                    std::future::poll_fn(|cx| match writer.as_mut() {
+                        Some(w) => std::pin::Pin::as_mut(w).poll_out(cx),
+                        None => std::task::Poll::Pending,
+                    })
+                    .await,
+                )
             };
 
             let delay = async {
@@ -4830,7 +4894,9 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
         match ev {
             Ev::Written(rc) => {
-                writer = None;
+                if let Some(w) = writer.as_mut() {
+                    std::pin::Pin::as_mut(w).clear();
+                }
 
                 p.end_send();
 
@@ -4916,7 +4982,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                         p.upstream_error = true;
                         upstream_timed_out(r, u);
 
-                        return (PipeEnd::TimedOut, writer);
+                        return (PipeEnd::TimedOut, pipe_writer(writer));
                     }
 
                     Some(Ok(Err(e))) => {
@@ -4966,7 +5032,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
                         if n == size {
                             poll_writer(&mut writer, p);
 
-                            let downstream_ready = writer.is_none();
+                            let downstream_ready = !pipe_in_flight(&writer);
 
                             if read_ready(r, u, m, p, downstream_ready, &mut delayed) == NGX_ERROR {
                                 return (PipeEnd::Finalize(NGX_ERROR), None);
@@ -4986,21 +5052,23 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 /// p->downstream->write->ready: the output in flight polled once, and if it
 /// is done (the client took it all, or an error), taken as the write event
 /// handler takes it.
-fn poll_writer(writer: &mut Option<PipeWriter<'_>>, p: &mut crate::event_pipe::EventPipe) {
+fn poll_writer<W: PipeOut + ?Sized>(writer: &mut Option<std::pin::Pin<Box<W>>>, p: &mut crate::event_pipe::EventPipe) {
     let done = match writer.as_mut() {
-        Some(fut) => {
+        Some(w) if w.in_flight() => {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
-            match fut.as_mut().poll(&mut cx) {
+            match w.as_mut().poll_out(&mut cx) {
                 std::task::Poll::Ready(rc) => Some(rc),
                 std::task::Poll::Pending => None,
             }
         }
-        None => None,
+        _ => None,
     };
 
     if let Some(rc) = done {
-        *writer = None;
+        if let Some(w) = writer.as_mut() {
+            w.as_mut().clear();
+        }
 
         p.end_send();
 
