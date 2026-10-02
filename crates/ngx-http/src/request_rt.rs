@@ -49,9 +49,9 @@ pub fn init_connection(c: Rc<Connection>) {
         return;
     }
 
-    ngx_core::event::spawn(async move {
-        connection_task(c).await;
-    });
+    // (the task's own future: a tokio task is a 128-byte aligned block
+    // holding it, which an async block around it makes larger)
+    ngx_core::event::spawn(connection_task(c));
 }
 
 fn addr_conf_for(c: &Rc<Connection>) -> Option<Rc<AddrConf>> {
@@ -629,38 +629,41 @@ type HeaderConf = (bool, bool, i64);
 /// while reading, the deadline; it awaits only the reads, the request's
 /// processing, and the (boxed) error paths.
 async fn run_request(r: &R) -> End {
-    let mut deadline: Option<tokio::time::Instant> = None;
-    // the header lines are read (after the request line), with their conf
-    let mut headers: Option<HeaderConf> = None;
-    let mut read = true;
+    // (a block: what the reading keeps is not kept by the rest)
+    let next = {
+        let mut deadline: Option<tokio::time::Instant> = None;
+        // the header lines are read (after the request line), with their conf
+        let mut headers: Option<HeaderConf> = None;
+        let mut read = true;
 
-    http_debug!(r, "http process request line");
-    let next = loop {
-        if read {
-            match read_request_header(r, &mut deadline).await {
-                Ok(true) => {}
-                Ok(false) => match large_header_buffer(r, headers.is_none()) {
-                    Next::Read => continue,
-                    next => break next,
-                },
-                Err(status) if status == NGX_HTTP_REQUEST_TIME_OUT => break Next::Close(status),
-                Err(status) => break Next::Finalize(status),
+        http_debug!(r, "http process request line");
+        loop {
+            if read {
+                match read_request_header(r, &mut deadline).await {
+                    Ok(true) => {}
+                    Ok(false) => match large_header_buffer(r, headers.is_none()) {
+                        Next::Read => continue,
+                        next => break next,
+                    },
+                    Err(status) if status == NGX_HTTP_REQUEST_TIME_OUT => break Next::Close(status),
+                    Err(status) => break Next::Finalize(status),
+                }
             }
-        }
-        let next = match headers {
-            None => request_line(r),
-            Some(conf) => header_line(r, conf),
-        };
-        match next {
-            Next::Read => read = true,
-            Next::Line => read = false,
-            Next::Headers => {
-                let cscf = r.cscf();
-                let s = cscf.borrow();
-                headers = Some((*s.underscores_in_headers, *s.ignore_invalid_headers, *s.max_headers));
-                read = true;
+            let next = match headers {
+                None => request_line(r),
+                Some(conf) => header_line(r, conf),
+            };
+            match next {
+                Next::Read => read = true,
+                Next::Line => read = false,
+                Next::Headers => {
+                    let cscf = r.cscf();
+                    let s = cscf.borrow();
+                    headers = Some((*s.underscores_in_headers, *s.ignore_invalid_headers, *s.max_headers));
+                    read = true;
+                }
+                next => break next,
             }
-            next => break next,
         }
     };
     match next {
