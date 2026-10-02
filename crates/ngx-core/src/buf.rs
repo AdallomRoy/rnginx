@@ -373,13 +373,7 @@ pub fn write_chain_to_temp_file(
                 continue;
             }
 
-            let n = unsafe {
-                libc::pwrite(tf.fd, data.as_ptr() as *const libc::c_void, data.len(), tf.offset)
-            };
-
-            if n < 0 {
-                return Err(crate::os::errno());
-            }
+            let n = os::pwrite(tf.fd, data, tf.offset)?;
 
             tf.offset += n as i64;
             written += n as i64;
@@ -387,6 +381,15 @@ pub fn write_chain_to_temp_file(
     }
 
     Ok(written)
+}
+
+/// sendfile() between descriptors of the process; Err(errno).
+fn sendfile(dst_fd: i32, src_fd: i32, pos: &mut u64, size: usize) -> Result<usize, i32> {
+    let errno = |e: std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    let dst = crate::fd::get(dst_fd).map_err(errno)?;
+    let src = crate::fd::get(src_fd).map_err(errno)?;
+
+    rustix::fs::sendfile(&dst, &src, Some(pos), size).map_err(|e| e.raw_os_error())
 }
 
 pub fn ngx_write_chain_to_file(dst_fd: i32, chain: &Chain) -> Result<i64, i32> {
@@ -403,30 +406,20 @@ pub fn ngx_write_chain_to_file(dst_fd: i32, chain: &Chain) -> Result<i64, i32> {
                 continue;
             }
 
-            let n = unsafe {
-                libc::write(dst_fd, data.as_ptr() as *const libc::c_void, data.len())
-            };
-
-            if n < 0 {
-                return Err(crate::os::errno());
-            }
+            let n = os::write_fd(dst_fd, data)?;
 
             written += n as i64;
         } else if buf.in_file {
             if let BufData::File(f) = &buf.data {
-                let mut pos = buf.file_pos;
-                let last = buf.file_last;
+                // the off_t of sendfile(), as unsigned
+                let mut pos = buf.file_pos as u64;
+                let last = buf.file_last as u64;
 
                 while pos < last {
                     let size = (last - pos) as usize;
-                    let n = unsafe {
-                        libc::sendfile(dst_fd, f.fd, &mut pos, size)
-                    };
+                    let n = sendfile(dst_fd, f.fd, &mut pos, size)?;
 
-                    if n <= 0 {
-                        if n < 0 {
-                            return Err(crate::os::errno());
-                        }
+                    if n == 0 {
                         break;
                     }
 

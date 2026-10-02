@@ -1756,15 +1756,11 @@ pub fn ngx_quic_shutdown_quic(c: &Connection) {
 pub fn ngx_quic_address_hash(sockaddr: &SockAddr, no_port: bool, salt: Option<&[u8]>) -> [u8; 20] {
     use sha1::{Digest, Sha1};
 
-    let (ss, socklen) = sockaddr.to_libc();
-
-    // SAFETY: the storage has socklen bytes of the address
-    let raw = unsafe { std::slice::from_raw_parts(&ss as *const libc::sockaddr_storage as *const u8, socklen as usize) };
-
+    // the address without the port, or the sockaddr of c->socklen bytes
     let data: Vec<u8> = match sockaddr {
         SockAddr::V6(sin6) if no_port => sin6.ip().octets().to_vec(),
         SockAddr::V4(sin) if no_port => sin.ip().octets().to_vec(),
-        _ => raw.to_vec(),
+        _ => sockaddr.raw_bytes(),
     };
 
     let mut sha1 = Sha1::new();

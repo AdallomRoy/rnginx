@@ -1016,14 +1016,13 @@ impl Mp4File {
 
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, self.log, "read: {}, {:p}, {}, {}", self.fd, dst.as_ptr(), size, offset);
 
-        let n = unsafe { libc::pread(self.fd, dst.as_mut_ptr() as *mut libc::c_void, size, offset) };
-
-        if n == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, self.log, Some(ngx_core::os::errno()), "pread() \"{}\" failed", B(&self.name));
-            return NGX_ERROR as isize;
+        match ngx_core::os::pread(self.fd, dst, offset) {
+            Ok(n) => n as isize,
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, self.log, Some(err), "pread() \"{}\" failed", B(&self.name));
+                NGX_ERROR as isize
+            }
         }
-
-        n
     }
 
     /// ngx_http_mp4_read_ftyp_atom

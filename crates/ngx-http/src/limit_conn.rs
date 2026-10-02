@@ -134,7 +134,8 @@ fn lc_cmp(key: &[u8], lc: LimitConnNode<'_>) -> i32 {
     }
 }
 
-/// ngx_memn2cmp
+/// ngx_memn2cmp (lc_cmp() is the one on the zone's bytes)
+#[cfg(test)]
 fn memn2cmp(s1: &[u8], s2: &[u8]) -> i32 {
     let (n, z) = if s1.len() <= s2.len() { (s1.len(), -1) } else { (s2.len(), 1) };
 

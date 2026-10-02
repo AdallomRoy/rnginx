@@ -21,7 +21,7 @@ use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
 use crate::request::*;
-use crate::upstream_round_robin::RrPeers;
+use crate::upstream_round_robin::UpstreamPeers;
 use crate::variables::{VarDef, NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_NOCACHEABLE, prefix_var_name};
 use crate::{NGX_HTTP_MAIN_CONF, NGX_HTTP_UPS_CONF, HttpModuleDef, http_module_def};
 
@@ -107,47 +107,36 @@ pub enum UpstreamSock {
 }
 
 
+// the stream types are Unpin: Pin::new projects to them
 impl AsyncRead for UpstreamSock {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            match this {
-                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
-                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
-                UpstreamSock::Conn(c) => c.poll_read(cx, buf),
-            }
+        match self.get_mut() {
+            UpstreamSock::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            UpstreamSock::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            UpstreamSock::Conn(c) => c.poll_read(cx, buf),
         }
     }
 }
 impl AsyncWrite for UpstreamSock {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            match this {
-                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, b),
-                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_write(cx, b),
-                UpstreamSock::Conn(c) => c.poll_write(cx, b),
-            }
+        match self.get_mut() {
+            UpstreamSock::Tcp(s) => Pin::new(s).poll_write(cx, b),
+            UpstreamSock::Unix(s) => Pin::new(s).poll_write(cx, b),
+            UpstreamSock::Conn(c) => c.poll_write(cx, b),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            match this {
-                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
-                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
-                UpstreamSock::Conn(_) => Poll::Ready(Ok(())),
-            }
+        match self.get_mut() {
+            UpstreamSock::Tcp(s) => Pin::new(s).poll_flush(cx),
+            UpstreamSock::Unix(s) => Pin::new(s).poll_flush(cx),
+            UpstreamSock::Conn(_) => Poll::Ready(Ok(())),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        unsafe {
-            let this = self.get_unchecked_mut();
-            match this {
-                UpstreamSock::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
-                UpstreamSock::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
-                UpstreamSock::Conn(c) => c.poll_shutdown(cx),
-            }
+        match self.get_mut() {
+            UpstreamSock::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            UpstreamSock::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            UpstreamSock::Conn(c) => c.poll_shutdown(cx),
         }
     }
 }
@@ -184,11 +173,7 @@ impl UpstreamSock {
 
 fn peek_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<usize> {
     let mut b = [0u8; 1];
-    let n = unsafe { libc::recv(fd, b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(n as usize)
+    Ok(nix::sys::socket::recv(fd, &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT)?)
 }
 
 
@@ -240,10 +225,9 @@ pub struct UpstreamSrvConf {
 
     pub init_upstream: Cell<Option<InitUpstream>>,
     pub init: RefCell<Option<InitPeer>>,
-    /// us->peer.data of the round-robin based balancers
-    pub peers: Cell<*mut RrPeers>,
-    /// the memory of the peers (cf->pool)
-    pub arena: crate::upstream_round_robin::Arena,
+    /// us->peer.data of the round-robin based balancers: the peers, in
+    /// their memory
+    pub peers: UpstreamPeers,
 
     pub shm_zone: RefCell<Option<Rc<ngx_core::shm::ShmZone>>>,
     pub resolver: RefCell<Option<Rc<Resolver>>>,
@@ -267,8 +251,7 @@ impl UpstreamSrvConf {
             block: Cell::new(false),
             init_upstream: Cell::new(None),
             init: RefCell::new(None),
-            peers: Cell::new(std::ptr::null_mut()),
-            arena: Default::default(),
+            peers: UpstreamPeers::default(),
             shm_zone: RefCell::new(None),
             resolver: RefCell::new(None),
             resolver_timeout: Cell::new(None),
