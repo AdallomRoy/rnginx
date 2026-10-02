@@ -296,7 +296,14 @@ fn scgi_eval(r: &R, codes: &[Part], u: &mut Upstream) -> i64 {
 
 impl UpstreamModule for ScgiModule {
     fn create_key(&self, r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
-        create_key(r, keys)
+        let mut k = crate::file_cache::CacheKeys::new();
+        let rc = create_keys(r, &mut k);
+        keys.extend(k.iter().map(|part| part.to_vec()));
+        rc
+    }
+
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        create_keys(r, keys)
     }
 
     /// ngx_http_scgi_create_request: the netstring, then, with
@@ -358,7 +365,7 @@ impl UpstreamModule for ScgiModule {
 }
 
 /// ngx_http_scgi_create_key: scgi_cache_key
-fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
     let lcf = r.loc_conf::<NgxHttpScgiLocConf>(ctx_index());
 
     let cv = lcf.borrow().cache.cache_key.clone();
@@ -371,7 +378,7 @@ fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         None => Vec::new(),
     };
 
-    keys.push(key);
+    keys.push_vec(key);
 
     NGX_OK
 }

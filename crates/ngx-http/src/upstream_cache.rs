@@ -475,7 +475,7 @@ pub fn upstream_of(r: &Request) -> Option<Rc<UpstreamCache>> {
 /// (ngx_http_upstream_cache_send), NGX_DECLINED to go to the upstream,
 /// NGX_BUSY to wait for the cache lock (file_cache_lock_wait_handler) and
 /// call again, NGX_ERROR, or the status of a cached error.
-pub fn upstream_cache(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut Vec<Vec<u8>>) -> i64) -> i64 {
+pub fn upstream_cache(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut CacheKeys) -> i64) -> i64 {
     let conf = &u.conf;
 
     let c_rc = match cache_of(r) {
@@ -498,7 +498,7 @@ pub fn upstream_cache(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut Vec
 
             let mut c = c_rc.borrow_mut();
 
-            let mut keys = Vec::new();
+            let mut keys = CacheKeys::new();
 
             if create_key(r, &mut keys) != NGX_OK {
                 return NGX_ERROR;
@@ -628,7 +628,7 @@ pub fn upstream_cache(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut Vec
 /// ngx_http_upstream_init_request with a cache: ngx_http_upstream_cache
 /// until it does not return NGX_BUSY, waiting for the cache lock meanwhile
 /// (r->write_event_handler = ngx_http_upstream_init_request).
-pub async fn upstream_cache_wait(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut Vec<Vec<u8>>) -> i64) -> i64 {
+pub async fn upstream_cache_wait(r: &R, u: &UpstreamCache, create_key: &dyn Fn(&R, &mut CacheKeys) -> i64) -> i64 {
     loop {
         let rc = upstream_cache(r, u, create_key);
 
@@ -688,9 +688,9 @@ where
         None => return NGX_ERROR,
     };
 
-    let (header_start, body_start, buf, name) = {
+    let (header_start, body_start) = {
         let c = c_rc.borrow();
-        (c.header_start, c.body_start, c.buf.clone(), c.file_name.clone())
+        (c.header_start, c.body_start)
     };
 
     if header_start == body_start {
@@ -700,8 +700,12 @@ where
 
     // TODO: cache stack
 
-    // u->buffer = *c->buf; u->buffer.pos += c->header_start
-    let header = buf.get(header_start..).unwrap_or(&[]).to_vec();
+    // u->buffer = *c->buf; u->buffer.pos += c->header_start: the buffer of
+    // the cache file becomes u->buffer (the response is sent from the
+    // cache once per request), the header of the cache file dropped from it
+    let mut header = std::mem::take(&mut c_rc.borrow_mut().buf);
+
+    header.drain(..header_start.min(header.len()));
 
     let mut rc = process(header).await;
 
@@ -723,7 +727,7 @@ where
 
     // rc == NGX_HTTP_UPSTREAM_INVALID_HEADER
 
-    ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "cache file \"{}\" contains invalid header", B(&name));
+    ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "cache file \"{}\" contains invalid header", B(&c_rc.borrow().file_name));
 
     // TODO: delete file
 
@@ -816,7 +820,7 @@ pub struct CacheHeadersIn {
     /// u->headers_in.last_modified_time (-1 when none)
     pub last_modified_time: i64,
     /// u->headers_in.etag
-    pub etag: Option<Vec<u8>>,
+    pub etag: Option<Header>,
 }
 
 impl CacheHeadersIn {
@@ -831,10 +835,13 @@ impl CacheHeadersIn {
 /// ngx_http_upstream_process_set_cookie, _cache_control, _expires,
 /// _accel_expires, _vary, _last_modified and the etag of
 /// ngx_http_upstream_process_header_line.
-pub fn process_header_line(r: &R, hin: &mut CacheHeadersIn, lowcase_key: &[u8], value: &[u8]) {
+pub fn process_header_line(r: &R, hin: &mut CacheHeadersIn, h: &Header) {
     let u = upstream_of(r);
 
-    match lowcase_key {
+    let value = h.value.borrow();
+    let value = &value[..];
+
+    match &h.lowcase_key[..] {
         b"set-cookie" => {
             if let Some(u) = &u {
                 if !u.conf.ignores(NGX_HTTP_UPSTREAM_IGN_SET_COOKIE) {
@@ -879,7 +886,7 @@ pub fn process_header_line(r: &R, hin: &mut CacheHeadersIn, lowcase_key: &[u8], 
         }
 
         b"etag" => {
-            hin.etag = Some(value.to_vec());
+            hin.etag = Some(h.clone());
         }
 
         _ => {}
@@ -1324,7 +1331,10 @@ pub fn send_response(r: &R, status: i64, hin: &CacheHeadersIn, raw_header_len: u
             if status == crate::NGX_HTTP_OK || status == crate::NGX_HTTP_PARTIAL_CONTENT {
                 c.last_modified = hin.last_modified_time;
 
-                c.etag = hin.etag.clone().unwrap_or_default();
+                match &hin.etag {
+                    Some(h) => c.etag.set(&h.value.borrow()),
+                    None => c.etag.clear(),
+                }
             } else {
                 c.last_modified = -1;
                 c.etag.clear();
@@ -1573,7 +1583,7 @@ fn cache_etag_variable(r: &R, v: &mut VariableValue, _data: usize) -> i64 {
     let c = cache_of(r);
 
     let etag = match (&u, &c) {
-        (Some(u), Some(c)) if u.conf.cache_revalidate.get_or(false) && u.cache_status.get() == NGX_HTTP_CACHE_EXPIRED => c.borrow().etag.clone(),
+        (Some(u), Some(c)) if u.conf.cache_revalidate.get_or(false) && u.cache_status.get() == NGX_HTTP_CACHE_EXPIRED => c.borrow().etag.to_vec(),
         _ => Vec::new(),
     };
 

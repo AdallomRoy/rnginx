@@ -2003,6 +2003,17 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
 /// (ctx->vars.key_start) and the URI of the request as the upstream
 /// request has it.
 pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
+    let mut k = crate::file_cache::CacheKeys::new();
+
+    let rc = create_keys(r, &mut k);
+
+    keys.extend(k.iter().map(|part| part.to_vec()));
+
+    rc
+}
+
+/// create_key() into c->keys, the parts written in place.
+pub(crate) fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
     let lcf = r.loc_conf::<NgxHttpProxyLocConf>(ctx_index());
     let plcf = lcf.borrow();
 
@@ -2011,37 +2022,44 @@ pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         None => return NGX_ERROR,
     };
 
-    let ctx = ctx.borrow();
+    let vars = ctx.borrow().vars.clone();
 
     if let Some(cv) = &plcf.cache.cache_key {
         match crate::script::complex_value(r, cv) {
-            Ok(k) => keys.push(k),
+            Ok(k) => keys.push_vec(k),
             Err(_) => return NGX_ERROR,
         }
 
         return NGX_OK;
     }
 
-    keys.push(ctx.vars.key_start.clone());
+    // room for the URL and the URI (escaped, at most 3 bytes a byte)
+    let room = vars.key_start.len() + vars.uri.len() + (3 * r.uri.borrow().len()).max(r.unparsed_uri.borrow().len()) + "?".len() + r.args.borrow().len();
 
-    if plcf.proxy_values.is_some() && !ctx.vars.uri.is_empty() {
-        keys.push(ctx.vars.uri.clone());
+    keys.data_mut().reserve(room);
+
+    keys.push(&vars.key_start);
+
+    if plcf.proxy_values.is_some() && !vars.uri.is_empty() {
+        keys.push(&vars.uri);
 
         return NGX_OK;
-    } else if ctx.vars.uri.is_empty() && r.valid_unparsed_uri.get() {
-        keys.push(r.unparsed_uri.borrow().clone());
+    } else if vars.uri.is_empty() && r.valid_unparsed_uri.get() {
+        keys.push(&r.unparsed_uri.borrow());
 
         return NGX_OK;
     }
 
     let uri = r.uri.borrow();
 
-    let loc_len = if r.valid_location.get() && !ctx.vars.uri.is_empty() { plcf.location.len().min(uri.len()) } else { 0 };
+    let loc_len = if r.valid_location.get() && !vars.uri.is_empty() { plcf.location.len().min(uri.len()) } else { 0 };
 
-    let mut key = ctx.vars.uri.clone();
+    let key = keys.data_mut();
+
+    key.extend_from_slice(&vars.uri);
 
     if r.quoted_uri.get() || r.internal.get() {
-        ngx_core::string::escape_uri_into(&mut key, &uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
+        ngx_core::string::escape_uri_into(key, &uri[loc_len..], ngx_core::string::NGX_ESCAPE_URI);
     } else {
         key.extend_from_slice(&uri[loc_len..]);
     }
@@ -2053,7 +2071,7 @@ pub(crate) fn create_key(r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         key.extend_from_slice(&args);
     }
 
-    keys.push(key);
+    keys.end();
 
     NGX_OK
 }
@@ -2080,6 +2098,10 @@ impl Default for HeaderParse {
 impl crate::upstream_rt::UpstreamModule for ProxyModule {
     fn create_key(&self, r: &R, keys: &mut Vec<Vec<u8>>) -> i64 {
         create_key(r, keys)
+    }
+
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        create_keys(r, keys)
     }
 
     /// ngx_http_proxy_create_request: the request (with the body of

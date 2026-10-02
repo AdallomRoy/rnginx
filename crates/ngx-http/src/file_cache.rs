@@ -437,6 +437,125 @@ fn sh_count_add(sh: FileCacheSh<'_>, n: isize) {
 /// The data of a cache path (cache->path->data).
 struct PathData(Weak<FileCache>);
 
+/// c->keys: the parts of the key, one after another in one buffer (as
+/// they are hashed, written to the cache file and compared with it), and
+/// where each ends (up to 4 in place).
+#[derive(Clone, Default)]
+pub struct CacheKeys {
+    data: Vec<u8>,
+    ends: [usize; 4],
+    n: usize,
+    more: Vec<usize>,
+}
+
+impl CacheKeys {
+    pub fn new() -> CacheKeys {
+        CacheKeys::default()
+    }
+
+    /// A part of the key.
+    pub fn push(&mut self, part: &[u8]) {
+        self.data.extend_from_slice(part);
+        self.end();
+    }
+
+    /// A part of the key made for it: taken as the buffer when it is the
+    /// first part.
+    pub fn push_vec(&mut self, part: Vec<u8>) {
+        if self.data.is_empty() {
+            self.data = part;
+            self.end();
+        } else {
+            self.push(&part);
+        }
+    }
+
+    /// The buffer to append the next part to, ended by end().
+    pub fn data_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.data
+    }
+
+    /// The part appended to data_mut() ends here.
+    pub fn end(&mut self) {
+        if self.n < self.ends.len() {
+            self.ends[self.n] = self.data.len();
+        } else {
+            self.more.push(self.data.len());
+        }
+
+        self.n += 1;
+    }
+
+    /// The bytes of all the parts.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The parts.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        let ends = self.ends[..self.n.min(self.ends.len())].iter().chain(self.more.iter());
+
+        ends.scan(0, move |start, &end| {
+            let part = &self.data[*start..end];
+            *start = end;
+            Some(part)
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
+/// c->etag: kept in place up to the length of the cache file header's (C
+/// points it at h->etag of c->buf), a longer one of a response allocated.
+#[derive(Clone)]
+pub enum CacheEtag {
+    Short(u8, [u8; NGX_HTTP_CACHE_ETAG_LEN]),
+    Long(Vec<u8>),
+}
+
+impl CacheEtag {
+    pub fn new() -> CacheEtag {
+        CacheEtag::Short(0, [0; NGX_HTTP_CACHE_ETAG_LEN])
+    }
+
+    pub fn set(&mut self, v: &[u8]) {
+        if v.len() <= NGX_HTTP_CACHE_ETAG_LEN {
+            let mut data = [0; NGX_HTTP_CACHE_ETAG_LEN];
+            data[..v.len()].copy_from_slice(v);
+            *self = CacheEtag::Short(v.len() as u8, data);
+        } else {
+            *self = CacheEtag::Long(v.to_vec());
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = CacheEtag::new();
+    }
+}
+
+impl Default for CacheEtag {
+    fn default() -> CacheEtag {
+        CacheEtag::new()
+    }
+}
+
+impl std::ops::Deref for CacheEtag {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            CacheEtag::Short(len, data) => &data[..*len as usize],
+            CacheEtag::Long(v) => v,
+        }
+    }
+}
+
 /// ngx_http_cache_t: the cache of a request (r->cache).
 pub struct HttpCache {
     /// c->file: the name of the cache file, and the file once open
@@ -445,7 +564,7 @@ pub struct HttpCache {
     pub file_handle: Option<Rc<CachedFileHandle>>,
     pub log: Log,
 
-    pub keys: Vec<Vec<u8>>,
+    pub keys: CacheKeys,
     pub crc32: u32,
     pub key: [u8; NGX_HTTP_CACHE_KEY_LEN],
     pub main: [u8; NGX_HTTP_CACHE_KEY_LEN],
@@ -457,7 +576,7 @@ pub struct HttpCache {
     pub last_modified: i64,
     pub date: i64,
 
-    pub etag: Vec<u8>,
+    pub etag: CacheEtag,
     pub vary: Vec<u8>,
     pub variant: [u8; NGX_HTTP_CACHE_KEY_LEN],
 
@@ -512,7 +631,7 @@ impl HttpCache {
             fd: -1,
             file_handle: None,
             log,
-            keys: Vec::new(),
+            keys: CacheKeys::new(),
             crc32: 0,
             key: [0; NGX_HTTP_CACHE_KEY_LEN],
             main: [0; NGX_HTTP_CACHE_KEY_LEN],
@@ -522,7 +641,7 @@ impl HttpCache {
             error_sec: 0,
             last_modified: 0,
             date: 0,
-            etag: Vec::new(),
+            etag: CacheEtag::new(),
             vary: Vec::new(),
             variant: [0; NGX_HTTP_CACHE_KEY_LEN],
             buffer_size: 0,
@@ -786,19 +905,19 @@ pub fn file_cache_create(r: &R) -> i64 {
 pub fn file_cache_create_key(r: &R, c: &mut HttpCache) {
     use md5::{Digest, Md5};
 
-    let mut len = 0;
+    for key in c.keys.iter() {
+        http_debug!(r, "http cache key: \"{}\"", B(key));
+    }
+
+    // the parts one after another
+    let key = c.keys.bytes();
+    let len = key.len();
 
     let mut crc = crc32fast::Hasher::new();
     let mut md5 = Md5::new();
 
-    for key in c.keys.iter() {
-        http_debug!(r, "http cache key: \"{}\"", B(key));
-
-        len += key.len();
-
-        crc.update(key);
-        md5.update(key);
-    }
+    crc.update(key);
+    md5.update(key);
 
     c.header_start = FILE_CACHE_HEADER_SIZE + NGX_HTTP_FILE_CACHE_KEY.len() + len + 1;
 
@@ -1070,10 +1189,7 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
     // ngx_http_file_cache_aio_read: without aio, ngx_read_file()
     let body_start = c.body_start;
 
-    let n = {
-        let (fd, name, log) = (c.fd, c.file_name.clone(), r.connection.log.clone());
-        read_file(fd, &name, &mut c.buf[..body_start], 0, &log)
-    };
+    let n = read_file(c.fd, &c.file_name, &mut c.buf[..body_start], 0, &r.connection.log);
 
     if n < 0 {
         return n as i64;
@@ -1098,15 +1214,13 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
         return NGX_DECLINED;
     }
 
-    let mut p = FILE_CACHE_HEADER_SIZE + NGX_HTTP_FILE_CACHE_KEY.len();
+    // the parts of the key, one after another
+    let p = FILE_CACHE_HEADER_SIZE + NGX_HTTP_FILE_CACHE_KEY.len();
+    let key = c.keys.bytes();
 
-    for key in c.keys.iter() {
-        if &c.buf[p..p + key.len()] != key.as_slice() {
-            ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "cache file \"{}\" has md5 collision", B(&c.file_name));
-            return NGX_DECLINED;
-        }
-
-        p += key.len();
+    if &c.buf[p..p + key.len()] != key {
+        ngx_log_error!(NGX_LOG_CRIT, r.connection.log, None, "cache file \"{}\" has md5 collision", B(&c.file_name));
+        return NGX_DECLINED;
     }
 
     if h.body_start as usize > c.body_start {
@@ -1138,7 +1252,7 @@ fn file_cache_read(r: &R, c_rc: &Rc<RefCell<HttpCache>>, c: &mut HttpCache) -> i
     c.date = h.date;
     c.valid_msec = h.valid_msec as usize;
     c.body_start = h.body_start as usize;
-    c.etag = h.etag[..h.etag_len as usize].to_vec();
+    c.etag.set(&h.etag[..h.etag_len as usize]);
 
     r.cached.set(true);
 
@@ -1329,11 +1443,45 @@ fn file_cache_name(r: &R, c: &mut HttpCache, path: &PathConf) -> i64 {
         return NGX_OK;
     }
 
-    c.file_name = path.hashed_filename(&hex(&c.key));
+    c.file_name = hashed_filename(path, &c.key);
 
     http_debug!(r, "cache file: \"{}\"", B(&c.file_name));
 
     NGX_OK
+}
+
+/// ngx_create_hashed_filename() of the md5 key in hex (as
+/// PathConf::hashed_filename does), made in one buffer.
+fn hashed_filename(path: &PathConf, key: &[u8; NGX_HTTP_CACHE_KEY_LEN]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut hex = [0u8; 2 * NGX_HTTP_CACHE_KEY_LEN];
+
+    for (i, &b) in key.iter().enumerate() {
+        hex[2 * i] = HEX[(b >> 4) as usize];
+        hex[2 * i + 1] = HEX[(b & 0xf) as usize];
+    }
+
+    let mut out = Vec::with_capacity(path.name.len() + path.len + 1 + hex.len());
+
+    out.extend_from_slice(&path.name);
+
+    let mut pos = hex.len();
+
+    for &lvl in path.level.iter() {
+        if lvl == 0 {
+            break;
+        }
+
+        out.push(b'/');
+        pos -= lvl;
+        out.extend_from_slice(&hex[pos..pos + lvl]);
+    }
+
+    out.push(b'/');
+    out.extend_from_slice(&hex);
+
+    out
 }
 
 /// ngx_http_file_cache_lookup: the node of the key, 0 if none (the zone is
@@ -1586,11 +1734,7 @@ pub fn file_cache_set_header(r: &R, c: &mut HttpCache) -> Result<Vec<u8>, ()> {
 
     buf.extend_from_slice(&h.to_bytes());
     buf.extend_from_slice(NGX_HTTP_FILE_CACHE_KEY);
-
-    for key in c.keys.iter() {
-        buf.extend_from_slice(key);
-    }
-
+    buf.extend_from_slice(c.keys.bytes());
     buf.push(b'\n');
 
     Ok(buf)
@@ -3096,6 +3240,56 @@ pub fn file_cache_valid_set_slot(cf: &mut Conf, _cmd: &Command, a: &mut Val<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_keys_parts() {
+        let mut k = CacheKeys::new();
+        assert!(k.is_empty());
+
+        // the first part made for it is the buffer
+        k.push_vec(b"http://backend".to_vec());
+        k.data_mut().extend_from_slice(b"/uri?a=1");
+        k.end();
+        k.push(b"");
+
+        assert_eq!(k.len(), 3);
+        assert_eq!(k.bytes(), b"http://backend/uri?a=1");
+        assert_eq!(k.iter().collect::<Vec<_>>(), [&b"http://backend"[..], b"/uri?a=1", b""]);
+
+        // more than 4 parts
+        for p in [&b"x"[..], b"yy", b"z"] {
+            k.push_vec(p.to_vec());
+        }
+
+        assert_eq!(k.iter().collect::<Vec<_>>(), [&b"http://backend"[..], b"/uri?a=1", b"", b"x", b"yy", b"z"]);
+        assert_eq!(k.bytes(), b"http://backend/uri?a=1xyyz");
+    }
+
+    #[test]
+    fn hashed_filename_as_path_conf() {
+        let key: [u8; NGX_HTTP_CACHE_KEY_LEN] = std::array::from_fn(|i| (i * 17 + 3) as u8);
+
+        for level in [[0, 0, 0], [1, 0, 0], [1, 2, 0], [2, 2, 2]] {
+            let path = PathConf::new(b"/var/cache/x".to_vec(), level);
+            assert_eq!(hashed_filename(&path, &key), path.hashed_filename(&hex(&key)));
+        }
+    }
+
+    #[test]
+    fn cache_etag_kept() {
+        let mut e = CacheEtag::new();
+        assert!(e.is_empty());
+
+        e.set(b"\"abc\"");
+        assert_eq!(&*e, b"\"abc\"");
+
+        let long = vec![b'e'; NGX_HTTP_CACHE_ETAG_LEN + 1];
+        e.set(&long);
+        assert_eq!(&*e, &long[..]);
+
+        e.clear();
+        assert_eq!(e.len(), 0);
+    }
 
     #[test]
     fn test_header_layout() {

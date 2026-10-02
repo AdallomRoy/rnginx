@@ -555,6 +555,19 @@ pub trait UpstreamModule {
     /// u->create_key: the keys of the cache
     fn create_key(&self, r: &R, keys: &mut Vec<Vec<u8>>) -> i64;
 
+    /// create_key() into c->keys as they are kept (one buffer)
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        let mut parts = Vec::new();
+
+        let rc = self.create_key(r, &mut parts);
+
+        for part in parts {
+            keys.push_vec(part);
+        }
+
+        rc
+    }
+
     /// u->create_request: u->request_bufs (and u->uri)
     fn create_request(&mut self, r: &R, u: &mut Upstream) -> i64;
 
@@ -807,7 +820,7 @@ pub fn process_header_line(r: &R, u: &mut Upstream, h: &Header) -> Result<(), u3
 
             // the cache handlers: ngx_http_upstream_process_expires,
             // _accel_expires, _last_modified, and the etag
-            crate::upstream_cache::process_header_line(r, &mut resp.cache, &h.lowcase_key, &h.value.borrow());
+            crate::upstream_cache::process_header_line(r, &mut resp.cache, h);
         }
 
         b"x-accel-buffering" => {
@@ -832,7 +845,7 @@ pub fn process_header_line(r: &R, u: &mut Upstream, h: &Header) -> Result<(), u3
 
         b"set-cookie" | b"cache-control" | b"vary" => {
             // ngx_http_upstream_process_set_cookie, _cache_control, _vary
-            crate::upstream_cache::process_header_line(r, &mut resp.cache, &h.lowcase_key, &h.value.borrow());
+            crate::upstream_cache::process_header_line(r, &mut resp.cache, h);
         }
 
         _ => {}
@@ -1823,7 +1836,7 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
 
         let mut rc = {
             let mm: &dyn UpstreamModule = &*m;
-            crate::upstream_cache::upstream_cache_wait(r, &ucache, &|r, keys| mm.create_key(r, keys)).await
+            crate::upstream_cache::upstream_cache_wait(r, &ucache, &|r, keys| mm.create_keys(r, keys)).await
         };
 
         if rc == NGX_ERROR {
@@ -3175,7 +3188,7 @@ async fn process_headers(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) ->
         }
 
         ho.status = u.resp.status_n;
-        ho.status_line = u.resp.status_line.clone();
+        ho.status_line = std::mem::take(&mut u.resp.status_line);
 
         ho.content_length_n = u.resp.content_length_n;
     }

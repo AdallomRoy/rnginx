@@ -190,6 +190,10 @@ impl UpstreamModule for ProxyV2Module {
         crate::proxy::create_key(r, keys)
     }
 
+    fn create_keys(&self, r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
+        crate::proxy::create_keys(r, keys)
+    }
+
     /// ngx_http_proxy_v2_create_request
     fn create_request(&mut self, r: &R, u: &mut Upstream) -> i64 {
         let plcf = self.lcf.borrow();
