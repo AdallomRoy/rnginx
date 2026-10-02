@@ -16,6 +16,7 @@ use ngx_core::os;
 use ngx_core::rc::*;
 use ngx_core::string::{atoi, eq_ignore_case, escape_json_into, B};
 use ngx_core::syslog::SyslogPeer;
+use ngx_core::times::CachedTime;
 use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
 use crate::core::*;
@@ -49,8 +50,9 @@ const NGX_OFF_T_LEN: usize = "-9223372036854775808".len();
 const SIZEOF_UINTPTR: usize = std::mem::size_of::<usize>();
 
 /// ngx_http_log_op_run_pt: the op appends its output to the line; false
-/// (NULL) if the line has no space left for it up to `end`
-pub type LogOpRun = fn(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool;
+/// (NULL) if the line has no space left for it up to `end`. `tp` is the
+/// time of the line (ngx_cached_time, read once for the request).
+pub type LogOpRun = fn(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, tp: &CachedTime) -> bool;
 
 /// ngx_http_log_op_getlen_pt
 pub type LogOpGetlen = fn(r: &R, data: usize) -> usize;
@@ -107,6 +109,23 @@ pub struct HttpLog {
     pub syslog_peer: Option<Rc<SyslogPeer>>,
     pub format: Rc<LogFmt>,
     pub filter: Option<ComplexValue>,
+    /// log->file->data: the buffer of the file, if any, looked up on the
+    /// first line (another access_log of the file may add it after this
+    /// one is configured)
+    pub buffer: std::cell::OnceCell<Option<Rc<LogBuf>>>,
+}
+
+impl HttpLog {
+    /// log->file->data
+    fn buffer(&self) -> Option<&Rc<LogBuf>> {
+        self.buffer.get_or_init(|| self.file.as_ref().and_then(|f| file_buffer(f))).as_ref()
+    }
+}
+
+thread_local! {
+    /// The memory of the lines that are not buffered (the request pool's
+    /// in C), reused from line to line
+    static LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// ngx_http_log_loc_conf_t
@@ -163,18 +182,21 @@ fn log_handler(r: &R) -> i64 {
 
     let lcf = r.loc_conf::<LogLocConf>(ctx_index());
 
-    let logs = {
-        let l = lcf.borrow();
+    // the logs are used where the configuration has them
+    let l = lcf.borrow();
 
-        if l.off {
-            return NGX_OK;
-        }
+    if l.off {
+        return NGX_OK;
+    }
 
-        match &l.logs {
-            Some(logs) => logs.clone(),
-            None => return NGX_OK,
-        }
+    let logs = match &l.logs {
+        Some(logs) => logs,
+        None => return NGX_OK,
     };
+
+    // the cached time, the same for all the lines of the request, as C's
+    // within an iteration of the event loop
+    let tp = ngx_core::times::cached();
 
     for log in logs.iter() {
         if let Some(filter) = &log.filter {
@@ -185,7 +207,7 @@ fn log_handler(r: &R) -> i64 {
             }
         }
 
-        if ngx_time() == log.disk_full_time.get() {
+        if tp.sec == log.disk_full_time.get() {
             // on FreeBSD writing to a full filesystem with enabled softupdates
             // may block process for much longer time than writing to non-full
             // filesystem, so we skip writing to a log for one second
@@ -215,35 +237,39 @@ fn log_handler(r: &R) -> i64 {
 
             // goto alloc_line
 
-            let mut line = Vec::with_capacity(len);
+            let sent = with_line(len, |line| {
+                peer.add_header(line);
 
-            peer.add_header(&mut line);
+                if !run_ops(r, &ops, line, len - LINEFEED_SIZE, &tp) {
+                    return false;
+                }
 
-            if !run_ops(r, &ops, &mut line, len - LINEFEED_SIZE) {
+                let size = line.len();
+
+                // peer->logp: the errors of the peer go to the cycle log
+                if peer.log.borrow().is_none() {
+                    peer.set_log(ngx_core::cycle::cycle().log.clone());
+                }
+
+                let n = peer.send(line);
+
+                if n < 0 {
+                    ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "send() to syslog failed");
+                } else if n as usize != size {
+                    ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "send() to syslog has written only {} of {}", n, size);
+                }
+
+                true
+            });
+
+            if !sent {
                 return NGX_ERROR;
-            }
-
-            let size = line.len();
-
-            // peer->logp: the errors of the peer go to the cycle log
-            if peer.log.borrow().is_none() {
-                peer.set_log(ngx_core::cycle::cycle().log.clone());
-            }
-
-            let n = peer.send(&line);
-
-            if n < 0 {
-                ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "send() to syslog failed");
-            } else if n as usize != size {
-                ngx_log_error!(NGX_LOG_WARN, r.connection.log, None, "send() to syslog has written only {} of {}", n, size);
             }
 
             continue;
         }
 
-        let buffer = log.file.as_ref().and_then(|f| file_buffer(f));
-
-        if let Some(buffer) = &buffer {
+        if let Some(buffer) = log.buffer() {
             if len > buffer.size - buffer.buf.borrow().len() {
                 let contents = std::mem::take(&mut *buffer.buf.borrow_mut());
 
@@ -262,15 +288,16 @@ fn log_handler(r: &R) -> i64 {
                     add_flush_timer(buffer, log.file.as_ref().expect("log file"));
                 }
 
-                let mut line = Vec::with_capacity(len);
+                // the line is made in the buffer itself
+                let mut b = buffer.buf.borrow_mut();
 
-                if !run_ops(r, &ops, &mut line, len - LINEFEED_SIZE) {
+                if !run_ops(r, &ops, &mut b, pos + len - LINEFEED_SIZE, &tp) {
+                    // buffer->pos is not moved
+                    b.truncate(pos);
                     return NGX_ERROR;
                 }
 
-                line.push(b'\n');
-
-                buffer.buf.borrow_mut().extend_from_slice(&line);
+                b.push(b'\n');
 
                 continue;
             }
@@ -280,25 +307,47 @@ fn log_handler(r: &R) -> i64 {
 
         // alloc_line:
 
-        let mut line = Vec::with_capacity(len);
+        let written = with_line(len, |line| {
+            if !run_ops(r, &ops, line, len - LINEFEED_SIZE, &tp) {
+                return false;
+            }
 
-        if !run_ops(r, &ops, &mut line, len - LINEFEED_SIZE) {
+            line.push(b'\n');
+
+            log_write(r, log, line);
+
+            true
+        });
+
+        if !written {
             return NGX_ERROR;
         }
-
-        line.push(b'\n');
-
-        log_write(r, log, &line);
     }
 
     NGX_OK
 }
 
+/// `f` with an empty line of capacity `len` (ngx_pnalloc(r->pool, len)): the
+/// memory of the previous lines, or a new one should a line be made while
+/// another is (it is not)
+fn with_line<T>(len: usize, f: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+    let mut line = LINE.with(|l| std::mem::take(&mut *l.borrow_mut()));
+
+    line.clear();
+    line.reserve(len);
+
+    let t = f(&mut line);
+
+    LINE.with(|l| *l.borrow_mut() = line);
+
+    t
+}
+
 /// The runs of the ops: false (NULL) if an op has no space left in the
 /// line, its length (up to `end`) being computed before.
-fn run_ops(r: &R, ops: &[LogOp], buf: &mut Vec<u8>, end: usize) -> bool {
+fn run_ops(r: &R, ops: &[LogOp], buf: &mut Vec<u8>, end: usize, tp: &CachedTime) -> bool {
     for op in ops {
-        if !(op.run)(r, buf, end, op) {
+        if !(op.run)(r, buf, end, op, tp) {
             return false;
         }
     }
@@ -620,7 +669,7 @@ fn log_flush_handler(file: &Rc<OpenFile>) {
 }
 
 /// ngx_http_log_copy_short
-fn log_copy_short(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
+fn log_copy_short(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, op.len) {
         return false;
     }
@@ -631,7 +680,7 @@ fn log_copy_short(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
 }
 
 /// ngx_http_log_copy_long
-fn log_copy_long(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
+fn log_copy_long(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, op.len) {
         return false;
     }
@@ -642,7 +691,7 @@ fn log_copy_long(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
 }
 
 /// ngx_http_log_pipe
-fn log_pipe(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_pipe(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, 1) {
         return false;
     }
@@ -657,62 +706,65 @@ fn log_pipe(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
 }
 
 /// ngx_http_log_time
-fn log_time(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
-    let time = ngx_core::times::cached_http_log_time();
+fn log_time(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, tp: &CachedTime) -> bool {
+    let time = tp.http_log_time.as_bytes();
 
     if !log_check_length(r, buf, end, time.len()) {
         return false;
     }
 
-    buf.extend_from_slice(time.as_bytes());
+    buf.extend_from_slice(time);
 
     true
 }
 
 /// ngx_http_log_iso8601
-fn log_iso8601(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
-    let time = ngx_core::times::cached_http_log_iso8601();
+fn log_iso8601(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, tp: &CachedTime) -> bool {
+    let time = tp.http_log_iso8601.as_bytes();
 
     if !log_check_length(r, buf, end, time.len()) {
         return false;
     }
 
-    buf.extend_from_slice(time.as_bytes());
+    buf.extend_from_slice(time);
 
     true
 }
 
+/// "%T.%03M"
+fn push_msec(buf: &mut Vec<u8>, sec: i64, msec: u64) {
+    push_i64(buf, sec);
+    buf.push(b'.');
+    push_u64_pad(buf, msec, 3);
+}
+
 /// ngx_http_log_msec
-fn log_msec(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_msec(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_TIME_T_LEN + 4) {
         return false;
     }
 
-    let tp = ngx_core::times::cached();
-
-    buf.extend_from_slice(format!("{}.{:03}", tp.sec, tp.msec).as_bytes());
+    push_msec(buf, tp.sec, tp.msec);
 
     true
 }
 
 /// ngx_http_log_request_time
-fn log_request_time(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_request_time(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_TIME_T_LEN + 4) {
         return false;
     }
 
-    let tp = ngx_core::times::cached();
-
     let ms = (tp.sec - r.start_sec.get()) * 1000 + (tp.msec as i64 - r.start_msec.get() as i64);
     let ms = ms.max(0);
 
-    buf.extend_from_slice(format!("{}.{:03}", ms / 1000, ms % 1000).as_bytes());
+    push_msec(buf, ms / 1000, (ms % 1000) as u64);
 
     true
 }
 
 /// ngx_http_log_status
-fn log_status(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_status(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_INT_T_LEN) {
         return false;
     }
@@ -727,18 +779,23 @@ fn log_status(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
         0
     };
 
-    buf.extend_from_slice(format!("{:03}", status).as_bytes());
+    // "%03ui"
+    if status >= 0 {
+        push_u64_pad(buf, status as u64, 3);
+    } else {
+        buf.extend_from_slice(format!("{:03}", status).as_bytes());
+    }
 
     true
 }
 
 /// ngx_http_log_bytes_sent
-fn log_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_OFF_T_LEN) {
         return false;
     }
 
-    buf.extend_from_slice(r.connection.sent.get().to_string().as_bytes());
+    push_u64(buf, r.connection.sent.get());
 
     true
 }
@@ -746,7 +803,7 @@ fn log_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
 /// ngx_http_log_body_bytes_sent: although there is a real $body_bytes_sent
 /// variable, this log operation code function is more optimized for
 /// logging
-fn log_body_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_body_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_OFF_T_LEN) {
         return false;
     }
@@ -754,7 +811,7 @@ fn log_body_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> boo
     let length = r.connection.sent.get() as i64 - r.header_size.get() as i64;
 
     if length > 0 {
-        buf.extend_from_slice(length.to_string().as_bytes());
+        push_i64(buf, length);
         return true;
     }
 
@@ -764,12 +821,12 @@ fn log_body_bytes_sent(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> boo
 }
 
 /// ngx_http_log_request_length
-fn log_request_length(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp) -> bool {
+fn log_request_length(r: &R, buf: &mut Vec<u8>, end: usize, _op: &LogOp, _tp: &CachedTime) -> bool {
     if !log_check_length(r, buf, end, NGX_OFF_T_LEN) {
         return false;
     }
 
-    buf.extend_from_slice(r.request_length.get().to_string().as_bytes());
+    push_i64(buf, r.request_length.get());
 
     true
 }
@@ -797,7 +854,7 @@ fn log_variable_getlen(r: &R, data: usize) -> usize {
 }
 
 /// ngx_http_log_variable
-fn log_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
+fn log_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, _tp: &CachedTime) -> bool {
     with_indexed_variable(r, op.data, |value| {
         let value = match value {
             Some(v) if !v.not_found => v,
@@ -895,7 +952,7 @@ fn log_json_variable_getlen(r: &R, data: usize) -> usize {
 }
 
 /// ngx_http_log_json_variable
-fn log_json_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
+fn log_json_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, _tp: &CachedTime) -> bool {
     with_indexed_variable(r, op.data, |value| {
         let value = match value {
             Some(v) if !v.not_found => v,
@@ -923,7 +980,7 @@ fn log_unescaped_variable_getlen(r: &R, data: usize) -> usize {
 }
 
 /// ngx_http_log_unescaped_variable
-fn log_unescaped_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp) -> bool {
+fn log_unescaped_variable(r: &R, buf: &mut Vec<u8>, end: usize, op: &LogOp, _tp: &CachedTime) -> bool {
     with_indexed_variable(r, op.data, |value| {
         let value = match value {
             Some(v) if !v.not_found => v,
@@ -1013,6 +1070,7 @@ fn log_merge_loc_conf(cf: &mut Conf, parent: &Rc<dyn Any>, child: &Rc<dyn Any>) 
         syslog_peer: None,
         format,
         filter: None,
+        buffer: std::cell::OnceCell::new(),
     };
 
     cell.borrow_mut().logs = Some(vec![Rc::new(log)]);
@@ -1158,6 +1216,7 @@ fn log_set_log(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> Conf
         syslog_peer,
         format,
         filter,
+        buffer: std::cell::OnceCell::new(),
     });
 
     llcf.borrow_mut().logs.get_or_insert_with(Vec::new).push(log);
@@ -1453,6 +1512,33 @@ mod tests {
         escape_json_into(&mut out, src);
         assert_eq!(out.len(), src.len() + escape_json_count(src));
         assert_eq!(&out[..], &b"\\\" \\\\ \\n\\u0001x\\u001B"[..]);
+    }
+
+    #[test]
+    fn msec_format() {
+        // "%T.%03M"
+        let mut b = Vec::new();
+        push_msec(&mut b, 1696000000, 5);
+        b.push(b' ');
+        push_msec(&mut b, 0, 0);
+        b.push(b' ');
+        push_msec(&mut b, 12, 345);
+        assert_eq!(b, b"1696000000.005 0.000 12.345".to_vec());
+    }
+
+    #[test]
+    fn line_memory_reused() {
+        let p = with_line(100, |l| {
+            assert!(l.is_empty() && l.capacity() >= 100);
+            l.extend_from_slice(b"line\n");
+            l.as_ptr() as usize
+        });
+
+        // the next line gets the same memory, empty
+        with_line(10, |l| {
+            assert!(l.is_empty());
+            assert_eq!(l.as_ptr() as usize, p);
+        });
     }
 
     #[test]
