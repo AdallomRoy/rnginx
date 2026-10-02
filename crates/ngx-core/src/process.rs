@@ -1597,6 +1597,30 @@ mod tests {
         }
     }
 
+    /// A descriptor inherited across execve() is taken into the table (under
+    /// its number, but for another thread of the test opening a file at the
+    /// same moment); a number not open is left as it is.
+    #[test]
+    fn inherited_descriptor() {
+        use std::os::fd::IntoRawFd;
+
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let n = l.into_raw_fd();
+        assert!(!fd::contains(n));
+
+        let m = adopt_inherited(n);
+        assert!(fd::contains(m));
+        assert!(std::net::TcpStream::connect(addr).is_ok(), "the adopted socket still listens");
+        assert_eq!(adopt_inherited(m), m, "a descriptor of the table is left as it is");
+        os::close(m);
+
+        let unused = 1 << 20;
+        assert_eq!(adopt_inherited(unused), unused);
+        assert!(!fd::contains(unused));
+        assert_eq!(adopt_inherited(2), 2, "the standard descriptors are std's");
+    }
+
     /// The signals recorded by the handler, with the pid of their sender,
     /// and the notices of ngx_signal_handler()
     #[test]

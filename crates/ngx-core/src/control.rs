@@ -1173,6 +1173,30 @@ fn done(r: &mut Request, p: usize) -> i64 {
 mod tests {
     use super::*;
 
+    /// poll() of the control sockets: revents of the ready ones, POLLNVAL
+    /// for a descriptor not open, and the count of both
+    #[test]
+    fn poll_descriptors() {
+        use std::os::fd::OwnedFd;
+
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (a, b) = (crate::fd::register(OwnedFd::from(a)), crate::fd::register(OwnedFd::from(b)));
+
+        let mut p = vec![PollFd { fd: b, events: libc::POLLIN, revents: 0 }, PollFd { fd: 1 << 20, events: libc::POLLIN, revents: 0 }];
+
+        assert_eq!(poll_now(&mut p), Ok(1));
+        assert_eq!((p[0].revents, p[1].revents), (0, libc::POLLNVAL));
+
+        os::write_fd(a, b"x").unwrap();
+        p[0].events |= libc::POLLOUT;
+
+        assert_eq!(poll_now(&mut p), Ok(2));
+        assert_eq!(p[0].revents, libc::POLLIN | libc::POLLOUT);
+
+        os::close(a);
+        os::close(b);
+    }
+
     /// (rc, method, path) of a request line given in pieces
     fn parse(pieces: &[&[u8]]) -> (i64, u32, Vec<u8>) {
         let mut r = Request::default();
