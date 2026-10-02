@@ -562,11 +562,21 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
     std::process::exit(0);
 }
 
+/// The read end of the signal pipe, which the process owns as long as it
+/// lives (process::signal_fd()), registered in the reactor by its number.
+struct SignalFd(i32);
+
+impl std::os::fd::AsRawFd for SignalFd {
+    fn as_raw_fd(&self) -> i32 {
+        self.0
+    }
+}
+
 /// Task that watches signal wakeups and the master channel, setting flags.
 async fn control_task(cycle: Rc<Cycle>, _single: bool) {
     let chan = CHANNEL.with(|c| c.get());
     // the read end of the signal pipe, readable once the signal handler ran
-    let wake_afd = signal_pipe().and_then(|p| AsyncFd::with_interest(p, tokio::io::Interest::READABLE).ok());
+    let wake_afd = signal_fd().and_then(|fd| AsyncFd::with_interest(SignalFd(fd), tokio::io::Interest::READABLE).ok());
     let mut chan_afd = if chan >= 0 && process_type() != ProcessType::Single {
         crate::fd::get(chan).ok().and_then(|f| AsyncFd::with_interest(f, tokio::io::Interest::READABLE).ok())
     } else {
@@ -1161,7 +1171,13 @@ fn events_unparked() {
         None => return,
     };
 
-    process_signals(&cycle.log, false);
+    if process_signals(&cycle.log, false) {
+        // the pipe the control task waits for is drained: the cycle checks
+        // the flags (ngx_quit of SIGWINCH, ngx_reconfigure, ...) anyway
+        let notify = flags_notify();
+        notify.notify_waiters();
+        notify.notify_one();
+    }
 
     if interrupted {
         ngx_log_error!(NGX_LOG_INFO, cycle.log, Some(libc::EINTR), "epoll_wait() failed");

@@ -307,10 +307,12 @@ fn init_child_signals(log: &Log) {
 /// The signals the handler recorded, as ngx_signal_handler() handles them:
 /// the flags it sets (but those the handler set), and the notice of each
 /// "signal N (SIGX) received from PID, action". Only if the handler ran
-/// since the last call, unless `force`.
-pub fn process_signals(log: &Log, force: bool) {
+/// since the last call, unless `force`. Whether signals were processed: the
+/// pipe of the records is drained then, and an event loop waiting for it
+/// to be readable is to be woken.
+pub fn process_signals(log: &Log, force: bool) -> bool {
     if !SIGNALED.swap(false, Ordering::SeqCst) && !force {
-        return;
+        return false;
     }
 
     let received: Vec<(i32, i32)> = DELIVERY.with(|d| match d.borrow_mut().as_mut() {
@@ -321,6 +323,8 @@ pub fn process_signals(log: &Log, force: bool) {
     for (signo, pid) in received {
         signal_handler(signo, pid, log);
     }
+
+    true
 }
 
 /// ngx_signal_handler() of a signal received from `pid` (0 if not sent by
@@ -400,9 +404,11 @@ pub fn events_interrupted() -> bool {
 }
 
 /// The read end of the signal pipe of the process, readable once the
-/// handler ran (for the event loop of a worker, helper or single process).
-pub fn signal_pipe() -> Option<UnixStream> {
-    DELIVERY.with(|d| d.borrow().as_ref().and_then(|d| d.get_read().try_clone().ok()))
+/// handler ran (for the event loop of a worker, helper or single process):
+/// the descriptor stays open as long as the process lives, a child
+/// replacing the pipe before it runs an event loop.
+pub fn signal_fd() -> Option<RawFd> {
+    DELIVERY.with(|d| d.borrow().as_ref().map(|d| d.get_read().as_raw_fd()))
 }
 
 /// setitimer(ITIMER_REAL): SIGALRM after `delay` milliseconds.
