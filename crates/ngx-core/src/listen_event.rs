@@ -29,34 +29,34 @@
 
 use std::cell::{Cell, RefCell};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::rc::Rc;
+use std::os::fd::{AsRawFd, RawFd};
 
 use rustix::event::epoll;
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::io::Interest;
 
-/// The dup() of the listening socket registered in the reactor.
-pub struct EventFd(OwnedFd);
+/// The dup() of the listening socket registered in the reactor: a
+/// descriptor of the table, closed with the event.
+pub struct EventFd(RawFd);
 
 impl AsRawFd for EventFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.0
     }
 }
 
-impl AsFd for EventFd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        let _ = crate::fd::close(self.0);
     }
 }
 
-/// The reactor's epoll instance in a process: its descriptor, and the
-/// duplicate of it which epoll_ctl() is called with.
+/// The reactor's epoll instance in a process: the duplicate of its
+/// descriptor which epoll_ctl() is called with (a descriptor of the table,
+/// open as long as the process lives).
 struct Reactor {
     pid: i32,
-    epfd: RawFd,
-    epoll: Rc<OwnedFd>,
+    dup: RawFd,
 }
 
 thread_local! {
@@ -67,8 +67,9 @@ thread_local! {
 /// The read event of a listening socket.
 pub struct ListenEvent {
     afd: AsyncFd<EventFd>,
-    /// the reactor's epoll instance and the token of the registration
-    reactor: Option<(Rc<OwnedFd>, u64)>,
+    /// the reactor's epoll instance (the duplicate of its descriptor) and
+    /// the token of the registration
+    reactor: Option<(RawFd, u64)>,
     /// rev->active
     active: Cell<bool>,
     exclusive: Cell<bool>,
@@ -79,11 +80,11 @@ pub struct ListenEvent {
 impl ListenEvent {
     /// The read event of the listening socket `fd`, not added.
     pub fn new(fd: RawFd) -> io::Result<ListenEvent> {
-        let s = rustix::io::fcntl_dupfd_cloexec(crate::fd::get(fd)?, 0)?;
+        let s = crate::fd::register(rustix::io::fcntl_dupfd_cloexec(crate::fd::get(fd)?, 0)?);
 
         let afd = AsyncFd::with_interest(EventFd(s), Interest::READABLE)?;
 
-        let reactor = reactor_registration(afd.get_ref().as_raw_fd());
+        let reactor = reactor_registration(s);
 
         let ev = ListenEvent { afd, reactor, active: Cell::new(true), exclusive: Cell::new(false), added: tokio::sync::Notify::new() };
 
@@ -96,10 +97,10 @@ impl ListenEvent {
     /// EPOLLIN | EPOLLRDHUP, level-triggered, or EPOLLIN | EPOLLEXCLUSIVE
     /// (ngx_epoll_add_event drops EPOLLRDHUP for an exclusive event).
     pub fn add(&self, exclusive: bool) -> io::Result<()> {
-        if let Some((epfd, token)) = &self.reactor {
+        if let Some((epfd, token)) = self.reactor {
             let events = if exclusive { epoll::EventFlags::IN | epoll::EventFlags::EXCLUSIVE } else { epoll::EventFlags::IN | epoll::EventFlags::RDHUP };
 
-            epoll::add(&**epfd, self.afd.get_ref(), epoll::EventData::new_u64(*token), events)?;
+            epoll::add(crate::fd::get(epfd)?, crate::fd::get(self.afd.get_ref().0)?, epoll::EventData::new_u64(token), events)?;
 
             self.exclusive.set(exclusive);
         }
@@ -112,8 +113,8 @@ impl ListenEvent {
 
     /// ngx_del_event(rev, NGX_READ_EVENT, NGX_DISABLE_EVENT)
     pub fn del(&self) -> io::Result<()> {
-        if let Some((epfd, _)) = &self.reactor {
-            epoll::delete(&**epfd, self.afd.get_ref())?;
+        if let Some((epfd, _)) = self.reactor {
+            epoll::delete(crate::fd::get(epfd)?, crate::fd::get(self.afd.get_ref().0)?)?;
         }
 
         self.active.set(false);
@@ -168,17 +169,18 @@ impl ListenEvent {
     }
 }
 
-/// The reactor's epoll instance holding `fd` (an owned duplicate of its
-/// descriptor), and the token of the registration (epoll_event.data), from
-/// /proc/self/fdinfo.
-fn reactor_registration(fd: RawFd) -> Option<(Rc<OwnedFd>, u64)> {
+/// The reactor's epoll instance holding `fd` (the duplicate of its
+/// descriptor the process owns), and the token of the registration
+/// (epoll_event.data), from /proc/self/fdinfo.
+fn reactor_registration(fd: RawFd) -> Option<(RawFd, u64)> {
     let pid = crate::os::getpid();
 
-    let cached = REACTOR.with(|r| r.borrow().as_ref().filter(|r| r.pid == pid).map(|r| (r.epfd, r.epoll.clone())));
+    let cached = REACTOR.with(|r| r.borrow().as_ref().filter(|r| r.pid == pid).map(|r| r.dup));
 
-    if let Some((epfd, epoll)) = cached {
-        if let Some(token) = registration_token(epfd, fd) {
-            return Some((epoll, token));
+    // the registration is looked for in the instance the duplicate is of
+    if let Some(dup) = cached {
+        if let Some(token) = registration_token(dup, fd) {
+            return Some((dup, token));
         }
     }
 
@@ -197,9 +199,16 @@ fn reactor_registration(fd: RawFd) -> Option<(Rc<OwnedFd>, u64)> {
 
         if let Some(token) = registration_token(epfd, fd) {
             // the descriptor is the reactor's: the process owns a duplicate
-            let epoll = Rc::new(crate::fd::duplicate(epfd).ok()?);
-            REACTOR.with(|r| *r.borrow_mut() = Some(Reactor { pid, epfd, epoll: epoll.clone() }));
-            return Some((epoll, token));
+            let dup = crate::fd::register(crate::fd::duplicate(epfd).ok()?);
+            let old = REACTOR.with(|r| r.borrow_mut().replace(Reactor { pid, dup }));
+
+            // the duplicate of a parent's reactor, inherited across fork()
+            // (that of this process stays: events may use it)
+            if let Some(old) = old.filter(|old| old.pid != pid) {
+                let _ = crate::fd::close(old.dup);
+            }
+
+            return Some((dup, token));
         }
     }
 
@@ -237,6 +246,7 @@ fn registration_token(epfd: RawFd, fd: RawFd) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::fd::OwnedFd;
     use std::time::Duration;
 
     fn run<F: std::future::Future<Output = ()>>(f: F) {
