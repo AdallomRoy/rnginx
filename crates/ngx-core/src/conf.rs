@@ -375,30 +375,29 @@ impl<'c> Conf<'c> {
     /// ngx_conf_read_token reads it: the size fstat() gives, with
     /// ngx_read_file() (pread) in NGX_CONF_BUFFER chunks.
     fn read_conf_file(&mut self, filename: &[u8]) -> Result<Vec<u8>, ConfError> {
-        let cname = match std::ffi::CString::new(filename) {
-            Ok(c) => c,
-            Err(_) => {
-                self.log_error(NGX_LOG_EMERG, Some(libc::EINVAL), format_args!("open() \"{}\" failed", B(filename)));
+        if filename.contains(&0) {
+            self.log_error(NGX_LOG_EMERG, Some(libc::EINVAL), format_args!("open() \"{}\" failed", B(filename)));
+            return Err(ConfError::Logged);
+        }
+
+        /* open configuration file */
+
+        let fd = match crate::os::open(filename, libc::O_RDONLY, 0) {
+            Ok(fd) => fd,
+            Err(e) => {
+                self.log_error(NGX_LOG_EMERG, Some(e), format_args!("open() \"{}\" failed", B(filename)));
                 return Err(ConfError::Logged);
             }
         };
 
-        /* open configuration file */
-
-        let fd = unsafe { libc::open(cname.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
-
-        if fd == -1 {
-            self.log_error(NGX_LOG_EMERG, Some(crate::os::errno()), format_args!("open() \"{}\" failed", B(filename)));
-            return Err(ConfError::Logged);
-        }
-
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-
-        if unsafe { libc::fstat(fd, &mut st) } == -1 {
-            ngx_log_error!(NGX_LOG_EMERG, self.log, Some(crate::os::errno()), "fstat() \"{}\" failed", B(filename));
-        }
-
-        let file_size = st.st_size.max(0) as usize;
+        // the size of the file, 0 if fstat() failed
+        let file_size = match crate::os::fstat(fd) {
+            Ok(st) => st.st_size.max(0) as usize,
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_EMERG, self.log, Some(e), "fstat() \"{}\" failed", B(filename));
+                0
+            }
+        };
 
         let mut data = vec![0u8; file_size];
         let mut offset = 0usize;
@@ -411,14 +410,15 @@ impl<'c> Conf<'c> {
             // NGX_CONF_BUFFER
             let size = (file_size - offset).min(4096);
 
-            let n = unsafe { libc::pread(fd, data[offset..].as_mut_ptr() as *mut libc::c_void, size, offset as libc::off_t) };
+            let n = match crate::os::pread(fd, &mut data[offset..offset + size], offset as i64) {
+                Ok(n) => n,
+                Err(e) => {
+                    ngx_log_error!(NGX_LOG_CRIT, self.log, Some(e), "pread() \"{}\" failed", B(filename));
+                    break Err(ConfError::Logged);
+                }
+            };
 
-            if n == -1 {
-                ngx_log_error!(NGX_LOG_CRIT, self.log, Some(crate::os::errno()), "pread() \"{}\" failed", B(filename));
-                break Err(ConfError::Logged);
-            }
-
-            if n as usize != size {
+            if n != size {
                 let prev = self.conf_file.take();
                 self.conf_file = Some(ConfFile { name: filename.to_vec(), data: Vec::new(), pos: 0, line: 1, dump: None, is_param: false });
                 self.log_error(NGX_LOG_EMERG, None, format_args!("pread() returned only {} bytes instead of {}", n, size));
@@ -429,8 +429,8 @@ impl<'c> Conf<'c> {
             offset += size;
         };
 
-        if unsafe { libc::close(fd) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(crate::os::errno()), "close() {} failed", B(filename));
+        if let Err(e) = crate::os::close_fd(fd) {
+            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(e), "close() {} failed", B(filename));
             rc?;
             return Err(ConfError::Logged);
         }

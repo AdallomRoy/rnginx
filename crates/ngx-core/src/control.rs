@@ -66,16 +66,66 @@ impl Request {
     }
 }
 
+/// struct pollfd
+#[derive(Clone, Copy, Default)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
 /// The state of ngx_control.c: ngx_control_requests[] and
 /// ngx_control_pollfd[] (the listening socket first), the path of a unix
 /// socket, ngx_control_inherited and ngx_control_env.
 #[derive(Default)]
 struct Control {
     requests: Vec<Request>,
-    pollfd: Vec<libc::pollfd>,
+    pollfd: Vec<PollFd>,
     unix_path: Vec<u8>,
     inherited: bool,
     env: Option<Vec<u8>>,
+}
+
+/// fcntl(F_SETFL, O_ASYNC|O_NONBLOCK): SIGIO once the socket is readable,
+/// and nonblocking calls.
+fn set_async(fd: i32) -> Result<(), i32> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+    fcntl(fd, FcntlArg::F_SETFL(OFlag::O_ASYNC | OFlag::O_NONBLOCK)).map(drop).map_err(|e| e as i32)
+}
+
+/// poll() of the descriptors with a zero timeout: the number of those
+/// ready, their revents set (POLLNVAL for a descriptor which is not open).
+fn poll_now(pollfd: &mut [PollFd]) -> Result<usize, i32> {
+    use rustix::event::{PollFd as RPollFd, PollFlags};
+
+    let handles: Vec<Option<crate::fd::Fd>> = pollfd.iter().map(|p| crate::fd::get(p.fd).ok()).collect();
+
+    let mut fds: Vec<RPollFd<'_>> = Vec::with_capacity(pollfd.len());
+    let mut index = Vec::with_capacity(pollfd.len());
+
+    for (i, h) in handles.iter().enumerate() {
+        pollfd[i].revents = 0;
+
+        match h {
+            Some(h) => {
+                fds.push(RPollFd::new(h, PollFlags::from_bits_retain(pollfd[i].events as u16)));
+                index.push(i);
+            }
+            None => pollfd[i].revents = libc::POLLNVAL,
+        }
+    }
+
+    let invalid = pollfd.len() - fds.len();
+    let zero = rustix::time::Timespec { tv_sec: 0, tv_nsec: 0 };
+
+    let n = if fds.is_empty() { 0 } else { rustix::event::poll(&mut fds, Some(&zero)).map_err(|e| e.raw_os_error())? };
+
+    for (f, &i) in fds.iter().zip(index.iter()) {
+        pollfd[i].revents = f.revents().bits() as i16;
+    }
+
+    Ok(n + invalid)
 }
 
 thread_local! {
@@ -132,53 +182,53 @@ pub fn init(addr: Option<&[u8]>, log: &Log) -> Result<(), ()> {
         None => return Err(()),
     };
 
-    let fd = unsafe { libc::socket(u.family, libc::SOCK_STREAM, 0) };
-
-    if fd == -1 {
-        ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "control: socket() failed");
-        return Err(());
-    }
+    // not close-on-exec: a new binary inherits it (ngx_control_handoff)
+    let fd = match rustix::net::socket(rustix::net::AddressFamily::from_raw(u.family as u16), rustix::net::SocketType::STREAM, None) {
+        Ok(s) => crate::fd::register(s),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "control: socket() failed");
+            return Err(());
+        }
+    };
 
     let fail = |msg: &str, err: i32| {
         ngx_log_error!(NGX_LOG_EMERG, log, Some(err), "control: {}", msg);
-        unsafe { libc::close(fd) };
+        os::close(fd);
         Err(())
     };
 
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_ASYNC | libc::O_NONBLOCK) } == -1 {
-        return fail("fcntl(O_ASYNC|O_NONBLOCK) failed", os::errno());
+    if let Err(e) = set_async(fd) {
+        return fail("fcntl(O_ASYNC|O_NONBLOCK) failed", e);
     }
 
-    if unsafe { libc::fcntl(fd, libc::F_SETOWN, os::getpid()) } == -1 {
-        return fail("fcntl(F_SETOWN) failed", os::errno());
+    if let Err(e) = crate::process::set_owner(fd, os::getpid()) {
+        return fail("fcntl(F_SETOWN) failed", e);
     }
 
-    let reuseaddr: libc::c_int = 1;
+    let reuseaddr = crate::fd::get(fd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF)).and_then(|s| rustix::net::sockopt::set_socket_reuseaddr(&s, true).map_err(|e| e.raw_os_error()));
 
-    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &reuseaddr as *const libc::c_int as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t) } == -1 {
-        return fail("setsockopt(SO_REUSEADDR) failed", os::errno());
+    if let Err(e) = reuseaddr {
+        return fail("setsockopt(SO_REUSEADDR) failed", e);
     }
 
-    let (ss, len) = sa.to_libc();
-
-    if unsafe { libc::bind(fd, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) } == -1 {
-        return fail("bind() failed", os::errno());
+    if let Err(e) = nix::sys::socket::bind(fd, sa.to_nix().as_dyn()) {
+        return fail("bind() failed", e as i32);
     }
 
     if u.family == libc::AF_UNIX {
-        let path = os::cstr(&u.host);
-
-        if unsafe { libc::chmod(path.as_ptr(), libc::S_IRUSR | libc::S_IWUSR) } == -1 {
-            return fail("chmod() failed", os::errno());
+        if let Err(e) = os::chmod(&u.host, libc::S_IRUSR | libc::S_IWUSR) {
+            return fail("chmod() failed", e);
         }
     }
 
-    if unsafe { libc::listen(fd, crate::listening::NGX_LISTEN_BACKLOG) } == -1 {
-        return fail("listen() failed", os::errno());
+    let listened = crate::fd::get(fd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF)).and_then(|s| rustix::net::listen(&s, crate::listening::NGX_LISTEN_BACKLOG).map_err(|e| e.raw_os_error()));
+
+    if let Err(e) = listened {
+        return fail("listen() failed", e);
     }
 
     with(|c| {
-        c.pollfd = vec![libc::pollfd { fd, events: libc::POLLIN, revents: 0 }];
+        c.pollfd = vec![PollFd { fd, events: libc::POLLIN, revents: 0 }];
         c.requests = vec![Request::default()];
     });
 
@@ -204,7 +254,7 @@ pub fn uninit(log: &Log) {
 pub fn close_sockets() {
     with(|c| {
         for p in c.pollfd.iter() {
-            unsafe { libc::close(p.fd) };
+            os::close(p.fd);
         }
     });
 }
@@ -223,8 +273,8 @@ pub fn reown(log: &Log) {
         None => return,
     };
 
-    if unsafe { libc::fcntl(fd, libc::F_SETOWN, os::getpid()) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "control: fcntl(F_SETOWN) failed");
+    if let Err(e) = crate::process::set_owner(fd, os::getpid()) {
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "control: fcntl(F_SETOWN) failed");
     }
 }
 
@@ -234,15 +284,14 @@ pub fn reown(log: &Log) {
 pub fn handle_events(cycle: &mut Rc<Cycle>) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "control: handle events");
 
-    let ready = with(|c| unsafe { libc::poll(c.pollfd.as_mut_ptr(), c.pollfd.len() as libc::nfds_t, 0) });
-
-    if ready <= 0 {
-        if ready == -1 && os::errno() != libc::EINTR {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "control: poll() failed");
+    match with(|c| poll_now(&mut c.pollfd)) {
+        Ok(0) => return NGX_OK,
+        Ok(_) => {}
+        Err(e) if e == libc::EINTR => return NGX_OK,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "control: poll() failed");
             return NGX_ERROR;
         }
-
-        return NGX_OK;
     }
 
     let mut reloaded = false;
@@ -309,14 +358,19 @@ fn inherit(log: &Log) -> Result<(), ()> {
         }
     };
 
-    if unsafe { libc::fcntl(fd, libc::F_SETOWN, os::getpid()) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "control: fcntl(F_SETOWN) failed");
-        unsafe { libc::close(fd) };
+    // the descriptor the old binary passed, taken into the table; not
+    // close-on-exec, as it is passed on to a next binary
+    let fd = crate::process::adopt_inherited(fd);
+    let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+
+    if let Err(e) = crate::process::set_owner(fd, os::getpid()) {
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "control: fcntl(F_SETOWN) failed");
+        os::close(fd);
         return Err(());
     }
 
     with(|c| {
-        c.pollfd = vec![libc::pollfd { fd, events: libc::POLLIN, revents: 0 }];
+        c.pollfd = vec![PollFd { fd, events: libc::POLLIN, revents: 0 }];
         c.requests = vec![Request::default()];
     });
 
@@ -326,7 +380,7 @@ fn inherit(log: &Log) -> Result<(), ()> {
 /// ngx_control_close: the connection closed, those after it moved down
 fn close(i: usize) {
     with(|c| {
-        unsafe { libc::close(c.requests[i].fd) };
+        os::close(c.requests[i].fd);
 
         c.requests.remove(i);
         c.pollfd.remove(i);
@@ -339,23 +393,24 @@ fn handle_accept(log: &Log) {
     let lfd = with(|c| c.pollfd[0].fd);
 
     loop {
-        let fd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let accepted = crate::fd::get(lfd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF)).and_then(|l| rustix::net::accept(&l).map_err(|e| e.raw_os_error()));
 
-        if fd == -1 {
-            let err = os::errno();
+        let fd = match accepted {
+            Ok(s) => crate::fd::register(s),
+            Err(err) => {
+                if err == libc::EAGAIN {
+                    return;
+                }
 
-            if err == libc::EAGAIN {
+                ngx_log_error!(NGX_LOG_ERR, log, Some(err), "control: accept() failed");
+
+                if err == libc::ECONNABORTED {
+                    continue;
+                }
+
                 return;
             }
-
-            ngx_log_error!(NGX_LOG_ERR, log, Some(err), "control: accept() failed");
-
-            if err == libc::ECONNABORTED {
-                continue;
-            }
-
-            return;
-        }
+        };
 
         if with(|c| c.pollfd.len()) == NGX_CTRL_MAX_FD {
             ngx_log_error!(NGX_LOG_WARN, log, None, "control: too many client connections");
@@ -366,11 +421,11 @@ fn handle_accept(log: &Log) {
 
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "control accept fd:{}", fd);
 
-        let failed = if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        let failed = if os::set_cloexec(fd).is_err() {
             Some("control: fcntl(FD_CLOEXEC) failed")
-        } else if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_ASYNC | libc::O_NONBLOCK) } == -1 {
+        } else if set_async(fd).is_err() {
             Some("control: fcntl(O_ASYNC|O_NONBLOCK) failed")
-        } else if unsafe { libc::fcntl(fd, libc::F_SETOWN, os::getpid()) } == -1 {
+        } else if crate::process::set_owner(fd, os::getpid()).is_err() {
             Some("control: fcntl(F_SETOWN) failed")
         } else {
             None
@@ -378,13 +433,13 @@ fn handle_accept(log: &Log) {
 
         if let Some(msg) = failed {
             ngx_log_error!(NGX_LOG_ERR, log, None, "{}", msg);
-            unsafe { libc::close(fd) };
+            os::close(fd);
             continue;
         }
 
         with(|c| {
             // read in this pass of the events already
-            c.pollfd.push(libc::pollfd { fd, events: libc::POLLIN, revents: libc::POLLIN });
+            c.pollfd.push(PollFd { fd, events: libc::POLLIN, revents: libc::POLLIN });
             c.requests.push(Request { fd, input: Vec::with_capacity(NGX_CTRL_MAX_REQUEST), ..Default::default() });
         });
     }
@@ -410,23 +465,26 @@ fn handle_read(i: usize, cycle: &mut Rc<Cycle>) -> i64 {
 
         b.resize(NGX_CTRL_MAX_REQUEST, 0);
 
-        let n = unsafe { libc::recv(fd, b[last..].as_mut_ptr() as *mut libc::c_void, NGX_CTRL_MAX_REQUEST - last, 0) };
+        let n = crate::fd::get(fd)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))
+            .and_then(|s| rustix::net::recv(&s, &mut b[last..], rustix::net::RecvFlags::empty()).map(|(n, _)| n).map_err(|e| e.raw_os_error()));
 
-        b.truncate(last + n.max(0) as usize);
+        b.truncate(last + *n.as_ref().unwrap_or(&0));
 
         n
     });
 
-    if n < 0 {
-        let err = os::errno();
+    let n = match n {
+        Ok(n) => n,
+        Err(err) => {
+            if err == libc::EAGAIN {
+                return NGX_AGAIN;
+            }
 
-        if err == libc::EAGAIN {
-            return NGX_AGAIN;
+            ngx_log_error!(NGX_LOG_ERR, cycle.log, Some(err), "control: recv() failed");
+            return NGX_ERROR;
         }
-
-        ngx_log_error!(NGX_LOG_ERR, cycle.log, Some(err), "control: recv() failed");
-        return NGX_ERROR;
-    }
+    };
 
     if n == 0 {
         return NGX_DONE;
@@ -584,22 +642,30 @@ fn handle_write(i: usize, log: &Log) -> i64 {
             return NGX_DONE;
         }
 
-        let n = with(|c| {
+        let sent = with(|c| {
             let r = &c.requests[i];
-            unsafe { libc::send(fd, r.out[r.sent..].as_ptr() as *const libc::c_void, rest, 0) }
+
+            crate::fd::get(fd)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))
+                .and_then(|s| rustix::net::send(&s, &r.out[r.sent..r.sent + rest], rustix::net::SendFlags::empty()).map_err(|e| e.raw_os_error()))
         });
 
-        if n <= 0 {
-            let err = os::errno();
-
-            if n == -1 && err == libc::EAGAIN {
-                with(|c| c.pollfd[i].events |= libc::POLLOUT);
-                return NGX_AGAIN;
+        let n = match sent {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                ngx_log_error!(NGX_LOG_ERR, log, Some(os::errno()), "control: send() failed");
+                return NGX_ERROR;
             }
+            Err(err) => {
+                if err == libc::EAGAIN {
+                    with(|c| c.pollfd[i].events |= libc::POLLOUT);
+                    return NGX_AGAIN;
+                }
 
-            ngx_log_error!(NGX_LOG_ERR, log, Some(err), "control: send() failed");
-            return NGX_ERROR;
-        }
+                ngx_log_error!(NGX_LOG_ERR, log, Some(err), "control: send() failed");
+                return NGX_ERROR;
+            }
+        };
 
         with(|c| c.requests[i].sent += n as usize);
 

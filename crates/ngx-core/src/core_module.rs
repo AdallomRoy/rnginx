@@ -392,8 +392,8 @@ pub fn create_pidfile(name: &[u8], log: &Log) -> Result<(), ()> {
     let mut rc = Ok(());
     if !test {
         let s = format!("{}\n", os::getpid());
-        if os::write_fd(fd, s.as_bytes()).is_err() {
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(os::errno()), "pwrite() \"{}\" failed", B(name));
+        if let Err(e) = os::write_fd(fd, s.as_bytes()) {
+            ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "pwrite() \"{}\" failed", B(name));
             rc = Err(());
         }
     }
@@ -421,8 +421,10 @@ pub fn log_redirect_stderr(cycle: &Cycle) -> Result<(), ()> {
         None => return Ok(()),
     };
     if fd != libc::STDERR_FILENO {
-        if unsafe { libc::dup2(fd, libc::STDERR_FILENO) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "dup2(STDERR) failed");
+        let rc = crate::fd::get(fd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF)).and_then(|f| rustix::stdio::dup2_stderr(&f).map_err(|e| e.raw_os_error()));
+
+        if let Err(e) = rc {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "dup2(STDERR) failed");
             return Err(());
         }
     }

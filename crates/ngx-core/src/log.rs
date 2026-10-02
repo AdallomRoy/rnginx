@@ -47,12 +47,12 @@ pub fn use_stderr() -> bool {
 }
 
 thread_local! {
-    static LOG_PID: Cell<i32> = Cell::new(unsafe { libc::getpid() });
+    static LOG_PID: Cell<i32> = Cell::new(crate::os::getpid());
 }
 
 /// Refresh cached pid (call after fork).
 pub fn update_pid() {
-    LOG_PID.with(|p| p.set(unsafe { libc::getpid() }));
+    LOG_PID.with(|p| p.set(crate::os::getpid()));
 }
 
 pub fn pid() -> i32 {
@@ -61,15 +61,7 @@ pub fn pid() -> i32 {
 
 /// strerror text like nginx's ngx_strerror.
 pub fn strerror(err: i32) -> String {
-    let mut buf = [0u8; 256];
-    unsafe {
-        let r = libc::strerror_r(err, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
-        if r != 0 {
-            return format!("Unknown error {}", err);
-        }
-        let cs = std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char);
-        cs.to_string_lossy().into_owned()
-    }
+    crate::os::strerror(err)
 }
 
 pub fn errno() -> i32 {
@@ -96,17 +88,14 @@ impl OpenFile {
         if fd < 0 {
             return Err(libc::EBADF);
         }
+        let file = crate::fd::get(fd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
         let mut off = 0;
         while off < buf.len() {
-            let n = unsafe { libc::write(fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off) };
-            if n < 0 {
-                let e = errno();
-                if e == libc::EINTR {
-                    continue;
-                }
-                return Err(e);
+            match nix::unistd::write(&file, &buf[off..]) {
+                Ok(n) => off += n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e as i32),
             }
-            off += n as usize;
         }
         Ok(())
     }
@@ -351,20 +340,20 @@ impl Log {
     }
 }
 
+/// write(2) of fd 2 (ngx_write_stderr)
 pub fn write_stderr(buf: &[u8]) {
-    unsafe {
-        let _ = libc::write(libc::STDERR_FILENO, buf.as_ptr() as *const libc::c_void, buf.len());
-    }
+    let _ = nix::unistd::write(std::io::stderr(), buf);
 }
 
+/// write(2) of fd 1 until all is written (ngx_write_stdout)
 pub fn write_stdout(buf: &[u8]) {
+    let out = std::io::stdout();
     let mut off = 0;
     while off < buf.len() {
-        let n = unsafe { libc::write(libc::STDOUT_FILENO, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off) };
-        if n <= 0 {
-            break;
+        match nix::unistd::write(&out, &buf[off..]) {
+            Ok(n) if n > 0 => off += n,
+            _ => break,
         }
-        off += n as usize;
     }
 }
 
@@ -469,24 +458,23 @@ pub fn log_init(prefix: Option<&[u8]>, error_log: Option<&[u8]>) -> Log {
     }
     name.extend_from_slice(error_log);
     let file = Rc::new(OpenFile::new(name.clone()));
-    let fd = open_log_file(&name);
-    if fd < 0 {
-        let e = errno();
-        log_stderr(Some(e), format_args!("[alert] could not open error log file: open() \"{}\" failed", crate::string::B(&name)));
-        file.fd.set(libc::STDERR_FILENO);
-    } else {
-        file.fd.set(fd);
+    match open_log_file(&name) {
+        Ok(fd) => file.fd.set(fd),
+        Err(e) => {
+            log_stderr(Some(e), format_args!("[alert] could not open error log file: open() \"{}\" failed", crate::string::B(&name)));
+            file.fd.set(libc::STDERR_FILENO);
+        }
     }
     let chain = LogChain::new();
     chain.insert(LogEntry::new(NGX_LOG_NOTICE, LogWriter::File(file)));
     Log::new(chain)
 }
 
-/// open(name, O_WRONLY|O_APPEND|O_CREAT, 0644)
-pub fn open_log_file(name: &[u8]) -> RawFd {
-    let c = match std::ffi::CString::new(name.to_vec()) {
-        Ok(c) => c,
-        Err(_) => return -1,
-    };
-    unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_CLOEXEC, 0o644) }
+/// open(name, O_WRONLY|O_APPEND|O_CREAT, 0644): the descriptor (in the
+/// table), or errno
+pub fn open_log_file(name: &[u8]) -> Result<RawFd, i32> {
+    if name.contains(&0) {
+        return Err(libc::EINVAL);
+    }
+    crate::os::open(name, libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT, 0o644)
 }

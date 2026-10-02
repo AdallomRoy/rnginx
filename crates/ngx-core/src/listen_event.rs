@@ -17,7 +17,9 @@
 //! level-triggered, EPOLLEXCLUSIVE if asked. The reactor's epoll instance
 //! and the token are found in /proc/self/fdinfo; without them the event
 //! stays as the reactor registered it (edge-triggered, never exclusive,
-//! deleted by not waiting for it).
+//! deleted by not waiting for it). The epoll_ctl() calls are made on a
+//! duplicate of the reactor's descriptor (the same epoll instance), which
+//! the process owns.
 //!
 //! The dup() also lets the event of a socket inherited by a new cycle be
 //! added before the reactor has deleted the previous one, and keeps the
@@ -25,38 +27,48 @@
 //! socket closed while other processes hold it would stay in the epoll
 //! instance otherwise.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::rc::Rc;
 
+use rustix::event::epoll;
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::io::Interest;
 
 /// The dup() of the listening socket registered in the reactor.
-pub struct EventFd(RawFd);
+pub struct EventFd(OwnedFd);
 
 impl AsRawFd for EventFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0
+        self.0.as_raw_fd()
     }
 }
 
-impl Drop for EventFd {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.0) };
+impl AsFd for EventFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
     }
+}
+
+/// The reactor's epoll instance in a process: its descriptor, and the
+/// duplicate of it which epoll_ctl() is called with.
+struct Reactor {
+    pid: i32,
+    epfd: RawFd,
+    epoll: Rc<OwnedFd>,
 }
 
 thread_local! {
     /// The reactor's epoll instance, once found, in the process.
-    static REACTOR: Cell<Option<(libc::pid_t, RawFd)>> = const { Cell::new(None) };
+    static REACTOR: RefCell<Option<Reactor>> = const { RefCell::new(None) };
 }
 
 /// The read event of a listening socket.
 pub struct ListenEvent {
     afd: AsyncFd<EventFd>,
     /// the reactor's epoll instance and the token of the registration
-    reactor: Option<(RawFd, u64)>,
+    reactor: Option<(Rc<OwnedFd>, u64)>,
     /// rev->active
     active: Cell<bool>,
     exclusive: Cell<bool>,
@@ -67,15 +79,11 @@ pub struct ListenEvent {
 impl ListenEvent {
     /// The read event of the listening socket `fd`, not added.
     pub fn new(fd: RawFd) -> io::Result<ListenEvent> {
-        let s = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-
-        if s == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        let s = rustix::io::fcntl_dupfd_cloexec(crate::fd::get(fd)?, 0)?;
 
         let afd = AsyncFd::with_interest(EventFd(s), Interest::READABLE)?;
 
-        let reactor = reactor_registration(s);
+        let reactor = reactor_registration(afd.get_ref().as_raw_fd());
 
         let ev = ListenEvent { afd, reactor, active: Cell::new(true), exclusive: Cell::new(false), added: tokio::sync::Notify::new() };
 
@@ -88,14 +96,10 @@ impl ListenEvent {
     /// EPOLLIN | EPOLLRDHUP, level-triggered, or EPOLLIN | EPOLLEXCLUSIVE
     /// (ngx_epoll_add_event drops EPOLLRDHUP for an exclusive event).
     pub fn add(&self, exclusive: bool) -> io::Result<()> {
-        if let Some((epfd, token)) = self.reactor {
-            let events = if exclusive { libc::EPOLLIN | libc::EPOLLEXCLUSIVE } else { libc::EPOLLIN | libc::EPOLLRDHUP };
+        if let Some((epfd, token)) = &self.reactor {
+            let events = if exclusive { epoll::EventFlags::IN | epoll::EventFlags::EXCLUSIVE } else { epoll::EventFlags::IN | epoll::EventFlags::RDHUP };
 
-            let mut ee = libc::epoll_event { events: events as u32, u64: token };
-
-            if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, self.afd.get_ref().0, &mut ee) } == -1 {
-                return Err(io::Error::last_os_error());
-            }
+            epoll::add(&**epfd, self.afd.get_ref(), epoll::EventData::new_u64(*token), events)?;
 
             self.exclusive.set(exclusive);
         }
@@ -108,10 +112,8 @@ impl ListenEvent {
 
     /// ngx_del_event(rev, NGX_READ_EVENT, NGX_DISABLE_EVENT)
     pub fn del(&self) -> io::Result<()> {
-        if let Some((epfd, _)) = self.reactor {
-            if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, self.afd.get_ref().0, std::ptr::null_mut()) } == -1 {
-                return Err(io::Error::last_os_error());
-            }
+        if let Some((epfd, _)) = &self.reactor {
+            epoll::delete(&**epfd, self.afd.get_ref())?;
         }
 
         self.active.set(false);
@@ -166,16 +168,17 @@ impl ListenEvent {
     }
 }
 
-/// The reactor's epoll instance holding `fd`, and the token of the
-/// registration (epoll_event.data), from /proc/self/fdinfo.
-fn reactor_registration(fd: RawFd) -> Option<(RawFd, u64)> {
-    let pid = unsafe { libc::getpid() };
+/// The reactor's epoll instance holding `fd` (an owned duplicate of its
+/// descriptor), and the token of the registration (epoll_event.data), from
+/// /proc/self/fdinfo.
+fn reactor_registration(fd: RawFd) -> Option<(Rc<OwnedFd>, u64)> {
+    let pid = crate::os::getpid();
 
-    if let Some((p, epfd)) = REACTOR.with(|r| r.get()) {
-        if p == pid {
-            if let Some(token) = registration_token(epfd, fd) {
-                return Some((epfd, token));
-            }
+    let cached = REACTOR.with(|r| r.borrow().as_ref().filter(|r| r.pid == pid).map(|r| (r.epfd, r.epoll.clone())));
+
+    if let Some((epfd, epoll)) = cached {
+        if let Some(token) = registration_token(epfd, fd) {
+            return Some((epoll, token));
         }
     }
 
@@ -193,8 +196,10 @@ fn reactor_registration(fd: RawFd) -> Option<(RawFd, u64)> {
         }
 
         if let Some(token) = registration_token(epfd, fd) {
-            REACTOR.with(|r| r.set(Some((pid, epfd))));
-            return Some((epfd, token));
+            // the descriptor is the reactor's: the process owns a duplicate
+            let epoll = Rc::new(crate::fd::duplicate(epfd).ok()?);
+            REACTOR.with(|r| *r.borrow_mut() = Some(Reactor { pid, epfd, epoll: epoll.clone() }));
+            return Some((epoll, token));
         }
     }
 
@@ -232,7 +237,6 @@ fn registration_token(epfd: RawFd, fd: RawFd) -> Option<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::unix::io::IntoRawFd;
     use std::time::Duration;
 
     fn run<F: std::future::Future<Output = ()>>(f: F) {
@@ -240,21 +244,24 @@ mod tests {
         rt.block_on(f);
     }
 
+    /// accept4() of a connection, closed at once
     fn accept(fd: RawFd) -> bool {
-        let s = unsafe { libc::accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
-        if s >= 0 {
-            unsafe { libc::close(s) };
-        }
-        s >= 0
+        let l = crate::fd::get(fd).unwrap();
+        rustix::net::accept_with(&l, rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC).is_ok()
+    }
+
+    /// A listening socket in the descriptor table.
+    fn listener() -> (RawFd, std::net::SocketAddr) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let addr = l.local_addr().unwrap();
+        (crate::fd::register(OwnedFd::from(l)), addr)
     }
 
     #[test]
     fn level_triggered_event() {
         run(async {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.set_nonblocking(true).unwrap();
-            let addr = l.local_addr().unwrap();
-            let fd = l.into_raw_fd();
+            let (fd, addr) = listener();
 
             let ev = ListenEvent::new(fd).unwrap();
             assert!(ev.is_level());
@@ -292,18 +299,16 @@ mod tests {
             assert!(accept(fd));
             ev.handled(&mut guard, false);
 
+            drop(guard);
             drop(ev);
-            unsafe { libc::close(fd) };
+            crate::fd::close(fd).unwrap();
         });
     }
 
     #[test]
     fn events_of_one_socket() {
         run(async {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.set_nonblocking(true).unwrap();
-            let addr = l.local_addr().unwrap();
-            let fd = l.into_raw_fd();
+            let (fd, addr) = listener();
 
             // the event of a previous cycle is not deleted yet
             let old = ListenEvent::new(fd).unwrap();
@@ -321,7 +326,7 @@ mod tests {
             drop(guard);
 
             drop(ev);
-            unsafe { libc::close(fd) };
+            crate::fd::close(fd).unwrap();
         });
     }
 }

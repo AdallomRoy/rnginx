@@ -355,34 +355,32 @@ fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
         (c.priority, c.rlimit_nofile.clone(), c.rlimit_core.clone(), c.user, c.group, c.username.clone(), c.working_directory.clone(), c.cpu_affinity.clone(), c.cpu_affinity_auto)
     };
     if worker >= 0 && priority != 0 {
-        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, priority as i32) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "setpriority({}) failed", priority);
+        if let Err(e) = rustix::process::setpriority_process(None, priority as i32) {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e.raw_os_error()), "setpriority({}) failed", priority);
         }
     }
     if let Some(n) = rlimit_nofile.as_option() {
-        let r = libc::rlimit { rlim_cur: *n as libc::rlim_t, rlim_max: *n as libc::rlim_t };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "setrlimit(RLIMIT_NOFILE, {}) failed", n);
+        if let Err(e) = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, *n as libc::rlim_t, *n as libc::rlim_t) {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "setrlimit(RLIMIT_NOFILE, {}) failed", n);
         }
     }
     if let Some(n) = rlimit_core.as_option() {
-        let r = libc::rlimit { rlim_cur: *n as libc::rlim_t, rlim_max: *n as libc::rlim_t };
-        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &r) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "setrlimit(RLIMIT_CORE, {}) failed", n);
+        if let Err(e) = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, *n as libc::rlim_t, *n as libc::rlim_t) {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "setrlimit(RLIMIT_CORE, {}) failed", n);
         }
     }
     if os::geteuid() == 0 {
         if let (Some(uid), Some(gid)) = (user, group) {
-            if unsafe { libc::setgid(gid) } == -1 {
-                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(os::errno()), "setgid({}) failed", gid);
+            if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
+                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(e as i32), "setgid({}) failed", gid);
                 std::process::exit(2);
             }
             let uname = os::cstr(&username);
-            if unsafe { libc::initgroups(uname.as_ptr(), gid) } == -1 {
-                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(os::errno()), "initgroups({}, {}) failed", B(&username), gid);
+            if let Err(e) = nix::unistd::initgroups(&uname, nix::unistd::Gid::from_raw(gid)) {
+                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(e as i32), "initgroups({}, {}) failed", B(&username), gid);
             }
-            if unsafe { libc::setuid(uid) } == -1 {
-                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(os::errno()), "setuid({}) failed", uid);
+            if let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)) {
+                ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(e as i32), "setuid({}) failed", uid);
                 std::process::exit(2);
             }
         }
@@ -395,36 +393,27 @@ fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
             Some(&cpu_affinity[idx])
         };
         if let Some(mask) = mask {
-            unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                libc::CPU_ZERO(&mut set);
-                for (i, &on) in mask.iter().enumerate() {
-                    if on && i < libc::CPU_SETSIZE as usize {
-                        libc::CPU_SET(i, &mut set);
-                    }
+            let mut set = nix::sched::CpuSet::new();
+            for (i, &on) in mask.iter().enumerate() {
+                if on && i < nix::sched::CpuSet::count() {
+                    let _ = set.set(i);
                 }
-                if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == -1 {
-                    ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "sched_setaffinity() failed");
-                }
+            }
+            if let Err(e) = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set) {
+                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "sched_setaffinity() failed");
             }
         }
     }
-    unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
-    }
+    // allow coredump after setuid()
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::Dumpable);
     if !workdir.is_empty() {
-        let c = os::cstr(&workdir);
-        if unsafe { libc::chdir(c.as_ptr()) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "chdir(\"{}\") failed", B(&workdir));
+        if let Err(e) = nix::unistd::chdir(os::path(&workdir)) {
+            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "chdir(\"{}\") failed", B(&workdir));
             std::process::exit(2);
         }
     }
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        if libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "sigprocmask() failed");
-        }
+    if let Err(e) = nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_SETMASK, Some(&nix::sys::signal::SigSet::empty()), None) {
+        ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "sigprocmask() failed");
     }
     for m in cycle.modules.iter() {
         if let Some(f) = m.def.init_process {
@@ -443,12 +432,14 @@ fn worker_process_init(cycle: &Rc<Cycle>, worker: i64) {
             if pr.pid == -1 || n == slot || pr.channel[1] == -1 {
                 continue;
             }
-            if unsafe { libc::close(pr.channel[1]) } == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() channel failed");
+            if let Err(e) = os::close_fd(pr.channel[1]) {
+                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "close() channel failed");
             }
         }
-        if slot < p.len() && p[slot].channel[0] != -1 && unsafe { libc::close(p[slot].channel[0]) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() channel failed");
+        if slot < p.len() && p[slot].channel[0] != -1 {
+            if let Err(e) = os::close_fd(p[slot].channel[0]) {
+                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "close() channel failed");
+            }
         }
     });
 }
@@ -573,17 +564,20 @@ pub fn cache_manager_process_cycle(cycle: Rc<Cycle>, data: i64) -> ! {
 
 /// Task that watches signal wakeups and the master channel, setting flags.
 async fn control_task(cycle: Rc<Cycle>, _single: bool) {
-    let wake = wake_fd();
     let chan = CHANNEL.with(|c| c.get());
-    let wake_afd = if wake >= 0 { AsyncFd::with_interest(Fd(wake), tokio::io::Interest::READABLE).ok() } else { None };
-    let mut chan_afd = if chan >= 0 && process_type() != ProcessType::Single { AsyncFd::with_interest(Fd(chan), tokio::io::Interest::READABLE).ok() } else { None };
+    // the read end of the signal pipe, readable once the signal handler ran
+    let wake_afd = signal_pipe().and_then(|p| AsyncFd::with_interest(p, tokio::io::Interest::READABLE).ok());
+    let mut chan_afd = if chan >= 0 && process_type() != ProcessType::Single {
+        crate::fd::get(chan).ok().and_then(|f| AsyncFd::with_interest(f, tokio::io::Interest::READABLE).ok())
+    } else {
+        None
+    };
     let notify = flags_notify();
     loop {
         tokio::select! {
             r = async { match &wake_afd { Some(a) => a.readable().await.map(|mut g| { g.clear_ready(); }), None => std::future::pending().await } } => {
                 let _ = r;
-                drain_wake_pipe();
-                drain_signal_log(&cycle.log);
+                process_signals(&cycle.log, true);
                 notify.notify_waiters();
                 notify.notify_one();
             }
@@ -595,8 +589,8 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
                             // ngx_close_connection() of the channel: signals
                             // are still handled
                             chan_afd = None;
-                            if unsafe { libc::close(chan) } == -1 {
-                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() socket {} failed", chan);
+                            if let Err(e) = os::close_fd(chan) {
+                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "close() socket {} failed", chan);
                             }
                             break;
                         }
@@ -624,8 +618,8 @@ async fn control_task(cycle: Rc<Cycle>, _single: bool) {
                                         let mut p = p.borrow_mut();
                                         let s = ch.slot as usize;
                                         if s < p.len() && p[s].channel[0] != -1 && p[s].pid == ch.pid {
-                                            if unsafe { libc::close(p[s].channel[0]) } == -1 {
-                                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "close() channel failed");
+                                            if let Err(e) = os::close_fd(p[s].channel[0]) {
+                                                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "close() channel failed");
                                             }
                                             p[s].channel[0] = -1;
                                         }
@@ -651,6 +645,27 @@ pub(crate) fn update_accept_disabled() {
 
 pub fn accept_disabled() -> i64 {
     ACCEPT_DISABLED.with(|d| d.get())
+}
+
+/// The peer address accept4() returned for the connection `s`; None for a
+/// family other than AF_INET, AF_INET6 and AF_UNIX. A unix address is the
+/// one getpeername() gives: rustix's conversion of it panics on a path
+/// filling sun_path, which a client can bind.
+fn accepted_sockaddr(addr: rustix::net::SocketAddrAny, s: i32) -> Option<crate::inet::SockAddr> {
+    use crate::inet::SockAddr;
+    use rustix::net::AddressFamily;
+
+    match addr.address_family() {
+        AddressFamily::INET => std::net::SocketAddrV4::try_from(addr).ok().map(SockAddr::V4),
+        AddressFamily::INET6 => std::net::SocketAddrV6::try_from(addr).ok().map(SockAddr::V6),
+        AddressFamily::UNIX => {
+            let ss = nix::sys::socket::getpeername::<nix::sys::socket::SockaddrStorage>(s).ok();
+
+            // an unnamed peer otherwise, as most are
+            Some(ss.and_then(|ss| SockAddr::from_nix(&ss)).unwrap_or(SockAddr::Unix(Vec::new())))
+        }
+        _ => None,
+    }
 }
 
 /// ngx_event_accept: the read handler of a TCP listening socket, as the
@@ -686,29 +701,31 @@ async fn accept_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
         let mut reorder = false;
 
         loop {
-            let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            let s = unsafe { libc::accept4(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len, libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
-            if s == -1 {
-                let err = os::errno();
-                if err == libc::EAGAIN {
-                    ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "accept() not ready");
-                    again = true;
+            let accepted = crate::fd::get(fd)
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))
+                .and_then(|lfd| rustix::net::acceptfrom_with(&lfd, rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC).map_err(|e| e.raw_os_error()));
+            let (s, addr) = match accepted {
+                Ok((owned, addr)) => (crate::fd::register(owned), addr),
+                Err(err) => {
+                    if err == libc::EAGAIN {
+                        ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "accept() not ready");
+                        again = true;
+                        break;
+                    }
+                    let level = if err == libc::ECONNABORTED { NGX_LOG_ERR } else if err == libc::EMFILE || err == libc::ENFILE { NGX_LOG_CRIT } else { NGX_LOG_ALERT };
+                    ngx_log_error!(level, log, Some(err), "accept4() failed");
+                    if err == libc::ECONNABORTED && multi_accept {
+                        continue;
+                    }
+                    if err == libc::EMFILE || err == libc::ENFILE {
+                        emfile = true;
+                    }
                     break;
                 }
-                let level = if err == libc::ECONNABORTED { NGX_LOG_ERR } else if err == libc::EMFILE || err == libc::ENFILE { NGX_LOG_CRIT } else { NGX_LOG_ALERT };
-                ngx_log_error!(level, log, Some(err), "accept4() failed");
-                if err == libc::ECONNABORTED && multi_accept {
-                    continue;
-                }
-                if err == libc::EMFILE || err == libc::ENFILE {
-                    emfile = true;
-                }
-                break;
-            }
+            };
             stats().accepted.fetch_add(1, Ordering::Relaxed);
             update_accept_disabled();
-            let sa = match crate::inet::SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len) {
+            let sa = match addr.and_then(|a| accepted_sockaddr(a, s)) {
                 Some(sa) => sa,
                 None => {
                     os::close(s);
@@ -1116,7 +1133,7 @@ fn start_accepting(cycle: &Rc<Cycle>) {
 fn event_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .on_thread_park(|| EVENTS_PARKED.store(true, Ordering::SeqCst))
+        .on_thread_park(events_park)
         .on_thread_unpark(events_unparked)
         .build()
         .expect("tokio runtime")
@@ -1128,14 +1145,14 @@ fn event_runtime() -> tokio::runtime::Runtime {
 /// any event is handled, as the cycles check it after
 /// ngx_process_events_and_timers()
 fn events_unparked() {
-    EVENTS_PARKED.store(false, Ordering::SeqCst);
+    let interrupted = events_interrupted();
 
     crate::times::update_event_msec();
 
     let pt = process_type();
     let exit = SIG_TERMINATE.load(Ordering::SeqCst) || (pt != ProcessType::Worker && SIG_QUIT.load(Ordering::SeqCst));
 
-    if !EVENTS_EINTR.load(Ordering::SeqCst) && !exit {
+    if !interrupted && !exit {
         return;
     }
 
@@ -1144,9 +1161,9 @@ fn events_unparked() {
         None => return,
     };
 
-    drain_signal_log(&cycle.log);
+    process_signals(&cycle.log, false);
 
-    if EVENTS_EINTR.swap(false, Ordering::SeqCst) {
+    if interrupted {
         ngx_log_error!(NGX_LOG_INFO, cycle.log, Some(libc::EINTR), "epoll_wait() failed");
     }
 

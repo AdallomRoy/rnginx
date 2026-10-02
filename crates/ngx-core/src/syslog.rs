@@ -174,19 +174,22 @@ impl SyslogPeer {
     }
 
     fn init(&self, log: &Log) -> Result<(), ()> {
-        let fd = unsafe { libc::socket(self.server.family(), libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-        if fd == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "socket() failed");
-            return Err(());
-        }
-        if os::set_nonblocking(fd).is_err() {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "ioctl(FIONBIO) failed");
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+        let fd = match rustix::net::socket_with(AddressFamily::from_raw(self.server.family() as u16), SocketType::DGRAM, SocketFlags::CLOEXEC, None) {
+            Ok(s) => crate::fd::register(s),
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e.raw_os_error()), "socket() failed");
+                return Err(());
+            }
+        };
+        if let Err(e) = os::set_nonblocking(fd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "ioctl(FIONBIO) failed");
             os::close(fd);
             return Err(());
         }
-        let (ss, len) = self.server.to_libc();
-        if unsafe { libc::connect(fd, &ss as *const _ as *const libc::sockaddr, len) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "connect() failed");
+        if let Err(e) = nix::sys::socket::connect(fd, self.server.to_nix().as_dyn()) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e as i32), "connect() failed");
             os::close(fd);
             return Err(());
         }
@@ -206,15 +209,22 @@ impl SyslogPeer {
         }
         // ngx_unix_send
         loop {
-            let n = unsafe { libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
+            let sent = crate::fd::get(self.fd.get())
+                .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))
+                .and_then(|s| rustix::net::send(&s, buf, rustix::net::SendFlags::empty()).map_err(|e| e.raw_os_error()));
+
+            // the errno of a failed send(), or the one left (not changed by
+            // a send() returning zero)
+            let (n, err) = match sent {
+                Ok(n) => (n as isize, os::errno()),
+                Err(e) => (-1, e),
+            };
 
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "send: fd:{} {} of {}", self.fd.get(), n, buf.len());
 
             if n > 0 {
                 return n;
             }
-
-            let err = os::errno();
 
             if n == 0 {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "send() returned zero");

@@ -314,9 +314,8 @@ impl Cycle {
                 }
             }
             if fi.st_mode & 0o700 != 0o700 {
-                let c = os::cstr(&p.name);
-                if unsafe { libc::chmod(c.as_ptr(), fi.st_mode | 0o700) } == -1 {
-                    ngx_log_error!(NGX_LOG_EMERG, self.log, Some(os::errno()), "chmod() \"{}\" failed", B(&p.name));
+                if let Err(e) = os::chmod(&p.name, fi.st_mode | 0o700) {
+                    ngx_log_error!(NGX_LOG_EMERG, self.log, Some(e), "chmod() \"{}\" failed", B(&p.name));
                     return Err(());
                 }
             }
@@ -341,11 +340,13 @@ impl Cycle {
             if f.name.is_empty() {
                 continue;
             }
-            let fd = open_log_file(&f.name);
-            if fd < 0 {
-                ngx_log_error!(NGX_LOG_EMERG, self.log, Some(os::errno()), "open() \"{}\" failed", B(&f.name));
-                return Err(());
-            }
+            let fd = match open_log_file(&f.name) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    ngx_log_error!(NGX_LOG_EMERG, self.log, Some(e), "open() \"{}\" failed", B(&f.name));
+                    return Err(());
+                }
+            };
             f.fd.set(fd);
         }
         Ok(())
@@ -360,24 +361,26 @@ impl Cycle {
             if let Some(flush) = f.flush.borrow().clone() {
                 flush(f, &self.log);
             }
-            let fd = open_log_file(&f.name);
-            if fd < 0 {
-                ngx_log_error!(NGX_LOG_EMERG, self.log, Some(os::errno()), "open() \"{}\" failed", B(&f.name));
-                continue;
-            }
+            let fd = match open_log_file(&f.name) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    ngx_log_error!(NGX_LOG_EMERG, self.log, Some(e), "open() \"{}\" failed", B(&f.name));
+                    continue;
+                }
+            };
             if let Some(user) = user {
                 if let Ok(fi) = os::fstat(fd) {
                     if fi.st_uid != user {
-                        if unsafe { libc::fchown(fd, user, u32::MAX) } == -1 {
-                            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "chown(\"{}\", {}) failed", B(&f.name), user);
+                        if let Err(e) = os::fchown(fd, user, u32::MAX) {
+                            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(e), "chown(\"{}\", {}) failed", B(&f.name), user);
                             os::close(fd);
                             continue;
                         }
                     }
                     if fi.st_mode & (libc::S_IRUSR | libc::S_IWUSR) != (libc::S_IRUSR | libc::S_IWUSR) {
                         let mode = fi.st_mode | libc::S_IRUSR | libc::S_IWUSR;
-                        if unsafe { libc::fchmod(fd, mode) } == -1 {
-                            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "chmod() \"{}\" failed", B(&f.name));
+                        if let Err(e) = os::fchmod(fd, mode) {
+                            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(e), "chmod() \"{}\" failed", B(&f.name));
                             os::close(fd);
                             continue;
                         }
@@ -693,8 +696,8 @@ pub fn init_cycle(old: Rc<Cycle>, hooks: &InitHooks) -> CycleResult {
         }
         // its read event goes with it (a single process reloading)
         crate::event::stop_accepting(ls);
-        if unsafe { libc::close(ls.fd.get()) } == -1 {
-            ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "close() listening socket on {} failed", B(&ls.addr_text));
+        if let Err(e) = os::close_fd(ls.fd.get()) {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(e), "close() listening socket on {} failed", B(&ls.addr_text));
         }
         if ls.is_unix() {
             let name = &ls.addr_text[5..];

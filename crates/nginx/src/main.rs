@@ -7,7 +7,7 @@ use ngx_core::cycle::*;
 use ngx_core::log::*;
 use ngx_core::module::*;
 use ngx_core::string::B;
-use ngx_core::{ngx_log_error, ngx_log_stderr, os, process};
+use ngx_core::{ngx_log_error, ngx_log_stderr, process};
 
 const NGX_COMPILER: &str = "rustc 1.96.1";
 const NGX_CONFIGURE: &str = " --with-debug --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module --with-http_addition_module --with-http_geoip_module --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-http_json_module --with-control-api --with-mail --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module --with-stream_ssl_preread_module --with-threads --with-file-aio";
@@ -282,9 +282,8 @@ fn main() {
     ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "{}", ngx_core::NGINX_VER_BUILD);
     ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "built by {}", NGX_COMPILER);
     ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "OS: {}", os_info());
-    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
-        ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "getrlimit(RLIMIT_NOFILE): {}:{}", rl.rlim_cur, rl.rlim_max);
+    if let Ok((cur, max)) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE) {
+        ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "getrlimit(RLIMIT_NOFILE): {}:{}", cur, max);
     }
 
     let ccf = core_conf(&cycle);
@@ -331,13 +330,6 @@ fn main() {
 }
 
 fn os_info() -> String {
-    unsafe {
-        let mut u: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut u) == 0 {
-            let s = std::ffi::CStr::from_ptr(u.sysname.as_ptr()).to_string_lossy().into_owned();
-            let r = std::ffi::CStr::from_ptr(u.release.as_ptr()).to_string_lossy().into_owned();
-            return format!("{} {}", s, r);
-        }
-    }
-    "unknown".into()
+    let u = rustix::system::uname();
+    format!("{} {}", u.sysname().to_string_lossy(), u.release().to_string_lossy())
 }

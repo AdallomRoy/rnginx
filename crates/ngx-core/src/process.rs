@@ -1,15 +1,28 @@
 //! Process management: master/worker cycle, signals, channels (ngx_process*.c).
 
 use std::cell::{Cell, RefCell};
-use std::ffi::CString;
+use std::collections::HashSet;
+use std::ffi::{CString, OsStr};
+use std::io::{IoSlice, IoSliceMut};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, LazyLock};
+
+use nix::sys::signal::{SigSet, SigmaskHow, Signal};
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+use signal_hook::iterator::backend::SignalDelivery;
+use signal_hook::iterator::exfiltrator::WithOrigin;
 
 use crate::core_module::{core_conf, delete_pidfile};
 use crate::cycle::*;
 use crate::log::*;
 use crate::string::B;
-use crate::{ngx_log_debug, ngx_log_error, os};
+use crate::{fd, ngx_log_debug, ngx_log_error, os};
 
 pub const NGX_MAX_PROCESSES: usize = 1024;
 pub const NGX_PROCESS_NORESPAWN: i64 = -1;
@@ -31,6 +44,35 @@ pub struct Channel {
     pub pid: i32,
     pub slot: i32,
     pub fd: i32,
+}
+
+/// The size of a channel message: the four fields, as the repr(C)
+/// structure lays them out
+const CHANNEL_SIZE: usize = std::mem::size_of::<Channel>();
+
+impl Channel {
+    /// The message as sent: the fields in their order, native endian.
+    fn to_bytes(self) -> [u8; CHANNEL_SIZE] {
+        let mut b = [0u8; CHANNEL_SIZE];
+
+        b[0..4].copy_from_slice(&self.command.to_ne_bytes());
+        b[4..8].copy_from_slice(&self.pid.to_ne_bytes());
+        b[8..12].copy_from_slice(&self.slot.to_ne_bytes());
+        b[12..16].copy_from_slice(&self.fd.to_ne_bytes());
+
+        b
+    }
+
+    fn from_bytes(b: &[u8; CHANNEL_SIZE]) -> Channel {
+        let field = |i: usize| [b[i], b[i + 1], b[i + 2], b[i + 3]];
+
+        Channel {
+            command: u32::from_ne_bytes(field(0)),
+            pid: i32::from_ne_bytes(field(4)),
+            slot: i32::from_ne_bytes(field(8)),
+            fd: i32::from_ne_bytes(field(12)),
+        }
+    }
 }
 
 pub type ProcFn = fn(Rc<Cycle>, i64) -> !;
@@ -57,10 +99,22 @@ thread_local! {
     static ARGV: RefCell<Vec<CString>> = RefCell::new(Vec::new());
 }
 
-// --- signal flags (set from the async-signal handler) ---
-pub static SIG_QUIT: AtomicBool = AtomicBool::new(false);
-pub static SIG_TERMINATE: AtomicBool = AtomicBool::new(false);
-pub static SIG_REOPEN: AtomicBool = AtomicBool::new(false);
+// --- signal flags ---
+
+/// A flag the signal handler sets itself.
+type HandlerFlag = LazyLock<Arc<AtomicBool>>;
+
+const fn handler_flag() -> HandlerFlag {
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)))
+}
+
+/// ngx_quit, ngx_terminate and ngx_reopen, which SIGQUIT, SIGTERM (and
+/// SIGINT) and SIGUSR1 set in every kind of process: set by the signal
+/// handler, as in C. The other flags are set when the signals are
+/// processed (process_signals()).
+pub static SIG_QUIT: HandlerFlag = handler_flag();
+pub static SIG_TERMINATE: HandlerFlag = handler_flag();
+pub static SIG_REOPEN: HandlerFlag = handler_flag();
 pub static SIG_RECONFIGURE: AtomicBool = AtomicBool::new(false);
 pub static SIG_NOACCEPT: AtomicBool = AtomicBool::new(false);
 pub static SIG_CHANGE_BINARY: AtomicBool = AtomicBool::new(false);
@@ -70,20 +124,40 @@ pub static SIG_REAP: AtomicBool = AtomicBool::new(false);
 pub static DEBUG_QUIT: AtomicBool = AtomicBool::new(false);
 pub static DAEMONIZED: AtomicBool = AtomicBool::new(false);
 pub static NEW_BINARY: AtomicI32 = AtomicI32::new(0);
-/// the event loop is blocked in epoll_wait(): the runtime of a worker,
-/// helper or single process is parked
-pub static EVENTS_PARKED: AtomicBool = AtomicBool::new(false);
-/// a signal interrupted epoll_wait() (EINTR in ngx_epoll_process_events())
-pub static EVENTS_EINTR: AtomicBool = AtomicBool::new(false);
-static PROCESS_KIND: AtomicI32 = AtomicI32::new(0); // 0 single, 1 master, 3 worker, 4 helper
-static WAKE_PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
 
-// ring of received signals for logging outside the handler: (signo, pid)
-const SIGRING: usize = 64;
-static SIGRING_SIGNO: [AtomicI32; SIGRING] = [const { AtomicI32::new(0) }; SIGRING];
-static SIGRING_PID: [AtomicI32; SIGRING] = [const { AtomicI32::new(0) }; SIGRING];
-static SIGRING_HEAD: AtomicUsize = AtomicUsize::new(0);
-static SIGRING_TAIL: AtomicUsize = AtomicUsize::new(0);
+/// the handler ran: there are signals to process
+static SIGNALED: HandlerFlag = handler_flag();
+/// a signal but SIGALRM (ngx_event_timer_alarm) came since the event loop
+/// blocked in epoll_wait(): it interrupted the wait (EINTR in
+/// ngx_epoll_process_events())
+static INTERRUPTED: HandlerFlag = handler_flag();
+
+static PROCESS_KIND: AtomicI32 = AtomicI32::new(0); // 0 single, 1 master, 3 worker, 4 helper
+
+/// ngx_signals[]: the signals of ngx_signal_handler() and their names
+const SIGNALS: [(i32, &str); 10] = [
+    (libc::SIGHUP, "SIGHUP"),
+    (libc::SIGUSR1, "SIGUSR1"),
+    (libc::SIGWINCH, "SIGWINCH"),
+    (libc::SIGTERM, "SIGTERM"),
+    (libc::SIGQUIT, "SIGQUIT"),
+    (libc::SIGUSR2, "SIGUSR2"),
+    (libc::SIGALRM, "SIGALRM"),
+    (libc::SIGINT, "SIGINT"),
+    (libc::SIGIO, "SIGIO"),
+    (libc::SIGCHLD, "SIGCHLD"),
+];
+
+/// The handler of the signals: it records each signal with the pid of its
+/// sender (si_pid) and wakes the process through a pipe of its own.
+type Delivery = SignalDelivery<UnixStream, WithOrigin>;
+
+thread_local! {
+    /// the signal handler's records of this process
+    static DELIVERY: RefCell<Option<Delivery>> = const { RefCell::new(None) };
+    /// the timer of the master's SIGALRM (setitimer(ITIMER_REAL))
+    static ALARM: RefCell<Option<nix::sys::timer::Timer>> = const { RefCell::new(None) };
+}
 
 pub fn set_process_kind(pt: ProcessType) {
     let k = match pt {
@@ -105,47 +179,181 @@ pub fn argv() -> Vec<CString> {
     ARGV.with(|a| a.borrow().clone())
 }
 
-pub fn wake_fd() -> i32 {
-    WAKE_PIPE[0].load(Ordering::Relaxed)
+/// The errno of an error of std or ngx-sys.
+fn io_errno(e: &std::io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(libc::EIO)
 }
 
 fn signame(signo: i32) -> &'static str {
-    match signo {
-        libc::SIGHUP => "SIGHUP",
-        libc::SIGUSR1 => "SIGUSR1",
-        libc::SIGWINCH => "SIGWINCH",
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGQUIT => "SIGQUIT",
-        libc::SIGUSR2 => "SIGUSR2",
-        libc::SIGALRM => "SIGALRM",
-        libc::SIGINT => "SIGINT",
-        libc::SIGIO => "SIGIO",
-        libc::SIGCHLD => "SIGCHLD",
-        _ => "unknown",
+    SIGNALS.iter().find(|&&(s, _)| s == signo).map_or("unknown", |&(_, name)| name)
+}
+
+/// ngx_parent
+static PARENT_PID: AtomicI32 = AtomicI32::new(0);
+
+/// A new handler record of the signals, with a pipe of its own.
+fn new_delivery() -> std::io::Result<Delivery> {
+    let (read, write) = UnixStream::pair()?;
+
+    SignalDelivery::with_pipe(read, write, WithOrigin::default(), std::iter::empty::<i32>())
+}
+
+/// ngx_init_signals: the handler of the signals nginx handles (signal-hook
+/// registers its own handler, which runs the actions registered for the
+/// signal: the flags of ngx_signal_handler() set in every kind of process,
+/// the flags telling there are signals to process, and the record of the
+/// signal with its sender, written to the pipe of the process). SIGSYS
+/// gets a handler doing nothing instead of SIG_IGN; std ignores SIGPIPE
+/// already.
+pub fn init_signals(log: &Log) -> Result<(), ()> {
+    PARENT_PID.store(os::getppid(), Ordering::Relaxed);
+
+    register_signals(log)
+}
+
+/// The actions of a signal: its record (registered first, so that it is
+/// there once a flag is seen), the flag the handler sets in every kind of
+/// process, and the flags telling there are signals to process.
+fn register_signal(delivery: &Delivery, signo: i32) -> std::io::Result<()> {
+    delivery.handle().add_signal(signo)?;
+
+    let flag: Option<&HandlerFlag> = match signo {
+        libc::SIGQUIT => Some(&SIG_QUIT),
+        libc::SIGTERM | libc::SIGINT => Some(&SIG_TERMINATE),
+        libc::SIGUSR1 => Some(&SIG_REOPEN),
+        _ => None,
+    };
+
+    if let Some(flag) = flag {
+        signal_hook::flag::register(signo, Arc::clone(flag))?;
+    }
+
+    signal_hook::flag::register(signo, Arc::clone(&SIGNALED))?;
+
+    if signo != libc::SIGALRM {
+        signal_hook::flag::register(signo, Arc::clone(&INTERRUPTED))?;
+    }
+
+    Ok(())
+}
+
+fn register_signals(log: &Log) -> Result<(), ()> {
+    let delivery = match new_delivery() {
+        Ok(d) => d,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(io_errno(&e)), "socketpair() failed");
+            return Err(());
+        }
+    };
+
+    for &(signo, name) in SIGNALS.iter() {
+        if let Err(e) = register_signal(&delivery, signo) {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(io_errno(&e)), "sigaction({}) failed", name);
+            return Err(());
+        }
+    }
+
+    // SIGSYS, SIG_IGN: a handler doing nothing
+    if let Err(e) = signal_hook::flag::register(libc::SIGSYS, Arc::new(AtomicBool::new(false))) {
+        ngx_log_error!(NGX_LOG_EMERG, log, Some(io_errno(&e)), "sigaction(SIGSYS, SIG_IGN) failed");
+        return Err(());
+    }
+
+    DELIVERY.with(|d| *d.borrow_mut() = Some(delivery));
+
+    Ok(())
+}
+
+/// After fork(), in the child: a record of the signals of its own, as the
+/// pipe of its parent's would wake both processes (the signals are still
+/// blocked here: those coming meanwhile are delivered to the new one);
+/// the parent's alarm timer is not inherited.
+fn init_child_signals(log: &Log) {
+    ALARM.with(|a| {
+        if let Some(t) = a.borrow_mut().take() {
+            // no timer_delete() of the parent's timer
+            std::mem::forget(t);
+        }
+    });
+
+    if DELIVERY.with(|d| d.borrow().is_none()) {
+        return;
+    }
+
+    // the flags registered by the parent are the child's too
+    let new = new_delivery().and_then(|d| {
+        let handle = d.handle();
+
+        for &(signo, _) in SIGNALS.iter() {
+            handle.add_signal(signo)?;
+        }
+
+        Ok(d)
+    });
+
+    let new = match new {
+        Ok(d) => Some(d),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(io_errno(&e)), "sigaction() failed");
+            None
+        }
+    };
+
+    // the parent's: its pipe closed here, its actions unregistered here
+    let old = DELIVERY.with(|d| std::mem::replace(&mut *d.borrow_mut(), new));
+    drop(old);
+}
+
+/// The signals the handler recorded, as ngx_signal_handler() handles them:
+/// the flags it sets (but those the handler set), and the notice of each
+/// "signal N (SIGX) received from PID, action". Only if the handler ran
+/// since the last call, unless `force`.
+pub fn process_signals(log: &Log, force: bool) {
+    if !SIGNALED.swap(false, Ordering::SeqCst) && !force {
+        return;
+    }
+
+    let received: Vec<(i32, i32)> = DELIVERY.with(|d| match d.borrow_mut().as_mut() {
+        Some(d) => d.pending().map(|o| (o.signal, o.process.map_or(0, |p| p.pid))).collect(),
+        None => Vec::new(),
+    });
+
+    for (signo, pid) in received {
+        signal_handler(signo, pid, log);
     }
 }
 
-extern "C" fn signal_handler(signo: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
-    let saved = unsafe { *libc::__errno_location() };
-    let kind = PROCESS_KIND.load(Ordering::Relaxed);
+/// ngx_signal_handler() of a signal received from `pid` (0 if not sent by
+/// a process).
+fn signal_handler(signo: i32, pid: i32, log: &Log) {
+    let mut action = "";
     let mut ignore = false;
-    match kind {
+
+    match PROCESS_KIND.load(Ordering::Relaxed) {
         0 | 1 => match signo {
-            libc::SIGQUIT => SIG_QUIT.store(true, Ordering::SeqCst),
-            libc::SIGTERM | libc::SIGINT => SIG_TERMINATE.store(true, Ordering::SeqCst),
+            libc::SIGQUIT => action = ", shutting down",
+            libc::SIGTERM | libc::SIGINT => action = ", exiting",
             libc::SIGWINCH => {
                 if DAEMONIZED.load(Ordering::Relaxed) {
                     SIG_NOACCEPT.store(true, Ordering::SeqCst);
+                    action = ", stop accepting connections";
                 }
             }
-            libc::SIGHUP => SIG_RECONFIGURE.store(true, Ordering::SeqCst),
-            libc::SIGUSR1 => SIG_REOPEN.store(true, Ordering::SeqCst),
+            libc::SIGHUP => {
+                SIG_RECONFIGURE.store(true, Ordering::SeqCst);
+                action = ", reconfiguring";
+            }
+            libc::SIGUSR1 => action = ", reopening logs",
             libc::SIGUSR2 => {
-                let ppid = unsafe { libc::getppid() };
-                if ppid == PARENT_PID.load(Ordering::Relaxed) || NEW_BINARY.load(Ordering::Relaxed) > 0 {
+                // ignored in the new binary while the old binary's process
+                // (its parent) runs, or in the old binary's process while
+                // the new binary's process runs
+                if os::getppid() == PARENT_PID.load(Ordering::Relaxed) || NEW_BINARY.load(Ordering::Relaxed) > 0 {
+                    action = ", ignoring";
                     ignore = true;
                 } else {
                     SIG_CHANGE_BINARY.store(true, Ordering::SeqCst);
+                    action = ", changing binary";
                 }
             }
             libc::SIGALRM => SIG_ALRM.store(true, Ordering::SeqCst),
@@ -158,234 +366,193 @@ extern "C" fn signal_handler(signo: libc::c_int, info: *mut libc::siginfo_t, _ct
                 if DAEMONIZED.load(Ordering::Relaxed) {
                     DEBUG_QUIT.store(true, Ordering::SeqCst);
                     SIG_QUIT.store(true, Ordering::SeqCst);
+                    action = ", shutting down";
                 }
             }
-            libc::SIGQUIT => SIG_QUIT.store(true, Ordering::SeqCst),
-            libc::SIGTERM | libc::SIGINT => SIG_TERMINATE.store(true, Ordering::SeqCst),
-            libc::SIGUSR1 => SIG_REOPEN.store(true, Ordering::SeqCst),
+            libc::SIGQUIT => action = ", shutting down",
+            libc::SIGTERM | libc::SIGINT => action = ", exiting",
+            libc::SIGUSR1 => action = ", reopening logs",
+            libc::SIGHUP | libc::SIGUSR2 | libc::SIGIO => action = ", ignoring",
             _ => {}
         },
         _ => {}
     }
-    // record for logging
-    let pid = if info.is_null() { 0 } else { unsafe { (*info).si_pid() } };
-    let h = SIGRING_HEAD.load(Ordering::Relaxed);
-    let next = (h + 1) % SIGRING;
-    if next != SIGRING_TAIL.load(Ordering::Relaxed) {
-        SIGRING_SIGNO[h].store(if ignore { -signo } else { signo }, Ordering::Relaxed);
-        SIGRING_PID[h].store(pid, Ordering::Relaxed);
-        SIGRING_HEAD.store(next, Ordering::Release);
-    }
-    // not the timer alarm: ngx_event_timer_alarm
-    if signo != libc::SIGALRM && EVENTS_PARKED.load(Ordering::Relaxed) {
-        EVENTS_EINTR.store(true, Ordering::Relaxed);
-    }
-    // wake the event loop
-    let w = WAKE_PIPE[1].load(Ordering::Relaxed);
-    if w >= 0 {
-        let b = [1u8];
-        unsafe {
-            libc::write(w, b.as_ptr() as *const libc::c_void, 1);
-        }
-    }
-    unsafe { *libc::__errno_location() = saved };
-}
 
-/// ngx_parent
-static PARENT_PID: AtomicI32 = AtomicI32::new(0);
+    if pid != 0 {
+        ngx_log_error!(NGX_LOG_NOTICE, log, None, "signal {} ({}) received from {}{}", signo, signame(signo), pid, action);
+    } else {
+        ngx_log_error!(NGX_LOG_NOTICE, log, None, "signal {} ({}) received{}", signo, signame(signo), action);
+    }
 
-/// Log queued "signal received" notices (called outside the handler).
-pub fn drain_signal_log(log: &Log) {
-    loop {
-        let t = SIGRING_TAIL.load(Ordering::Relaxed);
-        if t == SIGRING_HEAD.load(Ordering::Acquire) {
-            break;
-        }
-        let signo = SIGRING_SIGNO[t].load(Ordering::Relaxed);
-        let pid = SIGRING_PID[t].load(Ordering::Relaxed);
-        SIGRING_TAIL.store((t + 1) % SIGRING, Ordering::Release);
-        let ignored = signo < 0;
-        let signo = signo.abs();
-        let kind = PROCESS_KIND.load(Ordering::Relaxed);
-        let action = match (kind, signo) {
-            (0 | 1, libc::SIGQUIT) => ", shutting down",
-            (0 | 1, libc::SIGTERM) | (0 | 1, libc::SIGINT) => ", exiting",
-            (0 | 1, libc::SIGWINCH) => {
-                if DAEMONIZED.load(Ordering::Relaxed) {
-                    ", stop accepting connections"
-                } else {
-                    ""
-                }
-            }
-            (0 | 1, libc::SIGHUP) => ", reconfiguring",
-            (0 | 1, libc::SIGUSR1) => ", reopening logs",
-            (0 | 1, libc::SIGUSR2) => {
-                if ignored {
-                    ", ignoring"
-                } else {
-                    ", changing binary"
-                }
-            }
-            (3 | 4, libc::SIGWINCH) | (3 | 4, libc::SIGQUIT) => ", shutting down",
-            (3 | 4, libc::SIGTERM) | (3 | 4, libc::SIGINT) => ", exiting",
-            (3 | 4, libc::SIGUSR1) => ", reopening logs",
-            (3 | 4, libc::SIGHUP) | (3 | 4, libc::SIGUSR2) | (3 | 4, libc::SIGIO) => ", ignoring",
-            _ => "",
-        };
-        if pid != 0 {
-            ngx_log_error!(NGX_LOG_NOTICE, log, None, "signal {} ({}) received from {}{}", signo, signame(signo), pid, action);
-        } else {
-            ngx_log_error!(NGX_LOG_NOTICE, log, None, "signal {} ({}) received{}", signo, signame(signo), action);
-        }
-        if ignored {
-            ngx_log_error!(NGX_LOG_CRIT, log, None, "the changing binary signal is ignored: you should shutdown or terminate before either old or new binary's process");
-        }
+    if ignore {
+        ngx_log_error!(NGX_LOG_CRIT, log, None, "the changing binary signal is ignored: you should shutdown or terminate before either old or new binary's process");
     }
 }
 
-/// ngx_init_signals
-pub fn init_signals(log: &Log) -> Result<(), ()> {
-    PARENT_PID.store(unsafe { libc::getppid() }, Ordering::Relaxed);
-    // wake pipe
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } == 0 {
-        WAKE_PIPE[0].store(fds[0], Ordering::Relaxed);
-        WAKE_PIPE[1].store(fds[1], Ordering::Relaxed);
-    }
-    for &signo in &[libc::SIGHUP, libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM, libc::SIGQUIT, libc::SIGUSR2, libc::SIGALRM, libc::SIGINT, libc::SIGIO, libc::SIGCHLD] {
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = signal_handler as usize;
-            sa.sa_flags = libc::SA_SIGINFO;
-            libc::sigemptyset(&mut sa.sa_mask);
-            if libc::sigaction(signo, &sa, std::ptr::null_mut()) == -1 {
-                ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "sigaction({}) failed", signame(signo));
-                return Err(());
-            }
-        }
-    }
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = libc::SIG_IGN;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGPIPE, &sa, std::ptr::null_mut());
-    }
-    Ok(())
+/// The event loop blocks in epoll_wait().
+pub fn events_park() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
 }
 
-/// Drain the wake pipe.
-pub fn drain_wake_pipe() {
-    let fd = WAKE_PIPE[0].load(Ordering::Relaxed);
-    if fd < 0 {
-        return;
-    }
-    let mut buf = [0u8; 64];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
+/// epoll_wait() returned: whether a signal (but SIGALRM) interrupted it.
+pub fn events_interrupted() -> bool {
+    INTERRUPTED.swap(false, Ordering::SeqCst)
+}
+
+/// The read end of the signal pipe of the process, readable once the
+/// handler ran (for the event loop of a worker, helper or single process).
+pub fn signal_pipe() -> Option<UnixStream> {
+    DELIVERY.with(|d| d.borrow().as_ref().and_then(|d| d.get_read().try_clone().ok()))
+}
+
+/// setitimer(ITIMER_REAL): SIGALRM after `delay` milliseconds.
+fn set_alarm(delay: u64) -> Result<(), i32> {
+    use nix::sys::signal::{SigEvent, SigevNotify};
+    use nix::sys::timer::{Expiration, Timer, TimerSetTimeFlags};
+
+    ALARM.with(|a| {
+        let mut a = a.borrow_mut();
+
+        if a.is_none() {
+            let ev = SigEvent::new(SigevNotify::SigevSignal { signal: Signal::SIGALRM, si_value: 0 });
+            *a = Some(Timer::new(nix::time::ClockId::CLOCK_MONOTONIC, ev).map_err(|e| e as i32)?);
         }
-    }
+
+        let value = nix::sys::time::TimeSpec::from(std::time::Duration::from_millis(delay));
+
+        match a.as_mut() {
+            Some(timer) => timer.set(Expiration::OneShot(value), TimerSetTimeFlags::empty()).map_err(|e| e as i32),
+            None => Ok(()),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // channels
 
 pub fn write_channel(s: i32, ch: &Channel, log: &Log) -> Result<(), bool> {
-    unsafe {
-        let mut iov = libc::iovec { iov_base: ch as *const Channel as *mut libc::c_void, iov_len: std::mem::size_of::<Channel>() };
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        let mut cmsg_buf = [0u8; 32];
+    let bytes = ch.to_bytes();
+    let iov = [IoSlice::new(&bytes)];
+
+    let rc = fd::get(s).map_err(|e| io_errno(&e)).and_then(|sock| {
         if ch.fd == -1 {
-            msg.msg_control = std::ptr::null_mut();
-            msg.msg_controllen = 0;
-        } else {
-            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
-            let cm = libc::CMSG_FIRSTHDR(&msg);
-            (*cm).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
-            (*cm).cmsg_level = libc::SOL_SOCKET;
-            (*cm).cmsg_type = libc::SCM_RIGHTS;
-            std::ptr::copy_nonoverlapping(&ch.fd as *const i32 as *const u8, libc::CMSG_DATA(cm), std::mem::size_of::<i32>());
+            return rustix::net::sendmsg(&sock, &iov, &mut SendAncillaryBuffer::default(), SendFlags::empty()).map_err(|e| e.raw_os_error());
         }
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        let n = libc::sendmsg(s, &msg, 0);
-        if n == -1 {
-            let e = os::errno();
-            if e == libc::EAGAIN {
-                return Err(true);
-            }
+
+        let passed = fd::get(ch.fd).map_err(|e| io_errno(&e))?;
+        let fds = [passed.as_fd()];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+
+        cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+
+        rustix::net::sendmsg(&sock, &iov, &mut cmsg, SendFlags::empty()).map_err(|e| e.raw_os_error())
+    });
+
+    match rc {
+        Ok(_) => Ok(()),
+        Err(e) if e == libc::EAGAIN => Err(true),
+        Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "sendmsg() failed");
-            return Err(false);
+            Err(false)
         }
     }
-    Ok(())
 }
 
 /// Returns Ok(Some(ch)), Ok(None) for EAGAIN, Err(()) for error/EOF.
 pub fn read_channel(s: i32, log: &Log) -> Result<Option<Channel>, ()> {
-    unsafe {
-        let mut ch = Channel::default();
-        let mut iov = libc::iovec { iov_base: &mut ch as *mut Channel as *mut libc::c_void, iov_len: std::mem::size_of::<Channel>() };
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        let mut cmsg_buf = [0u8; 32];
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
-        let n = libc::recvmsg(s, &mut msg, 0);
-        if n == -1 {
-            let e = os::errno();
-            if e == libc::EAGAIN {
-                return Ok(None);
-            }
+    let mut bytes = [0u8; CHANNEL_SIZE];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+
+    let rc = fd::get(s).map_err(|e| io_errno(&e)).and_then(|sock| {
+        let mut iov = [IoSliceMut::new(&mut bytes)];
+        rustix::net::recvmsg(&sock, &mut iov, &mut cmsg, RecvFlags::empty()).map_err(|e| e.raw_os_error())
+    });
+
+    let msg = match rc {
+        Ok(msg) => msg,
+        Err(e) if e == libc::EAGAIN => return Ok(None),
+        Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "recvmsg() failed");
+
             if e == libc::EMSGSIZE || e == libc::EMFILE {
+                // file descriptor table is full
                 return Ok(Some(Channel::default()));
             }
+
             return Err(());
         }
-        if n == 0 {
-            ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "recvmsg() returned zero");
-            return Err(());
-        }
-        if (n as usize) < std::mem::size_of::<Channel>() {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned not enough data: {}", n);
-            return Err(());
-        }
-        if ch.command == NGX_CMD_OPEN_CHANNEL {
-            if msg.msg_controllen < libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize {
+    };
+
+    let n = msg.bytes;
+
+    if n == 0 {
+        ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "recvmsg() returned zero");
+        return Err(());
+    }
+
+    if n < CHANNEL_SIZE {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned not enough data: {}", n);
+        return Err(());
+    }
+
+    let mut ch = Channel::from_bytes(&bytes);
+
+    if ch.command == NGX_CMD_OPEN_CHANNEL {
+        // the first control message: the descriptors of SCM_RIGHTS, of which
+        // the first is the channel (the others, if any, are closed)
+        let first = cmsg.drain().next();
+
+        match first {
+            Some(RecvAncillaryMessage::ScmRights(mut fds)) => match fds.next() {
+                Some(owned) => ch.fd = fd::register(owned),
+                None => {
+                    ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned too small ancillary data");
+                    ch.fd = -1;
+                }
+            },
+            Some(RecvAncillaryMessage::ScmCredentials(_)) => {
+                ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned invalid ancillary data level {} or type {}", libc::SOL_SOCKET, libc::SCM_CREDENTIALS);
+                return Err(());
+            }
+            _ => {
+                // nothing, or no descriptor the file table had room for
                 ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned too small ancillary data");
                 ch.fd = -1;
-            } else {
-                let cm = libc::CMSG_FIRSTHDR(&msg);
-                if (*cm).cmsg_level != libc::SOL_SOCKET || (*cm).cmsg_type != libc::SCM_RIGHTS {
-                    ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned invalid ancillary data level {} or type {}", (*cm).cmsg_level, (*cm).cmsg_type);
-                    return Err(());
-                } else {
-                    let mut fd: i32 = -1;
-                    std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cm), &mut fd as *mut i32 as *mut u8, std::mem::size_of::<i32>());
-                    ch.fd = fd;
-                }
             }
         }
-        // not MSG_CTRUNC: a descriptor which could not be received (EMFILE)
-        // is the "too small ancillary data" above
-        if msg.msg_flags & libc::MSG_TRUNC != 0 {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() truncated data");
-        }
-        Ok(Some(ch))
     }
+
+    // not MSG_CTRUNC: a descriptor which could not be received (EMFILE)
+    // is the "too small ancillary data" above
+    if msg.flags.contains(ReturnFlags::TRUNC) {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() truncated data");
+    }
+
+    Ok(Some(ch))
 }
 
 pub fn close_channel(ch: &[i32; 2], log: &Log) {
     for &fd in ch {
-        if fd != -1 && unsafe { libc::close(fd) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "close() channel failed");
+        if fd != -1 {
+            if let Err(e) = os::close_fd(fd) {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "close() channel failed");
+            }
         }
     }
+}
+
+/// ioctl(FIOASYNC) on the channel: SIGIO when it is readable or closed.
+fn channel_async(fd: i32) -> Result<(), i32> {
+    let f = fd::get(fd).map_err(|e| io_errno(&e))?;
+    ngx_sys::os::ioctl_fioasync(f.as_fd(), true).map_err(|e| io_errno(&e))
+}
+
+/// fcntl(F_SETOWN): the SIGIO of the descriptor to `pid`.
+pub fn set_owner(fd: i32, pid: i32) -> Result<(), i32> {
+    let f = fd::get(fd).map_err(|e| io_errno(&e))?;
+    ngx_sys::os::fcntl_setown(f.as_fd(), pid).map_err(|e| io_errno(&e))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,9 +583,14 @@ pub fn spawn_process(cycle: &Rc<Cycle>, proc_fn: ProcFn, data: i64, name: &'stat
 
     let mut channel = [-1i32, -1];
     if respawn != NGX_PROCESS_DETACHED {
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, channel.as_mut_ptr()) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "socketpair() failed while spawning \"{}\"", name);
-            return -1;
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+        match rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None) {
+            Ok((a, b)) => channel = [fd::register(a), fd::register(b)],
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e.raw_os_error()), "socketpair() failed while spawning \"{}\"", name);
+                return -1;
+            }
         }
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "channel {}:{}", channel[0], channel[1]);
         for &fd in &channel {
@@ -428,38 +600,36 @@ pub fn spawn_process(cycle: &Rc<Cycle>, proc_fn: ProcFn, data: i64, name: &'stat
                 return -1;
             }
         }
-        unsafe {
-            let on: libc::c_int = 1;
-            if libc::ioctl(channel[0], libc::FIOASYNC, &on) == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "ioctl(FIOASYNC) failed while spawning \"{}\"", name);
-                close_channel(&channel, &log);
-                return -1;
-            }
-            if libc::fcntl(channel[0], libc::F_SETOWN, libc::getpid()) == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "fcntl(F_SETOWN) failed while spawning \"{}\"", name);
-                close_channel(&channel, &log);
-                return -1;
-            }
+        if let Err(e) = channel_async(channel[0]) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "ioctl(FIOASYNC) failed while spawning \"{}\"", name);
+            close_channel(&channel, &log);
+            return -1;
+        }
+        if let Err(e) = set_owner(channel[0], os::getpid()) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "fcntl(F_SETOWN) failed while spawning \"{}\"", name);
+            close_channel(&channel, &log);
+            return -1;
         }
         CHANNEL.with(|c| c.set(channel[1]));
     }
     PROCESSES.with(|p| p.borrow_mut()[s].channel = channel);
     PROCESS_SLOT.with(|p| p.set(s));
 
-    let pid = unsafe { libc::fork() };
-    match pid {
-        -1 => {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "fork() failed while spawning \"{}\"", name);
+    let pid = match ngx_sys::os::fork() {
+        Err(e) => {
+            // EAGAIN as well for a process with threads, which cannot fork
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e.raw_os_error().unwrap_or(libc::EAGAIN)), "fork() failed while spawning \"{}\"", name);
             close_channel(&channel, &log);
             return -1;
         }
-        0 => {
+        Ok(ngx_sys::os::Fork::Child) => {
             PARENT_PID.store(os::getppid(), Ordering::Relaxed);
             update_pid();
+            init_child_signals(&log);
             proc_fn(cycle.clone(), data);
         }
-        _ => {}
-    }
+        Ok(ngx_sys::os::Fork::Parent(pid)) => pid,
+    };
     ngx_log_error!(NGX_LOG_NOTICE, log, None, "start {} {}", name, pid);
     PROCESSES.with(|p| {
         let mut p = p.borrow_mut();
@@ -580,26 +750,25 @@ fn signal_worker_processes(cycle: &Rc<Cycle>, signo: i32) {
 fn process_get_status(log: &Log) {
     let mut one = false;
     loop {
-        let mut status: i32 = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid == 0 {
-            return;
-        }
-        if pid == -1 {
-            let e = os::errno();
-            if e == libc::EINTR {
-                continue;
-            }
-            if e == libc::ECHILD && one {
+        let (pid, status) = match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
+            Ok(None) => return,
+            Ok(Some((pid, status))) => (pid.as_raw_nonzero().get(), status.as_raw()),
+            Err(e) => {
+                let e = e.raw_os_error();
+                if e == libc::EINTR {
+                    continue;
+                }
+                if e == libc::ECHILD && one {
+                    return;
+                }
+                if e == libc::ECHILD {
+                    ngx_log_error!(NGX_LOG_INFO, log, Some(e), "waitpid() failed");
+                    return;
+                }
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "waitpid() failed");
                 return;
             }
-            if e == libc::ECHILD {
-                ngx_log_error!(NGX_LOG_INFO, log, Some(e), "waitpid() failed");
-                return;
-            }
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "waitpid() failed");
-            return;
-        }
+        };
         one = true;
         // ngx_shmtx_force_unlock(&ngx_accept_mutex, pid)
         let _ = crate::connection::stats().accept_mutex.compare_exchange(pid as i64, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
@@ -617,16 +786,21 @@ fn process_get_status(log: &Log) {
                 }
             }
         });
-        if libc::WIFSIGNALED(status) {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "{} {} exited on signal {}{}", process, pid, libc::WTERMSIG(status), if libc::WCOREDUMP(status) { " (core dumped)" } else { "" });
+
+        // WTERMSIG(), WCOREDUMP() and WEXITSTATUS() of the status
+        let termsig = status & 0x7f;
+        let exitcode = (status >> 8) & 0xff;
+
+        if termsig != 0 {
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "{} {} exited on signal {}{}", process, pid, termsig, if status & 0x80 != 0 { " (core dumped)" } else { "" });
         } else {
-            ngx_log_error!(NGX_LOG_NOTICE, log, None, "{} {} exited with code {}", process, pid, libc::WEXITSTATUS(status));
+            ngx_log_error!(NGX_LOG_NOTICE, log, None, "{} {} exited with code {}", process, pid, exitcode);
         }
-        if libc::WEXITSTATUS(status) == 2 {
+        if exitcode == 2 {
             if let Some(i) = idx {
                 let respawn = PROCESSES.with(|p| p.borrow()[i].respawn);
                 if respawn {
-                    ngx_log_error!(NGX_LOG_ALERT, log, None, "{} {} exited with fatal code {} and cannot be respawned", process, pid, libc::WEXITSTATUS(status));
+                    ngx_log_error!(NGX_LOG_ALERT, log, None, "{} {} exited with fatal code {} and cannot be respawned", process, pid, exitcode);
                     PROCESSES.with(|p| p.borrow_mut()[i].respawn = false);
                 }
             }
@@ -656,12 +830,11 @@ fn reap_children(cycle: &Rc<Cycle>) -> bool {
                 PROCESSES.with(|p| p.borrow_mut()[i].channel = [-1, -1]);
                 let ch = Channel { command: NGX_CMD_CLOSE_CHANNEL, pid: pr.pid, slot: i as i32, fd: -1 };
                 let procs = PROCESSES.with(|p| p.borrow().clone());
-                for (n2, other) in procs.iter().enumerate() {
+                for other in procs.iter() {
                     if other.exited || other.pid == -1 || other.channel[0] == -1 {
                         continue;
                     }
                     ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "pass close channel s:{} pid:{} to:{}", ch.slot, ch.pid, other.pid);
-                    let _ = n2;
                     let _ = write_channel(other.channel[0], &ch, &cycle.log);
                 }
             }
@@ -682,8 +855,8 @@ fn reap_children(cycle: &Rc<Cycle>) -> bool {
                     let c = ccf.borrow();
                     (c.oldpid.clone(), c.pid.clone())
                 };
-                if std::fs::rename(os::path(&oldpid), os::path(&pid)).is_err() {
-                    ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "rename() {} back to {} failed after the new binary process \"{}\" exited", B(&oldpid), B(&pid), B(argv()[0].as_bytes()));
+                if let Err(e) = std::fs::rename(os::path(&oldpid), os::path(&pid)) {
+                    ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(io_errno(&e)), "rename() {} back to {} failed after the new binary process \"{}\" exited", B(&oldpid), B(&pid), B(argv()[0].as_bytes()));
                 }
                 crate::control::reown(&cycle.log);
                 NEW_BINARY.store(0, Ordering::Relaxed);
@@ -728,16 +901,15 @@ fn master_process_exit(cycle: &Rc<Cycle>) -> ! {
 /// ngx_master_process_cycle
 pub fn master_process_cycle(mut cycle: Rc<Cycle>) -> ! {
     set_process_kind(ProcessType::Master);
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for &s in &[libc::SIGCHLD, libc::SIGALRM, libc::SIGIO, libc::SIGINT, libc::SIGHUP, libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM, libc::SIGQUIT, libc::SIGUSR2] {
-            libc::sigaddset(&mut set, s);
-        }
-        if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "sigprocmask() failed");
-        }
+
+    let mut set = SigSet::empty();
+    for s in [Signal::SIGCHLD, Signal::SIGALRM, Signal::SIGIO, Signal::SIGINT, Signal::SIGHUP, Signal::SIGUSR1, Signal::SIGWINCH, Signal::SIGTERM, Signal::SIGQUIT, Signal::SIGUSR2] {
+        set.add(s);
     }
+    if let Err(e) = nix::sys::signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None) {
+        ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e as i32), "sigprocmask() failed");
+    }
+
     let mut title = b"master process".to_vec();
     for a in argv() {
         title.push(b' ');
@@ -762,23 +934,17 @@ pub fn master_process_cycle(mut cycle: Rc<Cycle>) -> ! {
                 delay *= 2;
             }
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "termination cycle: {}", delay);
-            let itv = libc::itimerval {
-                it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 },
-                it_value: libc::timeval { tv_sec: (delay / 1000) as libc::time_t, tv_usec: ((delay % 1000) * 1000) as libc::suseconds_t },
-            };
-            if unsafe { libc::setitimer(libc::ITIMER_REAL, &itv, std::ptr::null_mut()) } == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "setitimer() failed");
+            if let Err(e) = set_alarm(delay) {
+                ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(e), "setitimer() failed");
             }
         }
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "sigsuspend");
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigsuspend(&set);
-        }
+
+        // returns once the handler of a signal ran (EINTR)
+        let _ = SigSet::empty().suspend();
+
         crate::times::update();
-        drain_wake_pipe();
-        drain_signal_log(&cycle.log);
+        process_signals(&cycle.log, true);
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, cycle.log, "wake up, sigio {}", sigio);
 
         if SIG_REAP.swap(false, Ordering::SeqCst) {
@@ -882,6 +1048,14 @@ pub fn single_process_cycle(cycle: Rc<Cycle>) -> ! {
     crate::event::single_process_run(cycle)
 }
 
+/// FD_CLOEXEC of a descriptor set or cleared.
+fn set_cloexec(fd: i32, on: bool) {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+
+    let flags = if on { FdFlag::FD_CLOEXEC } else { FdFlag::empty() };
+    let _ = fcntl(fd, FcntlArg::F_SETFD(flags));
+}
+
 /// ngx_exec_new_binary: start a new binary with inherited listening sockets.
 pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
     let mut env = environment(cycle);
@@ -920,17 +1094,15 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
         return -1;
     }
     let args = argv();
-    // clear close-on-exec on listening sockets
+    // the listening sockets are passed to the new binary: no close-on-exec
     for ls in cycle.listening.iter() {
         let fd = ls.fd.get();
         if fd != -1 {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, 0);
-            }
+            set_cloexec(fd, false);
         }
     }
     PENDING_EXEC_ENV.with(|e| *e.borrow_mut() = Some(env));
-    let child = spawn_process(cycle, exec_proc_stub, 0, "new binary process", NGX_PROCESS_DETACHED);
+    let child = spawn_process(cycle, exec_proc, 0, "new binary process", NGX_PROCESS_DETACHED);
     if child == -1 {
         if let Err(e) = std::fs::rename(os::path(&oldpid), os::path(&pid)) {
             ngx_log_error!(NGX_LOG_ALERT, cycle.log, e.raw_os_error(), "rename() {} back to {} failed after an attempt to execute new binary process \"{}\"", B(&oldpid), B(&pid), B(args[0].as_bytes()));
@@ -939,7 +1111,7 @@ pub fn exec_new_binary(cycle: &Rc<Cycle>) -> i32 {
     for ls in cycle.listening.iter() {
         let fd = ls.fd.get();
         if fd != -1 {
-            let _ = os::set_cloexec(fd);
+            set_cloexec(fd, true);
         }
     }
     PENDING_EXEC_ENV.with(|e| *e.borrow_mut() = None);
@@ -951,55 +1123,80 @@ thread_local! {
     static PENDING_EXEC_ENV: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) };
 }
 
-/// ngx_execute_proc
-fn exec_proc_stub(cycle: Rc<Cycle>, _data: i64) -> ! {
+/// ngx_execute_proc: execve() of argv[0] with the arguments of this binary
+/// and the environment of exec_new_binary().
+fn exec_proc(cycle: Rc<Cycle>, _data: i64) -> ! {
     let args = argv();
-    let argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    let envs: Vec<CString> = PENDING_EXEC_ENV.with(|e| e.borrow().iter().flatten().map(|v| os::cstr(v)).collect());
-    let env_ptrs: Vec<*const libc::c_char> = envs.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    unsafe {
-        libc::execve(args[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    let path = args[0].as_bytes();
+    let env = PENDING_EXEC_ENV.with(|e| e.borrow().clone().unwrap_or_default());
+
+    // execve() takes a path without a slash in the current directory,
+    // where Command would look for it in PATH
+    let program = if path.contains(&b'/') { path.to_vec() } else { [&b"./"[..], path].concat() };
+
+    let mut cmd = std::process::Command::new(OsStr::from_bytes(&program));
+
+    cmd.arg0(OsStr::from_bytes(path));
+    cmd.args(args[1..].iter().map(|a| OsStr::from_bytes(a.as_bytes())));
+    cmd.env_clear();
+
+    let mut names: HashSet<&[u8]> = HashSet::new();
+
+    for e in &env {
+        let i = match memchr::memchr(b'=', e) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // the first of a name, which getenv() finds
+        if names.insert(&e[..i]) {
+            cmd.env(OsStr::from_bytes(&e[..i]), OsStr::from_bytes(&e[i + 1..]));
+        }
     }
-    ngx_log_error!(NGX_LOG_ALERT, cycle.log, Some(os::errno()), "execve() failed while executing new binary process \"{}\"", B(args[0].as_bytes()));
+
+    let err = cmd.exec();
+
+    ngx_log_error!(NGX_LOG_ALERT, cycle.log, err.raw_os_error(), "execve() failed while executing new binary process \"{}\"", B(path));
     std::process::exit(1);
 }
 
 /// ngx_daemon
 pub fn daemon(log: &Log) -> Result<(), ()> {
     let pid = os::getpid();
-    match unsafe { libc::fork() } {
-        -1 => {
-            ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "fork() failed");
+    match ngx_sys::os::fork() {
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error().unwrap_or(libc::EAGAIN)), "fork() failed");
             return Err(());
         }
-        0 => {}
-        _ => std::process::exit(0),
+        Ok(ngx_sys::os::Fork::Child) => {}
+        Ok(ngx_sys::os::Fork::Parent(_)) => std::process::exit(0),
     }
     update_pid();
     // ngx_parent = ngx_pid
     PARENT_PID.store(pid, Ordering::Relaxed);
-    if unsafe { libc::setsid() } == -1 {
-        ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "setsid() failed");
+    if let Err(e) = nix::unistd::setsid() {
+        ngx_log_error!(NGX_LOG_EMERG, log, Some(e as i32), "setsid() failed");
         return Err(());
     }
-    unsafe { libc::umask(0) };
-    let fd = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
-    if fd == -1 {
-        ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "open(\"/dev/null\") failed");
+    nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+    let fd = match rustix::fs::open("/dev/null", rustix::fs::OFlags::RDWR, rustix::fs::Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "open(\"/dev/null\") failed");
+            return Err(());
+        }
+    };
+    if let Err(e) = rustix::stdio::dup2_stdin(&fd) {
+        ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "dup2(STDIN) failed");
         return Err(());
     }
-    unsafe {
-        if libc::dup2(fd, libc::STDIN_FILENO) == -1 {
-            ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "dup2(STDIN) failed");
-            return Err(());
-        }
-        if libc::dup2(fd, libc::STDOUT_FILENO) == -1 {
-            ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "dup2(STDOUT) failed");
-            return Err(());
-        }
-        if fd > libc::STDERR_FILENO {
-            libc::close(fd);
-        }
+    if let Err(e) = rustix::stdio::dup2_stdout(&fd) {
+        ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "dup2(STDOUT) failed");
+        return Err(());
+    }
+    if fd.as_raw_fd() <= libc::STDERR_FILENO {
+        // it is a standard descriptor itself now: left open
+        let _ = fd.into_raw_fd();
     }
     Ok(())
 }
@@ -1020,7 +1217,7 @@ fn environment(cycle: &Rc<Cycle>) -> Vec<Vec<u8>> {
         match full {
             Some(f) => env.push(f),
             None => {
-                if let Some(v) = std::env::var_os(std::ffi::OsStr::from_bytes(&name)) {
+                if let Some(v) = std::env::var_os(OsStr::from_bytes(&name)) {
                     let mut var = name;
                     var.push(b'=');
                     var.extend_from_slice(v.as_bytes());
@@ -1049,7 +1246,7 @@ pub fn set_environment(cycle: &Rc<Cycle>) {
                 vars.push((f[..i].to_vec(), f[i + 1..].to_vec()));
             }
             None => {
-                if let Some(v) = std::env::var_os(std::ffi::OsStr::from_bytes(name)) {
+                if let Some(v) = std::env::var_os(OsStr::from_bytes(name)) {
                     vars.push((name.clone(), v.as_bytes().to_vec()));
                 }
             }
@@ -1060,92 +1257,72 @@ pub fn set_environment(cycle: &Rc<Cycle>) {
             vars.push((b"TZ".to_vec(), v.as_bytes().to_vec()));
         }
     }
-    // keep NGINX var handling out; clear and set
-    let keep_nginx = std::env::var_os("NGINX");
-    unsafe {
-        libc::clearenv();
+    // environ = the variables only: the others removed (those whose names
+    // unsetenv() refuses cannot be)
+    let names: Vec<std::ffi::OsString> = std::env::vars_os().map(|(k, _)| k).collect();
+    for k in names {
+        if !k.is_empty() && !k.as_bytes().contains(&b'=') {
+            std::env::remove_var(&k);
+        }
     }
     for (k, v) in vars {
-        std::env::set_var(std::ffi::OsStr::from_bytes(&k), std::ffi::OsStr::from_bytes(&v));
-    }
-    let _ = keep_nginx;
-}
-
-use std::os::unix::ffi::OsStrExt;
-
-// --- setproctitle via argv area captured at startup ---
-
-static mut OS_ARGV: *mut *mut libc::c_char = std::ptr::null_mut();
-static mut OS_ARGC: libc::c_int = 0;
-static mut OS_ENVP: *mut *mut libc::c_char = std::ptr::null_mut();
-static mut ARGV_LAST: *mut libc::c_char = std::ptr::null_mut();
-
-#[used]
-#[link_section = ".init_array"]
-static CAPTURE_ARGS: extern "C" fn(libc::c_int, *mut *mut libc::c_char, *mut *mut libc::c_char) = capture_args;
-
-extern "C" fn capture_args(argc: libc::c_int, argv: *mut *mut libc::c_char, envp: *mut *mut libc::c_char) {
-    unsafe {
-        OS_ARGC = argc;
-        OS_ARGV = argv;
-        OS_ENVP = envp;
+        std::env::set_var(OsStr::from_bytes(&k), OsStr::from_bytes(&v));
     }
 }
 
-/// ngx_init_setproctitle: move environment strings so argv+environ area can hold the title.
+// --- the process title ---
+
+/// ngx_init_setproctitle() was called
+static PROCTITLE: AtomicBool = AtomicBool::new(false);
+
+/// ngx_init_setproctitle: the environment moved out of the argument and
+/// environment strings the title is written over (glibc copies a variable
+/// that setenv() sets).
 pub fn init_setproctitle() {
-    unsafe {
-        if OS_ARGV.is_null() {
-            return;
+    let mut names = HashSet::new();
+
+    for (k, v) in std::env::vars_os() {
+        // the first of a name, which getenv() finds
+        if k.is_empty() || k.as_bytes().contains(&b'=') || !names.insert(k.clone()) {
+            continue;
         }
-        let mut last: *mut libc::c_char = std::ptr::null_mut();
-        for i in 0..OS_ARGC as isize {
-            let a = *OS_ARGV.offset(i);
-            if last.is_null() || a == last {
-                last = a.add(libc::strlen(a) + 1);
-            }
-        }
-        let mut i = 0;
-        loop {
-            let e = *OS_ENVP.offset(i);
-            if e.is_null() {
-                break;
-            }
-            if e == last {
-                let len = libc::strlen(e) + 1;
-                last = e.add(len);
-                let copy = libc::malloc(len) as *mut libc::c_char;
-                if copy.is_null() {
-                    return;
-                }
-                std::ptr::copy_nonoverlapping(e, copy, len);
-                *OS_ENVP.offset(i) = copy;
-            }
-            i += 1;
-        }
-        ARGV_LAST = last.sub(1);
+
+        std::env::set_var(&k, &v);
     }
+
+    PROCTITLE.store(true, Ordering::Relaxed);
 }
 
 /// ngx_setproctitle: "nginx: <title>"
 pub fn setproctitle(title: &[u8]) {
-    unsafe {
-        if OS_ARGV.is_null() || ARGV_LAST.is_null() {
-            return;
-        }
-        let start = *OS_ARGV;
-        *OS_ARGV.offset(1) = std::ptr::null_mut();
-        let cap = ARGV_LAST as usize - start as usize;
-        let mut buf = b"nginx: ".to_vec();
-        buf.extend_from_slice(title);
-        if buf.len() > cap {
-            buf.truncate(cap);
-        }
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), start as *mut u8, buf.len());
-        let pad = cap - buf.len();
-        if pad > 0 {
-            std::ptr::write_bytes((start as *mut u8).add(buf.len()), 0, pad);
-        }
+    if !PROCTITLE.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let mut buf = b"nginx: ".to_vec();
+    buf.extend_from_slice(title);
+
+    let _ = ngx_sys::os::setproctitle(&buf);
+}
+
+/// A descriptor inherited across execve() (by the number the old binary
+/// passed) taken into the table under the same number; left as it is if
+/// it is not open, so that the calls on it fail as in C.
+pub fn adopt_inherited(n: RawFd) -> RawFd {
+    if n <= libc::STDERR_FILENO || fd::contains(n) {
+        return n;
+    }
+
+    let dup = match fd::duplicate(n) {
+        Ok(d) => d,
+        Err(_) => return n,
+    };
+
+    os::close(n);
+
+    match rustix::io::fcntl_dupfd_cloexec(&dup, n) {
+        Ok(owned) => fd::register(owned),
+        Err(_) => fd::register(dup),
     }
 }
 
@@ -1163,7 +1340,7 @@ pub fn add_inherited_sockets(cycle: &mut Cycle) -> Result<(), ()> {
         // the address is set by ngx_set_inherited_sockets
         let mut ls = crate::listening::Listening::new(crate::inet::SockAddr::v4(std::net::Ipv4Addr::UNSPECIFIED, 0), cycle.log.clone());
         ls.addr_text = Vec::new();
-        ls.fd.set(s);
+        ls.fd.set(adopt_inherited(s));
         ls.inherited.set(true);
         cycle.listening.push(Rc::new(ls));
     }
@@ -1215,7 +1392,7 @@ mod tests {
     use super::*;
     use crate::inet::SockAddr;
     use crate::listening::Listening;
-    use std::os::unix::io::IntoRawFd;
+    use std::os::fd::{BorrowedFd, OwnedFd};
 
     fn capture() -> (Log, Rc<RefCell<Vec<u8>>>) {
         let logged: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1295,7 +1472,7 @@ mod tests {
 
         for (process, new_binary, inherited, parent, deleted) in cases {
             let _ = std::fs::remove_file(&path);
-            let fd = std::os::unix::net::UnixListener::bind(&path).unwrap().into_raw_fd();
+            let fd = fd::register(OwnedFd::from(std::os::unix::net::UnixListener::bind(&path).unwrap()));
 
             let (log, _l) = capture();
             let mut cycle = Cycle::init_cycle(log.clone(), Rc::new(Vec::new()));
@@ -1326,32 +1503,33 @@ mod tests {
 
     /// sendmsg() of a channel message with SCM_RIGHTS descriptors
     fn send_channel(s: i32, ch: &Channel, fds: &[i32]) {
-        unsafe {
-            let mut iov = libc::iovec { iov_base: ch as *const Channel as *mut libc::c_void, iov_len: std::mem::size_of::<Channel>() };
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            let mut buf = [0u64; 8];
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            if !fds.is_empty() {
-                let len = std::mem::size_of_val(fds) as u32;
-                msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = libc::CMSG_SPACE(len) as usize;
-                let cm = libc::CMSG_FIRSTHDR(&msg);
-                (*cm).cmsg_len = libc::CMSG_LEN(len) as usize;
-                (*cm).cmsg_level = libc::SOL_SOCKET;
-                (*cm).cmsg_type = libc::SCM_RIGHTS;
-                std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cm), len as usize);
-            }
-            assert_eq!(libc::sendmsg(s, &msg, 0), std::mem::size_of::<Channel>() as isize);
+        let handles: Vec<fd::Fd> = fds.iter().map(|&f| fd::get(f).unwrap()).collect();
+        let borrowed: Vec<BorrowedFd<'_>> = handles.iter().map(|h| h.as_fd()).collect();
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+
+        if !borrowed.is_empty() {
+            assert!(cmsg.push(SendAncillaryMessage::ScmRights(&borrowed)));
         }
+
+        let bytes = ch.to_bytes();
+        let n = rustix::net::sendmsg(fd::get(s).unwrap(), &[IoSlice::new(&bytes)], &mut cmsg, SendFlags::empty()).unwrap();
+        assert_eq!(n, CHANNEL_SIZE);
     }
 
     fn inode(fd: i32) -> Option<(u64, u64)> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } == -1 {
-            return None;
-        }
+        let st = os::fstat(fd).ok()?;
         Some((st.st_dev, st.st_ino))
+    }
+
+    #[test]
+    fn channel_bytes() {
+        let ch = Channel { command: NGX_CMD_OPEN_CHANNEL, pid: 1234, slot: 7, fd: -1 };
+        let b = ch.to_bytes();
+        assert_eq!(&b[0..4], &1u32.to_ne_bytes());
+        assert_eq!(&b[12..16], &(-1i32).to_ne_bytes());
+        let back = Channel::from_bytes(&b);
+        assert_eq!((back.command, back.pid, back.slot, back.fd), (NGX_CMD_OPEN_CHANNEL, 1234, 7, -1));
     }
 
     /// ngx_read_channel: the descriptor of NGX_CMD_OPEN_CHANNEL; a message
@@ -1359,11 +1537,13 @@ mod tests {
     /// table is full) is not "truncated data"
     #[test]
     fn channel_ancillary_data() {
-        let mut sp = [0; 2];
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sp.as_mut_ptr()) }, 0);
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+        let (a, b) = rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None).unwrap();
+        let sp = [fd::register(a), fd::register(b)];
         os::set_nonblocking(sp[1]).unwrap();
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+        let pipe = [fd::register(r), fd::register(w)];
         let pipe_inode = inode(pipe[0]);
 
         let (log, l) = capture();
@@ -1377,16 +1557,14 @@ mod tests {
         let ch = read_channel(sp[1], &log).unwrap().unwrap();
         assert_eq!((ch.command, ch.pid, ch.slot), (NGX_CMD_OPEN_CHANNEL, 1, 2));
         assert!(ch.fd != -1 && ch.fd != pipe[0] && inode(ch.fd) == pipe_inode);
+        assert!(fd::contains(ch.fd), "the descriptor received is in the table");
         os::close(ch.fd);
 
-        // room for two descriptors in CMSG_SPACE(sizeof(int)): the third
-        // one is discarded
+        // more descriptors than the channel's: the first one is taken, the
+        // others are closed
         send_channel(sp[0], &open, &[pipe[0], pipe[0], pipe[0]]);
         let ch = read_channel(sp[1], &log).unwrap().unwrap();
         assert!(ch.fd != -1 && inode(ch.fd) == pipe_inode);
-        if inode(ch.fd + 1) == pipe_inode && ch.fd + 1 != pipe[1] {
-            os::close(ch.fd + 1);
-        }
         os::close(ch.fd);
 
         send_channel(sp[0], &open, &[]);
@@ -1397,8 +1575,65 @@ mod tests {
 
         assert_eq!(messages(&l), vec!["[alert] recvmsg() returned too small ancillary data"]);
 
-        for fd in sp.iter().chain(pipe.iter()) {
-            os::close(*fd);
+        // write_channel() passes the descriptor
+        write_channel(sp[0], &Channel { command: NGX_CMD_OPEN_CHANNEL, pid: 3, slot: 4, fd: pipe[1] }, &log).unwrap();
+        let ch = read_channel(sp[1], &log).unwrap().unwrap();
+        assert_eq!((ch.command, ch.pid, ch.slot), (NGX_CMD_OPEN_CHANNEL, 3, 4));
+        assert_eq!(inode(ch.fd), inode(pipe[1]));
+        os::close(ch.fd);
+
+        // EOF
+        os::close(sp[0]);
+        assert!(read_channel(sp[1], &log).is_err());
+
+        for fd in [sp[1], pipe[0], pipe[1]] {
+            os::close(fd);
         }
+    }
+
+    /// The signals recorded by the handler, with the pid of their sender,
+    /// and the notices of ngx_signal_handler()
+    #[test]
+    fn signal_notices() {
+        let (log, l) = capture();
+
+        // not init_signals(): ngx_parent is the one of another test
+        PROCESS_KIND.store(3, Ordering::Relaxed);
+        register_signals(&log).unwrap();
+
+        // a worker: SIGUSR1 sets ngx_reopen in the handler (which may run in
+        // another thread of the test)
+        SIG_REOPEN.store(false, Ordering::SeqCst);
+        nix::sys::signal::kill(nix::unistd::getpid(), Signal::SIGUSR1).unwrap();
+
+        for _ in 0..100 {
+            if SIG_REOPEN.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(SIG_REOPEN.swap(false, Ordering::SeqCst), "the handler sets the flag");
+        process_signals(&log, true);
+
+        let pid = os::getpid();
+        assert_eq!(messages(&l), vec![format!("[notice] signal 10 (SIGUSR1) received from {}, reopening logs", pid)]);
+
+        // the kind-dependent flags are set when processed
+        assert!(!SIG_RECONFIGURE.load(Ordering::SeqCst));
+        signal_handler(libc::SIGHUP, 0, &log);
+        assert!(!SIG_RECONFIGURE.load(Ordering::SeqCst), "SIGHUP is ignored by a worker");
+        PROCESS_KIND.store(1, Ordering::Relaxed);
+        signal_handler(libc::SIGHUP, 0, &log);
+        assert!(SIG_RECONFIGURE.swap(false, Ordering::SeqCst), "SIGHUP reconfigures the master");
+        signal_handler(libc::SIGALRM, 0, &log);
+        assert!(SIG_ALRM.swap(false, Ordering::SeqCst));
+
+        assert_eq!(
+            messages(&l)[1..],
+            ["[notice] signal 1 (SIGHUP) received, ignoring", "[notice] signal 1 (SIGHUP) received, reconfiguring", "[notice] signal 14 (SIGALRM) received"]
+        );
+
+        PROCESS_KIND.store(0, Ordering::Relaxed);
     }
 }

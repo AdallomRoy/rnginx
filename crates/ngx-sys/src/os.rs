@@ -164,3 +164,91 @@ mod tests {
         ioctl_fioasync(a.as_fd(), false).unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// The process title (ngx_setproctitle).
+
+/// The block of argument and environment strings that execve() copied to
+/// the top of the stack: [arg_start, env_end) of /proc/self/stat (fields 48
+/// to 51), or [arg_start, arg_end) if the environment strings do not follow
+/// the arguments. /proc/self/cmdline, and so ps, shows its bytes.
+fn cmdline_area() -> io::Result<(usize, usize)> {
+    let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+
+    // the fields after the command name, which is in parentheses and may
+    // have spaces and parentheses in it: the first of them is field 3
+    let rest = &stat[stat.rfind(')').ok_or_else(invalid)? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let field = |n: usize| fields.get(n - 3).and_then(|f| f.parse::<usize>().ok()).ok_or_else(invalid);
+
+    let (arg_start, arg_end, env_start, env_end) = (field(48)?, field(49)?, field(50)?, field(51)?);
+
+    let end = if env_start == arg_end && env_end > env_start { env_end } else { arg_end };
+
+    if arg_start == 0 || end <= arg_start {
+        return Err(invalid());
+    }
+
+    Ok((arg_start, end))
+}
+
+/// ngx_setproctitle(): the title written over the argument and environment
+/// strings of the process, then NULs up to their end, so that
+/// /proc/self/cmdline (and ps) shows it; the title is cut to the size of
+/// the strings, one NUL kept at their end.
+///
+/// The environment strings are written over too: the caller moves the
+/// environment out of them first, as ngx_init_setproctitle() does (a
+/// setenv() of each variable makes glibc copy it), or getenv() returns
+/// pieces of the title from then on.
+///
+/// Fails with EAGAIN while the process has other threads, which could read
+/// the strings while they are written.
+pub fn setproctitle(title: &[u8]) -> io::Result<()> {
+    if threads()? != 1 {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+
+    let (start, end) = cmdline_area()?;
+    let len = end - start;
+    let n = title.len().min(len - 1);
+
+    let p = std::ptr::with_exposed_provenance_mut::<u8>(start);
+
+    // SAFETY: [start, start + len) is the block of strings the kernel put
+    // on the stack at execve() (/proc/self/stat), mapped read-write as long
+    // as the process lives and not in any allocation of the program: nothing
+    // in it is referenced by Rust. glibc and std keep only raw pointers to
+    // it (argv[], environ[], program_invocation_name) and read it through
+    // them without synchronization, which no other thread can do while it
+    // is written (the process has one thread, checked above, and creates
+    // none here). n < len, so both writes stay in the block, and the block
+    // still ends with a NUL after them: the C strings argv[] and environ[]
+    // point to stay terminated within it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(title.as_ptr(), p, n);
+        std::ptr::write_bytes(p.add(n), 0, len - n);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod proctitle_tests {
+    use super::*;
+
+    #[test]
+    fn area_of_the_strings() {
+        let (start, end) = cmdline_area().unwrap();
+        let cmdline = std::fs::read("/proc/self/cmdline").unwrap();
+
+        // the arguments are at the start of the area
+        assert!(end - start >= cmdline.len());
+
+        // the test harness has threads: the title is refused
+        if threads().unwrap() > 1 {
+            assert_eq!(setproctitle(b"x").unwrap_err().raw_os_error(), Some(libc::EAGAIN));
+        }
+    }
+}

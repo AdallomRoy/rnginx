@@ -76,15 +76,22 @@ pub fn http_cookie_time(t: i64) -> String {
     }
 }
 
+/// The offset of the local time from UTC at time `t`, in seconds
+/// (tm_gmtoff of localtime_r()); chrono's Local reads the zone as glibc
+/// does, from TZ or /etc/localtime.
+fn offset_at(t: i64) -> Option<i32> {
+    use chrono::{Offset, TimeZone};
+
+    let utc = chrono::DateTime::from_timestamp(t, 0)?;
+
+    Some(chrono::Local.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc())
+}
+
 /// Local timezone offset in minutes for time `t`.
 pub fn gmtoff(t: i64) -> i64 {
-    unsafe {
-        let tt: libc::time_t = t as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&tt, &mut tm).is_null() {
-            return 0;
-        }
-        (tm.tm_gmtoff / 60) as i64
+    match offset_at(t) {
+        Some(off) => (off / 60) as i64,
+        None => 0,
     }
 }
 
@@ -102,7 +109,6 @@ pub struct CachedTime {
 
 thread_local! {
     static CACHED: RefCell<CachedTime> = RefCell::new(build(0, 0));
-    static TZ_INIT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn build(sec: i64, msec: u64) -> CachedTime {
@@ -139,13 +145,6 @@ fn now_raw() -> (i64, u64) {
 
 /// Refresh the cached time (call at least once per event-loop iteration; cheap).
 pub fn update() {
-    TZ_INIT.with(|i| {
-        if !*i.borrow() {
-            extern "C" { fn tzset(); }
-            unsafe { tzset() };
-            *i.borrow_mut() = true;
-        }
-    });
     let (sec, msec) = now_raw();
     CACHED.with(|c| {
         let mut c = c.borrow_mut();
@@ -163,46 +162,54 @@ pub fn time() -> i64 {
     CACHED.with(|c| c.borrow().sec)
 }
 
+/// mktime() of a local time (its fields normalized): the time and its
+/// offset from UTC. `hint`, the offset of the tm_isdst given, picks one of
+/// the two times of a repeated hour, and is the offset of a time skipped by
+/// a change of offset.
+fn mktime(local: chrono::NaiveDateTime, hint: i32) -> Option<(i64, i32)> {
+    use chrono::{LocalResult, Offset, TimeZone};
+
+    let t = match chrono::Local.from_local_datetime(&local) {
+        LocalResult::Single(t) => t.timestamp(),
+        LocalResult::Ambiguous(a, b) => {
+            if b.offset().fix().local_minus_utc() == hint {
+                b.timestamp()
+            } else {
+                a.timestamp()
+            }
+        }
+        LocalResult::None => local.and_utc().timestamp() - hint as i64,
+    };
+
+    Some((t, offset_at(t)?))
+}
+
 /// ngx_next_time: the next moment `when` seconds after a local midnight
 /// (today's if still to come, else tomorrow's), -1 if mktime() fails.
 pub fn next_time(when: i64) -> i64 {
     let now = time();
 
-    // SAFETY: tm is a plain struct filled by localtime_r() and normalized
-    // by mktime().
-    unsafe {
-        let t = now as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
+    let next = || -> Option<i64> {
+        // localtime_r(now): the day, and its offset (as tm_isdst)
+        let local = chrono::DateTime::from_timestamp(now, 0)?.with_timezone(&chrono::Local);
+        let offset = offset_at(now)?;
+        let midnight = local.date_naive().and_hms_opt(0, 0, 0)?;
 
-        libc::localtime_r(&t, &mut tm);
+        // tm_hour, tm_min and tm_sec of `when` that day, as mktime()
+        // normalizes them
+        let at = midnight.checked_add_signed(chrono::TimeDelta::try_seconds(when)?)?;
 
-        tm.tm_hour = (when / 3600) as libc::c_int;
-        let when = when % 3600;
-        tm.tm_min = (when / 60) as libc::c_int;
-        tm.tm_sec = (when % 60) as libc::c_int;
+        let (next, offset) = mktime(at, offset)?;
 
-        let next = libc::mktime(&mut tm);
-
-        if next == -1 {
-            return -1;
+        if next - now > 0 {
+            return Some(next);
         }
 
-        if next as i64 - now > 0 {
-            return next as i64;
-        }
+        // tm_mday + 1: mktime() normalizes a date (Jan 32, etc)
+        mktime(at.checked_add_signed(chrono::TimeDelta::try_days(1)?)?, offset).map(|(next, _)| next)
+    };
 
-        tm.tm_mday += 1;
-
-        // mktime() should normalize a date (Jan 32, etc)
-
-        let next = libc::mktime(&mut tm);
-
-        if next != -1 {
-            return next as i64;
-        }
-
-        -1
-    }
+    next().unwrap_or(-1)
 }
 
 /// Current time in milliseconds since epoch (wall clock).
@@ -216,10 +223,7 @@ pub fn msec() -> u64 {
 
 /// Monotonic milliseconds, like ngx_current_msec.
 pub fn current_msec() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     ts.tv_sec as u64 * 1000 + (ts.tv_nsec / 1_000_000) as u64
 }
 
