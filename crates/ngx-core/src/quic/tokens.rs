@@ -1,16 +1,17 @@
 //! ngx_event_quic_tokens.c: stateless reset tokens, address validation
 //! tokens (Retry and NEW_TOKEN).
 
-use std::os::raw::c_int;
+use openssl::cipher::Cipher;
+use openssl::cipher_ctx::CipherCtx;
+use openssl::rand::rand_bytes;
 
 use crate::connection::Connection;
 use crate::inet::SockAddr;
 use crate::log::*;
-use crate::openssl_ffi::*;
 use crate::rc::*;
 use crate::{ngx_log_debug, ngx_log_error};
 
-use super::protection::{ngx_quic_derive_key, CipherCtx};
+use super::protection::ngx_quic_derive_key;
 use super::transport::*;
 use super::{ngx_quic_address_hash, NGX_QUIC_SR_KEY_LEN, NGX_QUIC_SR_TOKEN_LEN};
 
@@ -69,42 +70,50 @@ pub fn ngx_quic_new_token(log: &Log, sockaddr: &SockAddr, key: &[u8; 32], odcid:
         return None;
     }
 
-    let ctx = CipherCtx::new()?;
+    // the errors of OpenSSL are left on its queue, as in the C
+    let failed = |e: openssl::error::ErrorStack| {
+        e.put();
+        None
+    };
+
+    let mut ctx = match CipherCtx::new() {
+        Ok(ctx) => ctx,
+        Err(e) => return failed(e),
+    };
+
+    let cipher = Cipher::aes_256_gcm();
 
     let mut token = vec![0u8; NGX_QUIC_TOKEN_BUF_SIZE];
 
-    // SAFETY: the buffers are large enough for the IV, the data (a block
-    // cipher in GCM mode outputs as much as its input) and the tag
-    unsafe {
-        let cipher = EVP_aes_256_gcm();
+    /* the IV, then the data (GCM outputs as much as its input) and the tag */
 
-        if RAND_bytes(token.as_mut_ptr(), iv_len as c_int) <= 0 || EVP_EncryptInit_ex(ctx.as_ptr(), cipher, std::ptr::null_mut(), key.as_ptr(), token.as_ptr()) == 0 {
-            return None;
-        }
-
-        let mut tlen = iv_len;
-        let mut n: c_int = 0;
-
-        if EVP_EncryptUpdate(ctx.as_ptr(), token.as_mut_ptr().add(tlen), &mut n, input.as_ptr(), len as c_int) != 1 {
-            return None;
-        }
-
-        tlen += n as usize;
-
-        if EVP_EncryptFinal_ex(ctx.as_ptr(), token.as_mut_ptr().add(tlen), &mut n) <= 0 {
-            return None;
-        }
-
-        tlen += n as usize;
-
-        if EVP_CIPHER_CTX_ctrl(ctx.as_ptr(), EVP_CTRL_AEAD_GET_TAG, NGX_QUIC_AES_256_GCM_TAG_LEN as c_int, token.as_mut_ptr().add(tlen) as *mut std::os::raw::c_void) == 0 {
-            return None;
-        }
-
-        tlen += NGX_QUIC_AES_256_GCM_TAG_LEN;
-
-        token.truncate(tlen);
+    if let Err(e) = rand_bytes(&mut token[..iv_len]) {
+        return failed(e);
     }
+
+    if let Err(e) = ctx.encrypt_init(Some(cipher), Some(&key[..]), Some(&token[..iv_len])) {
+        return failed(e);
+    }
+
+    let mut tlen = iv_len;
+
+    match ctx.cipher_update(&input[..len], Some(&mut token[tlen..])) {
+        Ok(n) => tlen += n,
+        Err(e) => return failed(e),
+    }
+
+    match ctx.cipher_final(&mut token[tlen..]) {
+        Ok(n) => tlen += n,
+        Err(e) => return failed(e),
+    }
+
+    if let Err(e) = ctx.tag(&mut token[tlen..tlen + NGX_QUIC_AES_256_GCM_TAG_LEN]) {
+        return failed(e);
+    }
+
+    tlen += NGX_QUIC_AES_256_GCM_TAG_LEN;
+
+    token.truncate(tlen);
 
     Some(token)
 }
@@ -135,43 +144,51 @@ pub fn ngx_quic_validate_token(c: &Connection, key: &[u8; 32], pkt: &mut QuicHea
         return garbage();
     }
 
-    let ctx = match CipherCtx::new() {
-        Some(ctx) => ctx,
-        None => return NGX_ERROR,
-    };
+    // the errors of OpenSSL are left on its queue, as in the C
+    let requeue = |e: openssl::error::ErrorStack| e.put();
 
-    let mut tdec = [0u8; NGX_QUIC_MAX_TOKEN_SIZE];
-    let mut total: usize;
-
-    // SAFETY: the token has the IV, the data and the tag (checked above),
-    // and the data decrypted fits tdec
-    unsafe {
-        let cipher = EVP_aes_256_gcm();
-
-        if EVP_DecryptInit_ex(ctx.as_ptr(), cipher, std::ptr::null_mut(), key.as_ptr(), pkt.token.as_ptr()) == 0 {
+    let mut ctx = match CipherCtx::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            requeue(e);
             return NGX_ERROR;
         }
+    };
 
-        let p = pkt.token.as_ptr().add(iv_len);
-        let len = pkt.token.len() - iv_len - NGX_QUIC_AES_256_GCM_TAG_LEN;
+    let cipher = Cipher::aes_256_gcm();
 
-        let mut tlen: c_int = 0;
+    /* the token is the IV, the data and the tag (checked above) */
 
-        if EVP_DecryptUpdate(ctx.as_ptr(), tdec.as_mut_ptr(), &mut tlen, p, len as c_int) != 1 {
+    if let Err(e) = ctx.decrypt_init(Some(cipher), Some(&key[..]), Some(&pkt.token[..iv_len])) {
+        requeue(e);
+        return NGX_ERROR;
+    }
+
+    let len = pkt.token.len() - iv_len - NGX_QUIC_AES_256_GCM_TAG_LEN;
+    let (data, tag) = pkt.token[iv_len..].split_at(len);
+
+    /* the data decrypted fits tdec (checked above) */
+    let mut tdec = [0u8; NGX_QUIC_MAX_TOKEN_SIZE];
+
+    let mut total = match ctx.cipher_update(data, Some(&mut tdec)) {
+        Ok(n) => n,
+        Err(e) => {
+            requeue(e);
             return garbage();
         }
+    };
 
-        total = tlen as usize;
+    if let Err(e) = ctx.set_tag(tag) {
+        requeue(e);
+        return garbage();
+    }
 
-        if EVP_CIPHER_CTX_ctrl(ctx.as_ptr(), EVP_CTRL_AEAD_SET_TAG, NGX_QUIC_AES_256_GCM_TAG_LEN as c_int, p.add(len) as *mut std::os::raw::c_void) == 0 {
+    match ctx.cipher_final(&mut tdec[total..]) {
+        Ok(n) => total += n,
+        Err(e) => {
+            requeue(e);
             return garbage();
         }
-
-        if EVP_DecryptFinal_ex(ctx.as_ptr(), tdec.as_mut_ptr().add(total), &mut tlen) <= 0 {
-            return garbage();
-        }
-
-        total += tlen as usize;
     }
 
     drop(ctx);
@@ -223,4 +240,130 @@ pub fn ngx_quic_validate_token(c: &Connection, key: &[u8; 32], pkt: &mut QuicHea
     pkt.validated = true;
 
     NGX_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use openssl::symm;
+
+    use super::*;
+
+    const KEY: [u8; 32] = [7; 32];
+
+    fn addr(port: u16) -> SockAddr {
+        SockAddr::v4(std::net::Ipv4Addr::new(127, 0, 0, 1), port)
+    }
+
+    fn conn(sockaddr: SockAddr) -> Rc<Connection> {
+        crate::connection::set_connection_n(16);
+        Connection::peer(-1, libc::SOCK_DGRAM, sockaddr, &Log::stderr(0)).expect("connection")
+    }
+
+    fn validate(c: &Connection, key: &[u8; 32], token: &[u8], dcid: &[u8]) -> (i64, QuicHeader<'static>) {
+        let mut pkt = QuicHeader { token: token.to_vec(), dcid: dcid.to_vec(), ..Default::default() };
+        let rc = ngx_quic_validate_token(c, key, &mut pkt);
+
+        (rc, pkt)
+    }
+
+    #[test]
+    fn retry_token() {
+        let c = conn(addr(4433));
+        let exp = crate::times::cached().sec + 3;
+        let odcid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+
+        let token = ngx_quic_new_token(&c.log, &addr(4433), &KEY, Some(&odcid), exp, true).expect("token");
+
+        assert_eq!(token.len(), NGX_QUIC_AES_256_GCM_IV_LEN + 20 + TIME_T_LEN + 2 + odcid.len() + NGX_QUIC_AES_256_GCM_TAG_LEN);
+
+        // AES-256-GCM of the address hash, the time, retry and the odcid
+        let (iv, rest) = token.split_at(NGX_QUIC_AES_256_GCM_IV_LEN);
+        let (data, tag) = rest.split_at(rest.len() - NGX_QUIC_AES_256_GCM_TAG_LEN);
+        let plain = symm::decrypt_aead(symm::Cipher::aes_256_gcm(), &KEY, Some(iv), b"", data, tag).unwrap();
+
+        assert_eq!(&plain[..20], &ngx_quic_address_hash(&addr(4433), false, None));
+        assert_eq!(&plain[20..28], &exp.to_ne_bytes());
+        assert_eq!(&plain[28..], &[1, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let (rc, pkt) = validate(&c, &KEY, &token, b"dcid");
+        assert_eq!(rc, NGX_OK);
+        assert!(pkt.retried && pkt.validated);
+        assert_eq!(pkt.odcid, odcid);
+
+        // a Retry token is for the address and the port
+        let (rc, pkt) = validate(&conn(addr(4434)), &KEY, &token, b"dcid");
+        assert_eq!(rc, NGX_DECLINED);
+        assert!(!pkt.validated);
+
+        // another key: the tag does not match
+        let (rc, pkt) = validate(&c, &[8; 32], &token, b"dcid");
+        assert_eq!(rc, NGX_ABORT);
+        assert!(!pkt.validated);
+
+        // the IVs are random
+        let again = ngx_quic_new_token(&c.log, &addr(4433), &KEY, Some(&odcid), exp, true).expect("token");
+        assert_ne!(token[..NGX_QUIC_AES_256_GCM_IV_LEN], again[..NGX_QUIC_AES_256_GCM_IV_LEN]);
+    }
+
+    #[test]
+    fn new_token() {
+        let c = conn(addr(4433));
+        let exp = crate::times::cached().sec + 600;
+
+        let token = ngx_quic_new_token(&c.log, &addr(4433), &KEY, None, exp, false).expect("token");
+
+        // a NEW_TOKEN token is for the address, whatever the port
+        let (rc, pkt) = validate(&conn(addr(5000)), &KEY, &token, b"the dcid");
+        assert_eq!(rc, NGX_OK);
+        assert!(!pkt.retried && pkt.validated);
+        assert_eq!(pkt.odcid, b"the dcid");
+
+        let (rc, _) = validate(&conn(SockAddr::v4(std::net::Ipv4Addr::new(127, 0, 0, 2), 4433)), &KEY, &token, b"dcid");
+        assert_eq!(rc, NGX_DECLINED);
+
+        let token = ngx_quic_new_token(&c.log, &addr(4433), &KEY, None, crate::times::cached().sec - 1, false).expect("token");
+        let (rc, pkt) = validate(&c, &KEY, &token, b"dcid");
+        assert_eq!(rc, NGX_DECLINED, "expired");
+        assert!(!pkt.validated);
+    }
+
+    #[test]
+    fn garbage_tokens() {
+        let c = conn(addr(4433));
+
+        for len in [0, NGX_QUIC_AES_256_GCM_IV_LEN + NGX_QUIC_AES_256_GCM_TAG_LEN - 1, NGX_QUIC_TOKEN_BUF_SIZE + 1] {
+            let (rc, _) = validate(&c, &KEY, &vec![0u8; len], b"dcid");
+            assert_eq!(rc, NGX_ABORT, "length {}", len);
+        }
+
+        // authentic, but too short to be a token
+        let iv = [3u8; NGX_QUIC_AES_256_GCM_IV_LEN];
+        let mut tag = [0u8; NGX_QUIC_AES_256_GCM_TAG_LEN];
+        let data = symm::encrypt_aead(symm::Cipher::aes_256_gcm(), &KEY, Some(&iv), b"", &[0; 29], &mut tag).unwrap();
+
+        let mut token = iv.to_vec();
+        token.extend_from_slice(&data);
+        token.extend_from_slice(&tag);
+
+        let (rc, _) = validate(&c, &KEY, &token, b"dcid");
+        assert_eq!(rc, NGX_ABORT);
+    }
+
+    #[test]
+    fn sr_tokens() {
+        let c = conn(addr(4433));
+        let key = [1u8; NGX_QUIC_SR_KEY_LEN];
+
+        let mut t1 = [0u8; NGX_QUIC_SR_TOKEN_LEN];
+        let mut t2 = [0u8; NGX_QUIC_SR_TOKEN_LEN];
+
+        assert_eq!(ngx_quic_new_sr_token(&c, b"cid1", &key, &mut t1), NGX_OK);
+        assert_eq!(ngx_quic_new_sr_token(&c, b"cid1", &key, &mut t2), NGX_OK);
+        assert_eq!(t1, t2);
+
+        assert_eq!(ngx_quic_new_sr_token(&c, b"cid2", &key, &mut t2), NGX_OK);
+        assert_ne!(t1, t2);
+    }
 }
