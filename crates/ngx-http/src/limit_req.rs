@@ -3,22 +3,22 @@
 //! queue to expire them.
 
 use std::any::Any;
-use std::cell::Cell;
-use std::ptr::{addr_of, addr_of_mut};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
-use ngx_core::queue::*;
-use ngx_core::rbtree::*;
 use ngx_core::rc::*;
 use ngx_core::shm::ShmZone;
-use ngx_core::slab::SlabPool;
+use ngx_core::shmem::queue;
+use ngx_core::shmem::rbtree::{self as rb, RbNode, RbTree, ShmRbtree};
+use ngx_core::shmem::slab::SlabPool;
+use ngx_core::shmem::ShmMem;
 use ngx_core::string::B;
 use ngx_core::times::current_msec;
-use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error};
+use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error, shm_struct};
 
 use crate::core::*;
 use crate::request::*;
@@ -37,37 +37,71 @@ const NGX_HTTP_LIMIT_REQ_REJECTED_DRY_RUN: u32 = 5;
 
 const TAG: &str = "ngx_http_limit_req_module";
 
-/// ngx_http_limit_req_node_t: it starts at the color of the rbtree node
-#[repr(C)]
-struct LimitReqNode {
-    color: u8,
-    dummy: u8,
-    len: u16,
-    queue: Queue,
-    /// ngx_msec_t
-    last: u64,
-    /// integer value, 1 corresponds to 0.001 r/s
-    excess: usize,
-    count: usize,
-    data: [u8; 1],
+shm_struct! {
+    /// ngx_http_limit_req_node_t: it starts at the color of the rbtree node
+    struct LimitReqNode {
+        color: u8,
+        dummy: u8,
+        len: u16,
+        /// ngx_queue_t queue
+        queue_prev: usize,
+        queue_next: usize,
+        /// ngx_msec_t
+        last: u64,
+        /// integer value, 1 corresponds to 0.001 r/s
+        excess: usize,
+        count: usize,
+        /// the key, len bytes
+        data: u8,
+    }
 }
 
-/// ngx_http_limit_req_shctx_t
-#[repr(C)]
-struct LimitReqShctx {
-    rbtree: Rbtree,
-    sentinel: RbtreeNode,
-    queue: Queue,
+shm_struct! {
+    /// ngx_http_limit_req_shctx_t: the rbtree, its sentinel node, then the
+    /// LRU queue of the nodes
+    struct LimitReqShctx {
+        rbtree_root: usize,
+        rbtree_sentinel: usize,
+        rbtree_insert: usize,
+        sentinel_key: usize,
+        sentinel_left: usize,
+        sentinel_right: usize,
+        sentinel_parent: usize,
+        sentinel_color: u8,
+        sentinel_data: u8,
+        queue_prev: usize,
+        queue_next: usize,
+    }
 }
 
 /// ngx_http_limit_req_ctx_t
 pub struct LimitReqCtx {
-    sh: Cell<*mut LimitReqShctx>,
-    shpool: Cell<*mut SlabPool>,
+    /// ctx->sh: the offset of the shctx in the zone
+    sh: Cell<usize>,
+    /// the zone's memory, its slab pool at the start (ctx->shpool)
+    mem: RefCell<Option<Rc<ShmMem>>>,
     /// integer value, 1 corresponds to 0.001 r/s
     rate: usize,
     key: ComplexValue,
-    node: Cell<*mut LimitReqNode>,
+    /// ctx->node: the offset of the ngx_http_limit_req_node_t looked up
+    /// without accounting, 0 for NULL
+    node: Cell<usize>,
+}
+
+impl LimitReqCtx {
+    fn mem(&self) -> Rc<ShmMem> {
+        self.mem.borrow().clone().expect("limit_req zone memory")
+    }
+
+    /// &ctx->sh->rbtree
+    fn rbtree<'a>(&self, mem: &'a ShmMem) -> ShmRbtree<'a> {
+        ShmRbtree::at(mem, self.sh.get() + LimitReqShctx::rbtree_root.off)
+    }
+
+    /// &ctx->sh->queue
+    fn queue(&self) -> usize {
+        self.sh.get() + LimitReqShctx::queue_prev.off
+    }
 }
 
 /// ngx_http_limit_req_limit_t
@@ -95,39 +129,46 @@ static LIMIT_REQ_VARS: &[VarDef] = &[VarDef { name: "limit_req_status", set: Non
 
 static LIMIT_REQ_STATUS: [&str; 5] = ["PASSED", "DELAYED", "REJECTED", "DELAYED_DRY_RUN", "REJECTED_DRY_RUN"];
 
-const COLOR_OFF: usize = std::mem::offset_of!(RbtreeNode, color);
+const COLOR_OFF: usize = RbNode::color.off;
 
-const DATA_OFF: usize = std::mem::offset_of!(LimitReqNode, data);
+const DATA_OFF: usize = LimitReqNode::data.off;
+
+/// offsetof(ngx_http_limit_req_node_t, queue)
+const QUEUE_OFF: usize = LimitReqNode::queue_prev.off;
 
 /// (ngx_http_limit_req_node_t *) &node->color
-unsafe fn lr_of(node: *mut RbtreeNode) -> *mut LimitReqNode {
-    (node as *mut u8).add(COLOR_OFF) as *mut LimitReqNode
+fn lr_of(mem: &ShmMem, node: usize) -> LimitReqNode<'_> {
+    LimitReqNode::at(mem, node + COLOR_OFF)
 }
 
 /// (ngx_rbtree_node_t *) ((u_char *) lr - offsetof(ngx_rbtree_node_t, color))
-unsafe fn node_of(lr: *mut LimitReqNode) -> *mut RbtreeNode {
-    (lr as *mut u8).sub(COLOR_OFF) as *mut RbtreeNode
+fn node_of(lr: LimitReqNode<'_>) -> usize {
+    lr.off - COLOR_OFF
 }
 
 /// ngx_queue_data(q, ngx_http_limit_req_node_t, queue)
-unsafe fn lr_of_queue(q: *mut Queue) -> *mut LimitReqNode {
-    (q as *mut u8).sub(std::mem::offset_of!(LimitReqNode, queue)) as *mut LimitReqNode
+fn lr_of_queue(mem: &ShmMem, q: usize) -> LimitReqNode<'_> {
+    LimitReqNode::at(mem, q - QUEUE_OFF)
 }
 
 /// lr->data, lr->len
-unsafe fn lr_data<'a>(lr: *mut LimitReqNode) -> &'a [u8] {
-    std::slice::from_raw_parts((lr as *const u8).add(DATA_OFF), (*lr).len as usize)
+fn lr_data(lr: LimitReqNode<'_>) -> Vec<u8> {
+    lr.mem.bytes(lr.field(LimitReqNode::data), lr.get(LimitReqNode::len) as usize)
 }
 
-/// ngx_memn2cmp
-fn memn2cmp(s1: &[u8], s2: &[u8]) -> i32 {
-    let (n, z) = if s1.len() <= s2.len() { (s1.len(), -1) } else { (s2.len(), 1) };
+/// ngx_memn2cmp(key, lr->data, key.len, lr->len), without copying lr->data
+fn lr_cmp(key: &[u8], lr: LimitReqNode<'_>) -> i32 {
+    let len = lr.get(LimitReqNode::len) as usize;
+    let n = key.len().min(len);
 
-    match s1[..n].cmp(&s2[..n]) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Greater => 1,
-        std::cmp::Ordering::Equal if s1.len() == s2.len() => 0,
-        std::cmp::Ordering::Equal => z,
+    match lr.mem.cmp_bytes(lr.field(LimitReqNode::data), &key[..n]) {
+        std::cmp::Ordering::Greater => -1,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => match key.len().cmp(&len) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        },
     }
 }
 
@@ -184,13 +225,13 @@ async fn limit_req_handler(r: R) -> i64 {
 
         let hash = crc32fast::hash(&key);
 
-        // SAFETY: shpool was set by the zone init to the zone's slab pool
-        let shpool = unsafe { &*ctx.shpool.get() };
+        let mem = ctx.mem();
+        let shpool = SlabPool::of(&mem);
 
         shpool.lock();
 
-        // SAFETY: the zone's rbtree and queue are used under its mutex
-        rc = unsafe { limit_req_lookup(&limits[n], hash, &key, &mut excess, n == limits.len() - 1) };
+        // the zone's rbtree and queue are used under its mutex
+        rc = limit_req_lookup(&limits[n], hash, &key, &mut excess, n == limits.len() - 1);
 
         shpool.unlock();
 
@@ -329,74 +370,60 @@ impl Drop for StreamTestReading {
 }
 
 /// ngx_http_limit_req_rbtree_insert_value
-unsafe fn limit_req_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let p: *mut *mut RbtreeNode = loop {
-        let p = if (*node).key < (*temp).key {
-            addr_of_mut!((*temp).left)
-        } else if (*node).key > (*temp).key {
-            addr_of_mut!((*temp).right)
-        } else {
-            // node->key == temp->key
+fn limit_req_rbtree_insert_value(tree: &ShmRbtree<'_>, temp: usize, node: usize, sentinel: usize) {
+    rb::insert_by(tree, temp, node, sentinel, |t, node, temp| {
+        let (nk, tk) = (t.key(node), t.key(temp));
 
-            let lrn = lr_of(node);
-            let lrnt = lr_of(temp);
-
-            if memn2cmp(lr_data(lrn), lr_data(lrnt)) < 0 {
-                addr_of_mut!((*temp).left)
-            } else {
-                addr_of_mut!((*temp).right)
-            }
-        };
-
-        if *p == sentinel {
-            break p;
+        if nk != tk {
+            return nk < tk;
         }
 
-        temp = *p;
-    };
+        // node->key == temp->key
 
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
+        lr_cmp(&lr_data(lr_of(t.mem, node)), lr_of(t.mem, temp)) < 0
+    });
 }
 
 /// ngx_http_limit_req_lookup (the zone's mutex is locked)
-unsafe fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mut usize, account: bool) -> i64 {
+fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mut usize, account: bool) -> i64 {
     let now = current_msec();
 
     let ctx = zone_ctx(limit);
 
-    let sh = ctx.sh.get();
+    let mem = ctx.mem();
+    let tree = ctx.rbtree(&mem);
 
-    let mut node = (*sh).rbtree.root;
-    let sentinel = (*sh).rbtree.sentinel;
+    let mut node = tree.root();
+    let sentinel = tree.sentinel();
 
     let hash = hash as usize;
 
     while node != sentinel {
-        if hash < (*node).key {
-            node = (*node).left;
+        let k = tree.key(node);
+
+        if hash < k {
+            node = tree.left(node);
             continue;
         }
 
-        if hash > (*node).key {
-            node = (*node).right;
+        if hash > k {
+            node = tree.right(node);
             continue;
         }
 
         // hash == node->key
 
-        let lr = lr_of(node);
+        let lr = lr_of(&mem, node);
 
-        let rc = memn2cmp(key, lr_data(lr));
+        let rc = lr_cmp(key, lr);
 
         if rc == 0 {
-            queue_remove(addr_of_mut!((*lr).queue));
-            queue_insert_head(addr_of_mut!((*sh).queue), addr_of_mut!((*lr).queue));
+            let q = lr.field(LimitReqNode::queue_prev);
 
-            let mut ms = now.wrapping_sub((*lr).last) as i64;
+            queue::remove(&mem, q);
+            queue::insert_head(&mem, ctx.queue(), q);
+
+            let mut ms = now.wrapping_sub(lr.get(LimitReqNode::last)) as i64;
 
             if ms < -60000 {
                 ms = 1;
@@ -404,7 +431,7 @@ unsafe fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mu
                 ms = 0;
             }
 
-            let mut excess = (*lr).excess.wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000).wrapping_add(1000) as isize;
+            let mut excess = lr.get(LimitReqNode::excess).wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000).wrapping_add(1000) as isize;
 
             if excess < 0 {
                 excess = 0;
@@ -417,23 +444,23 @@ unsafe fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mu
             }
 
             if account {
-                (*lr).excess = excess as usize;
+                lr.set(LimitReqNode::excess, excess as usize);
 
                 if ms != 0 {
-                    (*lr).last = now;
+                    lr.set(LimitReqNode::last, now);
                 }
 
                 return NGX_OK;
             }
 
-            (*lr).count = (*lr).count.wrapping_add(1);
+            lr.set(LimitReqNode::count, lr.get(LimitReqNode::count).wrapping_add(1));
 
-            ctx.node.set(lr);
+            ctx.node.set(lr.off);
 
             return NGX_AGAIN;
         }
 
-        node = if rc < 0 { (*node).left } else { (*node).right };
+        node = if rc < 0 { tree.left(node) } else { tree.right(node) };
     }
 
     *ep = 0;
@@ -442,45 +469,45 @@ unsafe fn limit_req_lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], ep: &mu
 
     limit_req_expire(&ctx, 1);
 
-    let shpool = &*ctx.shpool.get();
+    let shpool = SlabPool::of(&mem);
 
-    let mut node = shpool.alloc_locked(size) as *mut RbtreeNode;
+    let mut node = shpool.alloc_locked(size);
 
-    if node.is_null() {
+    if node == 0 {
         limit_req_expire(&ctx, 0);
 
-        node = shpool.alloc_locked(size) as *mut RbtreeNode;
-        if node.is_null() {
+        node = shpool.alloc_locked(size);
+        if node == 0 {
             if let Some(cycle) = ngx_core::cycle::try_cycle() {
-                ngx_log_error!(NGX_LOG_ALERT, cycle.log, None, "could not allocate node{}", B(shpool.log_ctx()));
+                ngx_log_error!(NGX_LOG_ALERT, cycle.log, None, "could not allocate node{}", B(&shpool.log_ctx()));
             }
             return NGX_ERROR;
         }
     }
 
-    (*node).key = hash;
+    tree.set_key(node, hash);
 
-    let lr = lr_of(node);
+    let lr = lr_of(&mem, node);
 
-    (*lr).len = key.len() as u16;
-    (*lr).excess = 0;
+    lr.set(LimitReqNode::len, key.len() as u16);
+    lr.set(LimitReqNode::excess, 0);
 
-    std::ptr::copy_nonoverlapping(key.as_ptr(), (lr as *mut u8).add(DATA_OFF), key.len());
+    mem.write(lr.field(LimitReqNode::data), key);
 
-    (*sh).rbtree.insert(node);
+    rb::insert(&tree, node, limit_req_rbtree_insert_value);
 
-    queue_insert_head(addr_of_mut!((*sh).queue), addr_of_mut!((*lr).queue));
+    queue::insert_head(&mem, ctx.queue(), lr.field(LimitReqNode::queue_prev));
 
     if account {
-        (*lr).last = now;
-        (*lr).count = 0;
+        lr.set(LimitReqNode::last, now);
+        lr.set(LimitReqNode::count, 0);
         return NGX_OK;
     }
 
-    (*lr).last = 0;
-    (*lr).count = 1;
+    lr.set(LimitReqNode::last, 0);
+    lr.set(LimitReqNode::count, 1);
 
-    ctx.node.set(lr);
+    ctx.node.set(lr.off);
 
     NGX_AGAIN
 }
@@ -501,45 +528,44 @@ fn limit_req_account(limits: &[LimitReqLimit], mut n: usize, ep: &mut usize, lim
         n -= 1;
 
         let ctx = zone_ctx(&limits[n]);
-        let lr = ctx.node.get();
 
-        if lr.is_null() {
+        if ctx.node.get() == 0 {
             continue;
         }
 
-        // SAFETY: ctx->node is a node of the zone, not expired while its
-        // count is not zero; it is changed under the zone's mutex
-        unsafe {
-            let shpool = &*ctx.shpool.get();
+        // ctx->node is a node of the zone, not expired while its count is
+        // not zero; it is changed under the zone's mutex
+        let mem = ctx.mem();
+        let shpool = SlabPool::of(&mem);
+        let lr = LimitReqNode::at(&mem, ctx.node.get());
 
-            shpool.lock();
+        shpool.lock();
 
-            let now = current_msec();
-            let mut ms = now.wrapping_sub((*lr).last) as i64;
+        let now = current_msec();
+        let mut ms = now.wrapping_sub(lr.get(LimitReqNode::last)) as i64;
 
-            if ms < -60000 {
-                ms = 1;
-            } else if ms < 0 {
-                ms = 0;
-            }
-
-            excess = (*lr).excess.wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000).wrapping_add(1000) as isize;
-
-            if excess < 0 {
-                excess = 0;
-            }
-
-            if ms != 0 {
-                (*lr).last = now;
-            }
-
-            (*lr).excess = excess as usize;
-            (*lr).count = (*lr).count.wrapping_sub(1);
-
-            shpool.unlock();
+        if ms < -60000 {
+            ms = 1;
+        } else if ms < 0 {
+            ms = 0;
         }
 
-        ctx.node.set(std::ptr::null_mut());
+        excess = lr.get(LimitReqNode::excess).wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000).wrapping_add(1000) as isize;
+
+        if excess < 0 {
+            excess = 0;
+        }
+
+        if ms != 0 {
+            lr.set(LimitReqNode::last, now);
+        }
+
+        lr.set(LimitReqNode::excess, excess as usize);
+        lr.set(LimitReqNode::count, lr.get(LimitReqNode::count).wrapping_sub(1));
+
+        shpool.unlock();
+
+        ctx.node.set(0);
 
         if excess as usize <= limits[n].delay {
             continue;
@@ -563,47 +589,48 @@ fn limit_req_unlock(limits: &[LimitReqLimit], mut n: usize) {
         n -= 1;
 
         let ctx = zone_ctx(&limits[n]);
-        let lr = ctx.node.get();
 
-        if lr.is_null() {
+        if ctx.node.get() == 0 {
             continue;
         }
 
-        // SAFETY: as in limit_req_account
-        unsafe {
-            let shpool = &*ctx.shpool.get();
+        // as in limit_req_account
+        let mem = ctx.mem();
+        let shpool = SlabPool::of(&mem);
+        let lr = LimitReqNode::at(&mem, ctx.node.get());
 
-            shpool.lock();
+        shpool.lock();
 
-            (*lr).count = (*lr).count.wrapping_sub(1);
+        lr.set(LimitReqNode::count, lr.get(LimitReqNode::count).wrapping_sub(1));
 
-            shpool.unlock();
-        }
+        shpool.unlock();
 
-        ctx.node.set(std::ptr::null_mut());
+        ctx.node.set(0);
     }
 }
 
 /// ngx_http_limit_req_expire (the zone's mutex is locked)
-unsafe fn limit_req_expire(ctx: &LimitReqCtx, mut n: usize) {
+fn limit_req_expire(ctx: &LimitReqCtx, mut n: usize) {
     let now = current_msec();
 
-    let sh = ctx.sh.get();
+    let mem = ctx.mem();
+    let tree = ctx.rbtree(&mem);
+    let head = ctx.queue();
 
     // n == 1 deletes one or two zero rate entries
     // n == 0 deletes oldest entry by force
     //        and one or two zero rate entries
 
     while n < 3 {
-        if queue_empty(addr_of!((*sh).queue)) {
+        if queue::empty(&mem, head) {
             return;
         }
 
-        let q = queue_last(addr_of!((*sh).queue));
+        let q = queue::last(&mem, head);
 
-        let lr = lr_of_queue(q);
+        let lr = lr_of_queue(&mem, q);
 
-        if (*lr).count != 0 {
+        if lr.get(LimitReqNode::count) != 0 {
             // There is not much sense in looking further,
             // because we bump nodes on the lookup stage.
 
@@ -615,26 +642,26 @@ unsafe fn limit_req_expire(ctx: &LimitReqCtx, mut n: usize) {
         n += 1;
 
         if !force {
-            let ms = (now.wrapping_sub((*lr).last) as i64).wrapping_abs();
+            let ms = (now.wrapping_sub(lr.get(LimitReqNode::last)) as i64).wrapping_abs();
 
             if ms < 60000 {
                 return;
             }
 
-            let excess = (*lr).excess.wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000) as isize;
+            let excess = lr.get(LimitReqNode::excess).wrapping_sub(ctx.rate.wrapping_mul(ms as usize) / 1000) as isize;
 
             if excess > 0 {
                 return;
             }
         }
 
-        queue_remove(q);
+        queue::remove(&mem, q);
 
         let node = node_of(lr);
 
-        (*sh).rbtree.delete(node);
+        rb::delete(&tree, node);
 
-        (*ctx.shpool.get()).free_locked(node as *mut u8);
+        SlabPool::of(&mem).free_locked(node);
     }
 }
 
@@ -659,41 +686,39 @@ fn limit_req_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Res
         }
 
         ctx.sh.set(octx.sh.get());
-        ctx.shpool.set(octx.shpool.get());
+        *ctx.mem.borrow_mut() = octx.mem.borrow().clone();
 
         return Ok(());
     }
 
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
+    let mem = shm_zone.mem();
+    let shpool = SlabPool::of(&mem);
 
-    ctx.shpool.set(shpool);
+    *ctx.mem.borrow_mut() = Some(mem.clone());
 
-    // SAFETY: the zone is mapped, with its slab pool at the start
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            ctx.sh.set((*shpool).data as *mut LimitReqShctx);
-            return Ok(());
-        }
-
-        let sh = (*shpool).alloc(std::mem::size_of::<LimitReqShctx>()) as *mut LimitReqShctx;
-        if sh.is_null() {
-            return Err(());
-        }
-
-        ctx.sh.set(sh);
-
-        (*shpool).data = sh as *mut u8;
-
-        (*sh).rbtree.init(addr_of_mut!((*sh).sentinel), limit_req_rbtree_insert_value);
-
-        queue_init(addr_of_mut!((*sh).queue));
-
-        let log_ctx = format!(" in limit_req zone \"{}\"", B(shm_zone.name()));
-
-        (*shpool).set_log_ctx(log_ctx.as_bytes())?;
-
-        (*shpool).log_nomem = false;
+    if shm_zone.shm.exists.get() {
+        ctx.sh.set(shpool.data());
+        return Ok(());
     }
+
+    let sh = shpool.alloc(LimitReqShctx::SIZE);
+    if sh == 0 {
+        return Err(());
+    }
+
+    ctx.sh.set(sh);
+
+    shpool.set_data(sh);
+
+    ctx.rbtree(&mem).init(LimitReqShctx::at(&mem, sh).field(LimitReqShctx::sentinel_key));
+
+    queue::init(&mem, ctx.queue());
+
+    let log_ctx = format!(" in limit_req zone \"{}\"", B(shm_zone.name()));
+
+    shpool.set_log_ctx(log_ctx.as_bytes())?;
+
+    shpool.set_log_nomem(false);
 
     Ok(())
 }
@@ -807,8 +832,9 @@ fn limit_req_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> C
         return Err(cf.emerg(format_args!("{} \"{}\" is already bound to key \"{}\"", cmd.name, B(&name), B(&ctx.key.value))));
     }
 
-    let ctx = Rc::new(LimitReqCtx { sh: Cell::new(std::ptr::null_mut()), shpool: Cell::new(std::ptr::null_mut()), rate, key, node: Cell::new(std::ptr::null_mut()) });
+    let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: RefCell::new(None), rate, key, node: Cell::new(0) });
 
+    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_req_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
 
@@ -918,35 +944,31 @@ pub fn limit_req_module() -> ModuleDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
-    use ngx_core::shmtx::ShmTx;
+    use ngx_core::shmem::{Field, ShmValue};
 
-    /// A zone with its slab pool in `mem`, initialized by the zone init.
-    fn zone(mem: &mut Vec<u64>, rate: usize) -> Rc<ShmZone> {
-        let size = mem.len() * 8;
-        let zone = ShmZone::new(b"test".to_vec(), size, TAG);
+    /// ngx_memn2cmp
+    fn memn2cmp(s1: &[u8], s2: &[u8]) -> i32 {
+        let (n, z) = if s1.len() <= s2.len() { (s1.len(), -1) } else { (s2.len(), 1) };
 
-        // SAFETY: as ngx_init_zone_pool does, on memory of the given size
-        unsafe {
-            ngx_core::slab::sizes_init();
-            let addr = mem.as_mut_ptr() as *mut u8;
-            let sp = addr as *mut SlabPool;
-            (*sp).end = addr.add(size);
-            (*sp).min_shift = 3;
-            (*sp).addr = addr;
-            std::ptr::write(addr_of_mut!((*sp).mutex), ShmTx::create(addr_of_mut!((*sp).lock) as *mut AtomicUsize));
-            ngx_core::slab::slab_init(sp);
-            zone.shm.addr.set(addr);
+        match s1[..n].cmp(&s2[..n]) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Equal if s1.len() == s2.len() => 0,
+            std::cmp::Ordering::Equal => z,
         }
+    }
 
-        let ctx = Rc::new(LimitReqCtx {
-            sh: Cell::new(std::ptr::null_mut()),
-            shpool: Cell::new(std::ptr::null_mut()),
-            rate,
-            key: ComplexValue::constant(b"$binary_remote_addr"),
-            node: Cell::new(std::ptr::null_mut()),
-        });
+    /// A zone of `size` bytes with its slab pool, initialized by the zone
+    /// init.
+    fn zone_of(size: usize, rate: usize) -> Rc<ShmZone> {
+        let mem = Rc::new(ShmMem::private(size).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"test".to_vec(), mem.len(), TAG);
+        zone.shm.attach(mem);
+
+        let ctx = Rc::new(LimitReqCtx { sh: Cell::new(0), mem: RefCell::new(None), rate, key: ComplexValue::constant(b"$binary_remote_addr"), node: Cell::new(0) });
 
         *zone.data.borrow_mut() = Some(ctx);
 
@@ -955,55 +977,64 @@ mod tests {
         zone
     }
 
+    fn zone(rate: usize) -> Rc<ShmZone> {
+        zone_of(1 << 19, rate)
+    }
+
     fn limit(zone: &Rc<ShmZone>, burst: usize, delay: usize) -> LimitReqLimit {
         LimitReqLimit { shm_zone: zone.clone(), burst: burst * 1000, delay: delay * 1000 }
     }
 
     fn lookup(limit: &LimitReqLimit, hash: u32, key: &[u8], account: bool) -> (i64, usize) {
         let mut excess = 0;
-        let rc = unsafe { limit_req_lookup(limit, hash, key, &mut excess, account) };
+        let rc = limit_req_lookup(limit, hash, key, &mut excess, account);
         (rc, excess)
     }
 
-    /// The node of a key, walking the tree as ngx_http_limit_req_lookup.
-    fn find(limit: &LimitReqLimit, hash: u32, key: &[u8]) -> *mut LimitReqNode {
+    /// The node of a key (its ngx_http_limit_req_node_t), walking the tree
+    /// as ngx_http_limit_req_lookup; 0 if none.
+    fn find(limit: &LimitReqLimit, hash: u32, key: &[u8]) -> usize {
         let ctx = zone_ctx(limit);
-        unsafe {
-            let sh = ctx.sh.get();
-            let mut node = (*sh).rbtree.root;
-            let sentinel = (*sh).rbtree.sentinel;
-            while node != sentinel {
-                if (hash as usize) < (*node).key {
-                    node = (*node).left;
-                    continue;
-                }
-                if (hash as usize) > (*node).key {
-                    node = (*node).right;
-                    continue;
-                }
-                let lr = lr_of(node);
-                match memn2cmp(key, lr_data(lr)) {
-                    0 => return lr,
-                    rc if rc < 0 => node = (*node).left,
-                    _ => node = (*node).right,
-                }
+        let mem = ctx.mem();
+        let tree = ctx.rbtree(&mem);
+        let mut node = tree.root();
+        let sentinel = tree.sentinel();
+        while node != sentinel {
+            if (hash as usize) < tree.key(node) {
+                node = tree.left(node);
+                continue;
+            }
+            if (hash as usize) > tree.key(node) {
+                node = tree.right(node);
+                continue;
+            }
+            let lr = lr_of(&mem, node);
+            match memn2cmp(key, &lr_data(lr)) {
+                0 => return lr.off,
+                rc if rc < 0 => node = tree.left(node),
+                _ => node = tree.right(node),
             }
         }
-        std::ptr::null_mut()
+        0
+    }
+
+    /// A field of the node of a key.
+    fn get<T: ShmValue>(limit: &LimitReqLimit, hash: u32, key: &[u8], f: Field<T>) -> T {
+        let lr = find(limit, hash, key);
+        assert!(lr != 0, "no node {:?}", key);
+        LimitReqNode::at(&zone_ctx(limit).mem(), lr).get(f)
+    }
+
+    /// Sets a field of the node of a key.
+    fn set<T: ShmValue>(limit: &LimitReqLimit, hash: u32, key: &[u8], f: Field<T>, v: T) {
+        let lr = find(limit, hash, key);
+        assert!(lr != 0, "no node {:?}", key);
+        LimitReqNode::at(&zone_ctx(limit).mem(), lr).set(f, v)
     }
 
     fn queue_len(limit: &LimitReqLimit) -> usize {
         let ctx = zone_ctx(limit);
-        let mut n = 0;
-        unsafe {
-            let h = addr_of_mut!((*ctx.sh.get()).queue);
-            let mut q = queue_head(h);
-            while q != h {
-                n += 1;
-                q = (*q).next;
-            }
-        }
-        n
+        queue::walk(&ctx.mem(), ctx.queue()).len()
     }
 
     #[test]
@@ -1014,21 +1045,35 @@ mod tests {
         assert!(memn2cmp(b"abd", b"abc") > 0);
         assert!(memn2cmp(b"b", b"abc") > 0);
         assert!(memn2cmp(b"", b"a") < 0);
+
+        let mem = ShmMem::private(4096).unwrap();
+        let lr = LimitReqNode::at(&mem, 64);
+        for (a, b) in [(&b"abc"[..], &b"abc"[..]), (b"ab", b"abc"), (b"abc", b"ab"), (b"abd", b"abc"), (b"b", b"abc"), (b"", b"a")] {
+            lr.set(LimitReqNode::len, b.len() as u16);
+            mem.write(lr.field(LimitReqNode::data), b);
+            assert_eq!(lr_cmp(a, lr), memn2cmp(a, b), "{:?} {:?}", a, b);
+            assert_eq!(lr_data(lr), b);
+        }
     }
 
     #[test]
     fn node_layout_as_c() {
         // offsetof(ngx_rbtree_node_t, color) + offsetof(ngx_http_limit_req_node_t, data)
         assert_eq!(COLOR_OFF, 32);
-        assert_eq!(std::mem::offset_of!(LimitReqNode, queue), 8);
-        assert_eq!(std::mem::offset_of!(LimitReqNode, last), 24);
+        assert_eq!(QUEUE_OFF, 8);
+        assert_eq!(LimitReqNode::last.off, 24);
+        assert_eq!(LimitReqNode::excess.off, 32);
+        assert_eq!(LimitReqNode::count.off, 40);
         assert_eq!(DATA_OFF, 48);
+        // sizeof(ngx_http_limit_req_shctx_t)
+        assert_eq!(LimitReqShctx::SIZE, 80);
+        assert_eq!(LimitReqShctx::sentinel_key.off, 24);
+        assert_eq!(LimitReqShctx::queue_prev.off, 64);
     }
 
     #[test]
     fn lookup_colliding_hashes() {
-        let mut mem = vec![0u64; 1 << 16];
-        let zone = zone(&mut mem, 1000);
+        let zone = zone(1000);
         let l = limit(&zone, 5, 0);
 
         // the same hash for all keys: the keys order the nodes
@@ -1038,15 +1083,25 @@ mod tests {
             assert_eq!(lookup(&l, 42, k, true), (NGX_OK, 0));
         }
 
+        let ctx = zone_ctx(&l);
+        let mem = ctx.mem();
+
         for k in &keys {
             let lr = find(&l, 42, k);
-            assert!(!lr.is_null());
-            assert_eq!(unsafe { lr_data(lr) }, k.as_slice());
+            assert!(lr != 0);
+            assert_eq!(lr_data(LimitReqNode::at(&mem, lr)), k.as_slice());
         }
 
-        assert!(find(&l, 42, b"key50").is_null());
-        assert!(find(&l, 43, b"key1").is_null());
+        assert_eq!(find(&l, 42, b"key50"), 0);
+        assert_eq!(find(&l, 43, b"key1"), 0);
         assert_eq!(queue_len(&l), 50);
+
+        // in order: the walk of the tree gives the keys sorted
+        let tree = ctx.rbtree(&mem);
+        let walked: Vec<Vec<u8>> = rb::walk(&tree).into_iter().map(|n| lr_data(lr_of(&mem, n))).collect();
+        let mut sorted = walked.clone();
+        sorted.sort_by(|a, b| memn2cmp(a, b).cmp(&0));
+        assert_eq!(walked, sorted);
 
         // found again: one more request within the same millisecond or so
         let (rc, excess) = lookup(&l, 42, b"key7", true);
@@ -1054,78 +1109,59 @@ mod tests {
         assert!(excess > 0 && excess <= 1000);
 
         // the node found goes to the head of the queue
-        let ctx = zone_ctx(&l);
-        unsafe {
-            let head = queue_head(addr_of!((*ctx.sh.get()).queue));
-            assert_eq!(lr_of_queue(head), find(&l, 42, b"key7"));
-        }
+        assert_eq!(lr_of_queue(&mem, queue::head(&mem, ctx.queue())).off, find(&l, 42, b"key7"));
     }
 
     #[test]
     fn excess_arithmetic() {
-        let mut mem = vec![0u64; 1 << 16];
         // rate=2r/s
-        let zone = zone(&mut mem, 2000);
+        let zone = zone(2000);
         let l = limit(&zone, 1, 0);
 
         assert_eq!(lookup(&l, 1, b"k", true), (NGX_OK, 0));
 
-        let lr = find(&l, 1, b"k");
-
-        unsafe {
-            // 250ms ago with excess 1.500: 1500 - 2000 * 250 / 1000 + 1000
-            (*lr).excess = 1500;
-            (*lr).last = current_msec() - 250;
-        }
+        // 250ms ago with excess 1.500: 1500 - 2000 * 250 / 1000 + 1000
+        set(&l, 1, b"k", LimitReqNode::excess, 1500);
+        set(&l, 1, b"k", LimitReqNode::last, current_msec() - 250);
 
         let (rc, excess) = lookup(&l, 1, b"k", false);
 
         // more than the burst: rejected, the node is not changed
         assert_eq!(rc, NGX_BUSY);
         assert!((1996..=2000).contains(&excess), "{}", excess);
-        assert_eq!(unsafe { (*lr).excess }, 1500);
+        assert_eq!(get(&l, 1, b"k", LimitReqNode::excess), 1500);
 
-        unsafe {
-            // 2s ago: negative excess is 0, then the request counts
-            (*lr).excess = 1500;
-            (*lr).last = current_msec() - 2000;
-        }
+        // 2s ago: negative excess is 0, then the request counts
+        set(&l, 1, b"k", LimitReqNode::excess, 1500);
+        set(&l, 1, b"k", LimitReqNode::last, current_msec() - 2000);
 
         assert_eq!(lookup(&l, 1, b"k", true), (NGX_OK, 0));
-        assert_eq!(unsafe { (*lr).excess }, 0);
+        assert_eq!(get(&l, 1, b"k", LimitReqNode::excess), 0);
 
         let l = limit(&zone, 5, 0);
 
-        unsafe {
-            // time went backwards by more than a minute: ms = 1
-            (*lr).excess = 900;
-            (*lr).last = current_msec() + 120000;
-        }
+        // time went backwards by more than a minute: ms = 1
+        set(&l, 1, b"k", LimitReqNode::excess, 900);
+        set(&l, 1, b"k", LimitReqNode::last, current_msec() + 120000);
 
         assert_eq!(lookup(&l, 1, b"k", true), (NGX_OK, 1898));
         // ...and last is set again
-        assert!(unsafe { (*lr).last } <= current_msec());
+        assert!(get(&l, 1, b"k", LimitReqNode::last) <= current_msec());
 
-        unsafe {
-            // backwards by less than a minute: ms = 0, last is kept
-            (*lr).excess = 100;
-            (*lr).last = current_msec() + 30000;
-        }
+        // backwards by less than a minute: ms = 0, last is kept
+        set(&l, 1, b"k", LimitReqNode::excess, 100);
+        set(&l, 1, b"k", LimitReqNode::last, current_msec() + 30000);
 
         assert_eq!(lookup(&l, 1, b"k", true), (NGX_OK, 1100));
-        assert!(unsafe { (*lr).last } > current_msec());
+        assert!(get(&l, 1, b"k", LimitReqNode::last) > current_msec());
     }
 
     #[test]
     fn account_takes_the_maximum_delay() {
-        let mut mem1 = vec![0u64; 1 << 16];
-        let mut mem2 = vec![0u64; 1 << 16];
-        let mut mem3 = vec![0u64; 1 << 16];
-
         // 1r/s, 2r/s, 30r/m
-        let z1 = zone(&mut mem1, 1000);
-        let z2 = zone(&mut mem2, 2000);
-        let z3 = zone(&mut mem3, 500);
+        let z1 = zone(1000);
+        let z2 = zone(2000);
+        let z3 = zone(500);
 
         let limits = vec![limit(&z1, 10, 0), limit(&z2, 10, 1), limit(&z3, 10, 0)];
 
@@ -1135,12 +1171,10 @@ mod tests {
 
         let now = current_msec();
 
-        unsafe {
-            (*find(&limits[0], 7, b"k")).excess = 2000;
-            (*find(&limits[0], 7, b"k")).last = now;
-            (*find(&limits[1], 7, b"k")).excess = 3000;
-            (*find(&limits[1], 7, b"k")).last = now;
-        }
+        set(&limits[0], 7, b"k", LimitReqNode::excess, 2000);
+        set(&limits[0], 7, b"k", LimitReqNode::last, now);
+        set(&limits[1], 7, b"k", LimitReqNode::excess, 3000);
+        set(&limits[1], 7, b"k", LimitReqNode::last, now);
 
         // the first two limits are looked up without accounting
         let (rc, excess) = lookup(&limits[0], 7, b"k", false);
@@ -1149,12 +1183,11 @@ mod tests {
         let (rc, _) = lookup(&limits[1], 7, b"k", false);
         assert_eq!(rc, NGX_AGAIN);
 
-        assert_eq!(unsafe { (*find(&limits[0], 7, b"k")).count }, 1);
+        assert_eq!(get(&limits[0], 7, b"k", LimitReqNode::count), 1);
+        assert_eq!(zone_ctx(&limits[0]).node.get(), find(&limits[0], 7, b"k"));
 
         // the last limit: 1.000 excess (2000ms at 30r/m)
-        unsafe {
-            (*find(&limits[2], 7, b"k")).last = current_msec();
-        }
+        set(&limits[2], 7, b"k", LimitReqNode::last, current_msec());
         let (rc, mut excess) = lookup(&limits[2], 7, b"k", true);
         assert_eq!((rc, excess), (NGX_OK, 1000));
 
@@ -1170,84 +1203,84 @@ mod tests {
         assert!((2998..=3000).contains(&excess), "{}", excess);
 
         for l in &limits[..2] {
-            let lr = find(l, 7, b"k");
-            assert_eq!(unsafe { (*lr).count }, 0);
-            assert!(zone_ctx(l).node.get().is_null());
+            assert_eq!(get(l, 7, b"k", LimitReqNode::count), 0);
+            assert_eq!(zone_ctx(l).node.get(), 0);
         }
 
-        assert_eq!(unsafe { (*find(&limits[1], 7, b"k")).excess } / 10, 400);
+        assert_eq!(get(&limits[1], 7, b"k", LimitReqNode::excess) / 10, 400);
     }
 
     #[test]
     fn unlock_decrements_counts() {
-        let mut mem1 = vec![0u64; 1 << 16];
-        let mut mem2 = vec![0u64; 1 << 16];
-        let z1 = zone(&mut mem1, 1000);
-        let z2 = zone(&mut mem2, 1000);
+        let z1 = zone(1000);
+        let z2 = zone(1000);
         let limits = vec![limit(&z1, 0, 0), limit(&z2, 0, 0)];
 
         assert_eq!(lookup(&limits[0], 3, b"a", false).0, NGX_AGAIN);
-        assert_eq!(unsafe { (*find(&limits[0], 3, b"a")).count }, 1);
+        assert_eq!(get(&limits[0], 3, b"a", LimitReqNode::count), 1);
         // a new node looked up without accounting has last = 0
-        assert_eq!(unsafe { (*find(&limits[0], 3, b"a")).last }, 0);
+        assert_eq!(get(&limits[0], 3, b"a", LimitReqNode::last), 0);
 
         limit_req_unlock(&limits, 1);
 
-        assert_eq!(unsafe { (*find(&limits[0], 3, b"a")).count }, 0);
-        assert!(zone_ctx(&limits[0]).node.get().is_null());
+        assert_eq!(get(&limits[0], 3, b"a", LimitReqNode::count), 0);
+        assert_eq!(zone_ctx(&limits[0]).node.get(), 0);
     }
 
     #[test]
     fn expire_old_and_forced() {
-        let mut mem = vec![0u64; 1 << 16];
-        let zone = zone(&mut mem, 1000);
+        let zone = zone(1000);
         let l = limit(&zone, 5, 0);
         let ctx = zone_ctx(&l);
+        let pfree = SlabPool::of(&ctx.mem()).pfree();
 
         for k in [b"a", b"b", b"c", b"d"] {
             assert_eq!(lookup(&l, 9, k, true).0, NGX_OK);
         }
 
         // "a" is the oldest: nothing expires while it is recent
-        unsafe { limit_req_expire(&ctx, 1) };
+        limit_req_expire(&ctx, 1);
         assert_eq!(queue_len(&l), 4);
 
         let now = current_msec();
 
-        unsafe {
-            (*find(&l, 9, b"a")).last = now - 61000;
-            (*find(&l, 9, b"b")).last = now - 61000;
-            (*find(&l, 9, b"b")).excess = 100000;
-            (*find(&l, 9, b"c")).last = now - 61000;
-        }
+        set(&l, 9, b"a", LimitReqNode::last, now - 61000);
+        set(&l, 9, b"b", LimitReqNode::last, now - 61000);
+        set(&l, 9, b"b", LimitReqNode::excess, 100000);
+        set(&l, 9, b"c", LimitReqNode::last, now - 61000);
 
         // "a" expires; "b" still has excess after 61s at 1r/s
-        unsafe { limit_req_expire(&ctx, 1) };
-        assert!(find(&l, 9, b"a").is_null());
-        assert!(!find(&l, 9, b"b").is_null());
+        limit_req_expire(&ctx, 1);
+        assert_eq!(find(&l, 9, b"a"), 0);
+        assert!(find(&l, 9, b"b") != 0);
         assert_eq!(queue_len(&l), 3);
 
         // by force: the oldest ("b") goes, then "c" (61s, no excess)
-        unsafe { limit_req_expire(&ctx, 0) };
-        assert!(find(&l, 9, b"b").is_null());
-        assert!(find(&l, 9, b"c").is_null());
-        assert!(!find(&l, 9, b"d").is_null());
+        limit_req_expire(&ctx, 0);
+        assert_eq!(find(&l, 9, b"b"), 0);
+        assert_eq!(find(&l, 9, b"c"), 0);
+        assert!(find(&l, 9, b"d") != 0);
 
         // a node in use (count) stops the expiration
         assert_eq!(lookup(&l, 9, b"d", false).0, NGX_AGAIN);
-        unsafe { limit_req_expire(&ctx, 0) };
-        assert!(!find(&l, 9, b"d").is_null());
+        limit_req_expire(&ctx, 0);
+        assert!(find(&l, 9, b"d") != 0);
         limit_req_unlock(std::slice::from_ref(&l), 1);
-        unsafe { limit_req_expire(&ctx, 0) };
-        assert!(find(&l, 9, b"d").is_null());
+        limit_req_expire(&ctx, 0);
+        assert_eq!(find(&l, 9, b"d"), 0);
         assert_eq!(queue_len(&l), 0);
+
+        // every node is freed, the tree is empty
+        let mem = ctx.mem();
+        let tree = ctx.rbtree(&mem);
+        assert_eq!(tree.root(), tree.sentinel());
+        assert_eq!(SlabPool::of(&mem).pfree(), pfree);
     }
 
     #[test]
     fn no_memory() {
         // the smallest zone: 8 pages
-        let mut mem = vec![0u64; ngx_core::os::pagesize()];
-        let zone = zone(&mut mem, 1000);
+        let zone = zone_of(8 * ngx_core::os::pagesize(), 1000);
         let l = limit(&zone, 5, 0);
 
         let key = |n: u32| format!("{:0>1000}", n).into_bytes();
@@ -1260,8 +1293,8 @@ mod tests {
 
         let kept = queue_len(&l);
         assert!(kept > 1 && kept < 100, "{}", kept);
-        assert!(find(&l, 0, &key(0)).is_null());
-        assert!(!find(&l, 99, &key(99)).is_null());
+        assert_eq!(find(&l, 0, &key(0)), 0);
+        assert!(find(&l, 99, &key(99)) != 0);
 
         // nodes in use are not expired: "could not allocate node"
         let mut n = 100;
@@ -1276,5 +1309,8 @@ mod tests {
         }
 
         assert!(n > 100);
+
+        // the pool does not log "ngx_slab_alloc() failed: no memory"
+        assert!(!SlabPool::of(&zone_ctx(&l).mem()).log_nomem());
     }
 }
