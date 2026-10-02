@@ -12,16 +12,21 @@
 //!   printable salt character, no clamping of "rounds=");
 //! * bcrypt ($2a$, $2b$, $2x$, $2y$) on the blowfish crate (what pwhash's
 //!   bcrypt uses), with crypt_blowfish's sign extension bug ($2x$) and
-//!   its countermeasure ($2a$).
+//!   its countermeasure ($2a$);
+//! * yescrypt ($y$), scrypt ($7$) and gost-yescrypt ($gy$, with GOST R
+//!   34.11-2012) ported from libxcrypt (yescrypt.rs, gost.rs).
 //!
-//! yescrypt ($y$), gost-yescrypt ($gy$) and scrypt ($7$) are not done:
-//! they fail like a malformed setting.  A failure gives libxcrypt's
-//! failure token ("*0", "*1" for a setting starting with "*0"), which
-//! never matches the setting: crypt_r() never returns NULL, so the
-//! "crypt_r() failed" message of ngx_libc_crypt() cannot happen.
+//! A failure gives libxcrypt's failure token ("*0", "*1" for a setting
+//! starting with "*0"), which never matches the setting: crypt_r() never
+//! returns NULL, so the "crypt_r() failed" message of ngx_libc_crypt()
+//! cannot happen.
 
 use md5::Md5;
 use sha1::{Digest, Sha1};
+
+mod gost;
+mod gost_tables;
+mod yescrypt;
 
 /// Hash a password with the algorithm of the salt (ngx_crypt()).
 pub fn crypt(key: &[u8], salt: &[u8]) -> Result<Vec<u8>, i32> {
@@ -329,8 +334,7 @@ fn do_crypt(phrase: &[u8], setting: &[u8]) -> Option<Vec<u8>> {
     } else if setting.starts_with(b"$2a$") || setting.starts_with(b"$2b$") || setting.starts_with(b"$2x$") || setting.starts_with(b"$2y$") {
         bcrypt(phrase, setting)
     } else if setting.starts_with(b"$gy$") {
-        // gost-yescrypt: not done
-        None
+        yescrypt::gost_yescrypt(phrase, setting)
     } else if setting.starts_with(b"$md5") {
         sunmd5(phrase, setting)
     } else if setting.starts_with(b"$1$") {
@@ -341,9 +345,10 @@ fn do_crypt(phrase: &[u8], setting: &[u8]) -> Option<Vec<u8>> {
         sha_crypt(phrase, setting, false)
     } else if setting.starts_with(b"$6$") {
         sha_crypt(phrase, setting, true)
-    } else if setting.starts_with(b"$7$") || setting.starts_with(b"$y$") {
-        // scrypt, yescrypt: not done
-        None
+    } else if setting.starts_with(b"$7$") {
+        yescrypt::scrypt(phrase, setting)
+    } else if setting.starts_with(b"$y$") {
+        yescrypt::yescrypt(phrase, setting)
     } else if setting.starts_with(b"_") {
         bsdicrypt(phrase, setting)
     } else if setting.is_empty() || (is_des_salt_char(setting.first()) && is_des_salt_char(setting.get(1))) {
@@ -1409,9 +1414,8 @@ mod tests {
         assert_eq!(c(b"pw", b"$9$x"), "*0");
         assert_eq!(c(b"pw", b"a\xe9"), "*0");
 
-        // not done: yescrypt, scrypt, gost-yescrypt
-        assert_eq!(c(b"password", b"$y$j9T$F5Jx5fExrKuPp53xLKQ..1$X3DX6M94c7o.9agCG9G317fhZg9SqC.5i5rd.RhAtQ7"), "*0");
-        assert_eq!(c(b"password", b"$7$CU..../....abc$"), "*0");
+        assert_eq!(c(b"password", b"$y$j9T$F5Jx5fExrKuPp53xLKQ..1$X3DX6M94c7o.9agCG9G317fhZg9SqC.5i5rd.RhAtQ7"), "$y$j9T$F5Jx5fExrKuPp53xLKQ..1$tnSYvahCwPBHKZUspmcxMfb0.WiB9W.zEaKlOBL35rC");
+        assert_eq!(c(b"password", b"$7$CU..../....abc$"), "$7$CU..../....abc$aq9nTbuadDKl/OmAH9ktvpXiAjiuBYpB578rVYQ/6K/");
     }
 
     /// The self-tests of BF_full_crypt()
