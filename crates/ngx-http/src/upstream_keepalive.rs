@@ -205,7 +205,7 @@ fn free_keepalive_peer(pc: &mut PeerConnection, kp: &mut KeepalivePeerData, stat
             break 'invalid;
         }
 
-        if ngx_core::times::current_msec().saturating_sub(conn.start_time) > kp.conf.time.get().unwrap_or(3600000) {
+        if ngx_core::times::event_msec().saturating_sub(conn.start_time) > kp.conf.time.get().unwrap_or(3600000) {
             break 'invalid;
         }
 

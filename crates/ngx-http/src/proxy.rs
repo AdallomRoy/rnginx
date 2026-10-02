@@ -1721,20 +1721,10 @@ pub(crate) fn run_codes(r: &R, codes: &[crate::script::Part]) -> Vec<u8> {
 /// evaluated and cached by ngx_http_get_indexed_variable()), lent to `f`;
 /// empty if not found. `f` must not evaluate variables.
 fn with_var<T>(r: &R, index: usize, f: impl FnOnce(&[u8]) -> T) -> T {
-    {
-        let vars = r.variables.borrow();
-
-        if let Some(v) = vars.get(index) {
-            if v.valid || v.not_found {
-                return f(if v.not_found { &[] } else { &v.data });
-            }
-        }
-    }
-
-    match crate::variables::get_indexed_variable(r, index) {
+    crate::variables::with_indexed_variable(r, index, |v| match v {
         Some(v) if !v.not_found => f(&v.data),
         _ => f(&[]),
-    }
+    })
 }
 
 /// A regex capture of the codes, lent to `f` (empty if not set).
@@ -1794,7 +1784,7 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
     // u->method (HEAD was changed to GET to cache response), proxy_method,
     // or r->method_name
     let method_value = match (u_method, plcf.method.as_option()) {
-        (None, Some(Some(cv))) => Some(crate::script::complex_value(r, cv).map_err(|_| ())?),
+        (None, Some(Some(cv))) => Some(crate::script::complex_value_cow(r, cv).map_err(|_| ())?),
         _ => None,
     };
 
@@ -1814,7 +1804,7 @@ fn create_request(r: &R, plcf: &NgxHttpProxyLocConf, ctx: &Rc<RefCell<ProxyCtx>>
     let vars = ctx.borrow().vars.clone();
 
     let host_value = match &plcf.host_value {
-        Some(hv) => Some(crate::script::complex_value(r, hv).map_err(|_| ())?),
+        Some(hv) => Some(crate::script::complex_value_cow(r, hv).map_err(|_| ())?),
         None => None,
     };
 
@@ -2025,12 +2015,7 @@ pub(crate) fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64
     let vars = ctx.borrow().vars.clone();
 
     if let Some(cv) = &plcf.cache.cache_key {
-        match crate::script::complex_value(r, cv) {
-            Ok(k) => keys.push_vec(k),
-            Err(_) => return NGX_ERROR,
-        }
-
-        return NGX_OK;
+        return crate::upstream_cache::push_key_value(r, cv, keys);
     }
 
     // room for the URL and the URI (escaped, at most 3 bytes a byte)

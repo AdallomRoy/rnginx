@@ -769,7 +769,7 @@ impl UpstreamPeer {
             tries = next_upstream_tries;
         }
 
-        let now = ngx_core::times::current_msec();
+        let now = ngx_core::times::event_msec();
 
         UpstreamPeer {
             pc: PeerConnection {
@@ -814,7 +814,7 @@ impl UpstreamPeer {
     /// "no live upstreams" with pc.name, the upstream's name, in the log
     /// context, and goes to next() with FT_NOLIVE).
     pub fn connect(&mut self, r: &R) -> i64 {
-        let now = ngx_core::times::current_msec();
+        let now = ngx_core::times::event_msec();
 
         {
             let mut states = r.upstream_states.borrow_mut();
@@ -958,7 +958,7 @@ impl UpstreamPeer {
         if self.pc.tries == 0
             || self.next_upstream & ft != ft
             || (self.request_sent && r.request_body_no_buffering.get())
-            || (timeout != 0 && ngx_core::times::current_msec().saturating_sub(self.pc.start_time) >= timeout)
+            || (timeout != 0 && ngx_core::times::event_msec().saturating_sub(self.pc.start_time) >= timeout)
         {
             return Err(status);
         }
@@ -972,7 +972,7 @@ impl UpstreamPeer {
     pub fn finalize(&mut self, r: &R, conn: Option<UpstreamConn>, keepalive: bool, request_body_sent: bool) {
         if let Some(last) = r.upstream_states.borrow_mut().last_mut() {
             if last.response_time == u64::MAX {
-                last.response_time = ngx_core::times::current_msec().saturating_sub(self.start_time);
+                last.response_time = ngx_core::times::event_msec().saturating_sub(self.start_time);
             }
         }
 

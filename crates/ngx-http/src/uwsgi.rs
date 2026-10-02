@@ -455,17 +455,13 @@ fn create_keys(r: &R, keys: &mut crate::file_cache::CacheKeys) -> i64 {
 
     let cv = lcf.borrow().cache.cache_key.clone();
 
-    let key = match cv {
-        Some(cv) => match crate::script::complex_value(r, &cv) {
-            Ok(k) => k,
-            Err(_) => return NGX_ERROR,
-        },
-        None => Vec::new(),
-    };
-
-    keys.push_vec(key);
-
-    NGX_OK
+    match cv {
+        Some(cv) => crate::upstream_cache::push_key_value(r, &cv, keys),
+        None => {
+            keys.push(b"");
+            NGX_OK
+        }
+    }
 }
 
 /// The start of the packet: modifier1, the 16-bit little-endian size of

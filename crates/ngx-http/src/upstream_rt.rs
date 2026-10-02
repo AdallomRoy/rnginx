@@ -237,7 +237,7 @@ impl UpstreamResponse {
 /// A header line of the upstream's response (an ngx_table_elt_t of
 /// u->headers_in), owning its key, value and lowcase key.
 pub fn upstream_header(key: Vec<u8>, value: Vec<u8>, hash: usize, lowcase_key: Vec<u8>) -> Header {
-    Rc::new(TableElt { hash: std::cell::Cell::new(hash), key, value: RefCell::new(value), lowcase_key, null: std::cell::Cell::new(false) })
+    TableElt::owned(key, value, hash, lowcase_key)
 }
 
 impl Default for UpstreamResponse {
@@ -2105,7 +2105,7 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
             Ok(Err(f)) => return Err(f),
             Ok(Ok(s)) => {
                 u.conn_requests = 0;
-                u.conn_start_time = ngx_core::times::current_msec();
+                u.conn_start_time = ngx_core::times::event_msec();
                 s
             }
         }
@@ -2183,7 +2183,7 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 
     Upstream::with_state(r, |st| {
         if st.connect_time == u64::MAX {
-            st.connect_time = ngx_core::times::current_msec().saturating_sub(start_time);
+            st.connect_time = ngx_core::times::event_msec().saturating_sub(start_time);
         }
     });
 
@@ -2516,7 +2516,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
 
     let start_time = u.peer.as_ref().map(|g| g.u.start_time).unwrap_or(0);
 
-    Upstream::with_state(r, |st| st.header_time = ngx_core::times::current_msec().saturating_sub(start_time));
+    Upstream::with_state(r, |st| st.header_time = ngx_core::times::event_msec().saturating_sub(start_time));
 
     // u->headers_in, for $upstream_http_* and the balancer's notify
     *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
@@ -2609,7 +2609,7 @@ async fn test_next_and_intercept(r: &R, u: &mut Upstream, m: &mut dyn UpstreamMo
         if tries > 1
             && u.conf.next_upstream & mask == mask
             && !(u.request_sent && r.request_body_no_buffering.get())
-            && !(timeout != 0 && ngx_core::times::current_msec().saturating_sub(start_time) >= timeout)
+            && !(timeout != 0 && ngx_core::times::event_msec().saturating_sub(start_time) >= timeout)
         {
             return Err(Failure::Next(ft));
         }
@@ -2689,7 +2689,7 @@ async fn test_next_and_intercept(r: &R, u: &mut Upstream, m: &mut dyn UpstreamMo
         let mut ho = r.headers_out.borrow_mut();
 
         for h in u.resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"www-authenticate") {
-            let o = TableElt::new(&h.key, &h.value.borrow());
+            let o = TableElt::generated(&h.key, h.value.borrow().clone());
             ho.headers.push(o.clone());
             ho.www_authenticate.push(o);
         }
@@ -2839,7 +2839,7 @@ fn finalize_peer(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, rc: i64) {
 
     Upstream::with_state(r, |st| {
         if st.response_time == u64::MAX {
-            st.response_time = ngx_core::times::current_msec().saturating_sub(start_time);
+            st.response_time = ngx_core::times::event_msec().saturating_sub(start_time);
 
             if let Some(sent) = sent {
                 st.bytes_sent = sent;
@@ -2959,19 +2959,12 @@ pub fn content_type_charset(value: &[u8]) -> Option<(usize, Vec<u8>)> {
     None
 }
 
-/// A copy of an upstream header in r->headers_out (*ho = *h), its lowcase
-/// key copied too.
+/// A copy of an upstream header in r->headers_out (*ho = *h): as the
+/// headers the modules make (nothing looks r->headers_out up by lowcase
+/// key), the key and the value copied.
 fn push_copy(ho: &mut HeadersOut, h: &Header) -> Header {
-    let o = Rc::new(TableElt {
-        hash: std::cell::Cell::new(1),
-        key: h.key.clone(),
-        value: RefCell::new(h.value.borrow().clone()),
-        lowcase_key: h.lowcase_key.clone(),
-        null: std::cell::Cell::new(h.null.get()),
-    });
-
-    ho.headers.push(o.clone());
-
+    let o = ho.add_generated(&h.key, h.value.borrow().clone());
+    o.null.set(h.null.get());
     o
 }
 
@@ -3738,7 +3731,7 @@ async fn send_request_event(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule,
 
     Upstream::with_state(r, |st| {
         if st.connect_time == u64::MAX {
-            st.connect_time = ngx_core::times::current_msec().saturating_sub(start_time);
+            st.connect_time = ngx_core::times::event_msec().saturating_sub(start_time);
         }
     });
 
@@ -3925,7 +3918,7 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
 
                 let start_time = u.peer.as_ref().map(|g| g.u.start_time).unwrap_or(0);
 
-                Upstream::with_state(r, |st| st.header_time = ngx_core::times::current_msec().saturating_sub(start_time));
+                Upstream::with_state(r, |st| st.header_time = ngx_core::times::event_msec().saturating_sub(start_time));
 
                 *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
 

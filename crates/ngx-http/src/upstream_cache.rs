@@ -389,6 +389,24 @@ pub fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(UpstreamCacheMainConf::default())
 }
 
+/// A part of the key of the cache made of a complex value (*_cache_key):
+/// written in place when it is a constant or one variable, else the value
+/// made for it taken. NGX_OK or NGX_ERROR.
+pub fn push_key_value(r: &R, cv: &ComplexValue, keys: &mut CacheKeys) -> i64 {
+    let lent = matches!(cv.parts.as_deref(), None | Some([crate::script::Part::Var(_)]));
+
+    let rc = if lent {
+        crate::script::with_complex_value(r, cv, |v| keys.push(v))
+    } else {
+        crate::script::complex_value(r, cv).map(|v| keys.push_vec(v))
+    };
+
+    match rc {
+        Ok(()) => NGX_OK,
+        Err(_) => NGX_ERROR,
+    }
+}
+
 /// u->caches of a module without caches (shared).
 pub fn no_caches() -> Rc<Vec<Rc<FileCache>>> {
     thread_local! {
