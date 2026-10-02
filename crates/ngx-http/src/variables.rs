@@ -271,16 +271,20 @@ pub fn get_variable(r: &R, name: &[u8]) -> Option<VariableValue> {
         }
         return None;
     }
-    // prefix variables
-    let prefixes = cmcf.borrow().prefix_variables.clone();
-    let mut best: Option<Rc<Variable>> = None;
-    let mut len = 0;
-    for pv in prefixes.iter() {
-        if name.len() >= pv.name.len() && name.len() > len && name[..pv.name.len()] == pv.name[..] {
-            len = pv.name.len();
-            best = Some(pv.clone());
+    // prefix variables: the longest one the name starts with, looked up in
+    // the configuration's list where it is
+    let best: Option<Rc<Variable>> = {
+        let m = cmcf.borrow();
+        let mut best: Option<&Rc<Variable>> = None;
+        let mut len = 0;
+        for pv in m.prefix_variables.iter() {
+            if name.len() >= pv.name.len() && name.len() > len && name[..pv.name.len()] == pv.name[..] {
+                len = pv.name.len();
+                best = Some(pv);
+            }
         }
-    }
+        best.cloned()
+    };
     if let Some(pv) = best {
         let mut vv = VariableValue::default();
         if let Some(g) = pv.get_handler.get() {
