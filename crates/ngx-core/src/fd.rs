@@ -14,8 +14,11 @@
 //! so the table is the thread's: a lookup is an index into a vector, and a
 //! handle a reference count, with no lock or atomic operation. A
 //! connection keeps the handle of its socket (its AsyncFd's), so its I/O
-//! does not look the number up at all. The table is never dropped: at
-//! exit, the kernel closes what is left, as for C's processes.
+//! does not look the number up at all. The owners of closed descriptors
+//! are kept for the next ones registered, so a descriptor opened and
+//! closed again (a connection, a file) allocates nothing. The table is
+//! never dropped: at exit, the kernel closes what is left, as for C's
+//! processes.
 //!
 //! Descriptors are closed by close() only; a number closed behind the
 //! table's back (a nix close() of a registered descriptor) leaves a stale
@@ -28,14 +31,60 @@ use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
-thread_local! {
-    /// The descriptors by number. ManuallyDrop: the thread-local has no
-    /// destructor, which exit() would run, closing every descriptor.
-    static TABLE: ManuallyDrop<RefCell<Vec<Option<Rc<OwnedFd>>>>> = const { ManuallyDrop::new(RefCell::new(Vec::new())) };
+/// The owner of a descriptor, shared with the handles lent of it. None
+/// only in an owner kept for reuse, which nobody else holds: an owner is
+/// emptied only when nobody else holds it.
+type Owner = Rc<Option<OwnedFd>>;
+
+struct Table {
+    /// the descriptors by number
+    fds: Vec<Option<Owner>>,
+    /// the owners of closed descriptors, for the next ones registered
+    free: Vec<Owner>,
 }
 
-fn with_table<R>(f: impl FnOnce(&mut Vec<Option<Rc<OwnedFd>>>) -> R) -> R {
+/// The owners kept for reuse at most.
+const FREE_MAX: usize = 256;
+
+thread_local! {
+    /// ManuallyDrop: the thread-local has no destructor, which exit() would
+    /// run, closing every descriptor.
+    static TABLE: ManuallyDrop<RefCell<Table>> = const { ManuallyDrop::new(RefCell::new(Table { fds: Vec::new(), free: Vec::new() })) };
+}
+
+fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     TABLE.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// An owner of `fd`: one kept for reuse, or a new one.
+fn new_owner(t: &mut Table, fd: OwnedFd) -> Owner {
+    if let Some(mut owner) = t.free.pop() {
+        if let Some(slot) = Rc::get_mut(&mut owner) {
+            *slot = Some(fd);
+            return owner;
+        }
+    }
+
+    Rc::new(Some(fd))
+}
+
+/// The descriptor of an owner nobody else holds, taken out of it (the
+/// owner is kept for reuse); the owner back if handles of it live.
+fn unique_fd(mut owner: Owner) -> Result<OwnedFd, Owner> {
+    let fd = Rc::get_mut(&mut owner).and_then(|slot| slot.take());
+
+    match fd {
+        Some(fd) => {
+            with_table(|t| {
+                if t.free.len() < FREE_MAX {
+                    t.free.push(owner);
+                }
+            });
+
+            Ok(fd)
+        }
+        None => Err(owner),
+    }
 }
 
 fn ebadf() -> io::Error {
@@ -48,7 +97,8 @@ pub struct Fd(Inner);
 
 #[derive(Debug)]
 enum Inner {
-    Owned(Rc<OwnedFd>),
+    /// never empty: an owner is emptied only when no handle holds it
+    Owned(Owner),
     /// the standard descriptors, which std owns
     Stdin(std::io::Stdin),
     Stdout(std::io::Stdout),
@@ -69,7 +119,7 @@ impl Clone for Fd {
 impl AsFd for Fd {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match &self.0 {
-            Inner::Owned(o) => o.as_fd(),
+            Inner::Owned(o) => o.as_ref().as_ref().expect("the descriptor of a handle is open").as_fd(),
             Inner::Stdin(s) => s.as_fd(),
             Inner::Stdout(s) => s.as_fd(),
             Inner::Stderr(s) => s.as_fd(),
@@ -89,11 +139,13 @@ pub fn register(fd: OwnedFd) -> RawFd {
     let i = n as usize;
 
     let stale = with_table(|t| {
-        if t.len() <= i {
-            t.resize(i + 1, None);
+        if t.fds.len() <= i {
+            t.fds.resize(i + 1, None);
         }
 
-        t[i].replace(Rc::new(fd))
+        let owner = new_owner(t, fd);
+
+        t.fds[i].replace(owner)
     });
 
     if let Some(stale) = stale {
@@ -113,7 +165,7 @@ pub fn get(fd: RawFd) -> io::Result<Fd> {
         return Err(ebadf());
     }
 
-    if let Some(owner) = with_table(|t| t.get(fd as usize).and_then(|e| e.clone())) {
+    if let Some(owner) = with_table(|t| t.fds.get(fd as usize).and_then(|e| e.clone())) {
         return Ok(Fd(Inner::Owned(owner)));
     }
 
@@ -139,22 +191,22 @@ pub fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
 
 /// Whether the table has the descriptor `fd`.
 pub fn contains(fd: RawFd) -> bool {
-    fd >= 0 && with_table(|t| t.get(fd as usize).is_some_and(|e| e.is_some()))
+    fd >= 0 && with_table(|t| t.fds.get(fd as usize).is_some_and(|e| e.is_some()))
 }
 
 /// The table's owner of `fd`, taken out of it.
-fn take_owner(fd: RawFd) -> Option<Rc<OwnedFd>> {
+fn take_owner(fd: RawFd) -> Option<Owner> {
     if fd < 0 {
         return None;
     }
 
-    with_table(|t| t.get_mut(fd as usize).and_then(|e| e.take()))
+    with_table(|t| t.fds.get_mut(fd as usize).and_then(|e| e.take()))
 }
 
 /// close() of the owner taken out of the table: now, or, if a handle of it
 /// still lives, when the last one is dropped.
-fn close_owner(owner: Rc<OwnedFd>) -> io::Result<()> {
-    match Rc::try_unwrap(owner) {
+fn close_owner(owner: Owner) -> io::Result<()> {
+    match unique_fd(owner) {
         // nix's close() reports the error OwnedFd's drop ignores
         Ok(owned) => nix::unistd::close(owned.into_raw_fd()).map_err(io::Error::from),
         Err(_) => Ok(()),
@@ -178,10 +230,10 @@ pub fn close_registered(fd: RawFd) -> Option<io::Result<()>> {
 pub fn take(fd: RawFd) -> io::Result<OwnedFd> {
     let owner = take_owner(fd).ok_or_else(ebadf)?;
 
-    match Rc::try_unwrap(owner) {
+    match unique_fd(owner) {
         Ok(owned) => Ok(owned),
         Err(owner) => {
-            with_table(|t| t[fd as usize] = Some(owner));
+            with_table(|t| t.fds[fd as usize] = Some(owner));
             Err(io::Error::from_raw_os_error(libc::EBUSY))
         }
     }
@@ -307,6 +359,47 @@ mod tests {
         }
         close(n2).unwrap();
         close(wn2).unwrap();
+    }
+
+    #[test]
+    fn owners_reused() {
+        let free = || with_table(|t| t.free.len());
+        let before = free();
+
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let rn = register(r);
+        let wn = register(w);
+        let kept = free();
+
+        // closed: the owner is kept, and given to the next descriptor
+        close(wn).unwrap();
+        assert_eq!(free(), kept + 1);
+        let (r2, w2) = nix::unistd::pipe().unwrap();
+        let rn2 = register(r2);
+        assert_eq!(free(), kept);
+        let wn2 = register(w2);
+        assert_eq!(nix::unistd::write(get(wn2).unwrap(), b"x").unwrap(), 1);
+        let mut buf = [0u8; 1];
+        assert_eq!(nix::unistd::read(rn2, &mut buf).unwrap(), 1);
+
+        // lent when closed: not kept, closed with the last handle
+        let f = free();
+        let h = get(rn).unwrap();
+        let h2 = h.clone();
+        close(rn).unwrap();
+        assert_eq!(free(), f);
+        drop(h);
+        assert_eq!(h2.as_fd().as_raw_fd(), rn, "still open");
+        drop(h2);
+
+        // taken: the owner is kept, the descriptor given back
+        let owned = take(rn2).unwrap();
+        assert_eq!(free(), f + 1);
+        drop(owned);
+
+        close(wn2).unwrap();
+        assert_eq!(free(), f + 2);
+        assert!(before <= FREE_MAX);
     }
 
     #[test]
