@@ -688,18 +688,16 @@ async fn run_request(r: &R) -> End {
             rc
         };
         if rc == NGX_OK {
-            let (key, value, hash, lowcase, invalid, name_start, header_end) = {
+            let invalid = {
                 let b = hc.buffer.borrow();
                 let p = r.parse.borrow();
                 r.request_length.set(r.request_length.get() + (b.pos - p.header_name_start) as i64);
-                let key = b.data[p.header_name_start..p.header_name_end].to_vec();
-                let value = b.data[p.header_start..p.header_end].to_vec();
-                let lowcase = if key.len() == p.lowcase_index { p.lowcase_header[..key.len()].to_vec() } else { ngx_core::string::to_lower_vec(&key) };
-                (key, value, p.header_hash, lowcase, p.invalid_header, p.header_name_start, p.header_end)
+                p.invalid_header
             };
             if invalid && ignore_invalid {
                 let b = hc.buffer.borrow();
-                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\"", B(&b.data[name_start..header_end]));
+                let p = r.parse.borrow();
+                ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent invalid header line: \"{}\"", B(&b.data[p.header_name_start..p.header_end]));
                 continue;
             }
             let count = {
@@ -713,7 +711,15 @@ async fn run_request(r: &R) -> End {
                 ngx_log_error!(NGX_LOG_INFO, c.log, None, "client sent too many header lines");
                 return finalize_and_end(r, NGX_HTTP_REQUEST_HEADER_TOO_LARGE).await;
             }
-            let h = TableElt::with_hash(&key, &value, hash, lowcase);
+            // the key, value and lowcase key copied once out of the buffer
+            let (h, hash) = {
+                let b = hc.buffer.borrow();
+                let p = r.parse.borrow();
+                let key = b.data[p.header_name_start..p.header_name_end].to_vec();
+                let value = b.data[p.header_start..p.header_end].to_vec();
+                let lowcase = if key.len() == p.lowcase_index { p.lowcase_header[..key.len()].to_vec() } else { ngx_core::string::to_lower_vec(&key) };
+                (TableElt::owned(key, value, p.header_hash, lowcase), p.header_hash)
+            };
             r.headers_in.borrow_mut().headers.push(h.clone());
             let handler = {
                 let m = cmcf.borrow();

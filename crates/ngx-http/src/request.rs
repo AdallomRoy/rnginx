@@ -46,6 +46,23 @@ impl TableElt {
         Rc::new(TableElt { hash: Cell::new(hash), key: key.to_vec(), value: RefCell::new(value.to_vec()), lowcase_key, null: Cell::new(false) })
     }
 
+    /// with_hash() taking its parts as they are, without copying them: a
+    /// parsed header line (key and value as read, the hash and lowcase key
+    /// of the parser). One allocation, the element itself.
+    pub fn owned(key: Vec<u8>, value: Vec<u8>, hash: usize, lowcase_key: Vec<u8>) -> Header {
+        Rc::new(TableElt { hash: Cell::new(hash), key, value: RefCell::new(value), lowcase_key, null: Cell::new(false) })
+    }
+
+    /// A header a module adds to r->headers_out (hash 1), with the value
+    /// moved in. As in C, where the modules set only the hash, key and value
+    /// of the headers they generate (lowcase_key stays NULL), it has no
+    /// lowcase key: nothing looks r->headers_out up by it (HeadersOut::find
+    /// compares the keys). Two allocations (the element and the key), where
+    /// new() makes four and copies the value.
+    pub fn generated(key: &[u8], value: Vec<u8>) -> Header {
+        Rc::new(TableElt { hash: Cell::new(1), key: key.to_vec(), value: RefCell::new(value), lowcase_key: Vec::new(), null: Cell::new(false) })
+    }
+
     pub fn value(&self) -> Vec<u8> {
         self.value.borrow().clone()
     }
@@ -199,9 +216,17 @@ impl HeadersOut {
         h
     }
 
-    /// Find first non-removed header by lowercase key.
+    /// add() with the value moved in, as TableElt::generated() makes it.
+    pub fn add_generated(&mut self, key: &[u8], value: Vec<u8>) -> Header {
+        let h = TableElt::generated(key, value);
+        self.headers.push(h.clone());
+        h
+    }
+
+    /// Find first non-removed header by name (lowercase), comparing the
+    /// keys as C does: the generated headers have no lowcase key.
     pub fn find(&self, lowcase: &[u8]) -> Option<&Header> {
-        self.headers.iter().find(|h| h.hash.get() != 0 && h.lowcase_key == lowcase)
+        self.headers.iter().find(|h| h.hash.get() != 0 && h.key.eq_ignore_ascii_case(lowcase))
     }
 }
 
@@ -919,4 +944,39 @@ macro_rules! http_debug {
 pub(crate) fn _silence(log: &Log) {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "{}", B(b""));
     ngx_log_error!(NGX_LOG_DEBUG, log, None, "{}", NGX_OK);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_elt_owned_keeps_its_parts() {
+        let key = b"X-Foo".to_vec();
+        let value = b"bar".to_vec();
+        let (kp, vp) = (key.as_ptr(), value.as_ptr());
+        let h = TableElt::owned(key, value, 42, b"x-foo".to_vec());
+        // moved in, not copied
+        assert_eq!(h.key.as_ptr(), kp);
+        assert_eq!(h.value.borrow().as_ptr(), vp);
+        assert_eq!(h.hash.get(), 42);
+        assert_eq!(h.lowcase_key, b"x-foo");
+        assert!(!h.null.get());
+    }
+
+    #[test]
+    fn generated_headers_are_found_by_name() {
+        let mut ho = HeadersOut::new();
+        let value = b"\"abc\"".to_vec();
+        let vp = value.as_ptr();
+        let h = ho.add_generated(b"ETag", value);
+        assert_eq!(h.hash.get(), 1);
+        assert_eq!(h.value.borrow().as_ptr(), vp);
+        assert!(h.lowcase_key.is_empty());
+        ho.add(b"Content-Range", b"bytes 0-1/2");
+        assert!(Rc::ptr_eq(ho.find(b"etag").unwrap(), &h));
+        assert_eq!(ho.find(b"content-range").unwrap().value(), b"bytes 0-1/2");
+        h.hash.set(0);
+        assert!(ho.find(b"etag").is_none());
+    }
 }
