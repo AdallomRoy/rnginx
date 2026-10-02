@@ -5,16 +5,20 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::io::IoSlice;
 use std::rc::Rc;
 
+use nix::errno::Errno;
+use nix::sys::socket::ControlMessage;
+
 use crate::connection::Connection;
-use crate::event_udp::{cmsg_space_addrinfo, set_srcaddr_cmsg, CmsgBuf};
-use crate::inet::SockAddr;
+use crate::event_udp::{sendmsg_to, set_srcaddr_cmsg, SrcAddrCmsg};
+use crate::inet::{NixSockAddr, SockAddr};
 use crate::log::*;
 use crate::openssl_ffi::RAND_bytes;
 use crate::rc::*;
 use crate::times;
-use crate::{ngx_log_debug, ngx_log_error, os};
+use crate::{ngx_log_debug, ngx_log_error};
 
 use super::ack::{ngx_quic_congestion_idle, ngx_quic_generate_ack, ngx_quic_set_lost_timer};
 use super::frames::*;
@@ -335,52 +339,32 @@ fn ngx_quic_create_segments(c: &Rc<Connection>, qc: &QuicConnection) -> i64 {
     NGX_OK
 }
 
-/// ngx_quic_send_segments
-fn ngx_quic_send_segments(c: &Connection, buf: &[u8], sockaddr: &SockAddr, segment: usize) -> isize {
-    #[repr(C, align(8))]
-    struct Control([u8; 128]);
-
-    let mut control = Control([0; 128]);
-
-    let mut iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
-
-    let (mut ss, slen) = sockaddr.to_libc();
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-
-    msg.msg_name = &mut ss as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = slen;
-
-    msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-
-    // SAFETY: the control buffer has room for both control messages
-    unsafe {
-        msg.msg_controllen = (libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize + cmsg_space_addrinfo()) as _;
-
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-
-        (*cmsg).cmsg_level = libc::SOL_UDP;
-        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
-
-        let mut clen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize;
-
-        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut u16, segment as u16);
-
-        if c.listening().is_some_and(|ls| ls.wildcard.get()) {
-            if let Some(local) = c.local_sockaddr.borrow().as_ref() {
-                let cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-                clen += set_srcaddr_cmsg(cmsg, local);
-            }
-        }
-
-        msg.msg_controllen = clen as _;
+/// The source address control message of a datagram of the connection: on
+/// a wildcard listening, its local address (ngx_set_srcaddr_cmsg).
+fn ngx_quic_srcaddr(c: &Connection) -> Option<SrcAddrCmsg> {
+    if c.listening().is_some_and(|ls| ls.wildcard.get()) {
+        return c.local_sockaddr.borrow().as_ref().and_then(set_srcaddr_cmsg);
     }
 
-    let n = ngx_sendmsg(c, &msg);
+    None
+}
+
+/// ngx_quic_send_segments: the datagrams in one sendmsg() with UDP_SEGMENT
+/// (a u16 of CMSG_SPACE(sizeof(uint16_t))) and the source address
+fn ngx_quic_send_segments(c: &Connection, buf: &[u8], sockaddr: &SockAddr, segment: usize) -> isize {
+    let iov = [IoSlice::new(buf)];
+
+    let segment = segment as u16;
+
+    let srcaddr = ngx_quic_srcaddr(c);
+
+    let mut cmsgs = vec![ControlMessage::UdpGsoSegments(&segment)];
+
+    if let Some(src) = &srcaddr {
+        cmsgs.push(src.cmsg());
+    }
+
+    let n = ngx_sendmsg(c, &iov, &cmsgs, &sockaddr.to_nix());
     if n < 0 {
         return n;
     }
@@ -577,86 +561,60 @@ fn ngx_quic_init_packet<'a>(c: &Connection, qc: &QuicConnection, ctx: &QuicSendC
 }
 
 /// ngx_sendmsg: the bytes sent, NGX_AGAIN or NGX_ERROR (logged)
-fn ngx_sendmsg(c: &Connection, msg: &libc::msghdr) -> isize {
+fn ngx_sendmsg(c: &Connection, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage<'_>], addr: &NixSockAddr) -> isize {
     let fd = match c.listening() {
         Some(ls) => ls.fd.get(),
         None => c.fd.get(),
     };
 
     loop {
-        // SAFETY: the message and its buffers are valid for the call
-        let n = unsafe { libc::sendmsg(fd, msg, 0) };
+        let n = match sendmsg_to(fd, iov, cmsgs, addr) {
+            Ok(n) => n,
 
-        if n == -1 {
-            let err = os::errno();
-
-            match err {
-                libc::EAGAIN => {
-                    if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
-                        c.log.error(NGX_LOG_DEBUG, Some(err), format_args!("sendmsg() not ready"));
-                    }
-
-                    return NGX_AGAIN as isize;
+            Err(Errno::EAGAIN) => {
+                if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+                    c.log.error(NGX_LOG_DEBUG, Some(libc::EAGAIN), format_args!("sendmsg() not ready"));
                 }
 
-                libc::EINTR => {
-                    if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
-                        c.log.error(NGX_LOG_DEBUG, Some(err), format_args!("sendmsg() was interrupted"));
-                    }
-
-                    continue;
-                }
-
-                _ => {
-                    if let Some(qc) = ngx_quic_get_connection(c) {
-                        qc.write_error.set(true);
-                    }
-
-                    c.connection_error(err, "sendmsg() failed");
-                    return NGX_ERROR as isize;
-                }
+                return NGX_AGAIN as isize;
             }
-        }
+
+            Err(Errno::EINTR) => {
+                if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+                    c.log.error(NGX_LOG_DEBUG, Some(libc::EINTR), format_args!("sendmsg() was interrupted"));
+                }
+
+                continue;
+            }
+
+            Err(e) => {
+                if let Some(qc) = ngx_quic_get_connection(c) {
+                    qc.write_error.set(true);
+                }
+
+                c.connection_error(e as i32, "sendmsg() failed");
+                return NGX_ERROR as isize;
+            }
+        };
 
         if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
-            let size: usize = (0..msg.msg_iovlen as usize).map(|i| unsafe { (*msg.msg_iov.add(i)).iov_len }).sum();
+            let size: usize = iov.iter().map(|v| v.len()).sum();
             ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "sendmsg: {} of {}", n, size);
         }
 
-        return n;
+        return n as isize;
     }
 }
 
 /// ngx_quic_send: a datagram to the address
 fn ngx_quic_send(c: &Connection, buf: &[u8], sockaddr: &SockAddr) -> isize {
-    let mut iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    let iov = [IoSlice::new(buf)];
 
-    let (mut ss, slen) = sockaddr.to_libc();
+    let srcaddr = ngx_quic_srcaddr(c);
 
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    let cmsgs: Vec<ControlMessage<'_>> = srcaddr.iter().map(SrcAddrCmsg::cmsg).collect();
 
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-
-    msg.msg_name = &mut ss as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = slen;
-
-    let mut control = CmsgBuf::default();
-
-    if c.listening().is_some_and(|ls| ls.wildcard.get()) {
-        if let Some(local) = c.local_sockaddr.borrow().as_ref() {
-            msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg_space_addrinfo() as _;
-
-            // SAFETY: the control buffer has room for ngx_addrinfo_t
-            unsafe {
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                msg.msg_controllen = set_srcaddr_cmsg(cmsg, local) as _;
-            }
-        }
-    }
-
-    let n = ngx_sendmsg(c, &msg);
+    let n = ngx_sendmsg(c, &iov, &cmsgs, &sockaddr.to_nix());
     if n < 0 {
         return n;
     }

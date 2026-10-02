@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -244,6 +244,15 @@ fn raw_fd(sock: &UpstreamSock) -> Option<RawFd> {
     }
 }
 
+/// A dup() of the socket of a cached connection, owned by the OwnedFd.
+fn dup_sock(sock: &UpstreamSock) -> Option<OwnedFd> {
+    match sock {
+        UpstreamSock::Tcp(s) => rustix::io::fcntl_dupfd_cloexec(s, 0).ok(),
+        UpstreamSock::Unix(s) => rustix::io::fcntl_dupfd_cloexec(s, 0).ok(),
+        UpstreamSock::Conn(c) => ngx_core::fd::get(c.fd()).ok().and_then(|s| rustix::io::fcntl_dupfd_cloexec(&s, 0).ok()),
+    }
+}
+
 /// ngx_http_upstream_keepalive_close: an https connection is closed
 /// without "close notify".
 fn keepalive_close(item: CacheItem) {
@@ -266,7 +275,7 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Opti
                 let cache = conf.cache.borrow();
 
                 match cache.iter().find(|it| it.id == id) {
-                    Some(it) => raw_fd(&it.conn.sock).map(|fd| unsafe { libc::dup(fd) }).filter(|&d| d >= 0).map(|d| unsafe { OwnedFd::from_raw_fd(d) }),
+                    Some(it) => dup_sock(&it.conn.sock),
                     None => return,
                 }
             }
@@ -301,9 +310,10 @@ fn spawn_close_handler(conf: Weak<KeepaliveConf>, id: u64, timeout: u64, c: Opti
                         };
 
                         let mut b = [0u8; 1];
-                        let n = unsafe { libc::recv(afd.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
 
-                        if n == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                        let n = nix::sys::socket::recv(afd.as_raw_fd(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT);
+
+                        if n == Err(nix::errno::Errno::EAGAIN) {
                             guard.clear_ready();
                             continue;
                         }

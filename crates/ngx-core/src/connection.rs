@@ -4,13 +4,19 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::io::IoSlice;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
 
+use nix::errno::Errno;
+use nix::sys::socket::{MsgFlags, SockaddrStorage};
+use rustix::net::sockopt;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
 use crate::cycle::*;
+use crate::fd;
 use crate::inet::SockAddr;
 use crate::listening::Listening;
 use crate::log::*;
@@ -71,6 +77,7 @@ impl AsRawFd for Fd {
 
 /// Shared statistics (in shared memory when workers > 1).
 #[repr(C)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout)]
 pub struct Stats {
     pub connection_counter: std::sync::atomic::AtomicU64,
     pub accepted: std::sync::atomic::AtomicU64,
@@ -85,7 +92,8 @@ pub struct Stats {
     pub accept_mutex: std::sync::atomic::AtomicI64,
 }
 
-static mut STATS_PTR: *const Stats = std::ptr::null();
+/// The stats block in shared memory, once init_shared_stats() mapped it.
+static STATS_SHARED: std::sync::OnceLock<&'static Stats> = std::sync::OnceLock::new();
 static STATS_LOCAL: Stats = Stats {
     connection_counter: std::sync::atomic::AtomicU64::new(0),
     accepted: std::sync::atomic::AtomicU64::new(0),
@@ -100,29 +108,40 @@ static STATS_LOCAL: Stats = Stats {
 };
 
 pub fn stats() -> &'static Stats {
-    unsafe {
-        if STATS_PTR.is_null() {
-            &STATS_LOCAL
-        } else {
-            &*STATS_PTR
-        }
+    match STATS_SHARED.get() {
+        Some(s) => s,
+        None => &STATS_LOCAL,
     }
 }
 
 /// Allocate the shared stats block (called once in the master before forking).
 pub fn init_shared_stats(log: &Log) {
-    unsafe {
-        if !STATS_PTR.is_null() {
+    if STATS_SHARED.get().is_some() {
+        return;
+    }
+
+    let size = std::mem::size_of::<Stats>().max(4096);
+
+    // an anonymous shared mapping (zero-filled), inherited by the workers
+    let map = match mmap_rs::MmapOptions::new(size).and_then(|o| o.with_flags(mmap_rs::MmapFlags::SHARED).map_mut()) {
+        Ok(m) => m,
+        Err(e) => {
+            let err = match &e {
+                mmap_rs::Error::Nix(errno) => Some(*errno as i32),
+                mmap_rs::Error::Io(e) => e.raw_os_error(),
+                _ => None,
+            };
+            ngx_log_error!(NGX_LOG_ALERT, log, err, "mmap(MAP_ANON|MAP_SHARED, {}) failed", size);
             return;
         }
-        let size = std::mem::size_of::<Stats>().max(4096);
-        let p = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_SHARED, -1, 0);
-        if p == libc::MAP_FAILED {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "mmap(MAP_ANON|MAP_SHARED, {}) failed", size);
-            return;
-        }
-        std::ptr::write_bytes(p as *mut u8, 0, size);
-        STATS_PTR = p as *const Stats;
+    };
+
+    // mapped for the life of the process, as the C shared memory is
+    let map: &'static mut mmap_rs::MmapMut = Box::leak(Box::new(map));
+
+    // a page-aligned mapping larger than the block: the cast succeeds
+    if let Ok((shared, _)) = <Stats as zerocopy::FromBytes>::mut_from_prefix(map.as_mut_slice()) {
+        let _ = STATS_SHARED.set(shared);
     }
 }
 
@@ -705,14 +724,9 @@ impl Connection {
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.try_send(self, buf);
         }
-        let n = unsafe {
-            libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT)
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let n = nix::sys::socket::send(self.fd.get(), buf, MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT)?;
         self.sent.set(self.sent.get() + n as u64);
-        Ok(n as usize)
+        Ok(n)
     }
 
     /// Drive a non-blocking operation that does its own socket I/O (an
@@ -871,14 +885,7 @@ impl Connection {
             return afd.try_io(Interest::READABLE, |_| ssl.try_recv(self, buf));
         }
         let fd = self.fd.get();
-        let mut recv = || {
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        };
+        let mut recv = || nix::sys::socket::recv(fd, buf, MsgFlags::empty()).map_err(io::Error::from);
         if self.ty == libc::SOCK_DGRAM {
             // recv() whatever the read readiness: the error of a connected
             // UDP socket comes without it (see readable())
@@ -916,11 +923,7 @@ impl Connection {
         if let Some(udp) = self.udp_conn() {
             return udp.try_recv(self, buf).ok_or_else(|| io::ErrorKind::WouldBlock.into());
         }
-        let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(n as usize)
+        Ok(nix::sys::socket::recv(self.fd.get(), buf, MsgFlags::empty())?)
     }
 
     pub fn try_send_raw(&self, buf: &[u8]) -> io::Result<usize> {
@@ -930,11 +933,7 @@ impl Connection {
         if let Some(udp) = self.udp_conn() {
             return udp.try_send(self, &[buf]);
         }
-        let n = unsafe { libc::send(self.fd.get(), buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(n as usize)
+        Ok(nix::sys::socket::send(self.fd.get(), buf, MsgFlags::MSG_NOSIGNAL)?)
     }
 
     /// ngx_unix_recv equivalent: read some bytes, awaiting readiness. Ok(0) is EOF.
@@ -960,14 +959,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| {
-                let n = unsafe { libc::recv(inner.get_ref().0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::empty()).map_err(io::Error::from)) {
                 Ok(r) => {
                     let r = r?;
                     if r == 0 && self.ty != libc::SOCK_DGRAM {
@@ -989,14 +981,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            match guard.try_io(|inner| {
-                let n = unsafe { libc::recv(inner.get_ref().0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_PEEK) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
+            match guard.try_io(|inner| nix::sys::socket::recv(inner.get_ref().0, buf, MsgFlags::MSG_PEEK).map_err(io::Error::from)) {
                 Ok(r) => return r,
                 Err(_) => continue,
             }
@@ -1017,16 +1002,14 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.readable().await?;
-            let n = unsafe { libc::recv(self.fd.get(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_PEEK) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::WouldBlock {
+            let n = match nix::sys::socket::recv(self.fd.get(), buf, MsgFlags::MSG_PEEK) {
+                Ok(n) => n,
+                Err(Errno::EAGAIN) => {
                     guard.clear_ready();
                     continue;
                 }
-                return Err(e);
-            }
-            let n = n as usize;
+                Err(e) => return Err(e.into()),
+            };
             let eof = guard.ready().is_read_closed();
             if n == 0 || n > have || eof {
                 return Ok((n, eof || n == 0));
@@ -1050,14 +1033,7 @@ impl Connection {
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
-            match guard.try_io(|inner| {
-                let n = unsafe { libc::send(inner.get_ref().0, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
+            match guard.try_io(|inner| nix::sys::socket::send(inner.get_ref().0, buf, MsgFlags::MSG_NOSIGNAL).map_err(io::Error::from)) {
                 Ok(r) => {
                     let n = r?;
                     self.sent.set(self.sent.get() + n as u64);
@@ -1087,19 +1063,16 @@ impl Connection {
             return Ok(0);
         }
         let afd = self.afd()?;
-        let iovs: Vec<libc::iovec> = iov.iter().filter(|s| !s.is_empty()).map(|s| libc::iovec { iov_base: s.as_ptr() as *mut libc::c_void, iov_len: s.len() }).collect();
+        let iovs: Vec<IoSlice<'_>> = iov.iter().filter(|s| !s.is_empty()).map(|s| IoSlice::new(s)).collect();
         if iovs.is_empty() {
             return Ok(0);
         }
+        let iovs = &iovs[..iovs.len().min(1024)];
         loop {
             let mut guard = afd.writable().await?;
             match guard.try_io(|inner| {
-                let n = unsafe { libc::writev(inner.get_ref().0, iovs.as_ptr(), iovs.len().min(1024) as i32) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+                let s = fd::get(inner.get_ref().0)?;
+                nix::sys::uio::writev(&s, iovs).map_err(io::Error::from)
             }) {
                 Ok(r) => {
                     let n = r?;
@@ -1118,13 +1091,11 @@ impl Connection {
         loop {
             let mut guard = afd.writable().await?;
             match guard.try_io(|inner| {
-                let mut off: libc::off_t = offset as libc::off_t;
-                let n = unsafe { libc::sendfile(inner.get_ref().0, file_fd, &mut off, count) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
+                let s = fd::get(inner.get_ref().0)?;
+                let file = fd::get(file_fd)?;
+                // the off_t of the kernel, as unsigned
+                let mut off = offset as u64;
+                rustix::fs::sendfile(&s, &file, Some(&mut off), count).map_err(io::Error::from)
             }) {
                 Ok(r) => {
                     let n = r?;
@@ -1146,11 +1117,14 @@ impl Connection {
     }
 
     pub fn setsockopt_int(&self, level: i32, name: i32, value: i32) -> io::Result<()> {
-        let r = unsafe { libc::setsockopt(self.fd.get(), level, name, &value as *const i32 as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t) };
-        if r == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        let s = fd::get(self.fd.get())?;
+        ngx_sys::os::setsockopt_int(s.as_fd(), level, name, value)
+    }
+
+    /// An option set on the socket, the error as io::Error.
+    fn with_socket<T, E: Into<io::Error>>(&self, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> io::Result<T> {
+        let s = fd::get(self.fd.get())?;
+        op(s.as_fd()).map_err(Into::into)
     }
 
     /// ngx_connection_error: log a socket error with the level of
@@ -1189,7 +1163,7 @@ impl Connection {
             return true;
         }
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, self.log, "tcp_nodelay");
-        if let Err(e) = self.setsockopt_int(libc::IPPROTO_TCP, libc::TCP_NODELAY, 1) {
+        if let Err(e) = self.with_socket(|s| sockopt::set_tcp_nodelay(s, true)) {
             ngx_log_error!(NGX_LOG_ALERT, self.log, e.raw_os_error(), "setsockopt(TCP_NODELAY) failed");
             return false;
         }
@@ -1199,30 +1173,24 @@ impl Connection {
 
     /// TCP_CORK on
     pub fn tcp_push_on(&self) -> io::Result<()> {
-        self.setsockopt_int(libc::IPPROTO_TCP, libc::TCP_CORK, 1)
+        self.with_socket(|s| sockopt::set_tcp_cork(s, true))
     }
 
     /// TCP_CORK off
     pub fn tcp_push_off(&self) -> io::Result<()> {
-        self.setsockopt_int(libc::IPPROTO_TCP, libc::TCP_CORK, 0)
+        self.with_socket(|s| sockopt::set_tcp_cork(s, false))
     }
 
     /// SO_LINGER {1, 0}: reset on close (reset_timedout_connection).
     pub fn set_linger_reset(&self) {
-        let l = libc::linger { l_onoff: 1, l_linger: 0 };
-        unsafe {
-            if libc::setsockopt(self.fd.get(), libc::SOL_SOCKET, libc::SO_LINGER, &l as *const _ as *const libc::c_void, std::mem::size_of::<libc::linger>() as libc::socklen_t) == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "setsockopt(SO_LINGER) failed");
-            }
+        if let Err(e) = self.with_socket(|s| sockopt::set_socket_linger(s, Some(std::time::Duration::ZERO))) {
+            ngx_log_error!(NGX_LOG_ALERT, self.log, e.raw_os_error(), "setsockopt(SO_LINGER) failed");
         }
     }
 
     /// shutdown(SHUT_WR)
     pub fn shutdown_write(&self) -> io::Result<()> {
-        if unsafe { libc::shutdown(self.fd.get(), libc::SHUT_WR) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        Ok(nix::sys::socket::shutdown(self.fd.get(), nix::sys::socket::Shutdown::Write)?)
     }
 
     /// Fetch and cache the local address (ngx_connection_local_sockaddr).
@@ -1230,13 +1198,14 @@ impl Connection {
         if let Some(a) = self.local_sockaddr.borrow().as_ref() {
             return Some(a.clone());
         }
-        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if unsafe { libc::getsockname(self.fd.get(), &mut ss as *mut _ as *mut libc::sockaddr, &mut len) } == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, self.log, Some(os::errno()), "getsockname() failed");
-            return None;
-        }
-        let sa = SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len)?;
+        let ss: SockaddrStorage = match nix::sys::socket::getsockname(self.fd.get()) {
+            Ok(ss) => ss,
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_CRIT, self.log, Some(e as i32), "getsockname() failed");
+                return None;
+            }
+        };
+        let sa = SockAddr::from_nix(&ss)?;
         *self.local_sockaddr.borrow_mut() = Some(sa.clone());
         Some(sa)
     }
@@ -1315,8 +1284,8 @@ impl Connection {
         self.free_connection();
         let fd = self.fd.replace(-1);
         if !self.shared.get() {
-            if unsafe { libc::close(fd) } == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "close() socket failed");
+            if let Err(e) = os::close_fd(fd) {
+                ngx_log_error!(NGX_LOG_ALERT, self.log, Some(e), "close() socket failed");
             }
         }
         // Mirror ngx_close_connection: decrement $connections_active as soon
@@ -1390,23 +1359,12 @@ pub fn cmp_listening(a: &Listening, b: &Listening) -> bool {
     a.sockaddr.cmp(&b.sockaddr, true)
 }
 
-fn setsockopt_int(fd: RawFd, level: i32, name: i32, value: i32) -> Result<(), i32> {
-    let r = unsafe { libc::setsockopt(fd, level, name, &value as *const i32 as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t) };
-    if r == -1 {
-        return Err(os::errno());
-    }
-    Ok(())
-}
-
-/// getsockopt() of an int option; returns the option length
-fn getsockopt_int(fd: RawFd, level: i32, name: i32, value: &mut i32) -> Result<libc::socklen_t, i32> {
-    let mut olen = std::mem::size_of::<i32>() as libc::socklen_t;
-    // SAFETY: value points to an i32 of olen bytes
-    let r = unsafe { libc::getsockopt(fd, level, name, value as *mut i32 as *mut libc::c_void, &mut olen) };
-    if r == -1 {
-        return Err(os::errno());
-    }
-    Ok(olen)
+/// An operation on the open descriptor `fd`; Err(errno) if it fails (or
+/// the descriptor is not open: EBADF, as the system call would fail).
+fn with_fd<T, E: Into<io::Error>>(fd: RawFd, op: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>) -> Result<T, i32> {
+    let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    let s = fd::get(fd).map_err(errno)?;
+    op(s.as_fd()).map_err(|e| errno(e.into()))
 }
 
 /// ngx_set_inherited_sockets: the listening entries pushed by
@@ -1417,23 +1375,17 @@ pub fn set_inherited_sockets(cycle: &mut Cycle) -> Result<(), ()> {
         let fd = cycle.listening[i].fd.get();
 
         // ngx_sockaddr_t
-        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut socklen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        // SAFETY: ss is a sockaddr_storage of socklen bytes
-        if unsafe { libc::getsockname(fd, &mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr, &mut socklen) } == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, cycle.log, Some(os::errno()), "getsockname() of the inherited socket #{} failed", fd);
-            cycle.listening[i].ignore.set(true);
-            continue;
-        }
-
-        if socklen > std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t {
-            socklen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        }
-
-        let sockaddr = match ss.ss_family as i32 {
-            libc::AF_INET6 | libc::AF_UNIX | libc::AF_INET => SockAddr::from_libc(&ss as *const libc::sockaddr_storage as *const libc::sockaddr, socklen),
-            _ => None,
+        let ss: SockaddrStorage = match nix::sys::socket::getsockname(fd) {
+            Ok(ss) => ss,
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_CRIT, cycle.log, Some(e as i32), "getsockname() of the inherited socket #{} failed", fd);
+                cycle.listening[i].ignore.set(true);
+                continue;
+            }
         };
+
+        // AF_INET6, AF_UNIX and AF_INET; None for the other families
+        let sockaddr = SockAddr::from_nix(&ss);
 
         let sockaddr = match sockaddr {
             Some(sa) => sa,
@@ -1461,34 +1413,34 @@ pub fn set_inherited_sockets(cycle: &mut Cycle) -> Result<(), ()> {
 /// is a "continue" there.
 fn get_inherited_socket_options(ls: &mut Listening, log: &Log) {
     let fd = ls.fd.get();
-    let mut value = 0;
 
-    if let Err(e) = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut ls.ty) {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "getsockopt(SO_TYPE) {} failed", B(&ls.addr_text));
-        ls.ignore.set(true);
-        return;
+    match with_fd(fd, |s| sockopt::socket_type(s)) {
+        Ok(ty) => ls.ty = ty.as_raw() as i32,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_CRIT, log, Some(e), "getsockopt(SO_TYPE) {} failed", B(&ls.addr_text));
+            ls.ignore.set(true);
+            return;
+        }
     }
 
-    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &mut value) {
-        Ok(_) => ls.rcvbuf.set(value),
+    match with_fd(fd, |s| sockopt::socket_recv_buffer_size(s)) {
+        Ok(value) => ls.rcvbuf.set(value as i32),
         Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_RCVBUF) {} failed, ignored", B(&ls.addr_text));
             ls.rcvbuf.set(-1);
         }
     }
 
-    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &mut value) {
-        Ok(_) => ls.sndbuf.set(value),
+    match with_fd(fd, |s| sockopt::socket_send_buffer_size(s)) {
+        Ok(value) => ls.sndbuf.set(value as i32),
         Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_SNDBUF) {} failed, ignored", B(&ls.addr_text));
             ls.sndbuf.set(-1);
         }
     }
 
-    let mut reuseport = 0;
-
-    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &mut reuseport) {
-        Ok(_) => ls.reuseport.set(reuseport != 0),
+    match with_fd(fd, |s| sockopt::socket_reuseport(s)) {
+        Ok(reuseport) => ls.reuseport.set(reuseport),
         Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_REUSEPORT) {} failed, ignored", B(&ls.addr_text));
         }
@@ -1498,16 +1450,19 @@ fn get_inherited_socket_options(ls: &mut Listening, log: &Log) {
         return;
     }
 
-    match getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL, &mut value) {
-        Ok(_) => ls.protocol.set(if value == libc::IPPROTO_TCP { 0 } else { value }),
+    match with_fd(fd, |s| sockopt::socket_protocol(s)) {
+        Ok(protocol) => {
+            let value = protocol.map_or(0, |p| p.as_raw().get() as i32);
+            ls.protocol.set(if value == libc::IPPROTO_TCP { 0 } else { value });
+        }
         Err(e) => {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "getsockopt(SO_PROTOCOL) {} failed, ignored", B(&ls.addr_text));
             ls.protocol.set(0);
         }
     }
 
-    match getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, &mut value) {
-        Ok(_) => ls.fastopen.set(value),
+    match with_fd(fd, |s| ngx_sys::os::getsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_FASTOPEN)) {
+        Ok(value) => ls.fastopen.set(value),
         Err(err) => {
             if err != libc::EOPNOTSUPP && err != libc::ENOPROTOOPT && err != libc::EINVAL {
                 ngx_log_error!(NGX_LOG_NOTICE, log, Some(err), "getsockopt(TCP_FASTOPEN) {} failed, ignored", B(&ls.addr_text));
@@ -1516,11 +1471,11 @@ fn get_inherited_socket_options(ls: &mut Listening, log: &Log) {
         }
     }
 
-    let mut timeout = 0;
-
-    match getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &mut timeout) {
-        Ok(olen) => {
-            if (olen as usize) < std::mem::size_of::<i32>() || timeout == 0 {
+    // the option is an int: the kernel returns all of its length (the olen
+    // < sizeof(int) test of C)
+    match with_fd(fd, |s| ngx_sys::os::getsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT)) {
+        Ok(timeout) => {
+            if timeout == 0 {
                 return;
             }
         }
@@ -1548,7 +1503,7 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
                 continue;
             }
             if ls.add_reuseport.get() || ls.change_protocol.get() {
-                if let Err(e) = setsockopt_int(ls.fd.get(), libc::SOL_SOCKET, libc::SO_REUSEPORT, 1) {
+                if let Err(e) = with_fd(ls.fd.get(), |s| sockopt::set_socket_reuseport(s, true)) {
                     ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(SO_REUSEPORT) {} failed, ignored", B(&ls.addr_text));
                 }
                 ls.add_reuseport.set(false);
@@ -1559,43 +1514,48 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
             if ls.inherited.get() {
                 continue;
             }
-            let s = unsafe { libc::socket(ls.sockaddr.family(), ls.ty | libc::SOCK_CLOEXEC, ls.protocol.get()) };
-            if s == -1 {
-                ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "socket() {} failed", B(&ls.addr_text));
-                return Err(());
-            }
+            let socket = rustix::net::socket_with(
+                rustix::net::AddressFamily::from_raw(ls.sockaddr.family() as rustix::net::RawAddressFamily),
+                rustix::net::SocketType::from_raw(ls.ty as rustix::net::RawSocketType),
+                rustix::net::SocketFlags::CLOEXEC,
+                std::num::NonZeroU32::new(ls.protocol.get() as u32).map(rustix::net::Protocol::from_raw),
+            );
+            // closed when dropped on an error, registered once listening
+            let s = match socket {
+                Ok(s) => s,
+                Err(e) => {
+                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "socket() {} failed", B(&ls.addr_text));
+                    return Err(());
+                }
+            };
             if ls.ty != libc::SOCK_DGRAM || !test {
-                if let Err(e) = setsockopt_int(s, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) {
-                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e), "setsockopt(SO_REUSEADDR) {} failed", B(&ls.addr_text));
-                    os::close(s);
+                if let Err(e) = sockopt::set_socket_reuseaddr(&s, true) {
+                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "setsockopt(SO_REUSEADDR) {} failed", B(&ls.addr_text));
                     return Err(());
                 }
             }
             if (ls.reuseport.get() || ls.change_protocol.get()) && !test {
-                if let Err(e) = setsockopt_int(s, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1) {
-                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e), "setsockopt(SO_REUSEPORT) {} failed", B(&ls.addr_text));
-                    os::close(s);
+                if let Err(e) = sockopt::set_socket_reuseport(&s, true) {
+                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "setsockopt(SO_REUSEPORT) {} failed", B(&ls.addr_text));
                     return Err(());
                 }
             }
             if ls.sockaddr.family() == libc::AF_INET6 {
-                if let Err(e) = setsockopt_int(s, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, ls.ipv6only.get() as i32) {
-                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e), "setsockopt(IPV6_V6ONLY) {} failed, ignored", B(&ls.addr_text));
+                if let Err(e) = sockopt::set_ipv6_v6only(&s, ls.ipv6only.get()) {
+                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "setsockopt(IPV6_V6ONLY) {} failed, ignored", B(&ls.addr_text));
                 }
             }
-            if let Err(e) = os::set_nonblocking(s) {
-                ngx_log_error!(NGX_LOG_EMERG, log, Some(e), "ioctl(FIONBIO) {} failed", B(&ls.addr_text));
-                os::close(s);
+            if let Err(e) = rustix::io::ioctl_fionbio(&s, true) {
+                ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "ioctl(FIONBIO) {} failed", B(&ls.addr_text));
                 return Err(());
             }
-            ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "bind() {} #{} ", B(&ls.addr_text), s);
-            let (ss, slen) = ls.sockaddr.to_libc();
-            if unsafe { libc::bind(s, &ss as *const _ as *const libc::sockaddr, slen) } == -1 {
-                let err = os::errno();
+            ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "bind() {} #{} ", B(&ls.addr_text), s.as_raw_fd());
+            if let Err(e) = nix::sys::socket::bind(s.as_raw_fd(), ls.sockaddr.to_nix().as_dyn()) {
+                let err = e as i32;
                 if err != libc::EADDRINUSE || !test {
                     ngx_log_error!(NGX_LOG_EMERG, log, Some(err), "bind() to {} failed", B(&ls.addr_text));
                 }
-                os::close(s);
+                drop(s);
                 if err != libc::EADDRINUSE {
                     return Err(());
                 }
@@ -1605,9 +1565,8 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
                 continue;
             }
             if let SockAddr::Unix(path) = &ls.sockaddr {
-                let c = os::cstr(path);
-                if unsafe { libc::chmod(c.as_ptr(), 0o666) } == -1 {
-                    ngx_log_error!(NGX_LOG_EMERG, log, Some(os::errno()), "chmod() \"{}\" failed", B(path));
+                if let Err(e) = rustix::fs::chmod(os::cstr(path).as_c_str(), rustix::fs::Mode::from_raw_mode(0o666)) {
+                    ngx_log_error!(NGX_LOG_EMERG, log, Some(e.raw_os_error()), "chmod() \"{}\" failed", B(path));
                 }
                 if test {
                     if let Err(e) = os::unlink(path) {
@@ -1616,16 +1575,16 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
                 }
             }
             if ls.ty != libc::SOCK_STREAM {
-                ls.fd.set(s);
+                ls.fd.set(fd::register(s));
                 ls.open.set(true);
                 continue;
             }
-            if unsafe { libc::listen(s, ls.backlog.get()) } == -1 {
-                let err = os::errno();
+            if let Err(e) = rustix::net::listen(&s, ls.backlog.get()) {
+                let err = e.raw_os_error();
                 if err != libc::EADDRINUSE || !test {
                     ngx_log_error!(NGX_LOG_EMERG, log, Some(err), "listen() to {}, backlog {} failed", B(&ls.addr_text), ls.backlog.get());
                 }
-                os::close(s);
+                drop(s);
                 if err != libc::EADDRINUSE {
                     return Err(());
                 }
@@ -1635,7 +1594,7 @@ pub fn open_listening_sockets(cycle: &mut Cycle) -> Result<(), ()> {
                 continue;
             }
             ls.listen.set(true);
-            ls.fd.set(s);
+            ls.fd.set(fd::register(s));
             ls.open.set(true);
         }
         if !failed {
@@ -1660,47 +1619,51 @@ pub fn configure_listening_sockets(cycle: &mut Cycle) {
             continue;
         }
         if ls.rcvbuf.get() != -1 {
-            if let Err(e) = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, ls.rcvbuf.get()) {
+            // the int as is (socket2 passes `size as c_int`)
+            if let Err(e) = with_fd(fd, |s| socket2::SockRef::from(&s).set_recv_buffer_size(ls.rcvbuf.get() as usize)) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(SO_RCVBUF, {}) {} failed, ignored", ls.rcvbuf.get(), B(&ls.addr_text));
             }
         }
         if ls.sndbuf.get() != -1 {
-            if let Err(e) = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, ls.sndbuf.get()) {
+            if let Err(e) = with_fd(fd, |s| socket2::SockRef::from(&s).set_send_buffer_size(ls.sndbuf.get() as usize)) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(SO_SNDBUF, {}) {} failed, ignored", ls.sndbuf.get(), B(&ls.addr_text));
             }
         }
         if ls.keepalive.get() != 0 {
             let value = if ls.keepalive.get() == 1 { 1 } else { 0 };
-            if let Err(e) = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, value) {
+            if let Err(e) = with_fd(fd, |s| sockopt::set_socket_keepalive(s, value == 1)) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(SO_KEEPALIVE, {}) {} failed, ignored", value, B(&ls.addr_text));
             }
         }
+        // the seconds and the count are positive: rustix passes them as is
         if ls.keepidle.get() != 0 {
-            if let Err(e) = setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, ls.keepidle.get()) {
+            if let Err(e) = with_fd(fd, |s| sockopt::set_tcp_keepidle(s, std::time::Duration::from_secs(ls.keepidle.get() as u64))) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(TCP_KEEPIDLE, {}) {} failed, ignored", ls.keepidle.get(), B(&ls.addr_text));
             }
         }
         if ls.keepintvl.get() != 0 {
-            if let Err(e) = setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, ls.keepintvl.get()) {
+            if let Err(e) = with_fd(fd, |s| sockopt::set_tcp_keepintvl(s, std::time::Duration::from_secs(ls.keepintvl.get() as u64))) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(TCP_KEEPINTVL, {}) {} failed, ignored", ls.keepintvl.get(), B(&ls.addr_text));
             }
         }
         if ls.keepcnt.get() != 0 {
-            if let Err(e) = setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, ls.keepcnt.get()) {
+            if let Err(e) = with_fd(fd, |s| sockopt::set_tcp_keepcnt(s, ls.keepcnt.get() as u32)) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(TCP_KEEPCNT, {}) {} failed, ignored", ls.keepcnt.get(), B(&ls.addr_text));
             }
         }
         if ls.fastopen.get() != -1 {
-            if let Err(e) = setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, ls.fastopen.get()) {
+            if let Err(e) = with_fd(fd, |s| ngx_sys::os::setsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, ls.fastopen.get())) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(TCP_FASTOPEN, {}) {} failed, ignored", ls.fastopen.get(), B(&ls.addr_text));
             }
         }
-        if ls.listen.get() && unsafe { libc::listen(fd, ls.backlog.get()) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "listen() to {}, backlog {} failed, ignored", B(&ls.addr_text), ls.backlog.get());
+        if ls.listen.get() {
+            if let Err(e) = with_fd(fd, |s| rustix::net::listen(s, ls.backlog.get())) {
+                ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "listen() to {}, backlog {} failed, ignored", B(&ls.addr_text), ls.backlog.get());
+            }
         }
         if ls.add_deferred.get() || ls.delete_deferred.get() {
             let value = if ls.add_deferred.get() { 1 } else { 0 };
-            if let Err(e) = setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, value) {
+            if let Err(e) = with_fd(fd, |s| ngx_sys::os::setsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, value)) {
                 ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(TCP_DEFER_ACCEPT, {}) for {} failed, ignored", value, B(&ls.addr_text));
                 continue;
             }
@@ -1710,22 +1673,22 @@ pub fn configure_listening_sockets(cycle: &mut Cycle) {
         }
         if ls.wildcard.get() && ls.ty == libc::SOCK_DGRAM {
             if ls.sockaddr.family() == libc::AF_INET {
-                if let Err(e) = setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1) {
+                if let Err(e) = with_fd(fd, |s| nix::sys::socket::setsockopt(&s, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)) {
                     ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(IP_PKTINFO) for {} failed, ignored", B(&ls.addr_text));
                 }
             } else if ls.sockaddr.family() == libc::AF_INET6 {
-                if let Err(e) = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1) {
+                if let Err(e) = with_fd(fd, |s| nix::sys::socket::setsockopt(&s, nix::sys::socket::sockopt::Ipv6RecvPacketInfo, &true)) {
                     ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(IPV6_RECVPKTINFO) for {} failed, ignored", B(&ls.addr_text));
                 }
             }
         }
         if ls.quic.get() {
             if ls.sockaddr.family() == libc::AF_INET {
-                if let Err(e) = setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_DO) {
+                if let Err(e) = with_fd(fd, |s| sockopt::set_ip_mtu_discover(s, sockopt::Ipv4PathMtuDiscovery::DO)) {
                     ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(IP_MTU_DISCOVER) for {} failed, ignored", B(&ls.addr_text));
                 }
             } else if ls.sockaddr.family() == libc::AF_INET6 {
-                if let Err(e) = setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO) {
+                if let Err(e) = with_fd(fd, |s| sockopt::set_ipv6_mtu_discover(s, sockopt::Ipv6PathMtuDiscovery::DO)) {
                     ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "setsockopt(IPV6_MTU_DISCOVER) for {} failed, ignored", B(&ls.addr_text));
                 }
             }
@@ -1748,8 +1711,8 @@ pub fn close_listening_sockets(cycle: &Cycle) {
         }
         crate::event::stop_accepting(ls);
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, cycle.log, "close listening {} #{} ", B(&ls.addr_text), fd);
-        if unsafe { libc::close(fd) } == -1 {
-            ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(os::errno()), "close() socket {} failed", B(&ls.addr_text));
+        if let Err(e) = os::close_fd(fd) {
+            ngx_log_error!(NGX_LOG_EMERG, cycle.log, Some(e), "close() socket {} failed", B(&ls.addr_text));
         }
         if let SockAddr::Unix(path) = &ls.sockaddr {
             let pt = process_type();
@@ -1779,7 +1742,7 @@ pub fn init_hooks() -> InitHooks {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use std::os::unix::io::IntoRawFd;
+    use std::os::fd::OwnedFd;
 
     fn capture() -> (Log, Rc<RefCell<Vec<u8>>>) {
         let logged: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1806,35 +1769,40 @@ mod tests {
         cycle
     }
 
+    /// A descriptor of the table, as ngx_add_inherited_sockets finds them.
+    fn registered(s: impl Into<OwnedFd>) -> RawFd {
+        fd::register(s.into())
+    }
+
     fn tcp_socket(protocol: i32, reuseport: bool, defer: bool) -> Option<RawFd> {
-        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, protocol) };
-        if s == -1 {
-            return None;
-        }
+        let s = rustix::net::socket_with(
+            rustix::net::AddressFamily::INET,
+            rustix::net::SocketType::STREAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            std::num::NonZeroU32::new(protocol as u32).map(rustix::net::Protocol::from_raw),
+        )
+        .ok()?;
         if reuseport {
-            setsockopt_int(s, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1).unwrap();
+            sockopt::set_socket_reuseport(&s, true).unwrap();
         }
         if defer {
-            setsockopt_int(s, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1).unwrap();
+            ngx_sys::os::setsockopt_int(s.as_fd(), libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, 1).unwrap();
         }
-        let (ss, len) = SockAddr::v4(Ipv4Addr::LOCALHOST, 0).to_libc();
-        assert_eq!(unsafe { libc::bind(s, &ss as *const _ as *const libc::sockaddr, len) }, 0);
-        assert_eq!(unsafe { libc::listen(s, 16) }, 0);
-        Some(s)
+        nix::sys::socket::bind(s.as_raw_fd(), SockAddr::v4(Ipv4Addr::LOCALHOST, 0).to_nix().as_dyn()).unwrap();
+        rustix::net::listen(&s, 16).unwrap();
+        Some(registered(s))
     }
 
     fn local_port(fd: RawFd) -> u16 {
-        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        assert_eq!(unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) }, 0);
-        SockAddr::from_libc(&ss as *const _ as *const libc::sockaddr, len).unwrap().port()
+        let ss: SockaddrStorage = nix::sys::socket::getsockname(fd).unwrap();
+        SockAddr::from_nix(&ss).unwrap().port()
     }
 
     #[test]
     fn inherited_unix_socket() {
         let path = std::env::temp_dir().join(format!("ngx-inherited-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let fd = std::os::unix::net::UnixListener::bind(&path).unwrap().into_raw_fd();
+        let fd = registered(std::os::unix::net::UnixListener::bind(&path).unwrap());
         let name = path.to_str().unwrap().as_bytes().to_vec();
 
         let (log, l) = capture();
@@ -1918,7 +1886,7 @@ mod tests {
 
     #[test]
     fn inherited_udp_socket() {
-        let fd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into_raw_fd();
+        let fd = registered(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
 
         let (log, l) = capture();
         let mut cycle = inherited_cycle(&log, &[fd]);
@@ -1938,10 +1906,10 @@ mod tests {
 
     #[test]
     fn inherited_not_listening_sockets() {
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        let netlink = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
-        assert!(netlink != -1);
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let pipe = [registered(r), registered(w)];
+        // NETLINK_ROUTE is protocol 0
+        let netlink = registered(rustix::net::socket_with(rustix::net::AddressFamily::NETLINK, rustix::net::SocketType::RAW, rustix::net::SocketFlags::CLOEXEC, None).unwrap());
         let tcp = tcp_socket(0, false, false).unwrap();
 
         let (log, l) = capture();

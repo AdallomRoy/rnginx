@@ -42,7 +42,7 @@ struct HashPeerData {
 
 impl PeerBalancer for HashPeerData {
     fn tries(&self) -> u32 {
-        unsafe { upstream_tries(self.rrp.peers) as u32 }
+        upstream_tries(self.rrp.m(), self.rrp.peers) as u32
     }
 
     fn get(&mut self, pc: &mut PeerConnection) -> i64 {
@@ -102,109 +102,113 @@ fn init_hash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> {
 fn get_hash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, try: {}", pc.tries);
 
-    unsafe {
-        let peers = hp.rrp.peers;
+    let pm = hp.rrp.mem.clone();
+    let mem = &*pm.mem;
 
-        peers_rlock(peers);
+    let peers = hp.rrp.peers;
+    let ps = RrPeers::at(mem, peers);
 
-        if hp.tries > 20 || (*peers).number < 2 || hp.key.is_empty() {
-            peers_unlock(peers);
-            return get_round_robin_peer(pc, &mut hp.rrp);
-        }
+    peers_rlock(mem, peers);
 
-        if hp.rrp.config_changed() {
-            peers_unlock(peers);
-            return get_round_robin_peer(pc, &mut hp.rrp);
-        }
+    if hp.tries > 20 || ps.get(RrPeers::number) < 2 || hp.key.is_empty() {
+        peers_unlock(mem, peers);
+        return get_round_robin_peer(pc, &mut hp.rrp);
+    }
 
-        let now = ngx_core::times::time();
+    if hp.rrp.config_changed() {
+        peers_unlock(mem, peers);
+        return get_round_robin_peer(pc, &mut hp.rrp);
+    }
 
-        pc.cached = false;
-        pc.connection = None;
+    let now = ngx_core::times::time();
 
-        let mut p = 0usize;
+    pc.cached = false;
+    pc.connection = None;
 
-        let mut peer = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut p, true);
+    let mut p = 0usize;
 
-        if peer.is_null() {
-            loop {
-                // Hash expression is compatible with Cache::Memcached:
-                // ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH
-                // with REHASH omitted at the first iteration.
+    let mut peer = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut p, true);
 
-                let mut h = crc32fast::Hasher::new();
+    if peer == 0 {
+        loop {
+            // Hash expression is compatible with Cache::Memcached:
+            // ((crc32([REHASH] KEY) >> 16) & 0x7fff) + PREV_HASH
+            // with REHASH omitted at the first iteration.
 
-                if hp.rehash > 0 {
-                    h.update(hp.rehash.to_string().as_bytes());
+            let mut h = crc32fast::Hasher::new();
+
+            if hp.rehash > 0 {
+                h.update(hp.rehash.to_string().as_bytes());
+            }
+
+            h.update(&hp.key);
+
+            let hash = (h.finalize() >> 16) & 0x7fff;
+
+            hp.hash = hp.hash.wrapping_add(hash);
+            hp.rehash += 1;
+
+            let mut w = (hp.hash as usize % ps.get(RrPeers::total_weight)) as isize;
+            peer = ps.get(RrPeers::peer);
+            p = 0;
+
+            while w >= RrPeer::at(mem, peer).get(RrPeer::weight) {
+                w -= RrPeer::at(mem, peer).get(RrPeer::weight);
+                peer = RrPeer::at(mem, peer).get(RrPeer::next);
+                p += 1;
+            }
+
+            let skip = if hp.rrp.is_tried(p) {
+                true
+            } else {
+                peer_lock(mem, peers, peer);
+
+                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, value:{}, peer:{}", hp.hash, p);
+
+                let pp = RrPeer::at(mem, peer);
+
+                let unavailable = pp.get(RrPeer::down) != 0 || pp.failed(now) || pp.max_conns_reached();
+
+                if unavailable {
+                    peer_unlock(mem, peers, peer);
                 }
 
-                h.update(&hp.key);
+                unavailable
+            };
 
-                let hash = (h.finalize() >> 16) & 0x7fff;
+            if !skip {
+                break;
+            }
 
-                hp.hash = hp.hash.wrapping_add(hash);
-                hp.rehash += 1;
+            // next:
 
-                let mut w = (hp.hash as usize % (*peers).total_weight) as isize;
-                peer = (*peers).peer;
-                p = 0;
-
-                while w >= (*peer).weight {
-                    w -= (*peer).weight;
-                    peer = (*peer).next;
-                    p += 1;
-                }
-
-                let skip = if hp.rrp.is_tried(p) {
-                    true
-                } else {
-                    peer_lock(peers, peer);
-
-                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get hash peer, value:{}, peer:{}", hp.hash, p);
-
-                    let unavailable = (*peer).down != 0
-                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
-                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns);
-
-                    if unavailable {
-                        peer_unlock(peers, peer);
-                    }
-
-                    unavailable
-                };
-
-                if !skip {
-                    break;
-                }
-
-                // next:
-
-                hp.tries += 1;
-                if hp.tries > 20 {
-                    peers_unlock(peers);
-                    return get_round_robin_peer(pc, &mut hp.rrp);
-                }
+            hp.tries += 1;
+            if hp.tries > 20 {
+                peers_unlock(mem, peers);
+                return get_round_robin_peer(pc, &mut hp.rrp);
             }
         }
-
-        // found:
-
-        hp.rrp.current = peer;
-        peer_ref(peers, peer);
-
-        connect_peer(pc, peer);
-
-        (*peer).conns += 1;
-
-        if now - (*peer).checked > (*peer).fail_timeout {
-            (*peer).checked = now;
-        }
-
-        peer_unlock(peers, peer);
-        peers_unlock(peers);
-
-        hp.rrp.set_tried(p);
     }
+
+    // found:
+
+    hp.rrp.current = peer;
+    peer_ref(mem, peer);
+
+    connect_peer(pc, mem, peer);
+
+    let pp = RrPeer::at(mem, peer);
+
+    pp.set(RrPeer::conns, pp.get(RrPeer::conns) + 1);
+
+    if now - pp.get(RrPeer::checked) > pp.get(RrPeer::fail_timeout) {
+        pp.set(RrPeer::checked, now);
+    }
+
+    peer_unlock(mem, peers, peer);
+    peers_unlock(mem, peers);
+
+    hp.rrp.set_tried(p);
 
     NGX_OK
 }
@@ -225,6 +229,27 @@ fn init_chash(cf: &mut Conf, us: &Rc<UpstreamSrvConf>) -> ConfResult {
     Ok(())
 }
 
+/// The host and the port of a server name, as the points are made of them.
+fn host_port(server: &[u8]) -> (&[u8], &[u8]) {
+    if server.len() >= 5 && server[..5].eq_ignore_ascii_case(b"unix:") {
+        return (&server[5..], &[]);
+    }
+
+    for j in 0..server.len() {
+        let c = server[server.len() - j - 1];
+
+        if c == b':' {
+            return (&server[..server.len() - j - 1], &server[server.len() - j..]);
+        }
+
+        if !c.is_ascii_digit() {
+            break;
+        }
+    }
+
+    (server, &[])
+}
+
 /// ngx_http_upstream_update_chash: 160 points per weight unit and server,
 /// compatible with Cache::Memcached::Fast: crc32(HOST \0 PORT PREV_HASH).
 fn update_chash(us: &Rc<UpstreamSrvConf>) {
@@ -233,63 +258,50 @@ fn update_chash(us: &Rc<UpstreamSrvConf>) {
         None => return,
     };
 
-    let peers = us.peers.get();
+    let Peers { mem: pm, off: peers } = match us.peers.get() {
+        Some(p) => p,
+        None => return,
+    };
+    let mem = &*pm.mem;
 
-    if peers.is_null() {
-        return;
-    }
+    let ps = RrPeers::at(mem, peers);
 
-    unsafe {
-        let mut points: Vec<ChashPoint> = Vec::with_capacity((*peers).total_weight * 160);
+    let mut points: Vec<ChashPoint> = Vec::with_capacity(ps.get(RrPeers::total_weight) * 160);
 
-        let mut peer = (*peers).peer;
+    let mut peer = ps.get(RrPeers::peer);
 
-        while !peer.is_null() {
-            let server = (*peer).server.bytes();
+    while peer != 0 {
+        let pp = RrPeer::at(mem, peer);
 
-            let (host, port): (&[u8], &[u8]) = if server.len() >= 5 && server[..5].eq_ignore_ascii_case(b"unix:") {
-                (&server[5..], &[])
-            } else {
-                let mut split = None;
-                for j in 0..server.len() {
-                    let c = server[server.len() - j - 1];
-                    if c == b':' {
-                        split = Some((&server[..server.len() - j - 1], &server[server.len() - j..]));
-                        break;
-                    }
-                    if !c.is_ascii_digit() {
-                        break;
-                    }
-                }
-                split.unwrap_or((server, &[]))
-            };
+        let server = pp.server();
 
-            let mut base = crc32fast::Hasher::new();
-            base.update(host);
-            base.update(&[0]);
-            base.update(port);
+        let (host, port) = host_port(&server);
 
-            let mut prev_hash: u32 = 0;
-            let npoints = (*peer).weight as usize * 160;
+        let mut base = crc32fast::Hasher::new();
+        base.update(host);
+        base.update(&[0]);
+        base.update(port);
 
-            for _ in 0..npoints {
-                let mut h = base.clone();
-                h.update(&prev_hash.to_le_bytes());
-                let hash = h.finalize();
+        let mut prev_hash: u32 = 0;
+        let npoints = pp.get(RrPeer::weight) as usize * 160;
 
-                points.push(ChashPoint { hash, server: server.to_vec() });
+        for _ in 0..npoints {
+            let mut h = base.clone();
+            h.update(&prev_hash.to_le_bytes());
+            let hash = h.finalize();
 
-                prev_hash = hash;
-            }
+            points.push(ChashPoint { hash, server: server.clone() });
 
-            peer = (*peer).next;
+            prev_hash = hash;
         }
 
-        points.sort_by_key(|p| p.hash);
-        points.dedup_by_key(|p| p.hash);
-
-        *hcf.points.borrow_mut() = Some(Rc::new(points));
+        peer = pp.get(RrPeer::next);
     }
+
+    points.sort_by_key(|p| p.hash);
+    points.dedup_by_key(|p| p.hash);
+
+    *hcf.points.borrow_mut() = Some(Rc::new(points));
 }
 
 /// ngx_http_upstream_find_chash_point: the first point >= hash.
@@ -318,26 +330,29 @@ fn init_chash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> 
 
     let hash = crc32(&hp.key);
 
-    unsafe {
-        let peers = hp.rrp.peers;
+    let pm = hp.rrp.mem.clone();
+    let mem = &*pm.mem;
 
-        peers_rlock(peers);
+    let peers = hp.rrp.peers;
 
-        if !(*peers).config.is_null() && (hp.conf.points.borrow().is_none() || hp.conf.config.get() != *(*peers).config as u64) {
-            update_chash(us);
-            hp.conf.config.set(*(*peers).config as u64);
-        }
+    peers_rlock(mem, peers);
 
-        let points = hp.conf.points.borrow().clone();
+    let config = RrPeers::at(mem, peers).get(RrPeers::config);
 
-        if let Some(points) = points {
-            if !points.is_empty() {
-                hp.hash = find_chash_point(&points, hash);
-            }
-        }
-
-        peers_unlock(peers);
+    if config != 0 && (hp.conf.points.borrow().is_none() || hp.conf.config.get() != mem.get(config) as u64) {
+        update_chash(us);
+        hp.conf.config.set(mem.get(config) as u64);
     }
+
+    let points = hp.conf.points.borrow().clone();
+
+    if let Some(points) = points {
+        if !points.is_empty() {
+            hp.hash = find_chash_point(&points, hash);
+        }
+    }
+
+    peers_unlock(mem, peers);
 
     Ok(hp)
 }
@@ -346,114 +361,124 @@ fn init_chash_peer(r: &R, us: &Rc<UpstreamSrvConf>) -> Result<HashPeerData, ()> 
 fn get_chash_peer(pc: &mut PeerConnection, hp: &mut HashPeerData) -> i64 {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "get consistent hash peer, try: {}", pc.tries);
 
-    unsafe {
-        let peers = hp.rrp.peers;
+    let pm = hp.rrp.mem.clone();
+    let mem = &*pm.mem;
 
-        peers_wlock(peers);
+    let peers = hp.rrp.peers;
+    let ps = RrPeers::at(mem, peers);
 
-        if hp.tries > 20 || (*peers).single || hp.key.is_empty() {
-            peers_unlock(peers);
-            return get_round_robin_peer(pc, &mut hp.rrp);
-        }
+    peers_wlock(mem, peers);
 
-        pc.cached = false;
-        pc.connection = None;
+    if hp.tries > 20 || ps.get(RrPeers::single) != 0 || hp.key.is_empty() {
+        peers_unlock(mem, peers);
+        return get_round_robin_peer(pc, &mut hp.rrp);
+    }
 
-        if (*peers).number == 0 {
-            pc.name = (*(*peers).name).bytes().to_vec();
-            peers_unlock(peers);
-            return NGX_BUSY;
-        }
+    pc.cached = false;
+    pc.connection = None;
 
-        if hp.rrp.config_changed() {
-            pc.name = (*(*peers).name).bytes().to_vec();
-            peers_unlock(peers);
-            return NGX_BUSY;
-        }
+    if ps.get(RrPeers::number) == 0 {
+        pc.name = ps.name_bytes();
+        peers_unlock(mem, peers);
+        return NGX_BUSY;
+    }
 
-        let now = ngx_core::times::time();
+    if hp.rrp.config_changed() {
+        pc.name = ps.name_bytes();
+        peers_unlock(mem, peers);
+        return NGX_BUSY;
+    }
 
-        let points = hp.conf.points.borrow().clone().unwrap_or_default();
+    let now = ngx_core::times::time();
 
-        if points.is_empty() {
-            peers_unlock(peers);
-            return get_round_robin_peer(pc, &mut hp.rrp);
-        }
+    let points = hp.conf.points.borrow().clone().unwrap_or_default();
 
-        let mut best_i = 0usize;
+    if points.is_empty() {
+        peers_unlock(mem, peers);
+        return get_round_robin_peer(pc, &mut hp.rrp);
+    }
 
-        let mut best = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut best_i, false);
+    let mut best_i = 0usize;
 
-        if best.is_null() {
-            loop {
-                let server = &points[hp.hash as usize % points.len()].server;
+    let mut best = get_rr_peer_by_sid(&hp.rrp, pc.hint.as_deref(), &mut best_i, false);
 
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "consistent hash peer:{}, server:\"{}\"", hp.hash, B(server));
+    if best == 0 {
+        loop {
+            let server = &points[hp.hash as usize % points.len()].server;
 
-                best = std::ptr::null_mut();
-                best_i = 0;
-                let mut total: isize = 0;
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "consistent hash peer:{}, server:\"{}\"", hp.hash, B(server));
 
-                let mut peer = (*peers).peer;
-                let mut i = 0;
+            best = 0;
+            best_i = 0;
+            let mut total: isize = 0;
 
-                while !peer.is_null() {
-                    let skip = hp.rrp.is_tried(i)
-                        || (*peer).down != 0
-                        || ((*peer).max_fails != 0 && (*peer).fails >= (*peer).max_fails && now - (*peer).checked <= (*peer).fail_timeout)
-                        || ((*peer).max_conns != 0 && (*peer).conns >= (*peer).max_conns)
-                        || (*peer).server.bytes() != server.as_slice();
+            let mut peer = ps.get(RrPeers::peer);
+            let mut i = 0;
 
-                    if !skip {
-                        (*peer).current_weight += (*peer).effective_weight;
-                        total += (*peer).effective_weight;
+            while peer != 0 {
+                let pp = RrPeer::at(mem, peer);
 
-                        if (*peer).effective_weight < (*peer).weight {
-                            (*peer).effective_weight += 1;
-                        }
+                let skip = hp.rrp.is_tried(i)
+                    || pp.get(RrPeer::down) != 0
+                    || pp.failed(now)
+                    || pp.max_conns_reached()
+                    || pp.get(RrPeer::server_len) != server.len()
+                    || !mem.eq_bytes(pp.get(RrPeer::server_data), server);
 
-                        if best.is_null() || (*peer).current_weight > (*best).current_weight {
-                            best = peer;
-                            best_i = i;
-                        }
+                if !skip {
+                    let effective_weight = pp.get(RrPeer::effective_weight);
+
+                    pp.set(RrPeer::current_weight, pp.get(RrPeer::current_weight) + effective_weight);
+                    total += effective_weight;
+
+                    if effective_weight < pp.get(RrPeer::weight) {
+                        pp.set(RrPeer::effective_weight, effective_weight + 1);
                     }
 
-                    peer = (*peer).next;
-                    i += 1;
+                    if best == 0 || pp.get(RrPeer::current_weight) > RrPeer::at(mem, best).get(RrPeer::current_weight) {
+                        best = peer;
+                        best_i = i;
+                    }
                 }
 
-                if !best.is_null() {
-                    (*best).current_weight -= total;
-                    break;
-                }
+                peer = pp.get(RrPeer::next);
+                i += 1;
+            }
 
-                hp.hash = hp.hash.wrapping_add(1);
-                hp.tries += 1;
+            if best != 0 {
+                let b = RrPeer::at(mem, best);
+                b.set(RrPeer::current_weight, b.get(RrPeer::current_weight) - total);
+                break;
+            }
 
-                if hp.tries > 20 {
-                    peers_unlock(peers);
-                    return get_round_robin_peer(pc, &mut hp.rrp);
-                }
+            hp.hash = hp.hash.wrapping_add(1);
+            hp.tries += 1;
+
+            if hp.tries > 20 {
+                peers_unlock(mem, peers);
+                return get_round_robin_peer(pc, &mut hp.rrp);
             }
         }
-
-        // found:
-
-        hp.rrp.current = best;
-        peer_ref(peers, best);
-
-        connect_peer(pc, best);
-
-        (*best).conns += 1;
-
-        if now - (*best).checked > (*best).fail_timeout {
-            (*best).checked = now;
-        }
-
-        peers_unlock(peers);
-
-        hp.rrp.set_tried(best_i);
     }
+
+    // found:
+
+    hp.rrp.current = best;
+    peer_ref(mem, best);
+
+    connect_peer(pc, mem, best);
+
+    let b = RrPeer::at(mem, best);
+
+    b.set(RrPeer::conns, b.get(RrPeer::conns) + 1);
+
+    if now - b.get(RrPeer::checked) > b.get(RrPeer::fail_timeout) {
+        b.set(RrPeer::checked, now);
+    }
+
+    peers_unlock(mem, peers);
+
+    hp.rrp.set_tried(best_i);
 
     NGX_OK
 }
@@ -490,4 +515,27 @@ fn hash_handler(cf: &mut Conf, _cmd: &Command, _conf: Option<Rc<dyn Any>>) -> Co
 pub fn upstream_hash_module() -> ModuleDef {
     let commands = vec![cmd_fn!("hash", NGX_HTTP_UPS_CONF | NGX_CONF_TAKE12, ConfLevel::None, hash_handler)];
     http_module_def("ngx_http_upstream_hash_module", HttpModuleDef::default(), commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_host_and_port() {
+        assert_eq!(host_port(b"127.0.0.1:8080"), (&b"127.0.0.1"[..], &b"8080"[..]));
+        assert_eq!(host_port(b"unix:/tmp/sock"), (&b"/tmp/sock"[..], &b""[..]));
+        assert_eq!(host_port(b"example.com"), (&b"example.com"[..], &b""[..]));
+        assert_eq!(host_port(b"[::1]:80"), (&b"[::1]"[..], &b"80"[..]));
+        assert_eq!(host_port(b"a:b"), (&b"a:b"[..], &b""[..]));
+    }
+
+    #[test]
+    fn chash_points() {
+        let points: Vec<ChashPoint> = [10u32, 20, 30].iter().map(|&hash| ChashPoint { hash, server: Vec::new() }).collect();
+        assert_eq!(find_chash_point(&points, 5), 0);
+        assert_eq!(find_chash_point(&points, 20), 1);
+        assert_eq!(find_chash_point(&points, 21), 2);
+        assert_eq!(find_chash_point(&points, 31), 3);
+    }
 }

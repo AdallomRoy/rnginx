@@ -136,15 +136,13 @@ struct File<'a> {
 fn read_file(file: &File, buf: &mut [u8], offset: i64) -> Result<usize, ()> {
     ngx_log_debug!(NGX_LOG_DEBUG_CORE, file.log, "read: {}, {:016x}, {}, {}", file.fd, buf.as_ptr() as usize, buf.len(), offset);
 
-    // SAFETY: buf is a valid writable slice of buf.len() bytes
-    let n = unsafe { libc::pread(file.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset as libc::off_t) };
-
-    if n == -1 {
-        ngx_log_error!(NGX_LOG_CRIT, file.log, Some(ngx_core::os::errno()), "pread() \"{}\" failed", B(file.name));
-        return Err(());
+    match ngx_core::os::pread(file.fd, buf, offset) {
+        Ok(n) => Ok(n),
+        Err(err) => {
+            ngx_log_error!(NGX_LOG_CRIT, file.log, Some(err), "pread() \"{}\" failed", B(file.name));
+            Err(())
+        }
     }
-
-    Ok(n as usize)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -342,9 +340,8 @@ async fn auth_basic_handler(r: R) -> i64 {
         }
     };
 
-    // SAFETY: fd was opened above and is closed once
-    if unsafe { libc::close(fd) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(ngx_core::os::errno()), "close() \"{}\" failed", B(c_str(&user_file)));
+    if let Err(err) = ngx_core::os::close_fd(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, r.connection.log, Some(err), "close() \"{}\" failed", B(c_str(&user_file)));
     }
 
     rc

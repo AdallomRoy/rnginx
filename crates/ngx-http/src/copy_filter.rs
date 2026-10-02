@@ -386,17 +386,19 @@ fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize,
 
         ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "read: {}, {:p}, {}, {}", fd, buf.as_ptr(), size, src.file_pos);
 
-        let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, size, src.file_pos as libc::off_t) };
-        let err = ngx_core::os::errno();
+        let read = ngx_core::os::pread(fd, buf, src.file_pos);
 
         if unaligned && ngx_core::os::directio_on(fd) == -1 {
             ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "{} \"{}\" failed", ngx_core::os::DIRECTIO_ON_N, B(&name));
         }
 
-        if n == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pread() \"{}\" failed", B(&name));
-            return Err(NGX_ERROR);
-        }
+        let n = match read {
+            Ok(n) => n as isize,
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pread() \"{}\" failed", B(&name));
+                return Err(NGX_ERROR);
+            }
+        };
 
         if n as usize != size {
             ngx_log_error!(NGX_LOG_ALERT, log, None, "pread() read only {} of {} from \"{}\"", n, size, B(&name));
