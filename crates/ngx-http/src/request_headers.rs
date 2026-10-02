@@ -93,8 +93,8 @@ fn process_host(r: &R, h: Header) -> i64 {
         }
     }
     r.headers_in.borrow_mut().host = Some(h.clone());
-    let value = h.value.borrow().clone();
-    let (host, port) = match crate::request_rt::validate_host(&value, false) {
+    let valid = crate::request_rt::validate_host(&h.value.borrow(), false);
+    let (host, port) = match valid {
         Ok(v) => v,
         Err(_) => {
             ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent invalid host header");
@@ -114,12 +114,19 @@ fn process_host(r: &R, h: Header) -> i64 {
 }
 
 fn process_connection(r: &R, h: Header) -> i64 {
-    let v = h.value.borrow().clone();
+    let ty = {
+        let v = h.value.borrow();
+        if strcasestr(&v, b"close").is_some() {
+            NGX_HTTP_CONNECTION_CLOSE
+        } else if strcasestr(&v, b"keep-alive").is_some() {
+            NGX_HTTP_CONNECTION_KEEP_ALIVE
+        } else {
+            0
+        }
+    };
     multi(r, h, |i| &mut i.connection);
-    if strcasestr(&v, b"close").is_some() {
-        r.headers_in.borrow_mut().connection_type = NGX_HTTP_CONNECTION_CLOSE;
-    } else if strcasestr(&v, b"keep-alive").is_some() {
-        r.headers_in.borrow_mut().connection_type = NGX_HTTP_CONNECTION_KEEP_ALIVE;
+    if ty != 0 {
+        r.headers_in.borrow_mut().connection_type = ty;
     }
     NGX_OK
 }
@@ -131,8 +138,8 @@ fn process_proxy_connection(r: &R, h: Header) -> i64 {
 }
 
 fn process_user_agent(r: &R, h: Header) -> i64 {
-    let ua = h.value.borrow().clone();
-    multi(r, h, |i| &mut i.user_agent);
+    multi(r, h.clone(), |i| &mut i.user_agent);
+    let ua = h.value.borrow();
     let mut hin = r.headers_in.borrow_mut();
     if let Some(m) = strstr(&ua, b"MSIE ") {
         if m + 7 < ua.len() {
@@ -185,9 +192,9 @@ pub fn process_request_header(r: &R) -> i64 {
         return NGX_ERROR;
     }
     if let Some(cl) = &hin.content_length {
-        let v = cl.value.borrow().clone();
+        let n = atoof(&cl.value.borrow());
         drop(hin);
-        match atoof(&v) {
+        match n {
             Some(n) => r.headers_in.borrow_mut().content_length_n = n,
             None => {
                 ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent invalid \"Content-Length\" header");
@@ -199,10 +206,10 @@ pub fn process_request_header(r: &R) -> i64 {
         drop(hin);
     }
     let hin = r.headers_in.borrow();
-    if let Some(te) = &hin.transfer_encoding {
-        let v = te.value.borrow().clone();
+    if let Some(te) = hin.transfer_encoding.clone() {
         let has_cl = hin.content_length.is_some();
         drop(hin);
+        let v = te.value.borrow();
         if r.http_version.get() < NGX_HTTP_VERSION_11 {
             ngx_log_error!(NGX_LOG_INFO, r.connection.log, None, "client sent HTTP/1.0 request with \"Transfer-Encoding\" header");
             crate::request_rt::set_pending_finalize(r, NGX_HTTP_BAD_REQUEST);
@@ -227,8 +234,8 @@ pub fn process_request_header(r: &R) -> i64 {
         let mut hin = r.headers_in.borrow_mut();
         if hin.connection_type == NGX_HTTP_CONNECTION_KEEP_ALIVE {
             if let Some(ka) = hin.keep_alive.first() {
-                let v = ka.value.borrow().clone();
-                hin.keep_alive_n = atotm(&v).unwrap_or(-1);
+                let n = atotm(&ka.value.borrow()).unwrap_or(-1);
+                hin.keep_alive_n = n;
             }
         }
     }
