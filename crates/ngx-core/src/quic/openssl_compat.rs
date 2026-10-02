@@ -242,7 +242,7 @@ fn ngx_quic_compat_set_encryption_secret(c: &Connection, keys: &mut QuicCompatKe
     // SAFETY: the cipher of the connection
     keys.cipher = unsafe { SSL_CIPHER_get_id(cipher) };
 
-    let mut ciphers = QuicCiphers { c: std::ptr::null(), hp: std::ptr::null(), d: std::ptr::null() };
+    let mut ciphers = QuicCiphers::default();
 
     let key_len = ngx_quic_ciphers(keys.cipher, &mut ciphers);
 

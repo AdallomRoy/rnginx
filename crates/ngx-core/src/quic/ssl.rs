@@ -60,6 +60,9 @@ fn ngx_quic_set_read_secret(c: &Connection, ssl_level: usize, cipher: *const SSL
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic ngx_quic_set_read_secret() level:{}", ssl_level);
 
+    // SAFETY: the current cipher of the connection (SSL_get_current_cipher())
+    let cipher = unsafe { <openssl::ssl::SslCipherRef as foreign_types::ForeignTypeRef>::from_ptr(cipher as *mut _) };
+
     if ngx_quic_keys_set_encryption_secret(&c.log, false, &mut qc.keys.borrow_mut(), level, cipher, rsecret) != NGX_OK {
         qc.error.set(NGX_QUIC_ERR_INTERNAL_ERROR);
     }
@@ -77,6 +80,9 @@ fn ngx_quic_set_write_secret(c: &Connection, ssl_level: usize, cipher: *const SS
     let level = ngx_quic_map_encryption_level(ssl_level);
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "quic ngx_quic_set_write_secret() level:{}", ssl_level);
+
+    // SAFETY: the current cipher of the connection (SSL_get_current_cipher())
+    let cipher = unsafe { <openssl::ssl::SslCipherRef as foreign_types::ForeignTypeRef>::from_ptr(cipher as *mut _) };
 
     if ngx_quic_keys_set_encryption_secret(&c.log, true, &mut qc.keys.borrow_mut(), level, cipher, wsecret) != NGX_OK {
         qc.error.set(NGX_QUIC_ERR_INTERNAL_ERROR);
