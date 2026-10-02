@@ -1544,6 +1544,59 @@ mod tests {
     }
 
     #[test]
+    fn resolvable_and_backup_servers() {
+        let mut host = server("example.com:8080", &[("0.0.0.0", 8080)], 3);
+        host.host = b"example.com".to_vec();
+        host.service = b"http".to_vec();
+        host.sid = vec![b'r'; 32];
+
+        let mut backup = server("b", &[("10.0.0.9", 80), ("10.0.0.10", 80)], 1);
+        backup.backup = true;
+
+        let mut backup_host = server("backup.example.com", &[("0.0.0.0", 80)], 1);
+        backup_host.backup = true;
+        backup_host.host = b"backup.example.com".to_vec();
+
+        let servers = [server("a", &[("10.0.0.1", 80)], 1), host, backup, backup_host];
+
+        // as init_round_robin makes them: one memory, no room left over
+        // the size computed
+        let pm = PeerMem::process(servers_size(b"up", &servers)).unwrap();
+        let name = pm.str(b"up");
+        let peers = new_peers(&pm, name, 1, 1, 1, true, false);
+        make_peers(&pm, &servers, false, peers, 2);
+        let backup = new_peers(&pm, name, 2, 2, 2, false, false);
+        make_peers(&pm, &servers, true, backup, 3);
+        assert!(pm.next.get() <= ALIGN + servers_size(b"up", &servers));
+
+        let mem = &*pm.mem;
+        let ps = RrPeers::at(mem, peers);
+
+        let resolve = ps.get(RrPeers::resolve);
+        let r = RrPeer::at(mem, resolve);
+        assert_eq!(r.get(RrPeer::next), 0);
+        assert_eq!(r.server(), b"example.com:8080");
+        assert_eq!(r.get(RrPeer::weight), 3);
+        assert_eq!(r.sid(), vec![b'r'; 32]);
+        let h = UpstreamHost::at(mem, r.get(RrPeer::host));
+        assert_eq!(h.name(), b"example.com");
+        assert_eq!(h.service(), b"http");
+
+        let first = RrPeer::at(mem, ps.get(RrPeers::peer));
+        assert_eq!(first.name(), b"10.0.0.1:80");
+        assert_eq!(first.get(RrPeer::next), 0);
+        assert_eq!(first.get(RrPeer::host), 0);
+
+        let bs = RrPeers::at(mem, backup);
+        let b1 = RrPeer::at(mem, bs.get(RrPeers::peer));
+        assert_eq!(b1.name(), b"10.0.0.9:80");
+        assert_eq!(RrPeer::at(mem, b1.get(RrPeer::next)).name(), b"10.0.0.10:80");
+        let br = RrPeer::at(mem, bs.get(RrPeers::resolve));
+        assert_eq!(UpstreamHost::at(mem, br.get(RrPeer::host)).name(), b"backup.example.com");
+        assert_eq!(UpstreamHost::at(mem, br.get(RrPeer::host)).service(), b"");
+    }
+
+    #[test]
     fn routes() {
         let mut s = server("a", &[("127.0.0.1", 8081)], 1);
         s.sid = b"r1".to_vec();
