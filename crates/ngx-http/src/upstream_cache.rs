@@ -380,12 +380,22 @@ pub fn cache_background_update_slot<T: UpstreamCacheLocConf>(cf: &mut Conf, cmd:
 /// ngx_http_proxy_main_conf_t, ngx_http_fastcgi_main_conf_t.
 #[derive(Default)]
 pub struct UpstreamCacheMainConf {
-    /// caches: the ngx_http_file_cache_t of *_cache_path
-    pub caches: Vec<Rc<FileCache>>,
+    /// caches: the ngx_http_file_cache_t of *_cache_path (u->caches of the
+    /// requests, shared)
+    pub caches: Rc<Vec<Rc<FileCache>>>,
 }
 
 pub fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
     make_slot(UpstreamCacheMainConf::default())
+}
+
+/// u->caches of a module without caches (shared).
+pub fn no_caches() -> Rc<Vec<Rc<FileCache>>> {
+    thread_local! {
+        static NONE: Rc<Vec<Rc<FileCache>>> = Rc::new(Vec::new());
+    }
+
+    NONE.with(|c| c.clone())
 }
 
 /// "*_cache_path ..." (ngx_http_file_cache_set_slot with cmd->post the
@@ -393,7 +403,7 @@ pub fn create_main_conf(_cf: &mut Conf) -> Rc<dyn Any> {
 pub fn cache_path_slot(cf: &mut Conf, cmd: &Command, conf: Option<Rc<dyn Any>>, tag: &'static str) -> ConfResult {
     let cell = conf_rc::<UpstreamCacheMainConf>(conf.as_ref().expect("conf"));
     let mut caches = std::mem::take(&mut cell.borrow_mut().caches);
-    let rc = file_cache_set_slot(cf, cmd, &mut caches, tag);
+    let rc = file_cache_set_slot(cf, cmd, Rc::make_mut(&mut caches), tag);
     cell.borrow_mut().caches = caches;
     rc
 }
@@ -422,14 +432,14 @@ pub struct UpstreamCache {
 
     /// u->schema, u->uri, u->peer.name, and whether u->peer.sockaddr is a
     /// unix socket: the upstream part of the error log
-    pub schema: RefCell<Vec<u8>>,
+    pub schema: RefCell<Rc<[u8]>>,
     pub uri: RefCell<Vec<u8>>,
     pub peer_name: RefCell<Option<Vec<u8>>>,
     pub peer_unix: Cell<bool>,
 }
 
 /// ngx_http_upstream_create: r->upstream anew, r->cache NULL.
-pub fn upstream_create(r: &R, conf: UpstreamCacheConf, caches: Rc<Vec<Rc<FileCache>>>, module: &'static str, buffer_size: usize) -> Rc<UpstreamCache> {
+pub fn upstream_create(r: &R, conf: UpstreamCacheConf, caches: Rc<Vec<Rc<FileCache>>>, module: &'static str, buffer_size: usize, schema: Rc<[u8]>) -> Rc<UpstreamCache> {
     let u = Rc::new(UpstreamCache {
         conf,
         caches,
@@ -438,7 +448,7 @@ pub fn upstream_create(r: &R, conf: UpstreamCacheConf, caches: Rc<Vec<Rc<FileCac
         cache_status: Cell::new(0),
         cacheable: Cell::new(false),
         method: RefCell::new(None),
-        schema: RefCell::new(Vec::new()),
+        schema: RefCell::new(schema),
         uri: RefCell::new(Vec::new()),
         peer_name: RefCell::new(None),
         peer_unix: Cell::new(false),

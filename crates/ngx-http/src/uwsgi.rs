@@ -294,7 +294,7 @@ async fn uwsgi_handler(r: R) -> i64 {
     let caches = {
         let uwmcf = r.main_conf::<UpstreamCacheMainConf>(ctx_index());
         let caches = uwmcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     let mut u = Upstream::create(&r, conf, caches, b"uwsgi://");
@@ -398,9 +398,8 @@ impl UpstreamModule for UwsgiModule {
         let mut bufs = Chain::new();
         bufs.push_back(b);
 
-        if !r.request_body_no_buffering.get() && *uwcf.pass_request_body {
-            bufs.extend(crate::upstream_rt::request_body_bufs(r));
-        }
+        // the buffers of the body follow, linked
+        u.request_body_link = !r.request_body_no_buffering.get() && *uwcf.pass_request_body;
 
         u.request_bufs = bufs;
 
@@ -470,13 +469,18 @@ fn packet_header(modifier1: i64, len: usize, modifier2: i64) -> [u8; 4] {
 
 /// A param as the packet has it: the 16-bit little-endian length and the
 /// key, the 16-bit little-endian length and the value.
+#[cfg(test)]
 fn push_param(b: &mut Vec<u8>, key: &[u8], value: &[u8]) {
-    b.push((key.len() & 0xff) as u8);
-    b.push(((key.len() >> 8) & 0xff) as u8);
+    push_len(b, key.len());
     b.extend_from_slice(key);
-    b.push((value.len() & 0xff) as u8);
-    b.push(((value.len() >> 8) & 0xff) as u8);
+    push_len(b, value.len());
     b.extend_from_slice(value);
+}
+
+/// The length of a name or a value of a param: 2 bytes, little endian.
+fn push_len(b: &mut Vec<u8>, len: usize) {
+    b.push((len & 0xff) as u8);
+    b.push(((len >> 8) & 0xff) as u8);
 }
 
 /// ngx_http_uwsgi_create_request: the packet (u->request_bufs without the
@@ -489,46 +493,39 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     let params = if cacheable { uwcf.params_cache.as_ref() } else { uwcf.params.as_ref() };
 
     let params = match params {
-        Some(p) => p.clone(),
+        Some(p) => p,
         None => return Err(()),
     };
 
     let mut len: usize = 0;
     let mut params_len: usize = 0;
 
-    // the lengths of the params
+    // the lengths of the params (e.flushed: the values are evaluated once,
+    // the values pass reads them)
 
     crate::script::script_flush_no_cacheable_variables(r, Some(&params.flushes));
 
-    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(params.params.len());
-
     for p in params.params.iter() {
-        let value = crate::proxy::run_codes(r, &p.codes);
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        if p.skip_empty && value.is_empty() {
-            values.push(None);
+        if p.skip_empty && val_len == 0 {
             continue;
         }
 
-        params_len += 2 + p.key.len() + 2 + value.len();
-
-        values.push(Some(value));
+        params_len += 2 + p.key.len() + 2 + val_len;
     }
 
     len += params_len;
 
-    let header_params = if *uwcf.pass_request_headers {
-        let headers = r.headers_in.borrow().headers.clone();
+    let pass_request_headers = *uwcf.pass_request_headers;
+    let hides = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        let hidden = |lowcase_key: &[u8]| params.hides(lowcase_key);
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
 
-        crate::upstream_rt::header_params(&headers, &hidden)
-    } else {
-        Vec::new()
-    };
-
-    for (key, value) in header_params.iter() {
-        len += 2 + key.len() + 2 + value.len();
+        crate::upstream_rt::for_each_header_param(&hin.headers, &hides, |_, key_len, val_len| {
+            len += 2 + key_len + 2 + val_len;
+        });
     }
 
     let uwsgi_string = uwcf.uwsgi_string.get();
@@ -547,21 +544,45 @@ fn create_request(r: &R, uwcf: &NgxHttpUwsgiLocConf, cacheable: bool) -> Result<
     // the values of the params (the lengths were those of these values:
     // "uwsgi request length mismatch" cannot happen)
 
-    for (p, value) in params.params.iter().zip(values.iter()) {
-        let value = match value {
-            Some(v) => v,
-            None => continue,
-        };
+    for p in params.params.iter() {
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        push_param(&mut b, &p.key, value);
+        if p.skip_empty && val_len == 0 {
+            continue;
+        }
 
-        http_debug!(r, "uwsgi param: \"{}: {}\"", B(&p.key), B(value));
+        push_len(&mut b, p.key.len());
+        b.extend_from_slice(&p.key);
+        push_len(&mut b, val_len);
+
+        let value = b.len();
+
+        crate::proxy::append_codes(r, &p.codes, &mut b);
+
+        http_debug!(r, "uwsgi param: \"{}: {}\"", B(&p.key), B(&b[value..]));
     }
 
-    for (key, value) in header_params.iter() {
-        push_param(&mut b, key, value);
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
+        let headers = &hin.headers;
 
-        http_debug!(r, "uwsgi param: \"{}: {}\"", B(key), B(value));
+        crate::upstream_rt::for_each_header_param(headers, &hides, |i, key_len, val_len| {
+            push_len(&mut b, key_len);
+
+            let key = b.len();
+
+            crate::upstream_rt::push_header_param_key(&mut b, headers, i);
+
+            let key_end = b.len();
+
+            push_len(&mut b, val_len);
+
+            let value = b.len();
+
+            crate::upstream_rt::push_header_param_value(&mut b, headers, i);
+
+            http_debug!(r, "uwsgi param: \"{}: {}\"", B(&b[key..key_end]), B(&b[value..]));
+        });
     }
 
     b.extend_from_slice(uwsgi_string);

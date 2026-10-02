@@ -237,7 +237,7 @@ async fn scgi_handler(r: R) -> i64 {
     let caches = {
         let smcf = r.main_conf::<UpstreamCacheMainConf>(ctx_index());
         let caches = smcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     let mut u = Upstream::create(&r, conf, caches, b"scgi://");
@@ -313,9 +313,8 @@ impl UpstreamModule for ScgiModule {
         let mut bufs = Chain::new();
         bufs.push_back(Buf::from_vec(packet));
 
-        if !r.request_body_no_buffering.get() && *scf.pass_request_body {
-            bufs.extend(crate::upstream_rt::request_body_bufs(r));
-        }
+        // the buffers of the body follow, linked
+        u.request_body_link = !r.request_body_no_buffering.get() && *scf.pass_request_body;
 
         u.request_bufs = bufs;
 
@@ -394,39 +393,34 @@ fn create_request(r: &R, scf: &NgxHttpScgiLocConf, cacheable: bool) -> Result<Ve
     let params = if cacheable { scf.params_cache.as_ref() } else { scf.params.as_ref() };
 
     let params = match params {
-        Some(p) => p.clone(),
+        Some(p) => p,
         None => return Err(()),
     };
 
-    // the lengths of the params
+    // the lengths of the params (e.flushed: the values are evaluated once,
+    // the values pass reads them)
 
     crate::script::script_flush_no_cacheable_variables(r, Some(&params.flushes));
 
-    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(params.params.len());
-
     for p in params.params.iter() {
-        let value = crate::proxy::run_codes(r, &p.codes);
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        if p.skip_empty && value.is_empty() {
-            values.push(None);
+        if p.skip_empty && val_len == 0 {
             continue;
         }
 
-        len += p.key.len() + 1 + value.len() + 1;
-
-        values.push(Some(value));
+        len += p.key.len() + 1 + val_len + 1;
     }
 
-    let header_params = if *scf.pass_request_headers {
-        let headers = r.headers_in.borrow().headers.clone();
+    let pass_request_headers = *scf.pass_request_headers;
+    let hides = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        crate::upstream_rt::header_params(&headers, &|lowcase_key: &[u8]| params.hides(lowcase_key))
-    } else {
-        Vec::new()
-    };
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
 
-    for (key, value) in header_params.iter() {
-        len += key.len() + 1 + value.len() + 1;
+        crate::upstream_rt::for_each_header_param(&hin.headers, &hides, |_, key_len, val_len| {
+            len += key_len + 1 + val_len + 1;
+        });
     }
 
     // netstring: "length:" + packet + ","
@@ -441,27 +435,44 @@ fn create_request(r: &R, scf: &NgxHttpScgiLocConf, cacheable: bool) -> Result<Ve
     // the values of the params (the lengths were those of these values:
     // "scgi request length mismatch" cannot happen)
 
-    for (p, value) in params.params.iter().zip(values.iter()) {
-        let value = match value {
-            Some(v) => v,
-            None => continue,
-        };
+    for p in params.params.iter() {
+        if p.skip_empty && crate::proxy::codes_len(r, &p.codes) == 0 {
+            continue;
+        }
 
         b.extend_from_slice(&p.key);
         b.push(0);
-        b.extend_from_slice(value);
-        b.push(0);
 
-        http_debug!(r, "scgi param: \"{}: {}\"", B(&p.key), B(value));
+        let value = b.len();
+
+        crate::proxy::append_codes(r, &p.codes, &mut b);
+
+        http_debug!(r, "scgi param: \"{}: {}\"", B(&p.key), B(&b[value..]));
+
+        b.push(0);
     }
 
-    for (key, value) in header_params.iter() {
-        b.extend_from_slice(key);
-        b.push(0);
-        b.extend_from_slice(value);
-        b.push(0);
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
+        let headers = &hin.headers;
 
-        http_debug!(r, "scgi param: \"{}: {}\"", B(key), B(value));
+        crate::upstream_rt::for_each_header_param(headers, &hides, |i, _, _| {
+            let key = b.len();
+
+            crate::upstream_rt::push_header_param_key(&mut b, headers, i);
+
+            let key_end = b.len();
+
+            b.push(0);
+
+            let value = b.len();
+
+            crate::upstream_rt::push_header_param_value(&mut b, headers, i);
+
+            http_debug!(r, "scgi param: \"{}: {}\"", B(&b[key..key_end]), B(&b[value..]));
+
+            b.push(0);
+        });
     }
 
     b.push(b',');

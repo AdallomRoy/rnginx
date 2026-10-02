@@ -559,7 +559,7 @@ async fn fastcgi_handler(r: R) -> i64 {
     let caches = {
         let fmcf = r.main_conf::<UpstreamCacheMainConf>(ctx_index());
         let caches = fmcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     let mut u = Upstream::create(&r, conf, caches, b"fastcgi://");
@@ -1046,7 +1046,7 @@ impl UpstreamModule for FastcgiModule {
     /// buffer to p->in, as its shadows; the end of the request, and with
     /// fastcgi_keep_conn, p->length for the rest of the record.
     fn pipe_input_filter(&mut self, r: &R, u: &mut Upstream, p: &mut EventPipe, buf: RawBuf) -> i64 {
-        if buf.data.is_empty() {
+        if buf.is_empty() {
             p.release_raw(buf.slot);
             return NGX_OK;
         }
@@ -1060,7 +1060,7 @@ impl UpstreamModule for FastcgiModule {
             return NGX_OK;
         }
 
-        let data = &buf.data;
+        let data = buf.bytes();
         let last = data.len();
 
         // f->pos, and the last shadow made (b)
@@ -1327,7 +1327,8 @@ fn push_nv_len(out: &mut Vec<u8>, len: usize) {
 }
 
 /// A param: the length of the name, the length of the value, the name, the
-/// value.
+/// value (create_request writes the value in place).
+#[cfg(test)]
 fn push_param(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     push_nv_len(out, key.len());
     push_nv_len(out, value.len());
@@ -1428,41 +1429,36 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     let params = if cacheable { flcf.params_cache.as_ref() } else { flcf.params.as_ref() };
 
     let params = match params {
-        Some(p) => p.clone(),
+        Some(p) => p,
         None => return Err(()),
     };
 
     let mut len: usize = 0;
 
-    // the lengths of the params
+    // the lengths of the params (e.flushed: the values are evaluated once,
+    // the values pass reads them)
 
     crate::script::script_flush_no_cacheable_variables(r, Some(&params.flushes));
 
-    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(params.params.len());
-
     for p in params.params.iter() {
-        let value = crate::proxy::run_codes(r, &p.codes);
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        if p.skip_empty && value.is_empty() {
-            values.push(None);
+        if p.skip_empty && val_len == 0 {
             continue;
         }
 
-        len += nv_len_size(p.key.len()) + p.key.len() + nv_len_size(value.len()) + value.len();
-
-        values.push(Some(value));
+        len += nv_len_size(p.key.len()) + p.key.len() + nv_len_size(val_len) + val_len;
     }
 
-    let header_params = if *flcf.pass_request_headers {
-        let headers = r.headers_in.borrow().headers.clone();
+    let pass_request_headers = *flcf.pass_request_headers;
+    let hides = |lowcase_key: &[u8]| params.hides(lowcase_key);
 
-        crate::upstream_rt::header_params(&headers, &|lowcase_key: &[u8]| params.hides(lowcase_key))
-    } else {
-        Vec::new()
-    };
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
 
-    for (key, value) in header_params.iter() {
-        len += nv_len_size(key.len()) + key.len() + nv_len_size(value.len()) + value.len();
+        crate::upstream_rt::for_each_header_param(&hin.headers, &hides, |_, key_len, val_len| {
+            len += nv_len_size(key_len) + key_len + nv_len_size(val_len) + val_len;
+        });
     }
 
     if len > 65535 {
@@ -1484,21 +1480,42 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     // the values of the params (the lengths were those of these values:
     // "fastcgi request length mismatch" cannot happen)
 
-    for (p, value) in params.params.iter().zip(values.iter()) {
-        let value = match value {
-            Some(v) => v,
-            None => continue,
-        };
+    for p in params.params.iter() {
+        let val_len = crate::proxy::codes_len(r, &p.codes);
 
-        push_param(&mut b, &p.key, value);
+        if p.skip_empty && val_len == 0 {
+            continue;
+        }
 
-        http_debug!(r, "fastcgi param: \"{}: {}\"", B(&p.key), B(value));
+        push_nv_len(&mut b, p.key.len());
+        push_nv_len(&mut b, val_len);
+        b.extend_from_slice(&p.key);
+
+        let value = b.len();
+
+        crate::proxy::append_codes(r, &p.codes, &mut b);
+
+        http_debug!(r, "fastcgi param: \"{}: {}\"", B(&p.key), B(&b[value..]));
     }
 
-    for (key, value) in header_params.iter() {
-        push_param(&mut b, key, value);
+    if pass_request_headers {
+        let hin = r.headers_in.borrow();
+        let headers = &hin.headers;
 
-        http_debug!(r, "fastcgi param: \"{}: {}\"", B(key), B(value));
+        crate::upstream_rt::for_each_header_param(headers, &hides, |i, key_len, val_len| {
+            push_nv_len(&mut b, key_len);
+            push_nv_len(&mut b, val_len);
+
+            let key = b.len();
+
+            crate::upstream_rt::push_header_param_key(&mut b, headers, i);
+
+            let value = b.len();
+
+            crate::upstream_rt::push_header_param_value(&mut b, headers, i);
+
+            http_debug!(r, "fastcgi param: \"{}: {}\"", B(&b[key..value]), B(&b[value..]));
+        });
     }
 
     b.resize(b.len() + padding, 0);
@@ -1518,13 +1535,15 @@ fn create_request(r: &R, flcf: &NgxHttpFastcgiLocConf, cacheable: bool) -> Resul
     let mut cl = b;
 
     if *flcf.pass_request_body {
-        for body in crate::upstream_rt::request_body_bufs(r).iter() {
-            if body.special_buf() {
-                continue;
-            }
+        crate::upstream_rt::with_request_body_bufs(r, |bodies| {
+            for body in bodies {
+                if body.special_buf() {
+                    continue;
+                }
 
-            stdin_records(&mut bufs, &mut cl, body);
-        }
+                stdin_records(&mut bufs, &mut cl, body);
+            }
+        });
     }
 
     record_header(&mut cl, NGX_HTTP_FASTCGI_STDIN, 0, 0);

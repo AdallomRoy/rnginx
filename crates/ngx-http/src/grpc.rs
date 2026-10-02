@@ -150,8 +150,9 @@ pub struct NgxHttpGrpcLocConf {
     pub headers: Option<Rc<GrpcHeaders>>,
     pub headers_source: Val<Option<Rc<Vec<(Vec<u8>, Vec<u8>)>>>>,
 
-    /// glcf->host: the :authority of grpc_pass without variables
-    pub host: Vec<u8>,
+    /// glcf->host: the :authority of grpc_pass without variables (shared
+    /// with the requests)
+    pub host: Rc<[u8]>,
     /// glcf->host_value: the value of "grpc_set_header Host"
     pub host_value: Option<Rc<ComplexValue>>,
 
@@ -224,7 +225,7 @@ fn new_loc_conf() -> NgxHttpGrpcLocConf {
         cache: UpstreamCacheConf::default(),
         headers: None,
         headers_source: Val::unset(),
-        host: Vec::new(),
+        host: Rc::from(&b""[..]),
         host_value: None,
         grpc_values: None,
         upstream_ssl: UpstreamSslConf::default(),
@@ -250,7 +251,7 @@ fn new_loc_conf() -> NgxHttpGrpcLocConf {
 struct GrpcModule {
     lcf: Rc<RefCell<NgxHttpGrpcLocConf>>,
     ctx: H2Ctx,
-    host: Vec<u8>,
+    host: Rc<[u8]>,
 }
 
 /// ngx_http_grpc_handler
@@ -269,16 +270,12 @@ async fn grpc_handler(r: R) -> i64 {
 
     // ngx_http_upstream_create
 
-    let mut u = Upstream::create(&r, conf, Rc::new(Vec::new()), b"grpc://");
+    let mut u = Upstream::create(&r, conf, crate::upstream_cache::no_caches(), b"grpc://");
 
     let ctx = H2Ctx::new("grpc", GRPC_TAG);
 
-    let mut authority_host = Vec::new();
-
-    match grpc_values {
+    let authority_host: Rc<[u8]> = match grpc_values {
         None => {
-            authority_host = host;
-
             u.ssl = ssl;
 
             if ssl {
@@ -286,14 +283,20 @@ async fn grpc_handler(r: R) -> i64 {
             } else {
                 u.set_schema(b"grpc://");
             }
+
+            host
         }
 
         Some(codes) => {
+            let mut authority_host = Vec::new();
+
             if grpc_eval(&r, &mut authority_host, &codes, &mut u) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
+
+            authority_host.into()
         }
-    }
+    };
 
     r.request_body_no_buffering.set(true);
 
@@ -2183,7 +2186,7 @@ fn grpc_pass(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
 
     glcf.upstream = Some(uscf);
 
-    glcf.host = authority(&u);
+    glcf.host = authority(&u).into();
 
     Ok(())
 }

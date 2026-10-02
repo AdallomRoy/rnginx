@@ -23,18 +23,46 @@ use ngx_core::{ngx_log_debug, ngx_log_error};
 
 /// A raw buffer of the pipe: what was read into it, its size and number.
 pub struct RawBuf {
-    /// buf->pos .. buf->last
+    /// buf->start .. buf->last, the data from `pos`
     pub data: Vec<u8>,
-    /// buf->end - buf->start
+    /// buf->pos: u->buffer has the response header before the body
+    pub pos: usize,
+    /// buf->end - buf->pos: the room for data
     pub size: usize,
     /// which raw buffer (0: u->buffer)
     pub slot: usize,
 }
 
 impl RawBuf {
+    /// buf->pos .. buf->last
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[self.pos..]
+    }
+
+    /// buf->last - buf->pos
+    pub fn len(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// buf->last == buf->end
     pub fn full(&self) -> bool {
-        self.data.len() >= self.size
+        self.len() >= self.size
+    }
+
+    /// The room left (buf->end - buf->last).
+    pub fn room(&self) -> usize {
+        self.size.saturating_sub(self.len())
+    }
+
+    /// The shadow of all the data of the buffer, owning its memory.
+    pub fn into_buf(self) -> Buf {
+        let mut b = Buf::from_vec(self.data);
+        b.pos = self.pos;
+        b
     }
 }
 
@@ -100,6 +128,17 @@ impl PipeTempFile {
     }
 }
 
+/// What the pipe keeps of a raw buffer.
+#[derive(Clone, Copy)]
+struct RawSlot {
+    /// its size
+    size: usize,
+    /// its shadows that are in p->in or being sent
+    refs: usize,
+    /// it is in free_raw
+    in_free: bool,
+}
+
 /// ngx_event_pipe_t
 pub struct EventPipe {
     // the configuration of the upstream
@@ -137,12 +176,8 @@ pub struct EventPipe {
     free_raw: VecDeque<RawBuf>,
     /// p->allocated
     allocated: usize,
-    /// the shadows of each raw buffer that are in p->in or being sent
-    refs: Vec<usize>,
-    /// the size of each raw buffer
-    sizes: Vec<usize>,
-    /// raw buffers that are in free_raw
-    in_free: Vec<bool>,
+    /// the raw buffers, by number
+    slots: Vec<RawSlot>,
     pub temp_file: PipeTempFile,
     file: Option<Rc<BufFile>>,
     /// p->preread_bufs: u->buffer with the body read with the header
@@ -152,9 +187,16 @@ pub struct EventPipe {
 
 impl EventPipe {
     /// The pipe of ngx_http_upstream_send_response, with u->buffer as its
-    /// first raw buffer (`preread`, the body read with the header, in a
-    /// buffer of `preread_size` bytes).
-    pub fn new(bufs: Bufs, busy_size: usize, temp_file: PipeTempFile, preread: Vec<u8>, preread_room: usize, log: &Log) -> EventPipe {
+    /// first raw buffer: `buffer`, the body read with the header from
+    /// `pos`, with room for `preread_room` bytes of it.
+    pub fn new(bufs: Bufs, busy_size: usize, temp_file: PipeTempFile, buffer: Vec<u8>, pos: usize, preread_room: usize, log: &Log) -> EventPipe {
+        let pos = pos.min(buffer.len());
+        let preread = buffer.len() - pos;
+
+        let mut slots = Vec::with_capacity(bufs.num + 1);
+
+        slots.push(RawSlot { size: preread_room.max(preread).max(1), refs: 0, in_free: false });
+
         let mut p = EventPipe {
             bufs,
             busy_size,
@@ -171,14 +213,12 @@ impl EventPipe {
             downstream_done: false,
             downstream_error: false,
             read_length: 0,
-            preread_size: preread.len() as i64,
+            preread_size: preread as i64,
             in_bufs: Chain::new(),
             out_bufs: Chain::new(),
             free_raw: VecDeque::new(),
             allocated: 0,
-            refs: vec![0],
-            sizes: vec![preread_room.max(preread.len()).max(1)],
-            in_free: vec![false],
+            slots,
             temp_file,
             file: None,
             preread: None,
@@ -186,7 +226,7 @@ impl EventPipe {
         };
 
         // p->preread_bufs: u->buffer as a raw buffer being read into
-        p.preread = Some(RawBuf { data: preread, size: p.sizes[0], slot: 0 });
+        p.preread = Some(RawBuf { data: buffer, pos, size: p.slots[0].size, slot: 0 });
 
         p
     }
@@ -204,37 +244,38 @@ impl EventPipe {
     /// ngx_event_pipe_add_free_buf: a raw buffer free again goes to
     /// p->free_raw_bufs, first if the first one is empty, else after it.
     fn add_free_buf(&mut self, slot: usize) {
-        let size = self.sizes[slot];
+        let size = self.slots[slot].size;
 
-        let b = RawBuf { data: Vec::with_capacity(size), size, slot };
+        let b = RawBuf { data: Vec::with_capacity(size), pos: 0, size, slot };
 
-        self.in_free[slot] = true;
+        self.slots[slot].in_free = true;
 
         match self.free_raw.front() {
             None => self.free_raw.push_back(b),
-            Some(first) if first.data.is_empty() => self.free_raw.push_front(b),
+            Some(first) if first.is_empty() => self.free_raw.push_front(b),
             Some(_) => self.free_raw.insert(1, b),
         }
     }
 
     /// A shadow of a raw buffer is sent or written to the temporary file.
     pub fn release(&mut self, slot: usize) {
-        if slot >= self.refs.len() {
-            return;
+        let s = match self.slots.get_mut(slot) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if s.refs > 0 {
+            s.refs -= 1;
         }
 
-        if self.refs[slot] > 0 {
-            self.refs[slot] -= 1;
-        }
-
-        if self.refs[slot] == 0 && !self.in_free[slot] {
+        if s.refs == 0 && !s.in_free {
             self.add_free_buf(slot);
         }
     }
 
     /// A raw buffer the input filter made no shadow of.
     pub fn release_raw(&mut self, slot: usize) {
-        if slot < self.refs.len() && self.refs[slot] == 0 && !self.in_free[slot] {
+        if self.slots.get(slot).is_some_and(|s| s.refs == 0 && !s.in_free) {
             self.add_free_buf(slot);
         }
     }
@@ -244,8 +285,8 @@ impl EventPipe {
         b.num = slot as i32;
         b.recycled = true;
 
-        if slot < self.refs.len() {
-            self.refs[slot] += 1;
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.refs += 1;
         }
 
         self.in_bufs.push_back(b);
@@ -263,7 +304,7 @@ impl EventPipe {
     /// the temporary file first, if allowed).
     pub fn raw_buf(&mut self, downstream_ready: bool) -> Result<Option<RawBuf>, ()> {
         if let Some(b) = self.free_raw.pop_front() {
-            self.in_free[b.slot] = false;
+            self.slots[b.slot].in_free = false;
             return Ok(Some(b));
         }
 
@@ -271,13 +312,12 @@ impl EventPipe {
             // allocate a new buf if it's still allowed
             self.allocated += 1;
 
-            let slot = self.sizes.len();
+            let slot = self.slots.len();
+            let size = self.bufs.size.max(1);
 
-            self.sizes.push(self.bufs.size.max(1));
-            self.refs.push(0);
-            self.in_free.push(false);
+            self.slots.push(RawSlot { size, refs: 0, in_free: false });
 
-            return Ok(Some(RawBuf { data: Vec::with_capacity(self.bufs.size), size: self.bufs.size.max(1), slot }));
+            return Ok(Some(RawBuf { data: Vec::with_capacity(self.bufs.size), pos: 0, size, slot }));
         }
 
         if !self.cacheable && !self.downstream_error && downstream_ready {
@@ -299,7 +339,7 @@ impl EventPipe {
             }
 
             if let Some(b) = self.free_raw.pop_front() {
-                self.in_free[b.slot] = false;
+                self.slots[b.slot].in_free = false;
                 return Ok(Some(b));
             }
 
@@ -315,7 +355,7 @@ impl EventPipe {
     /// A raw buffer read into but not full goes back first to
     /// p->free_raw_bufs.
     pub fn put_back(&mut self, b: RawBuf) {
-        self.in_free[b.slot] = true;
+        self.slots[b.slot].in_free = true;
         self.free_raw.push_front(b);
     }
 
@@ -327,7 +367,7 @@ impl EventPipe {
         let take = if self.upstream_eof || self.upstream_error {
             true
         } else {
-            self.length != -1 && first.data.len() as i64 >= self.length
+            self.length != -1 && first.len() as i64 >= self.length
         };
 
         if !take {
@@ -335,7 +375,7 @@ impl EventPipe {
         }
 
         let b = self.free_raw.pop_front()?;
-        self.in_free[b.slot] = false;
+        self.slots[b.slot].in_free = false;
         Some(b)
     }
 
@@ -466,7 +506,7 @@ impl EventPipe {
             };
 
             if recycled && prev_slot != Some(slot) {
-                let size = self.sizes.get(slot as usize).copied().unwrap_or(0);
+                let size = self.slots.get(slot as usize).map(|s| s.size).unwrap_or(0);
 
                 if bsize + size > self.busy_size && !batch.is_empty() {
                     break;
@@ -504,7 +544,7 @@ pub fn batch_slots(batch: &Chain) -> Vec<i32> {
 /// ngx_event_pipe_copy_input_filter: the raw buffer as it is (up to
 /// p->length), its shadow in p->in.
 pub fn copy_input_filter(p: &mut EventPipe, buf: RawBuf) -> i64 {
-    if buf.data.is_empty() {
+    if buf.is_empty() {
         p.release_raw(buf.slot);
         return NGX_OK;
     }
@@ -525,25 +565,24 @@ pub fn copy_input_filter(p: &mut EventPipe, buf: RawBuf) -> i64 {
     }
 
     let slot = buf.slot;
-    let mut data = buf.data;
+    let len = buf.len();
+    let mut buf = buf;
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, p.log, "input buf #{}", slot);
 
     if p.length != -1 {
-        if data.len() as i64 > p.length {
+        if len as i64 > p.length {
             ngx_log_error!(NGX_LOG_WARN, p.log, None, "upstream sent more data than specified in \"Content-Length\" header");
 
-            data.truncate(p.length as usize);
+            buf.data.truncate(buf.pos + p.length as usize);
             p.length = 0;
             p.upstream_done = true;
         } else {
-            p.length -= data.len() as i64;
+            p.length -= len as i64;
         }
     }
 
-    let b = Buf::from_vec(data);
-
-    p.push_in(b, slot);
+    p.push_in(buf.into_buf(), slot);
 
     NGX_OK
 }
@@ -559,7 +598,7 @@ mod tests {
     fn pipe(num: usize, size: usize, preread: &[u8], room: usize) -> EventPipe {
         let path = Rc::new(ngx_core::conf::PathConf::new(std::env::temp_dir().to_str().unwrap().as_bytes().to_vec(), [0, 0, 0]));
         let tf = ngx_core::file::TempFile::new(path, &log());
-        let mut p = EventPipe::new(Bufs { num, size }, size * 2, PipeTempFile::Plain(tf), preread.to_vec(), room, &log());
+        let mut p = EventPipe::new(Bufs { num, size }, size * 2, PipeTempFile::Plain(tf), preread.to_vec(), 0, room, &log());
         p.max_temp_file_size = 1 << 20;
         p.temp_file_write_size = (size * 2) as i64;
         p
@@ -570,9 +609,9 @@ mod tests {
         let mut p = pipe(2, 4, b"", 8);
         p.length = 5;
 
-        copy_input_filter(&mut p, RawBuf { data: b"abcd".to_vec(), size: 4, slot: 0 });
+        copy_input_filter(&mut p, RawBuf { data: b"abcd".to_vec(), pos: 0, size: 4, slot: 0 });
         assert_eq!(p.length, 1);
-        copy_input_filter(&mut p, RawBuf { data: b"efgh".to_vec(), size: 4, slot: 0 });
+        copy_input_filter(&mut p, RawBuf { data: b"efgh".to_vec(), pos: 0, size: 4, slot: 0 });
         assert!(p.upstream_done);
         let data: Vec<u8> = p.in_bufs.iter().flat_map(|b| match &b.data {
             BufData::Memory(v) => v[b.pos..b.last].to_vec(),
@@ -593,7 +632,7 @@ mod tests {
         // all allocated, the downstream ready: the upstream waits
         assert!(p.raw_buf(true).unwrap().is_none());
 
-        copy_input_filter(&mut p, RawBuf { data: b"1234".to_vec(), size: 4, slot: a.slot });
+        copy_input_filter(&mut p, RawBuf { data: b"1234".to_vec(), pos: 0, size: 4, slot: a.slot });
 
         // the shadow sent: the raw buffer is free again
         let batch = p.write_batch().unwrap();
@@ -609,7 +648,7 @@ mod tests {
         let _ = p.take_preread();
 
         let a = p.raw_buf(false).unwrap().unwrap();
-        copy_input_filter(&mut p, RawBuf { data: b"1234".to_vec(), size: 4, slot: a.slot });
+        copy_input_filter(&mut p, RawBuf { data: b"1234".to_vec(), pos: 0, size: 4, slot: a.slot });
 
         // no more buffers, the downstream busy: p->in goes to the file
         let b = p.raw_buf(false).unwrap().unwrap();
@@ -619,10 +658,35 @@ mod tests {
         assert_eq!(p.temp_file.offset(), 4);
 
         // contiguous writes extend the file buffer
-        copy_input_filter(&mut p, RawBuf { data: b"5678".to_vec(), size: 4, slot: b.slot });
+        copy_input_filter(&mut p, RawBuf { data: b"5678".to_vec(), pos: 0, size: 4, slot: b.slot });
         let _ = p.raw_buf(false).unwrap().unwrap();
         assert_eq!(p.out_bufs.len(), 1);
         assert_eq!(p.out_bufs[0].file_last, 8);
+    }
+
+    #[test]
+    fn preread_after_header() {
+        // u->buffer: the header, then the body read with it
+        let path = Rc::new(ngx_core::conf::PathConf::new(std::env::temp_dir().to_str().unwrap().as_bytes().to_vec(), [0, 0, 0]));
+        let tf = ngx_core::file::TempFile::new(path, &log());
+        let mut p = EventPipe::new(Bufs { num: 2, size: 4 }, 8, PipeTempFile::Plain(tf), b"HDR\r\nbody".to_vec(), 5, 6, &log());
+
+        assert_eq!(p.preread_size, 4);
+
+        let raw = p.take_preread().unwrap();
+        assert_eq!(raw.bytes(), b"body");
+        assert_eq!(raw.room(), 2);
+        assert!(!raw.full());
+
+        p.length = 3;
+        copy_input_filter(&mut p, raw);
+
+        let b = &p.in_bufs[0];
+        match &b.data {
+            BufData::Memory(v) => assert_eq!(&v[b.pos..b.last], b"bod"),
+            _ => panic!("memory"),
+        }
+        assert!(p.upstream_done);
     }
 
     #[test]

@@ -57,31 +57,34 @@ pub async fn proxy_v2_handler(r: R) -> i64 {
     let caches = {
         let pmcf = r.main_conf::<crate::upstream_cache::UpstreamCacheMainConf>(crate::proxy::ctx_index());
         let caches = pmcf.borrow().caches.clone();
-        Rc::new(caches)
+        caches
     };
 
     // ngx_http_upstream_create
 
     let mut u = Upstream::create(&r, conf, caches, b"");
 
-    let pctx = r.set_ctx(crate::proxy::ctx_index(), ProxyCtx::default());
-
     let proxy_values = lcf.borrow().proxy_values.clone();
 
-    match proxy_values {
+    let pctx = match proxy_values {
         None => {
             let plcf = lcf.borrow();
-            pctx.borrow_mut().vars = plcf.vars.clone();
+            let pctx = r.set_ctx(crate::proxy::ctx_index(), ProxyCtx::new(plcf.vars.clone()));
             u.set_schema(&plcf.vars.schema);
             u.ssl = plcf.ssl;
+            pctx
         }
 
         Some(codes) => {
+            let pctx = r.set_ctx(crate::proxy::ctx_index(), ProxyCtx::new(crate::proxy::no_vars()));
+
             if crate::proxy::proxy_eval(&r, &pctx, &codes, &mut u) != NGX_OK {
                 return NGX_HTTP_INTERNAL_SERVER_ERROR;
             }
+
+            pctx
         }
-    }
+    };
 
     // NGX_HTTP_V2_ALPN_PROTO
     u.ssl_alpn = b"\x02h2".to_vec();
@@ -390,7 +393,7 @@ impl UpstreamModule for ProxyV2Module {
     /// ngx_http_proxy_v2_body_filter: the DATA payloads of a raw buffer to
     /// p->in
     fn pipe_input_filter(&mut self, r: &R, u: &mut Upstream, p: &mut EventPipe, raw: RawBuf) -> i64 {
-        if raw.data.is_empty() {
+        if raw.is_empty() {
             p.release_raw(raw.slot);
             return NGX_OK;
         }
@@ -399,9 +402,9 @@ impl UpstreamModule for ProxyV2Module {
             return NGX_ERROR;
         }
 
-        http_debug!(r, "http proxy filter bytes:{}", raw.data.len());
+        http_debug!(r, "http proxy filter bytes:{}", raw.len());
 
-        let data = &raw.data[..];
+        let data = raw.bytes();
         let mut pos = 0;
         let mut copied = false;
 

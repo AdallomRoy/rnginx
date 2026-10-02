@@ -225,13 +225,10 @@ impl Default for UpstreamResponse {
 pub struct Upstream {
     pub conf: Rc<UpstreamConf>,
     /// r->upstream as the other modules see it: the cache fields, and the
-    /// schema, uri and peer name of the error log
+    /// schema ("http://", "fastcgi://", ...), uri (of the request line to
+    /// the upstream, if any) and peer name of the error log
     pub ucache: Rc<UpstreamCache>,
 
-    /// u->schema: "http://", "fastcgi://", ... (the error log's upstream)
-    pub schema: Vec<u8>,
-    /// u->uri: the URI of the request line to the upstream, if any
-    pub uri: Vec<u8>,
     /// u->ssl
     pub ssl: bool,
     /// the ALPN protocols of the SSL connection (gRPC)
@@ -241,6 +238,12 @@ pub struct Upstream {
 
     /// u->request_bufs: the request u->create_request made, with the body
     pub request_bufs: Chain,
+    /// the buffers of a buffered request body (r->request_body->bufs) go
+    /// after u->request_bufs as they are, linked instead of copied (as
+    /// ngx_http_proxy_create_request links shallow copies of them)
+    pub request_body_link: bool,
+    /// how much of u->request_bufs (and of the linked body) was sent
+    request_cursor: ReqCursor,
 
     /// u->headers_in and u->buffer
     pub resp: UpstreamResponse,
@@ -304,20 +307,18 @@ impl Upstream {
     /// ngx_http_upstream_create with the module's u->conf, u->schema and
     /// u->caches: r->upstream anew, r->cache NULL.
     pub fn create(r: &R, conf: Rc<UpstreamConf>, caches: Rc<Vec<Rc<crate::file_cache::FileCache>>>, schema: &[u8]) -> Upstream {
-        let ucache = crate::upstream_cache::upstream_create(r, conf.cache.clone(), caches, conf.module, conf.buffer_size);
-
-        *ucache.schema.borrow_mut() = schema.to_vec();
+        let ucache = crate::upstream_cache::upstream_create(r, conf.cache.clone(), caches, conf.module, conf.buffer_size, intern_schema(schema));
 
         Upstream {
             buffering: conf.buffering,
             conf,
             ucache,
-            schema: schema.to_vec(),
-            uri: Vec::new(),
             ssl: false,
             ssl_alpn: Vec::new(),
             resolved: None,
             request_bufs: Chain::new(),
+            request_body_link: false,
+            request_cursor: ReqCursor::default(),
             resp: UpstreamResponse::new(),
             length: -1,
             out_bufs: Chain::new(),
@@ -368,14 +369,21 @@ impl Upstream {
 
     /// u->schema
     pub fn set_schema(&mut self, schema: &[u8]) {
-        self.schema = schema.to_vec();
-        *self.ucache.schema.borrow_mut() = schema.to_vec();
+        if **self.ucache.schema.borrow() != *schema {
+            *self.ucache.schema.borrow_mut() = intern_schema(schema);
+        }
     }
 
     /// u->uri for the error log
     pub fn set_uri(&mut self, uri: &[u8]) {
-        self.uri = uri.to_vec();
-        *self.ucache.uri.borrow_mut() = uri.to_vec();
+        let mut v = self.ucache.uri.borrow_mut();
+        v.clear();
+        v.extend_from_slice(uri);
+    }
+
+    /// set_uri() with the URI made for it
+    pub fn set_uri_owned(&mut self, uri: Vec<u8>) {
+        *self.ucache.uri.borrow_mut() = uri;
     }
 
     /// ngx_chain_writer(&u->writer, out): the output goes after what the
@@ -421,6 +429,33 @@ impl Upstream {
             }
         }
     }
+}
+
+/// The schemas of the error log's upstream ("http://", "fastcgi://", ...):
+/// one shared copy of each in the worker, a request takes a reference (C
+/// points u->schema at a constant or at the URL of the configuration).
+fn intern_schema(schema: &[u8]) -> Rc<[u8]> {
+    thread_local! {
+        static SCHEMAS: RefCell<Vec<Rc<[u8]>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    SCHEMAS.with(|s| {
+        let mut s = s.borrow_mut();
+
+        if let Some(rc) = s.iter().find(|rc| ***rc == *schema) {
+            return rc.clone();
+        }
+
+        let rc: Rc<[u8]> = Rc::from(schema);
+
+        // the schemas of proxy_pass with variables are bounded (case
+        // variants of "http://" and "https://"); a cap anyway
+        if s.len() < 64 {
+            s.push(rc.clone());
+        }
+
+        rc
+    })
 }
 
 /// c->send_chain of ngx_chain_writer: the buffers written without waiting,
@@ -1310,6 +1345,452 @@ pub fn request_body_bufs(r: &R) -> Chain {
     }
 }
 
+/// `f` on the buffers of request_body_bufs(), lent instead of copied (it
+/// must not touch r->request_body).
+pub fn with_request_body_bufs<T>(r: &R, f: impl FnOnce(&mut dyn Iterator<Item = &Buf>) -> T) -> T {
+    let rb = r.request_body.borrow().clone();
+
+    match rb {
+        Some(rb) => {
+            let rb = rb.borrow();
+            f(&mut rb.bufs.iter().filter(|b| b.buf_size() > 0))
+        }
+        None => f(&mut std::iter::empty()),
+    }
+}
+
+/// u->request_bufs as sent: the buffer the next byte to send is in (of
+/// u->request_bufs, then of the request body linked after them) and the
+/// bytes of it sent. The buffers themselves are not consumed: the request
+/// goes to the next upstream again from the start, as
+/// ngx_http_upstream_reinit rewinds buf->pos.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct ReqCursor {
+    idx: usize,
+    off: usize,
+}
+
+/// The buffers of the request: u->request_bufs, then those of the linked
+/// body (r->request_body->bufs).
+struct ReqBufs<'a> {
+    own: &'a Chain,
+    body: Option<&'a Chain>,
+}
+
+impl<'a> ReqBufs<'a> {
+    fn get(&self, i: usize) -> Option<&'a Buf> {
+        match self.own.get(i) {
+            Some(b) => Some(b),
+            None => self.body.and_then(|body| body.get(i - self.own.len())),
+        }
+    }
+
+    /// The buffer is one of the request: the buffers of the body without
+    /// data are not linked (request_body_bufs()).
+    fn linked(&self, i: usize, b: &Buf) -> bool {
+        i < self.own.len() || b.buf_size() > 0
+    }
+
+    /// The bytes of the request: what u->request_bufs and the linked body
+    /// hold.
+    fn total(&self) -> i64 {
+        self.own.iter().map(|b| b.buf_size()).sum::<i64>() + self.body.map(|c| c.iter().map(|b| b.buf_size().max(0)).sum::<i64>()).unwrap_or(0)
+    }
+}
+
+/// The bytes of a request buffer to send, as c->send_chain sends it: its
+/// memory, or its part of a file; none for a special buffer.
+fn req_buf_len(b: &Buf) -> usize {
+    if b.in_memory() {
+        match &b.data {
+            BufData::Memory(v) => b.last.min(v.len()).saturating_sub(b.pos),
+            _ => 0,
+        }
+    } else if b.in_file {
+        (b.file_last - b.file_pos).max(0) as usize
+    } else {
+        0
+    }
+}
+
+impl ReqCursor {
+    /// Past `n` bytes sent.
+    fn advance(&mut self, bufs: &ReqBufs, mut n: usize) {
+        while n > 0 {
+            let rest = match bufs.get(self.idx) {
+                Some(b) => req_buf_len(b).saturating_sub(self.off),
+                None => return,
+            };
+
+            if n < rest {
+                self.off += n;
+                return;
+            }
+
+            n -= rest;
+            self.idx += 1;
+            self.off = 0;
+        }
+    }
+
+    /// Past the buffers with nothing more to send: false at the end of the
+    /// request.
+    fn skip_sent(&mut self, bufs: &ReqBufs) -> bool {
+        while let Some(b) = bufs.get(self.idx) {
+            if req_buf_len(b) > self.off {
+                return true;
+            }
+
+            self.idx += 1;
+            self.off = 0;
+        }
+
+        false
+    }
+}
+
+/// What an attempt to send the request did, when it sent something.
+enum ReqStep {
+    /// all of it is sent
+    All,
+    /// more can be sent at once (64 buffers were written, the SEND_CHUNK of
+    /// a send_chain is reached, or a file buffer follows)
+    More,
+    /// the connection took no more: NGX_AGAIN with wev->ready = 0, or
+    /// (true) the TLS layer wants to read
+    Blocked(bool),
+}
+
+/// The step after something was sent: `partial` if the connection took
+/// less than was written.
+fn req_step(bufs: &ReqBufs, cur: &mut ReqCursor, partial: bool) -> ReqStep {
+    if partial {
+        ReqStep::Blocked(false)
+    } else if cur.skip_sent(bufs) {
+        ReqStep::More
+    } else {
+        ReqStep::All
+    }
+}
+
+/// The TCP_CORK of ngx_linux_sendfile_chain for a header before a file
+/// (output.rs): TCP_NODELAY off first, the two are mutually exclusive.
+/// EINTR leaves the connection as it is.
+fn req_tcp_nopush(c: &ngx_core::connection::Connection) -> std::io::Result<()> {
+    use ngx_core::connection::TcpNodelay;
+
+    if c.tcp_nodelay.get() == TcpNodelay::Set {
+        match c.setsockopt_int(libc::IPPROTO_TCP, libc::TCP_NODELAY, 0) {
+            Ok(()) => {
+                c.tcp_nodelay.set(TcpNodelay::Unset);
+                ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "no tcp_nodelay");
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => {
+                c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(TCP_NODELAY) failed");
+                return Err(e);
+            }
+        }
+    }
+
+    if c.tcp_nodelay.get() == TcpNodelay::Unset {
+        match c.tcp_push_on() {
+            Ok(()) => {
+                c.tcp_nopush.set(TcpNopush::Set);
+                ngx_core::ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "tcp_nopush");
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => {
+                c.connection_error(e.raw_os_error().unwrap_or(0), "setsockopt(TCP_CORK) failed");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// One attempt of c->send_chain (ngx_linux_sendfile_chain) on a plain
+/// connection from the cursor, without waiting: the memory buffers up to a
+/// file buffer gathered (64 at most) and written, or the file buffer sent,
+/// within what is left of the SEND_CHUNK of the send (`budget`).
+fn req_send_plain(c: &ngx_core::connection::Connection, bufs: &ReqBufs, cur: &mut ReqCursor, budget: &mut usize) -> ngx_core::connection::IoStep<std::io::Result<ReqStep>> {
+    use ngx_core::connection::IoStep;
+    use std::io::{Error, ErrorKind, IoSlice};
+
+    if !cur.skip_sent(bufs) {
+        return IoStep::Done(Ok(ReqStep::All));
+    }
+
+    let first = match bufs.get(cur.idx) {
+        Some(b) => b,
+        None => return IoStep::Done(Ok(ReqStep::All)),
+    };
+
+    let sent = |cur: &mut ReqCursor, budget: &mut usize, n: usize, asked: usize| {
+        c.sent.set(c.sent.get() + n as u64);
+        cur.advance(bufs, n);
+
+        *budget -= n.min(*budget);
+
+        if *budget == 0 {
+            *budget = SEND_CHUNK as usize;
+        }
+
+        IoStep::Done(Ok(req_step(bufs, cur, n < asked)))
+    };
+
+    if first.in_file && !first.in_memory() {
+        let fd = match &first.data {
+            BufData::File(f) => f.fd,
+            _ => return IoStep::Done(Err(Error::from_raw_os_error(libc::EINVAL))),
+        };
+
+        let size = (req_buf_len(first) - cur.off).min(*budget);
+
+        // a non-blocking sendfile() from the file to the socket, at the
+        // file position sent so far (the off_t of the kernel, as unsigned)
+        let mut off = (first.file_pos + cur.off as i64) as u64;
+
+        let res = ngx_core::fd::get(c.fd.get())
+            .and_then(|s| ngx_core::fd::get(fd).map(|file| (s, file)))
+            .and_then(|(s, file)| rustix::fs::sendfile(&s, &file, Some(&mut off), size).map_err(Error::from));
+
+        return match res {
+            Ok(0) => IoStep::Done(Err(Error::from_raw_os_error(libc::EPIPE))),
+            Ok(n) => sent(cur, budget, n, size),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => IoStep::WantWrite,
+            Err(e) => IoStep::Done(Err(e)),
+        };
+    }
+
+    // the memory buffers up to a file one (ngx_output_chain_to_iovec), the
+    // special ones skipped
+    let mut iov = [IoSlice::new(&[]); 64];
+    let mut n_iov = 0;
+    let mut gathered = 0usize;
+    let mut file_next = false;
+
+    let mut i = cur.idx;
+    let mut off = cur.off;
+
+    while let Some(b) = bufs.get(i) {
+        if b.special_buf() {
+            i += 1;
+            off = 0;
+            continue;
+        }
+
+        if !b.in_memory() {
+            file_next = b.in_file;
+            break;
+        }
+
+        if gathered >= *budget {
+            break;
+        }
+
+        let data = match &b.data {
+            BufData::Memory(v) => &v[b.pos.min(v.len())..b.last.min(v.len())],
+            _ => break,
+        };
+
+        let data = &data[off.min(data.len())..];
+        let take = (*budget - gathered).min(data.len());
+
+        if take > 0 {
+            iov[n_iov] = IoSlice::new(&data[..take]);
+            n_iov += 1;
+            gathered += take;
+        }
+
+        i += 1;
+        off = 0;
+
+        if n_iov == iov.len() {
+            break;
+        }
+    }
+
+    if n_iov == 0 {
+        return IoStep::Done(Ok(ReqStep::All));
+    }
+
+    // TCP_CORK if there is a header before a file
+    if file_next && c.tcp_nopush.get() == TcpNopush::Unset {
+        if let Err(e) = req_tcp_nopush(c) {
+            return IoStep::Done(Err(e));
+        }
+    }
+
+    // a non-blocking writev() to the socket
+    match ngx_core::fd::get(c.fd.get()).and_then(|s| nix::sys::uio::writev(&s, &iov[..n_iov]).map_err(Error::from)) {
+        Ok(n) => sent(cur, budget, n, gathered),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => IoStep::WantWrite,
+        Err(e) => IoStep::Done(Err(e)),
+    }
+}
+
+/// One attempt of c->send_chain on an SSL connection (ngx_ssl_send_chain)
+/// from the cursor: the buffers are copied to c->ssl->buf, which is
+/// written when full or on a flush.
+fn req_send_ssl(c: &ngx_core::connection::Connection, bufs: &ReqBufs, cur: &mut ReqCursor) -> ngx_core::connection::IoStep<std::io::Result<ReqStep>> {
+    use ngx_core::connection::IoStep;
+    use ngx_core::event_openssl::{ngx_ssl_buffered, ngx_ssl_send_chain, SslChainBuf, SslChainFile, SslChainPos};
+
+    let mut links: Vec<SslChainBuf> = Vec::new();
+
+    let mut i = cur.idx;
+
+    while let Some(b) = bufs.get(i) {
+        if bufs.linked(i, b) {
+            let off = if i == cur.idx { cur.off } else { 0 };
+
+            let (mem, file): (&[u8], Option<SslChainFile>) = match &b.data {
+                BufData::Memory(v) if b.in_memory() => (&v[(b.pos + off).min(b.last)..b.last], None),
+                BufData::File(f) if b.in_file => (&[], Some(SslChainFile { fd: f.fd, name: &f.name, pos: b.file_pos + off as i64, last: b.file_last })),
+                _ => (&[], None),
+            };
+
+            links.push(SslChainBuf { mem, file, flush: b.flush, last_buf: b.last_buf });
+        }
+
+        i += 1;
+    }
+
+    let mut pos = SslChainPos::default();
+
+    let step = ngx_ssl_send_chain(c, &links, &mut pos, 0);
+
+    let link_len = |l: &SslChainBuf| match &l.file {
+        Some(f) => (f.last - f.pos).max(0) as usize,
+        None => l.mem.len(),
+    };
+
+    let taken = links[..pos.link.min(links.len())].iter().map(link_len).sum::<usize>() + pos.off as usize;
+
+    drop(links);
+
+    cur.advance(bufs, taken);
+
+    match step {
+        IoStep::Done(Err(())) => IoStep::Done(Err(std::io::Error::other("SSL send failed"))),
+
+        IoStep::Done(Ok(())) => {
+            // what c->ssl->buf holds still is NGX_AGAIN (c->buffered)
+            if c.ssl.borrow().as_ref().is_some_and(|sc| ngx_ssl_buffered(sc)) {
+                IoStep::Done(Ok(ReqStep::Blocked(false)))
+            } else {
+                IoStep::Done(Ok(req_step(bufs, cur, false)))
+            }
+        }
+
+        IoStep::WantWrite if taken > 0 => IoStep::Done(Ok(ReqStep::Blocked(false))),
+        IoStep::WantRead if taken > 0 => IoStep::Done(Ok(ReqStep::Blocked(true))),
+        IoStep::WantWrite => IoStep::WantWrite,
+        IoStep::WantRead => IoStep::WantRead,
+    }
+}
+
+/// ngx_output_chain(&u->output, u->request_bufs) of a buffered request
+/// (ngx_chain_writer): u->request_bufs, and the linked body, written from
+/// the cursor. The send timer (u->conf->send_timeout) runs only while the
+/// connection takes no more, armed anew at each write event, as
+/// ngx_http_upstream_send_request does on NGX_AGAIN. Err(None) when it
+/// expires, Err(Some(e)) for an error.
+async fn send_request_bufs(r: &R, sock: &mut UpstreamSock, own: &Chain, link: bool, cur: &mut ReqCursor, send_timeout: u64) -> Result<(), Option<std::io::Error>> {
+    use ngx_core::connection::IoStep;
+
+    let c = match sock {
+        UpstreamSock::Conn(pc) => pc.c.clone(),
+        _ => {
+            // a connection of the keepalive cache made by the other
+            // upstream code: the rest of the request as a chain
+            let mut out = Chain::new();
+
+            {
+                let rb = if link { r.request_body.borrow().clone() } else { None };
+                let rb = rb.as_ref().map(|b| b.borrow());
+                let bufs = ReqBufs { own, body: rb.as_ref().map(|b| &b.bufs) };
+
+                let mut i = cur.idx;
+
+                while let Some(b) = bufs.get(i) {
+                    if bufs.linked(i, b) {
+                        let mut b = b.clone();
+
+                        if i == cur.idx {
+                            if b.in_memory() {
+                                b.pos += cur.off;
+                            } else if b.in_file {
+                                b.file_pos += cur.off as i64;
+                            }
+                        }
+
+                        out.push_back(b);
+                    }
+
+                    i += 1;
+                }
+
+                cur.idx = i;
+                cur.off = 0;
+            }
+
+            return write_chain(sock, &mut out, send_timeout).await.map(|_| ());
+        }
+    };
+
+    let body = if link { r.request_body.borrow().clone() } else { None };
+    let ssl = c.ssl.borrow().as_ref().is_some_and(|sc| sc.state.ngx.get());
+
+    let mut budget = SEND_CHUNK as usize;
+
+    // one attempt; the body's buffers are lent to it, not across a wait
+    let mut op = || {
+        let rb = body.as_ref().map(|b| b.borrow());
+        let bufs = ReqBufs { own, body: rb.as_ref().map(|b| &b.bufs) };
+
+        if ssl {
+            req_send_ssl(&c, &bufs, cur)
+        } else {
+            req_send_plain(&c, &bufs, cur, &mut budget)
+        }
+    };
+
+    let mut step = op();
+
+    loop {
+        let wait = match step {
+            IoStep::Done(Ok(ReqStep::All)) => return Ok(()),
+            IoStep::Done(Ok(ReqStep::More)) => {
+                step = op();
+                continue;
+            }
+            IoStep::Done(Ok(ReqStep::Blocked(false))) | IoStep::WantWrite => IoStep::WantWrite,
+            IoStep::Done(Ok(ReqStep::Blocked(true))) | IoStep::WantRead => IoStep::WantRead,
+            IoStep::Done(Err(e)) => return Err(Some(e)),
+        };
+
+        // NGX_AGAIN: ngx_add_timer(c->write, u->conf->send_timeout), and
+        // the write event (the readiness the attempt found used up is
+        // cleared first)
+        step = match tokio::time::timeout(Duration::from_millis(send_timeout), c.drive_io_from(wait, &mut op)).await {
+            Err(_) => return Err(None),
+            Ok(Err(e)) => return Err(Some(e)),
+            Ok(Ok(res)) => IoStep::Done(res),
+        };
+    }
+}
+
+/// The bytes of u->request_bufs and of the linked body.
+fn request_total(r: &R, u: &Upstream) -> i64 {
+    let rb = if u.request_body_link { r.request_body.borrow().clone() } else { None };
+    let rb = rb.as_ref().map(|b| b.borrow());
+
+    ReqBufs { own: &u.request_bufs, body: rb.as_ref().map(|b| &b.bufs) }.total()
+}
+
 // ---------------------------------------------------------------------------
 // ngx_http_upstream_init_request
 // ---------------------------------------------------------------------------
@@ -1608,6 +2089,10 @@ async fn connect(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, opts: &Pee
         }
     }
 
+    // the request chain from its start (ngx_http_upstream_reinit: buf->pos
+    // = buf->start)
+    u.request_cursor = ReqCursor::default();
+
     u.request_sent = false;
     u.request_body_sent = false;
     u.response_received = false;
@@ -1664,16 +2149,12 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
 
     http_debug!(r, "http upstream send request body");
 
-    // u->request_sent = 1; out = u->request_bufs (and for an unbuffered
-    // body the part of it read so far, through u->output.output_filter)
-
-    let mut out = u.request_bufs.clone();
+    // u->request_sent = 1; out = u->request_bufs, sent from the cursor (the
+    // buffers stay for the next upstream). An unbuffered request goes to
+    // one upstream only once it is sent, so its buffers are taken, with the
+    // part of the body read so far, through u->output.output_filter.
 
     let no_buffering = r.request_body_no_buffering.get();
-
-    if no_buffering {
-        out.extend(take_request_body_bufs(r));
-    }
 
     u.request_sent = true;
 
@@ -1681,8 +2162,14 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
         g.u.request_sent = true;
     }
 
+    let mut out = None;
+
     if no_buffering {
-        out = m.body_output_filter(r, u, out);
+        let mut o = std::mem::take(&mut u.request_bufs);
+
+        o.extend(take_request_body_bufs(r));
+
+        out = Some(m.body_output_filter(r, u, o));
 
         // ngx_tcp_nodelay(c)
         if *r.clcf().borrow().tcp_nodelay {
@@ -1697,8 +2184,11 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
     let send_timeout = u.conf.send_timeout;
     let mut watch = if no_buffering { None } else { u.watch.clone() };
 
-    // the bytes sent: what the chain had less what is left of it
-    let total: i64 = out.iter().map(|b| b.buf_size()).sum();
+    // the bytes sent: all of the request once it is out
+    let total: i64 = match &out {
+        Some(o) => o.iter().map(|b| b.buf_size()).sum(),
+        None => request_total(r, u),
+    };
 
     let mut bytes_sent: i64;
 
@@ -1707,7 +2197,15 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
         let is_plain = plain(sock);
 
         let written = {
-            let write = write_chain(sock, &mut out, send_timeout);
+            let (own, link, cur) = (&u.request_bufs, u.request_body_link, &mut u.request_cursor);
+            let out = out.as_mut();
+
+            let write = async move {
+                match out {
+                    Some(o) => write_chain(sock, o, send_timeout).await.map(|_| ()),
+                    None => send_request_bufs(r, sock, own, link, cur, send_timeout).await,
+                }
+            };
 
             tokio::select! {
                 res = write => Some(res),
@@ -1732,8 +2230,8 @@ async fn send_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, start
                 continue;
             }
 
-            Some(Ok(_)) => {
-                bytes_sent = total - out.iter().map(|b| b.buf_size()).sum::<i64>();
+            Some(Ok(())) => {
+                bytes_sent = total;
 
                 if tcp_push(u).is_err() {
                     return Err(Failure::Finalize(NGX_HTTP_INTERNAL_SERVER_ERROR));
@@ -2812,16 +3310,22 @@ async fn send_non_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) 
     }
 
     let pos = u.resp.pos.min(u.resp.buf.len());
-    let preread: Vec<u8> = u.resp.buf[pos..].to_vec();
 
     let do_write;
 
-    if !preread.is_empty() {
+    if pos < u.resp.buf.len() {
+        // the body read with the header goes to the input filter from
+        // u->buffer
+        let buf = std::mem::take(&mut u.resp.buf);
+
+        Upstream::with_state(r, |st| st.response_length += (buf.len() - pos) as i64);
+
+        let rc = m.input_filter(r, u, &buf[pos..]);
+
+        u.resp.buf = buf;
         u.resp.buf.truncate(pos);
 
-        Upstream::with_state(r, |st| st.response_length += preread.len() as i64);
-
-        if m.input_filter(r, u, &preread) == NGX_ERROR {
+        if rc == NGX_ERROR {
             return finalize(r, u, m, NGX_ERROR).await;
         }
 
@@ -3107,7 +3611,9 @@ async fn send_request_body_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamM
             g.u.request_sent = true;
         }
 
-        let mut o = u.request_bufs.clone();
+        // once sent, an unbuffered request does not go to another upstream:
+        // its buffers are taken
+        let mut o = std::mem::take(&mut u.request_bufs);
 
         o.extend(take_request_body_bufs(r));
 
@@ -3701,10 +4207,13 @@ async fn send_buffered(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i
 
     let header_start = crate::file_cache::cache_of(r).map(|c| c.borrow().header_start).unwrap_or(0);
     let pos = u.resp.pos.min(u.resp.buf.len());
-    let preread = u.resp.buf[pos..].to_vec();
     let room = u.conf.buffer_size.saturating_sub(header_start).saturating_sub(pos);
 
-    let mut p = crate::event_pipe::EventPipe::new(u.conf.bufs, u.conf.busy_buffers_size, temp_file, preread, room, &log);
+    // u->buffer is the first raw buffer of the pipe, with the body read
+    // after the header (p->preread_bufs)
+    let buffer = std::mem::take(&mut u.resp.buf);
+
+    let mut p = crate::event_pipe::EventPipe::new(u.conf.bufs, u.conf.busy_buffers_size, temp_file, buffer, pos, room, &log);
 
     p.limit_rate = crate::script::complex_value_size(r, &u.conf.limit_rate, 0);
     p.start_sec = ngx_core::times::time();
@@ -3877,7 +4386,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
     // the pre-read part of the body (p->preread_bufs)
     if let Some(raw) = p.take_preread() {
-        let n = raw.data.len();
+        let n = raw.len();
 
         if n > 0 {
             http_debug!(r, "pipe preread: {}", n);
@@ -4010,7 +4519,7 @@ async fn pipe_run<'a>(r: &'a R, u: &mut Upstream, m: &mut dyn UpstreamModule, p:
 
         let room = match &raw {
             Some(b) => {
-                let room = b.size.saturating_sub(b.data.len()).max(1);
+                let room = b.room().max(1);
                 if limit > 0 { room.min(limit) } else { room }
             }
             None => 0,
@@ -4330,7 +4839,7 @@ fn read_ready(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, p: &mut crate
             Err(()) => return NGX_ERROR,
         };
 
-        let mut room = raw.size.saturating_sub(raw.data.len()).max(1);
+        let mut room = raw.room().max(1);
 
         if limit > 0 {
             room = room.min(limit);
@@ -4699,7 +5208,7 @@ pub fn log_info(r: &Request) -> Option<Vec<u8>> {
     let name = u.peer_name.try_borrow().ok()?;
     let name = name.as_ref()?;
 
-    let mut v = u.schema.try_borrow().ok()?.clone();
+    let mut v = u.schema.try_borrow().ok()?.to_vec();
 
     v.extend_from_slice(name);
 
@@ -5230,6 +5739,98 @@ pub fn header_hash_key(name: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Two request headers of the same name (ngx_http_link_multi_headers).
+fn same_header_name(a: &Header, b: &Header) -> bool {
+    a.key.len() == b.key.len() && a.key.eq_ignore_ascii_case(&b.key)
+}
+
+/// The request headers the CGI-like modules send as params, as
+/// header_params() makes them, without copies: `f(i, key_len, val_len)`
+/// for each header sent, `key_len` being that of "HTTP_" and its name,
+/// `val_len` that of its value with the values of the headers of its name
+/// after it (push_header_param_key and push_header_param_value write
+/// them).
+pub fn for_each_header_param(headers: &[Header], hidden: &dyn Fn(&[u8]) -> bool, mut f: impl FnMut(usize, usize, usize)) {
+    // the name as the params hash has it (C's lowcase_key buffer)
+    let mut short = [0u8; 64];
+    let mut long = Vec::new();
+
+    for (i, h) in headers.iter().enumerate() {
+        // linked to the first header of its name (or hidden as it is)
+        if headers[..i].iter().any(|p| same_header_name(p, h)) {
+            continue;
+        }
+
+        let key: &[u8] = if h.key.len() <= short.len() {
+            for (d, &ch) in short.iter_mut().zip(h.key.iter()) {
+                *d = header_hash_char(ch);
+            }
+
+            &short[..h.key.len()]
+        } else {
+            long.clear();
+            long.extend(h.key.iter().map(|&ch| header_hash_char(ch)));
+            &long
+        };
+
+        if hidden(key) {
+            continue;
+        }
+
+        let mut val_len = h.value.borrow().len();
+
+        for hn in headers[i + 1..].iter().filter(|hn| same_header_name(hn, h)) {
+            val_len += "; ".len() + hn.value.borrow().len();
+        }
+
+        f(i, "HTTP_".len() + h.key.len(), val_len);
+    }
+}
+
+/// The key of the request header `i` as a param (header_param_key()).
+pub fn push_header_param_key(out: &mut Vec<u8>, headers: &[Header], i: usize) {
+    out.extend_from_slice(b"HTTP_");
+
+    out.extend(headers[i].key.iter().map(|&ch| {
+        if ch.is_ascii_lowercase() {
+            ch & !0x20
+        } else if ch == b'-' {
+            b'_'
+        } else {
+            ch
+        }
+    }));
+}
+
+/// The value of the request header `i` as a param: its value, and those of
+/// the headers of its name after it, joined with "; " for "Cookie" and
+/// ", " otherwise.
+pub fn push_header_param_value(out: &mut Vec<u8>, headers: &[Header], i: usize) {
+    let h = &headers[i];
+
+    out.extend_from_slice(&h.value.borrow());
+
+    let sep = if h.key.len() == "Cookie".len() && h.key.eq_ignore_ascii_case(b"Cookie") { b';' } else { b',' };
+
+    for hn in headers[i + 1..].iter().filter(|hn| same_header_name(hn, h)) {
+        out.push(sep);
+        out.push(b' ');
+        out.extend_from_slice(&hn.value.borrow());
+    }
+}
+
+/// A character of the name of a request header as the params hash has it
+/// (header_hash_key()).
+fn header_hash_char(ch: u8) -> u8 {
+    if ch.is_ascii_uppercase() {
+        ch | 0x20
+    } else if ch == b'-' {
+        b'_'
+    } else {
+        ch
+    }
+}
+
 /// The request headers as params: ngx_http_link_multi_headers() links the
 /// headers of a name (compared case-insensitively) to the first one, which
 /// is sent with the values of all, joined with "; " for "Cookie" and ", "
@@ -5287,5 +5888,102 @@ mod tests {
         assert_eq!(atoof(b"12a"), NGX_ERROR);
         assert_eq!(atoof(b" 1"), NGX_ERROR);
         assert_eq!(atoof(b"99999999999999999999"), NGX_ERROR);
+    }
+
+    fn file_buf(pos: i64, last: i64) -> Buf {
+        Buf::file(Rc::new(ngx_core::buf::BufFile { fd: -1, name: b"f".to_vec(), directio: false }), pos, last)
+    }
+
+    #[test]
+    fn request_cursor() {
+        let mut own = Chain::new();
+        own.push_back(Buf::from_vec(b"GET / HTTP/1.1\r\n\r\n".to_vec()));
+
+        // the body: an empty buffer (not linked), memory, a file part, and
+        // a special last buffer
+        let mut body = Chain::new();
+        body.push_back(Buf::from_vec(Vec::new()));
+        let mut m = Buf::from_vec(b"xxabcd".to_vec());
+        m.pos = 2;
+        body.push_back(m);
+        body.push_back(file_buf(10, 15));
+        let mut last = Buf::special();
+        last.last_buf = true;
+        body.push_back(last);
+
+        let bufs = ReqBufs { own: &own, body: Some(&body) };
+
+        assert_eq!(bufs.total(), 18 + 4 + 5);
+        assert!(!bufs.linked(1, &body[0]));
+        assert!(bufs.linked(2, &body[1]));
+
+        let mut cur = ReqCursor::default();
+        assert!(cur.skip_sent(&bufs));
+        assert_eq!(cur, ReqCursor { idx: 0, off: 0 });
+
+        // within the header, then up to its end
+        cur.advance(&bufs, 10);
+        assert_eq!(cur, ReqCursor { idx: 0, off: 10 });
+        cur.advance(&bufs, 8);
+        assert_eq!(cur, ReqCursor { idx: 1, off: 0 });
+
+        // the empty buffer is skipped
+        assert!(cur.skip_sent(&bufs));
+        assert_eq!(cur, ReqCursor { idx: 2, off: 0 });
+
+        // across the memory buffer into the file one
+        cur.advance(&bufs, 6);
+        assert_eq!(cur, ReqCursor { idx: 3, off: 2 });
+
+        cur.advance(&bufs, 3);
+        assert_eq!(cur, ReqCursor { idx: 4, off: 0 });
+        assert!(!cur.skip_sent(&bufs));
+
+        // the next upstream: from the start again, the buffers untouched
+        let cur = ReqCursor::default();
+        assert_eq!(req_buf_len(bufs.get(cur.idx).unwrap()), 18);
+        assert_eq!(req_buf_len(&body[1]), 4);
+        assert_eq!(req_buf_len(&body[2]), 5);
+    }
+
+    fn headers(list: &[(&str, &str)]) -> Vec<Header> {
+        list.iter().map(|(k, v)| TableElt::new(k.as_bytes(), v.as_bytes())).collect()
+    }
+
+    #[test]
+    fn header_params_in_place() {
+        let hs = headers(&[
+            ("Host", "example.com"),
+            ("Cookie", "a=1"),
+            ("X-Foo", "1"),
+            ("cookie", "b=2"),
+            ("Accept", "*/*"),
+            ("x-foo", "2"),
+            ("X_Foo", "3"),
+            ("Secret", "s"),
+        ]);
+
+        let hidden = |k: &[u8]| k == b"secret";
+
+        let mut written = Vec::new();
+
+        for_each_header_param(&hs, &hidden, |i, key_len, val_len| {
+            let mut key = Vec::new();
+            push_header_param_key(&mut key, &hs, i);
+            let mut value = Vec::new();
+            push_header_param_value(&mut value, &hs, i);
+
+            assert_eq!(key.len(), key_len);
+            assert_eq!(value.len(), val_len);
+
+            written.push((key, value));
+        });
+
+        assert_eq!(written, header_params(&hs, &hidden));
+
+        assert_eq!(written[1], (b"HTTP_COOKIE".to_vec(), b"a=1; b=2".to_vec()));
+        assert_eq!(written[2], (b"HTTP_X_FOO".to_vec(), b"1, 2".to_vec()));
+        assert_eq!(written[4], (b"HTTP_X_FOO".to_vec(), b"3".to_vec()));
+        assert_eq!(written.len(), 5);
     }
 }
