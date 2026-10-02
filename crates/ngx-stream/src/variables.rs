@@ -703,43 +703,63 @@ pub fn regex_compile(cf: &mut Conf, pattern: &[u8], options: u32) -> Result<Rc<S
 
 /// ngx_stream_regex_exec: NGX_OK (the captures are set), NGX_DECLINED
 /// (no match) or NGX_ERROR
+///
+/// The captures and their subject go to the session's own arrays, reused
+/// from match to match; the subject may be borrowed from anything but
+/// them and s->variables.
 pub fn regex_exec(s: &Session, re: &StreamRegex, str: &[u8]) -> i64 {
-    let caps = match re.regex.exec(str) {
-        None => return NGX_DECLINED,
-        Some(c) => c,
-    };
-
     // the return code of pcre2_match(): the highest set pair plus one
-    let rc = caps.iter().rposition(|(a, _)| *a >= 0).map(|i| i + 1).unwrap_or(1);
+    let rc;
 
     if re.ncaptures > 0 {
         let len = s.cmcf().borrow().ncaptures;
-        let n = caps.len().min(len / 3);
 
         let mut captures = s.captures.borrow_mut();
-        captures.clear();
-        for (a, b) in caps.iter().take(n) {
-            captures.push(*a);
-            captures.push(*b);
-        }
-    }
 
-    if !re.variables.is_empty() {
-        let nvars = s.cmcf().borrow().variables.len();
-        ensure_variables(s, nvars);
+        let pairs = match re.regex.exec_into(str, &mut captures) {
+            None => return NGX_DECLINED,
+            Some(n) => n,
+        };
 
-        for (n, index) in re.variables.iter() {
-            let (a, b) = caps.get(n / 2).copied().unwrap_or((-1, -1));
+        rc = (0..pairs).rposition(|i| captures[2 * i] >= 0).map(|i| i + 1).unwrap_or(1);
 
-            let data = if a >= 0 && b >= a { str[a as usize..b as usize].to_vec() } else { Vec::new() };
+        if !re.variables.is_empty() {
+            let nvars = s.cmcf().borrow().variables.len();
+            ensure_variables(s, nvars);
 
             let mut vars = s.variables.borrow_mut();
-            vars[*index] = VariableValue { data, valid: true, no_cacheable: false, not_found: false };
+
+            for (n, index) in re.variables.iter() {
+                let (a, b) = if n / 2 < pairs { (captures[*n], captures[*n + 1]) } else { (-1, -1) };
+
+                // the value of the named capture, its buffer reused
+                let vv = &mut vars[*index];
+                vv.data.clear();
+                if a >= 0 && b >= a {
+                    vv.data.extend_from_slice(&str[a as usize..b as usize]);
+                }
+                vv.valid = true;
+                vv.no_cacheable = false;
+                vv.not_found = false;
+            }
         }
+
+        // the pairs that fit in the array of cmcf->ncaptures ints
+        captures.truncate(2 * pairs.min(len / 3));
+    } else {
+        // no captures: nothing is written to s->captures (len 0 in C)
+        if !re.regex.is_match(str) {
+            return NGX_DECLINED;
+        }
+
+        rc = 1;
     }
 
     s.ncaptures.set(rc * 2);
-    *s.captures_data.borrow_mut() = str.to_vec();
+
+    let mut data = s.captures_data.borrow_mut();
+    data.clear();
+    data.extend_from_slice(str);
 
     NGX_OK
 }

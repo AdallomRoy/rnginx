@@ -398,42 +398,52 @@ pub fn regex_compile(cf: &mut Conf, pattern: &[u8], options: u32) -> Result<Rc<H
 }
 
 /// ngx_http_regex_exec: NGX_OK on match (captures stored), NGX_DECLINED on no match, NGX_ERROR.
+///
+/// The captures and their subject go to the request's own arrays, reused
+/// from match to match (C allocates r->captures once per request); the
+/// subject may be borrowed from anything but them and r->variables.
 pub fn regex_exec(r: &R, re: &Rc<HttpRegex>, s: &[u8]) -> i64 {
     let cmcf = r.cmcf();
     let ncaptures = cmcf.borrow().ncaptures;
     if re.ncaptures > 0 || !re.variables.is_empty() || ncaptures > 0 {
         // full exec with captures
-        match re.regex.exec(s) {
+        let n = match re.regex.exec_into(s, &mut r.captures.borrow_mut()) {
             None => return NGX_DECLINED,
-            Some(caps) => {
-                let mut flat = Vec::with_capacity(caps.len() * 2);
-                for (a, b) in caps.iter() {
-                    flat.push(*a);
-                    flat.push(*b);
+            Some(n) => n,
+        };
+        r.ncaptures.set(n * 2);
+        {
+            let mut data = r.captures_data.borrow_mut();
+            data.clear();
+            data.extend_from_slice(s);
+        }
+        if !re.variables.is_empty() {
+            let nvars = cmcf.borrow().variables.len();
+            let caps = r.captures.borrow();
+            let mut vars = r.variables.borrow_mut();
+            if vars.len() < nvars {
+                vars.resize(nvars, VariableValue::default());
+            }
+            for (cap, vi) in re.variables.iter() {
+                if *vi >= vars.len() {
+                    continue;
                 }
-                r.ncaptures.set(caps.len() * 2);
-                *r.captures.borrow_mut() = flat;
-                *r.captures_data.borrow_mut() = s.to_vec();
-                let nvars = cmcf.borrow().variables.len();
-                for (cap, vi) in re.variables.iter() {
-                    let mut vv = VariableValue::default();
-                    if let Some((a, b)) = caps.get(*cap) {
-                        if *a >= 0 {
-                            vv.data = s[*a as usize..*b as usize].to_vec();
-                        }
-                    }
-                    vv.valid = true;
-                    let mut vars = r.variables.borrow_mut();
-                    if vars.len() < nvars {
-                        vars.resize(nvars, VariableValue::default());
-                    }
-                    if *vi < vars.len() {
-                        vars[*vi] = vv;
+                // the value of the named capture, its buffer reused
+                let vv = &mut vars[*vi];
+                vv.data.clear();
+                if *cap < n {
+                    let (a, b) = (caps[2 * cap], caps[2 * cap + 1]);
+                    if a >= 0 {
+                        vv.data.extend_from_slice(&s[a as usize..b as usize]);
                     }
                 }
-                return NGX_OK;
+                vv.valid = true;
+                vv.no_cacheable = false;
+                vv.not_found = false;
+                vv.escape = false;
             }
         }
+        return NGX_OK;
     }
     if re.regex.is_match(s) {
         NGX_OK

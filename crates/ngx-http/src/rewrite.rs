@@ -1117,20 +1117,30 @@ fn rewritten_uri_args(mut buf: Vec<u8>, args_pos: Option<usize>, add_args: bool,
 /// the rewrite directive (code->uri set), with the NULL code that follows
 /// them after a rewrite with "last", "break", "redirect" or "permanent".
 async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
-    let uri = r.uri.borrow().clone();
-
     http_debug!(r, "http script regex: \"{}\"", B(&rule.regex.name));
 
     let log = log || r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP);
 
-    // ngx_http_regex_exec: the captures of a match are the request's
-    let rc = crate::variables::regex_exec(r, &rule.regex, &uri);
+    let rc = {
+        // the URI is matched where it is: ngx_http_regex_exec() changes
+        // the captures and the variables of the request, not r->uri
+        let uri = r.uri.borrow();
 
-    if rc == NGX_DECLINED {
-        if log {
-            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&rule.regex.name), B(&uri));
+        // ngx_http_regex_exec: the captures of a match are the request's
+        let rc = crate::variables::regex_exec(r, &rule.regex, &uri);
+
+        if rc == NGX_DECLINED {
+            if log {
+                ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" does not match \"{}\"", B(&rule.regex.name), B(&uri));
+            }
+        } else if rc != NGX_ERROR && log {
+            ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&rule.regex.name), B(&uri));
         }
 
+        rc
+    };
+
+    if rc == NGX_DECLINED {
         r.ncaptures.set(0);
 
         // e->ip += code->next: past the end code and the NULL code
@@ -1139,10 +1149,6 @@ async fn regex_code(r: &R, rule: &RewriteRule, log: bool) -> Flow {
 
     if rc == NGX_ERROR {
         return Flow::Exit(NGX_HTTP_INTERNAL_SERVER_ERROR);
-    }
-
-    if log {
-        ngx_core::ngx_log_error!(NGX_LOG_NOTICE, r.connection.log, None, "\"{}\" matches \"{}\"", B(&rule.regex.name), B(&uri));
     }
 
     // code->uri
