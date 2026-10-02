@@ -223,15 +223,25 @@ impl UpstreamResponse {
         self.headers.push(h);
     }
 
-    /// The headers that count, as $upstream_http_* see them
-    /// (r->upstream->headers_in.headers).
-    pub fn headers_in(&self) -> Vec<Header> {
-        let mut v = Vec::with_capacity(self.headers.len());
+    /// The header processed: the list goes to r->upstream->headers_in, for
+    /// $upstream_http_*, the balancer's notify and what follows the header
+    /// (the copy to r->headers_out, X-Accel-Redirect, *_store), with the
+    /// headers that count only. Moved, not copied: the response's own list
+    /// is not read after that.
+    pub fn move_headers_in(&mut self, r: &R) {
+        let mut v = std::mem::take(&mut self.headers);
 
-        v.extend(self.headers.iter().filter(|h| h.hash.get() != 0).cloned());
+        v.retain(|h| h.hash.get() != 0);
 
-        v
+        *r.upstream_headers_in.borrow_mut() = v;
     }
+}
+
+/// The first header of a name in r->upstream->headers_in once the header is
+/// processed (see UpstreamResponse::move_headers_in()): u->headers_in.
+/// x_accel_redirect, u->headers_in.last_modified and the like.
+fn header_in(r: &R, lowcase_key: &[u8]) -> Option<Header> {
+    r.upstream_headers_in.borrow().iter().find(|h| h.hash.get() != 0 && h.lowcase_key == lowcase_key).cloned()
 }
 
 /// A header line of the upstream's response (an ngx_table_elt_t of
@@ -1244,6 +1254,10 @@ async fn connect_peer(r: &R, u: &mut Upstream, sockaddr: &SockAddr, opts: &PeerO
     let rc = match ssl {
         Some(ssl) => {
             let g = u.peer.as_mut().expect("peer");
+
+            // u->ssl_name, the upstream's host before ngx_http_upstream_ssl_name
+            g.u.ssl_name_init();
+
             crate::upstream_ssl::ssl_init_connection(r, &mut g.u, &c, ssl, deadline, u.conf.connect_timeout).await
         }
 
@@ -2563,7 +2577,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
     Upstream::with_state(r, |st| st.header_time = ngx_core::times::event_msec().saturating_sub(start_time));
 
     // u->headers_in, for $upstream_http_* and the balancer's notify
-    *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
+    u.resp.move_headers_in(r);
 
     Ok(())
 }
@@ -2732,7 +2746,7 @@ async fn test_next_and_intercept(r: &R, u: &mut Upstream, m: &mut dyn UpstreamMo
         // the WWW-Authenticate of the upstream goes with the error page
         let mut ho = r.headers_out.borrow_mut();
 
-        for h in u.resp.headers.iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"www-authenticate") {
+        for h in r.upstream_headers_in.borrow().iter().filter(|h| h.hash.get() != 0 && h.lowcase_key == b"www-authenticate") {
             let o = TableElt::generated(&h.key, h.value.borrow().clone());
             ho.headers.push(o.clone());
             ho.www_authenticate.push(o);
@@ -3217,11 +3231,11 @@ async fn process_headers(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) ->
     // u->headers_in.no_cache || u->headers_in.expired
     crate::upstream_cache::process_headers_cacheable(r, &u.resp.cache);
 
-    if let Some(xar) = u.resp.header(b"x-accel-redirect") {
+    if let Some(xar) = header_in(r, b"x-accel-redirect") {
         if !u.conf.ignores(NGX_HTTP_UPSTREAM_IGN_XA_REDIRECT) {
             finalize(r, u, m, NGX_DECLINED).await;
 
-            let failed = u.resp.headers.iter().any(|h| h.hash.get() != 0 && REDIRECT_HEADERS.iter().any(|k| h.lowcase_key == *k) && copy_header(r, u, m, h) != NGX_OK);
+            let failed = r.upstream_headers_in.borrow().iter().any(|h| h.hash.get() != 0 && REDIRECT_HEADERS.iter().any(|k| h.lowcase_key == *k) && copy_header(r, u, m, h) != NGX_OK);
 
             if failed {
                 return Processed::Done(NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -3233,10 +3247,14 @@ async fn process_headers(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) ->
         }
     }
 
-    // room in r->headers_out.headers for the headers copied
-    r.headers_out.borrow_mut().headers.reserve(u.resp.headers.len());
+    let headers_in = r.upstream_headers_in.borrow();
 
-    let failed = u.resp.headers.iter().any(|h| h.hash.get() != 0 && !u.conf.hidden(&h.lowcase_key) && copy_header(r, u, m, h) != NGX_OK);
+    // room in r->headers_out.headers for the headers copied
+    r.headers_out.borrow_mut().headers.reserve(headers_in.len());
+
+    let failed = headers_in.iter().any(|h| h.hash.get() != 0 && !u.conf.hidden(&h.lowcase_key) && copy_header(r, u, m, h) != NGX_OK);
+
+    drop(headers_in);
 
     if failed {
         return Processed::Done(finalize(r, u, m, NGX_HTTP_INTERNAL_SERVER_ERROR).await);
@@ -3322,7 +3340,7 @@ async fn cache_send(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i64 
         }
 
         // u->headers_in, for $upstream_http_*
-        *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
+        u.resp.move_headers_in(r);
 
         match process_headers(r, u, m).await {
             Processed::Ok => NGX_OK,
@@ -4037,7 +4055,7 @@ async fn send_request_duplex(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule
 
                 Upstream::with_state(r, |st| st.header_time = ngx_core::times::event_msec().saturating_sub(start_time));
 
-                *r.upstream_headers_in.borrow_mut() = u.resp.headers_in();
+                u.resp.move_headers_in(r);
 
                 return test_next_and_intercept(r, u, m).await;
             }
@@ -5287,7 +5305,7 @@ fn store(r: &R, u: &mut Upstream, p: &mut crate::event_pipe::EventPipe) {
     // ext.time: the time of "Last-Modified"
     let mut time = -1;
 
-    if let Some(lm) = u.resp.header(b"last-modified") {
+    if let Some(lm) = header_in(r, b"last-modified") {
         if let Some(t) = ngx_core::parse::parse_http_time(&lm.value.borrow()) {
             time = t;
         }

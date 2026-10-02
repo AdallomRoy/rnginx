@@ -178,7 +178,16 @@ pub fn hex_head(data: &[u8]) -> String {
 /// block following it, and creates additional CONTINUATION frames for the
 /// part of the block over the frame size.
 pub fn header_frames(b: &mut Vec<u8>, headers_frame: usize) {
-    let block = b.split_off(headers_frame + FRAME_SIZE);
+    let start = headers_frame + FRAME_SIZE;
+    let len = b.len() - start;
+
+    if len <= NGX_HTTP_V2_DEFAULT_FRAME_SIZE {
+        // the block fits in the HEADERS frame: its header written in place
+        b[headers_frame..start].copy_from_slice(&frame_header(len, NGX_HTTP_V2_HEADERS_FRAME, NGX_HTTP_V2_END_HEADERS_FLAG, 1));
+        return;
+    }
+
+    let block = b.split_off(start);
 
     let mut chunks = block.chunks(NGX_HTTP_V2_DEFAULT_FRAME_SIZE).peekable();
 

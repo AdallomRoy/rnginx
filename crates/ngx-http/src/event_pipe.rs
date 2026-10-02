@@ -178,6 +178,69 @@ struct RawSlot {
     mem: Vec<u8>,
 }
 
+/// The lists of a pipe, which the worker keeps when a pipe is done (their
+/// memory, emptied) for the next one: a pipe allocates none of them while
+/// another one ended before it, as C takes them from the request's pool.
+#[derive(Default)]
+struct PipeLists {
+    slots: Vec<RawSlot>,
+    in_bufs: Chain,
+    free_raw: VecDeque<RawBuf>,
+    chain: Vec<RawBuf>,
+    sending: Vec<i32>,
+}
+
+/// The lists kept: as many as pipes may end one after the other, each of
+/// up to PIPE_LIST_KEPT elements (a longer one is let go).
+const PIPE_LISTS_KEPT: usize = 16;
+const PIPE_LIST_KEPT: usize = 64;
+
+thread_local! {
+    static PIPE_LISTS: std::cell::RefCell<Vec<PipeLists>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl PipeLists {
+    fn take() -> PipeLists {
+        PIPE_LISTS.try_with(|l| l.borrow_mut().pop()).ok().flatten().unwrap_or_default()
+    }
+
+    fn keep(mut self) {
+        if self.slots.capacity() > PIPE_LIST_KEPT {
+            self.slots = Vec::new();
+        }
+
+        if self.in_bufs.capacity() > PIPE_LIST_KEPT {
+            self.in_bufs = Chain::new();
+        }
+
+        if self.free_raw.capacity() > PIPE_LIST_KEPT {
+            self.free_raw = VecDeque::new();
+        }
+
+        if self.chain.capacity() > PIPE_LIST_KEPT {
+            self.chain = Vec::new();
+        }
+
+        if self.sending.capacity() > PIPE_LIST_KEPT {
+            self.sending = Vec::new();
+        }
+
+        self.slots.clear();
+        self.in_bufs.clear();
+        self.free_raw.clear();
+        self.chain.clear();
+        self.sending.clear();
+
+        let _ = PIPE_LISTS.try_with(|l| {
+            let mut l = l.borrow_mut();
+
+            if l.len() < PIPE_LISTS_KEPT {
+                l.push(self);
+            }
+        });
+    }
+}
+
 /// ngx_event_pipe_t
 pub struct EventPipe {
     // the configuration of the upstream
@@ -236,8 +299,11 @@ impl EventPipe {
         let pos = pos.min(buffer.len());
         let preread = buffer.len() - pos;
 
-        let mut slots = Vec::with_capacity(bufs.num + 1);
+        let lists = PipeLists::take();
 
+        let mut slots = lists.slots;
+
+        slots.reserve(bufs.num + 1);
         slots.push(RawSlot { size: preread_room.max(preread).max(1), refs: 0, in_free: false, mem: Vec::new() });
 
         let mut p = EventPipe {
@@ -257,13 +323,13 @@ impl EventPipe {
             downstream_error: false,
             read_length: 0,
             preread_size: preread as i64,
-            in_bufs: Chain::new(),
+            in_bufs: lists.in_bufs,
             out_bufs: Chain::new(),
-            free_raw: VecDeque::new(),
+            free_raw: lists.free_raw,
             allocated: 0,
             slots,
-            chain: Vec::new(),
-            sending: Vec::new(),
+            chain: lists.chain,
+            sending: lists.sending,
             temp_file,
             file: None,
             preread: None,
@@ -639,6 +705,20 @@ impl EventPipe {
     }
 }
 
+impl Drop for EventPipe {
+    /// The lists go back to the worker for the next pipe.
+    fn drop(&mut self) {
+        PipeLists {
+            slots: std::mem::take(&mut self.slots),
+            in_bufs: std::mem::take(&mut self.in_bufs),
+            free_raw: std::mem::take(&mut self.free_raw),
+            chain: std::mem::take(&mut self.chain),
+            sending: std::mem::take(&mut self.sending),
+        }
+        .keep();
+    }
+}
+
 /// The numbers of the raw buffers of the memory buffers of a batch.
 pub fn batch_slots(batch: &Chain) -> Vec<i32> {
     batch.iter().filter(|b| !b.in_file).map(|b| b.num).collect()
@@ -907,5 +987,27 @@ mod tests {
         p.put_back(a);
         let t = p.take_partial().unwrap();
         assert_eq!(t.bytes(), b"abc");
+    }
+
+    #[test]
+    fn lists_kept_for_the_next_pipe() {
+        let mut p = pipe(4, 4, b"", 8);
+        let _ = p.take_preread();
+
+        let a = one(&mut p, true).unwrap();
+        copy_input_filter(&mut p, raw(b"1234", 4, a.slot));
+
+        let cap = p.in_bufs.capacity();
+        assert!(cap > 0);
+
+        drop(p);
+
+        // the next pipe of the worker: the lists emptied, their memory kept
+        let p = pipe(4, 4, b"", 8);
+
+        assert!(p.in_bufs.is_empty());
+        assert!(p.in_bufs.capacity() >= cap);
+        assert_eq!(p.slots.len(), 1);
+        assert!(p.free_raw.is_empty());
     }
 }

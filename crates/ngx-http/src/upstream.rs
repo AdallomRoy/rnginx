@@ -743,25 +743,53 @@ pub trait PeerBalancer {
     }
 }
 
+/// peer.data with its methods: the request's own, or, for an https
+/// upstream, shared with c->data of its connections
+/// (ngx_http_upstream_ssl_save_session)
+pub enum Balancer {
+    Owned(RefCell<Box<dyn PeerBalancer>>),
+    Shared(Rc<RefCell<Box<dyn PeerBalancer>>>),
+}
+
+impl Balancer {
+    pub fn cell(&self) -> &RefCell<Box<dyn PeerBalancer>> {
+        match self {
+            Balancer::Owned(b) => b,
+            Balancer::Shared(b) => b,
+        }
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Box<dyn PeerBalancer>> {
+        self.cell().borrow_mut()
+    }
+}
+
 /// The peer side of a request's upstream (ngx_http_upstream_t: peer,
 /// the next upstream settings, request_sent).
 pub struct UpstreamPeer {
     pub pc: PeerConnection,
-    /// peer.data with its methods; shared with c->data of the upstream
-    /// connection (ngx_http_upstream_ssl_save_session)
-    pub balancer: Rc<RefCell<Box<dyn PeerBalancer>>>,
+    /// peer.data with its methods
+    pub balancer: Balancer,
     pub next_upstream: u32,
     pub next_upstream_timeout: u64,
     pub request_sent: bool,
     /// ngx_current_msec at the start of the current try (u->start_time)
     pub start_time: u64,
     /// u->ssl_name: the host of the upstream (uscf->host, or
-    /// u->resolved->host), the name ngx_http_upstream_ssl_name found
+    /// u->resolved->host), the name ngx_http_upstream_ssl_name found; see
+    /// ssl_name_init()
     pub ssl_name: Vec<u8>,
+    /// the upstream whose host ssl_name is, until a new connection needs it
+    ssl_host: Option<Rc<UpstreamSrvConf>>,
 }
 
 impl UpstreamPeer {
     fn new(r: &R, balancer: Box<dyn PeerBalancer>, ssl_name: Option<&[u8]>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
+        UpstreamPeer::with_ssl(r, balancer, ssl_name.is_some(), ssl_name.map(|n| n.to_vec()).unwrap_or_default(), None, next_upstream, next_upstream_tries, next_upstream_timeout, tag)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_ssl(r: &R, balancer: Box<dyn PeerBalancer>, ssl: bool, ssl_name: Vec<u8>, ssl_host: Option<Rc<UpstreamSrvConf>>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize) -> UpstreamPeer {
         let mut tries = balancer.tries();
 
         // ngx_http_upstream_init_request
@@ -786,19 +814,31 @@ impl UpstreamPeer {
                 request_body_sent: false,
                 tag,
             },
-            balancer: Rc::new(RefCell::new(balancer)),
+            // only the connections of an https upstream refer to it
+            balancer: if ssl { Balancer::Shared(Rc::new(RefCell::new(balancer))) } else { Balancer::Owned(RefCell::new(balancer)) },
             next_upstream,
             next_upstream_timeout,
             request_sent: false,
             start_time: now,
-            ssl_name: ssl_name.map(|n| n.to_vec()).unwrap_or_default(),
+            ssl_name,
+            ssl_host,
         }
     }
 
     /// uscf->peer.init for the request's upstream.
     pub fn init(r: &R, uscf: &Rc<UpstreamSrvConf>, next_upstream: u32, next_upstream_tries: u32, next_upstream_timeout: u64, tag: usize, ssl: bool) -> Result<UpstreamPeer, i64> {
         let balancer = uscf.init_peer(r).map_err(|_| crate::NGX_HTTP_INTERNAL_SERVER_ERROR)?;
-        Ok(UpstreamPeer::new(r, balancer, ssl.then_some(&uscf.host[..]), next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+
+        // u->ssl_name = uscf->host: copied when a new connection needs it
+        Ok(UpstreamPeer::with_ssl(r, balancer, ssl, Vec::new(), ssl.then(|| uscf.clone()), next_upstream, next_upstream_tries, next_upstream_timeout, tag))
+    }
+
+    /// u->ssl_name for ngx_http_upstream_ssl_init_connection: the upstream's
+    /// host, if not made yet.
+    pub fn ssl_name_init(&mut self) {
+        if let Some(uscf) = self.ssl_host.take() {
+            self.ssl_name = uscf.host.clone();
+        }
     }
 
     /// ngx_http_upstream_create_round_robin_peer for addresses resolved for
@@ -869,7 +909,14 @@ impl UpstreamPeer {
     /// c->data = r (ngx_http_upstream_connect): the request's upstream
     /// uses the connection (its new TLS sessions go to peer.save_session).
     pub fn attach(&self, c: &ngx_core::connection::Connection) {
-        let data = crate::upstream_ssl::UpstreamConnData { balancer: Rc::downgrade(&self.balancer) };
+        // the balancer of an https upstream is shared (a connection with
+        // c->ssl is one of those)
+        let balancer = match &self.balancer {
+            Balancer::Shared(b) => Rc::downgrade(b),
+            Balancer::Owned(_) => std::rc::Weak::new(),
+        };
+
+        let data = crate::upstream_ssl::UpstreamConnData { balancer };
         *c.data.borrow_mut() = Some(Rc::new(data));
     }
 
