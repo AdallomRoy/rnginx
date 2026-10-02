@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::io::IoSlice;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -152,10 +152,9 @@ thread_local! {
     /// ngx_free_connection() (cycle->free_connection_n is what is left)
     static USED: Cell<usize> = const { Cell::new(0) };
     static CONNECTION_N: Cell<usize> = const { Cell::new(512) };
-    /// cycle->reusable_connections_queue: the reusable connections by the
-    /// time they became reusable, the first one first
-    static REUSABLE: RefCell<BTreeMap<u64, Weak<Connection>>> = const { RefCell::new(BTreeMap::new()) };
-    static REUSABLE_SEQ: Cell<u64> = const { Cell::new(0) };
+    /// cycle->reusable_connections_queue: the reusable connections, the
+    /// last one reusable for the longest time
+    static REUSABLE: RefCell<LinkedSlab<Weak<Connection>>> = const { RefCell::new(LinkedSlab::new()) };
     /// cycle->connections_reuse_time
     static REUSE_TIME: Cell<i64> = const { Cell::new(0) };
     static CLOSE_NOTIFY: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
@@ -208,12 +207,12 @@ fn drain_connections() {
 
     for _ in 0..n {
         // ngx_queue_last(): the connection reusable for the longest time
-        let last = REUSABLE.with(|q| q.borrow().first_key_value().map(|(k, w)| (*k, w.upgrade())));
+        let last = REUSABLE.with(|q| q.borrow().last().map(|(k, w)| (k, w.upgrade())));
 
         let rc = match last {
             Some((_, Some(rc))) => rc,
             Some((key, None)) => {
-                REUSABLE.with(|q| q.borrow_mut().remove(&key));
+                REUSABLE.with(|q| q.borrow_mut().remove(key));
                 continue;
             }
             None => break,
@@ -255,11 +254,109 @@ pub fn for_each_connection(mut f: impl FnMut(&Rc<Connection>)) {
 }
 
 /// The Rc of a connection known by reference only (the OpenSSL callbacks
-/// find the connection by a pointer, ngx_ssl_get_connection()).
+/// find the connection by a pointer, ngx_ssl_get_connection()); None for a
+/// per-stream copy of an HTTP/2 connection.
 pub fn connection_rc(c: &Connection) -> Option<Rc<Connection>> {
-    CONNECTIONS
-        .with(|m| m.borrow().get(&c.number).and_then(|w| w.upgrade()))
-        .filter(|rc| std::ptr::eq(Rc::as_ptr(rc), c))
+    if c.fake {
+        return None;
+    }
+
+    c.this.upgrade()
+}
+
+/// Nodes in a slab linked by index, for the queues C links through the
+/// objects themselves (ngx_queue_t): inserting at the head, removing an
+/// item by its key and finding the last one take constant time, the order
+/// is the insertion order, and nothing is allocated once the slab is as
+/// large as the queue has been. A key is a node's index plus one; 0 is no
+/// key (an item not in the queue).
+struct LinkedSlab<T> {
+    nodes: Vec<SlabNode<T>>,
+    /// the first node (the last inserted), the last one, the first free one
+    head: u32,
+    tail: u32,
+    free: u32,
+    len: usize,
+}
+
+struct SlabNode<T> {
+    prev: u32,
+    next: u32,
+    /// None in a free node
+    item: Option<T>,
+}
+
+impl<T> LinkedSlab<T> {
+    const fn new() -> LinkedSlab<T> {
+        LinkedSlab { nodes: Vec::new(), head: 0, tail: 0, free: 0, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// ngx_queue_insert_head: the key of the item's node.
+    fn insert_head(&mut self, item: T) -> u32 {
+        let node = SlabNode { prev: 0, next: self.head, item: Some(item) };
+
+        let key = if self.free != 0 {
+            let key = self.free;
+            self.free = self.nodes[key as usize - 1].next;
+            self.nodes[key as usize - 1] = node;
+            key
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() as u32
+        };
+
+        if self.head != 0 {
+            self.nodes[self.head as usize - 1].prev = key;
+        } else {
+            self.tail = key;
+        }
+
+        self.head = key;
+        self.len += 1;
+
+        key
+    }
+
+    /// ngx_queue_remove of the item of `key`, which is returned; None for a
+    /// key of no item.
+    fn remove(&mut self, key: u32) -> Option<T> {
+        let i = (key as usize).checked_sub(1)?;
+        let node = self.nodes.get_mut(i)?;
+        let item = node.item.take()?;
+        let (prev, next) = (node.prev, node.next);
+
+        node.next = self.free;
+        self.free = key;
+
+        if prev != 0 {
+            self.nodes[prev as usize - 1].next = next;
+        } else {
+            self.head = next;
+        }
+
+        if next != 0 {
+            self.nodes[next as usize - 1].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+
+        self.len -= 1;
+
+        Some(item)
+    }
+
+    /// ngx_queue_last: the key and the item inserted first of those left.
+    fn last(&self) -> Option<(u32, &T)> {
+        if self.tail == 0 {
+            return None;
+        }
+
+        self.nodes[self.tail as usize - 1].item.as_ref().map(|item| (self.tail, item))
+    }
 }
 
 pub struct Connection {
@@ -306,7 +403,10 @@ pub struct Connection {
     pub reusable: Cell<bool>,
     /// c->queue: the key of the connection in the reusable connections
     /// queue, 0 if not there
-    queue: Cell<u64>,
+    queue: Cell<u32>,
+    /// the connection's own Rc, weak (none for a per-stream copy of an
+    /// HTTP/2 connection)
+    this: Weak<Connection>,
     /// the connection holds one of connection_n (ngx_free_connection()
     /// not called yet)
     slot: Cell<bool>,
@@ -386,7 +486,7 @@ impl Connection {
             clog
         };
         let now = crate::times::cached();
-        let c = Rc::new(Connection {
+        let c = Rc::new_cyclic(|this| Connection {
             fd: Cell::new(fd),
             afd: RefCell::new(None),
             number,
@@ -421,6 +521,7 @@ impl Connection {
             data: RefCell::new(None),
             reusable: Cell::new(false),
             queue: Cell::new(0),
+            this: this.clone(),
             slot: Cell::new(true),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -522,6 +623,7 @@ impl Connection {
             data: RefCell::new(c.data.borrow().clone()),
             reusable: Cell::new(false),
             queue: Cell::new(0),
+            this: Weak::new(),
             slot: Cell::new(false),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -594,20 +696,13 @@ impl Connection {
 
     /// ngx_queue_insert_head(&cycle->reusable_connections_queue, &c->queue)
     fn enqueue(&self) {
-        if self.fd.get() == -1 {
+        // not a per-stream copy of an HTTP/2 connection
+        if self.fd.get() == -1 || self.fake {
             return;
         }
 
-        // not a per-stream copy of an HTTP/2 connection
-        if let Some(rc) = connection_rc(self) {
-            let key = REUSABLE_SEQ.with(|s| {
-                s.set(s.get() + 1);
-                s.get()
-            });
-
-            REUSABLE.with(|q| q.borrow_mut().insert(key, Rc::downgrade(&rc)));
-            self.queue.set(key);
-        }
+        let key = REUSABLE.with(|q| q.borrow_mut().insert_head(self.this.clone()));
+        self.queue.set(key);
     }
 
     /// ngx_queue_remove(&c->queue) of a reusable connection
@@ -615,7 +710,7 @@ impl Connection {
         let key = self.queue.replace(0);
 
         if key != 0 {
-            REUSABLE.with(|q| q.borrow_mut().remove(&key));
+            REUSABLE.with(|q| q.borrow_mut().remove(key));
         }
     }
 
@@ -2150,6 +2245,121 @@ mod tests {
             assert_eq!(c.try_send(b"x").unwrap(), 1, "the socket itself is untouched");
 
             c.close();
+        });
+    }
+
+    #[test]
+    fn linked_slab_queue() {
+        let mut q: LinkedSlab<u32> = LinkedSlab::new();
+        assert!(q.last().is_none());
+
+        let a = q.insert_head(1);
+        let b = q.insert_head(2);
+        let c = q.insert_head(3);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.last(), Some((a, &1)));
+
+        // the middle one
+        assert_eq!(q.remove(b), Some(2));
+        assert_eq!(q.remove(b), None, "removed already");
+        assert_eq!(q.last(), Some((a, &1)));
+
+        // the last one, then the first one
+        assert_eq!(q.remove(a), Some(1));
+        assert_eq!(q.last(), Some((c, &3)));
+        let d = q.insert_head(4);
+        assert!(d == a || d == b, "a free node is used again");
+        assert_eq!(q.last(), Some((c, &3)));
+        assert_eq!(q.remove(d), Some(4));
+        assert_eq!(q.last(), Some((c, &3)));
+        assert_eq!(q.remove(c), Some(3));
+        assert!(q.last().is_none());
+        assert_eq!(q.len(), 0);
+
+        assert_eq!(q.remove(0), None);
+        assert_eq!(q.remove(99), None);
+
+        // in and out: the slab does not grow
+        for i in 0..1000 {
+            let k = q.insert_head(i);
+            assert_eq!(q.remove(k), Some(i));
+        }
+        assert!(q.nodes.len() <= 3);
+    }
+
+    #[test]
+    fn linked_slab_as_a_deque() {
+        // against a model: insert at the front, remove anywhere, the last
+        // one at the back
+        let mut q: LinkedSlab<u64> = LinkedSlab::new();
+        let mut model: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+        let mut seed: u64 = 0x2545f4914f6cdd1d;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for i in 0..20000u64 {
+            let r = next();
+            if model.is_empty() || r % 3 != 0 {
+                let k = q.insert_head(i);
+                model.push_front((k, i));
+            } else {
+                let at = (next() % model.len() as u64) as usize;
+                let (k, v) = model.remove(at).unwrap();
+                assert_eq!(q.remove(k), Some(v));
+            }
+            assert_eq!(q.len(), model.len());
+            assert_eq!(q.last(), model.back().map(|(k, v)| (*k, v)));
+        }
+
+        assert!(q.nodes.len() <= model.len() + 64);
+    }
+
+    #[test]
+    fn drain_takes_the_oldest_reusable() {
+        run_local(async {
+            let saved = connection_n();
+            set_connection_n(connection_n() - free_connections() + 4);
+
+            let pairs: Vec<_> = (0..4).map(|_| tcp_pair(None)).collect();
+            assert_eq!(free_connections(), 0);
+
+            for i in [2, 0, 3, 1] {
+                pairs[i].0.set_reusable(true);
+            }
+
+            // no longer reusable, then again: the newest
+            pairs[2].0.set_reusable(false);
+            pairs[2].0.set_reusable(true);
+
+            // oldest first: 0, 3, 1, 2; one of 4 is closed (n = 4 / 8,
+            // at least 1)
+            let (c4, _p4) = tcp_pair(None);
+            let closed: Vec<bool> = pairs.iter().map(|(c, _)| c.close.get()).collect();
+            assert_eq!(closed, [true, false, false, false]);
+            assert_eq!(free_connections(), 0);
+
+            let (c5, _p5) = tcp_pair(None);
+            let closed: Vec<bool> = pairs.iter().map(|(c, _)| c.close.get()).collect();
+            assert_eq!(closed, [true, false, false, true]);
+
+            // the per-stream copies of HTTP/2 are never queued
+            let fake = Connection::new_fake(&pairs[1].0);
+            fake.set_reusable(true);
+            assert_eq!(fake.queue.get(), 0);
+            assert!(connection_rc(&fake).is_none());
+            assert!(Rc::ptr_eq(&connection_rc(&pairs[1].0).unwrap(), &pairs[1].0));
+
+            for (c, _) in &pairs {
+                c.close();
+            }
+            c4.close();
+            c5.close();
+            assert_eq!(REUSABLE.with(|q| q.borrow().len()), 0);
+            set_connection_n(saved);
         });
     }
 
