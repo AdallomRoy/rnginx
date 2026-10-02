@@ -42,42 +42,32 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::io::{IoSlice, IoSliceMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
 
+use nix::errno::Errno;
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, SockaddrLike, SockaddrStorage, UnixAddr};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
 use crate::connection::{stats, Connection, ListenHandler};
-use crate::inet::SockAddr;
+use crate::inet::{NixSockAddr, SockAddr};
 use crate::listen_event::ListenEvent;
 use crate::listening::Listening;
 use crate::log::*;
 use crate::rc::*;
 use crate::string::B;
-use crate::{ngx_log_debug, ngx_log_error, os};
+use crate::{fd, ngx_log_debug, ngx_log_error};
 
 /// The most datagrams kept for a connection which does not read them.
 pub const NGX_UDP_MAX_UNREAD: usize = 64;
 
 /// The static buffer of ngx_event_recvmsg.
 const NGX_UDP_BUFFER_SIZE: usize = 65535;
-
-/// sizeof(ngx_sockaddr_t)
-const NGX_SOCKADDRLEN: usize = std::mem::size_of::<libc::sockaddr_un>();
-
-/// A cmsghdr buffer, aligned for cmsghdr: enough for
-/// CMSG_SPACE(sizeof(ngx_addrinfo_t)).
-#[repr(C, align(8))]
-pub(crate) struct CmsgBuf(pub(crate) [u8; 64]);
-
-impl Default for CmsgBuf {
-    fn default() -> Self {
-        CmsgBuf([0; 64])
-    }
-}
 
 /// ngx_log_debug with an error number, e.g. "recvmsg() not ready (11: ...)"
 macro_rules! udp_debug_err {
@@ -90,17 +80,11 @@ macro_rules! udp_debug_err {
 
 /// A dup() of a listening socket, closed on drop (after the AsyncFd owning
 /// it has removed it from the reactor).
-pub struct DupFd(RawFd);
+pub struct DupFd(OwnedFd);
 
 impl AsRawFd for DupFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
-impl Drop for DupFd {
-    fn drop(&mut self) {
-        os::close(self.0);
+        self.0.as_raw_fd()
     }
 }
 
@@ -158,11 +142,13 @@ impl UdpListening {
     fn open(ls: &Listening, log: &Log, read_event: Rc<ListenEvent>) -> Option<Rc<UdpListening>> {
         let fd = ls.fd.get();
 
-        let s = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if s == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "fcntl(F_DUPFD_CLOEXEC) {} failed", B(&ls.addr_text));
-            return None;
-        }
+        let s = match fd::get(fd).and_then(|l| rustix::io::fcntl_dupfd_cloexec(&l, 0).map_err(io::Error::from)) {
+            Ok(s) => s,
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "fcntl(F_DUPFD_CLOEXEC) {} failed", B(&ls.addr_text));
+                return None;
+            }
+        };
 
         let afd = match AsyncFd::with_interest(DupFd(s), Interest::WRITABLE) {
             Ok(a) => a,
@@ -310,7 +296,7 @@ pub async fn recvmsg_loop(ls: Rc<Listening>, ev: Rc<ListenEvent>) {
                 break;
             }
 
-            let r = recvmsg(sock.get_ref().0, &ls, &mut buffer, &log);
+            let r = recvmsg(sock.get_ref().as_raw_fd(), &ls, &mut buffer, &log);
 
             let (n, sockaddr, local_sockaddr) = match r {
                 Recvmsg::Again => {
@@ -362,98 +348,106 @@ enum Recvmsg {
     Truncated,
 }
 
+/// The client address of a datagram.
+enum Peer {
+    Addr(SockAddr),
+    /// msg_namelen 0
+    Unnamed,
+    /// another family than the listening socket's
+    Unsupported(i32),
+}
+
 /// The recvmsg() of ngx_event_recvmsg, with the client address and the
 /// local address (from IP_PKTINFO / IPV6_PKTINFO on a wildcard listening).
+///
+/// The address buffer is sizeof(ngx_sockaddr_t) for a unix listening (the
+/// address length, 0 from an unbound socket, is kept in the UnixAddr),
+/// sizeof(sockaddr_storage) otherwise (the kernel always writes an inet
+/// address); the control buffer is CMSG_SPACE(sizeof(ngx_addrinfo_t)).
 fn recvmsg(fd: RawFd, ls: &Listening, buffer: &mut [u8], log: &Log) -> Recvmsg {
-    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut control = CmsgBuf([0; 64]);
-
-    let mut iov = libc::iovec { iov_base: buffer.as_mut_ptr() as *mut libc::c_void, iov_len: buffer.len() };
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-
-    msg.msg_name = &mut sa as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = NGX_SOCKADDRLEN as libc::socklen_t;
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-
     let wildcard = ls.wildcard.get();
 
-    if wildcard {
-        msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space_addrinfo() as _;
-    }
+    let mut local_sockaddr = ls.sockaddr.clone();
 
-    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    let mut iov = [IoSliceMut::new(buffer)];
+
+    let r = if ls.sockaddr.is_unix() {
+        nix::sys::socket::recvmsg::<UnixAddr>(fd, &mut iov, None, MsgFlags::empty()).map(|msg| {
+            let peer = match &msg.address {
+                Some(a) if a.len() != 0 => Peer::Addr(SockAddr::from_unix_addr(a)),
+                _ => Peer::Unnamed,
+            };
+
+            (msg.bytes, msg.flags, peer)
+        })
+    } else {
+        let mut control = nix::cmsg_space!(libc::in6_pktinfo);
+
+        nix::sys::socket::recvmsg::<SockaddrStorage>(fd, &mut iov, wildcard.then_some(&mut control), MsgFlags::empty()).map(|msg| {
+            let peer = match &msg.address {
+                Some(ss) => match SockAddr::from_nix(ss) {
+                    Some(sa) => Peer::Addr(sa),
+                    None => Peer::Unsupported(ss.family().map_or(0, |f| f as i32)),
+                },
+                None => Peer::Unnamed,
+            };
+
+            // the control data of a datagram not truncated (cmsgs() refuses
+            // truncated control data)
+            if wildcard && !msg.flags.contains(MsgFlags::MSG_TRUNC) {
+                if let Ok(cmsgs) = msg.cmsgs() {
+                    for cmsg in cmsgs {
+                        if get_srcaddr_cmsg(&cmsg, &mut local_sockaddr) == NGX_OK {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            (msg.bytes, msg.flags, peer)
+        })
+    };
 
     let quic = if ls.quic.get() { "quic " } else { "" };
 
-    if n == -1 {
-        let err = os::errno();
+    let (n, flags, peer) = match r {
+        Ok(r) => r,
 
-        if err == libc::EAGAIN {
-            udp_debug_err!(log, err, "{}recvmsg() not ready", quic);
+        Err(Errno::EAGAIN) => {
+            udp_debug_err!(log, libc::EAGAIN, "{}recvmsg() not ready", quic);
             return Recvmsg::Again;
         }
 
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "{}recvmsg() failed", quic);
-
-        return Recvmsg::Error;
-    }
-
-    if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-        ngx_log_error!(NGX_LOG_ALERT, log, None, "{}recvmsg() truncated data", quic);
-        return Recvmsg::Truncated;
-    }
-
-    let mut socklen = msg.msg_namelen;
-
-    if socklen as usize > NGX_SOCKADDRLEN {
-        socklen = NGX_SOCKADDRLEN as libc::socklen_t;
-    }
-
-    if socklen == 0 {
-        // on Linux recvmsg() returns zero msg_namelen
-        // when receiving packets from unbound AF_UNIX sockets
-
-        socklen = std::mem::size_of::<libc::sockaddr>() as libc::socklen_t;
-        sa = unsafe { std::mem::zeroed() };
-        sa.ss_family = ls.sockaddr.family() as libc::sa_family_t;
-    }
-
-    let sockaddr = match SockAddr::from_libc(&sa as *const _ as *const libc::sockaddr, socklen) {
-        Some(s) => s,
-        None => {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned an unsupported address family {}", sa.ss_family);
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e as i32), "{}recvmsg() failed", quic);
             return Recvmsg::Error;
         }
     };
 
-    let mut local_sockaddr = ls.sockaddr.clone();
-
-    if wildcard {
-        // SAFETY: the kernel filled msg_controllen bytes of control, and
-        // CMSG_FIRSTHDR / CMSG_NXTHDR stay within them
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-
-            while !cmsg.is_null() {
-                if get_srcaddr_cmsg(cmsg, &mut local_sockaddr) == NGX_OK {
-                    break;
-                }
-
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
+    if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
+        ngx_log_error!(NGX_LOG_ALERT, log, None, "{}recvmsg() truncated data", quic);
+        return Recvmsg::Truncated;
     }
 
-    Recvmsg::Datagram(n as usize, sockaddr, local_sockaddr)
-}
+    let sockaddr = match peer {
+        Peer::Addr(sa) => sa,
 
-/// CMSG_SPACE(sizeof(ngx_addrinfo_t))
-pub(crate) fn cmsg_space_addrinfo() -> usize {
-    let size = std::mem::size_of::<libc::in_pktinfo>().max(std::mem::size_of::<libc::in6_pktinfo>());
-    unsafe { libc::CMSG_SPACE(size as u32) as usize }
+        // on Linux recvmsg() returns zero msg_namelen
+        // when receiving packets from unbound AF_UNIX sockets:
+        // a zeroed sockaddr of the listening's family
+        Peer::Unnamed => match ls.sockaddr.family() {
+            libc::AF_INET => SockAddr::v4(Ipv4Addr::UNSPECIFIED, 0),
+            libc::AF_INET6 => SockAddr::v6(Ipv6Addr::UNSPECIFIED, 0),
+            _ => SockAddr::Unix(Vec::new()),
+        },
+
+        Peer::Unsupported(family) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "recvmsg() returned an unsupported address family {}", family);
+            return Recvmsg::Error;
+        }
+    };
+
+    Recvmsg::Datagram(n, sockaddr, local_sockaddr)
 }
 
 /// The part of ngx_event_recvmsg after a datagram is read: give it to the
@@ -793,44 +787,22 @@ impl UdpConnection {
             None => return Err(io::Error::from_raw_os_error(libc::EBADF)),
         };
 
-        let mut iovs: Vec<libc::iovec> = iov.iter().filter(|s| !s.is_empty()).map(|s| libc::iovec { iov_base: s.as_ptr() as *mut libc::c_void, iov_len: s.len() }).collect();
+        let mut iovs: Vec<IoSlice<'_>> = iov.iter().filter(|s| !s.is_empty()).map(|s| IoSlice::new(s)).collect();
 
         // zero-sized datagram; pretend to have at least 1 iov
 
         if iovs.is_empty() {
-            iovs.push(libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 });
+            iovs.push(IoSlice::new(&[]));
         }
 
-        let (mut ss, slen) = c.sockaddr.borrow().to_libc();
+        let addr = c.sockaddr.borrow().to_nix();
 
-        let mut control = CmsgBuf([0; 64]);
+        // the source address on a wildcard listening (none for a unix one)
+        let srcaddr = if self.listening.wildcard { c.local_sockaddr.borrow().as_ref().and_then(set_srcaddr_cmsg) } else { None };
 
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        let cmsgs: Vec<ControlMessage<'_>> = srcaddr.iter().map(SrcAddrCmsg::cmsg).collect();
 
-        msg.msg_name = &mut ss as *mut _ as *mut libc::c_void;
-        msg.msg_namelen = slen;
-        msg.msg_iov = iovs.as_mut_ptr();
-        msg.msg_iovlen = iovs.len() as _;
-
-        if self.listening.wildcard {
-            if let Some(local) = c.local_sockaddr.borrow().as_ref() {
-                msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = cmsg_space_addrinfo() as _;
-
-                // SAFETY: msg_control points to cmsg_space_addrinfo()
-                // bytes, enough for the header and ngx_addrinfo_t
-                unsafe {
-                    let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                    msg.msg_controllen = set_srcaddr_cmsg(cmsg, local) as _;
-                }
-
-                if msg.msg_controllen == 0 {
-                    msg.msg_control = std::ptr::null_mut();
-                }
-            }
-        }
-
-        let n = sendmsg(c, sock.get_ref().0, &msg)?;
+        let n = sendmsg(c, sock.get_ref().as_raw_fd(), &iovs, &cmsgs, &addr)?;
 
         c.sent.set(c.sent.get() + n as u64);
 
@@ -838,106 +810,96 @@ impl UdpConnection {
     }
 }
 
-/// ngx_sendmsg: EAGAIN is WouldBlock; other errors are returned to the
-/// caller, which logs "sendmsg() failed" (ngx_connection_error).
-fn sendmsg(c: &Connection, fd: RawFd, msg: &libc::msghdr) -> io::Result<usize> {
-    loop {
-        let n = unsafe { libc::sendmsg(fd, msg, 0) };
+/// sendmsg() of the buffers as one datagram to the address, with the
+/// control messages (nix wants the address as its own type).
+pub(crate) fn sendmsg_to(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage<'_>], addr: &NixSockAddr) -> nix::Result<usize> {
+    let flags = MsgFlags::empty();
 
-        if n == -1 {
-            let err = os::errno();
-
-            match err {
-                libc::EAGAIN => {
-                    udp_debug_err!(c.log, err, "sendmsg() not ready");
-                    return Err(io::ErrorKind::WouldBlock.into());
-                }
-
-                libc::EINTR => {
-                    udp_debug_err!(c.log, err, "sendmsg() was interrupted");
-                    continue;
-                }
-
-                _ => return Err(io::Error::from_raw_os_error(err)),
-            }
-        }
-
-        if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
-            let size: usize = (0..msg.msg_iovlen as usize).map(|i| unsafe { (*msg.msg_iov.add(i)).iov_len }).sum();
-            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "sendmsg: {} of {}", n, size);
-        }
-
-        return Ok(n as usize);
+    match addr {
+        NixSockAddr::V4(a) => nix::sys::socket::sendmsg(fd, iov, cmsgs, flags, Some(a)),
+        NixSockAddr::V6(a) => nix::sys::socket::sendmsg(fd, iov, cmsgs, flags, Some(a)),
+        NixSockAddr::Unix(a) => nix::sys::socket::sendmsg(fd, iov, cmsgs, flags, Some(a)),
     }
 }
 
-/// ngx_set_srcaddr_cmsg: the source address of a datagram, the length of
-/// the control data.
-///
-/// # Safety
-/// `cmsg` must point to a writable cmsghdr buffer of at least
-/// CMSG_SPACE(sizeof(ngx_addrinfo_t)) bytes.
-pub unsafe fn set_srcaddr_cmsg(cmsg: *mut libc::cmsghdr, local_sockaddr: &SockAddr) -> usize {
+/// ngx_sendmsg: EAGAIN is WouldBlock; other errors are returned to the
+/// caller, which logs "sendmsg() failed" (ngx_connection_error).
+fn sendmsg(c: &Connection, fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage<'_>], addr: &NixSockAddr) -> io::Result<usize> {
+    loop {
+        let n = match sendmsg_to(fd, iov, cmsgs, addr) {
+            Ok(n) => n,
+
+            Err(Errno::EAGAIN) => {
+                udp_debug_err!(c.log, libc::EAGAIN, "sendmsg() not ready");
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+
+            Err(Errno::EINTR) => {
+                udp_debug_err!(c.log, libc::EINTR, "sendmsg() was interrupted");
+                continue;
+            }
+
+            Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+        };
+
+        if c.log.debug_enabled(NGX_LOG_DEBUG_EVENT) {
+            let size: usize = iov.iter().map(|v| v.len()).sum();
+            ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "sendmsg: {} of {}", n, size);
+        }
+
+        return Ok(n);
+    }
+}
+
+/// The control message of ngx_set_srcaddr_cmsg: IP_PKTINFO with the source
+/// address in ipi_spec_dst, or IPV6_PKTINFO with it in ipi6_addr.
+pub enum SrcAddrCmsg {
+    V4(libc::in_pktinfo),
+    V6(libc::in6_pktinfo),
+}
+
+impl SrcAddrCmsg {
+    /// The message for sendmsg(): CMSG_SPACE(sizeof(struct in_pktinfo)) or
+    /// CMSG_SPACE(sizeof(struct in6_pktinfo)) bytes of control data.
+    pub fn cmsg(&self) -> ControlMessage<'_> {
+        match self {
+            SrcAddrCmsg::V4(pkt) => ControlMessage::Ipv4PacketInfo(pkt),
+            SrcAddrCmsg::V6(pkt6) => ControlMessage::Ipv6PacketInfo(pkt6),
+        }
+    }
+}
+
+/// ngx_set_srcaddr_cmsg: the control message with the source address of a
+/// datagram; None, no control data, for a unix socket.
+pub fn set_srcaddr_cmsg(local_sockaddr: &SockAddr) -> Option<SrcAddrCmsg> {
     match local_sockaddr {
-        SockAddr::V4(sin) => {
-            (*cmsg).cmsg_level = libc::IPPROTO_IP;
-            (*cmsg).cmsg_type = libc::IP_PKTINFO;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
-            let len = libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+        SockAddr::V4(sin) => Some(SrcAddrCmsg::V4(libc::in_pktinfo {
+            ipi_ifindex: 0,
+            ipi_spec_dst: libc::in_addr { s_addr: u32::from(*sin.ip()).to_be() },
+            ipi_addr: libc::in_addr { s_addr: 0 },
+        })),
 
-            let mut pkt: libc::in_pktinfo = std::mem::zeroed();
-            pkt.ipi_spec_dst.s_addr = u32::from(*sin.ip()).to_be();
+        SockAddr::V6(sin6) => Some(SrcAddrCmsg::V6(libc::in6_pktinfo { ipi6_addr: libc::in6_addr { s6_addr: sin6.ip().octets() }, ipi6_ifindex: 0 })),
 
-            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo, pkt);
-
-            len
-        }
-
-        SockAddr::V6(sin6) => {
-            (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
-            (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
-            let len = libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
-
-            let mut pkt6: libc::in6_pktinfo = std::mem::zeroed();
-            pkt6.ipi6_addr.s6_addr = sin6.ip().octets();
-
-            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::in6_pktinfo, pkt6);
-
-            len
-        }
-
-        SockAddr::Unix(_) => 0,
+        SockAddr::Unix(_) => None,
     }
 }
 
 /// ngx_get_srcaddr_cmsg: the local address of a received datagram.
-///
-/// # Safety
-/// `cmsg` must point to a control message filled by the kernel.
-pub unsafe fn get_srcaddr_cmsg(cmsg: *const libc::cmsghdr, local_sockaddr: &mut SockAddr) -> i64 {
-    let level = (*cmsg).cmsg_level;
-    let ty = (*cmsg).cmsg_type;
-
-    if level == libc::IPPROTO_IP && ty == libc::IP_PKTINFO {
-        if let SockAddr::V4(sin) = local_sockaddr {
-            let pkt = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo);
+pub fn get_srcaddr_cmsg(cmsg: &ControlMessageOwned, local_sockaddr: &mut SockAddr) -> i64 {
+    match (cmsg, local_sockaddr) {
+        (ControlMessageOwned::Ipv4PacketInfo(pkt), SockAddr::V4(sin)) => {
             sin.set_ip(Ipv4Addr::from(u32::from_be(pkt.ipi_addr.s_addr)));
-
-            return NGX_OK;
+            NGX_OK
         }
-    }
 
-    if level == libc::IPPROTO_IPV6 && ty == libc::IPV6_PKTINFO {
-        if let SockAddr::V6(sin6) = local_sockaddr {
-            let pkt6 = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo);
+        (ControlMessageOwned::Ipv6PacketInfo(pkt6), SockAddr::V6(sin6)) => {
             sin6.set_ip(Ipv6Addr::from(pkt6.ipi6_addr.s6_addr));
-
-            return NGX_OK;
+            NGX_OK
         }
-    }
 
-    NGX_DECLINED
+        _ => NGX_DECLINED,
+    }
 }
 
 #[cfg(test)]
@@ -945,9 +907,15 @@ mod tests {
     use super::*;
     use crate::log::LogChain;
     use std::future::Future;
+    use crate::os;
     use std::net::SocketAddr;
-    use std::os::unix::io::IntoRawFd;
     use std::time::Duration;
+
+    /// A socket of the descriptor table, by its number (the listening
+    /// sockets and the peers are registered).
+    fn registered(s: impl Into<OwnedFd>) -> RawFd {
+        fd::register(s.into())
+    }
 
     /// the read event of the listening socket, added
     fn read_event(ls: &Listening) -> Rc<ListenEvent> {
@@ -978,16 +946,15 @@ mod tests {
         let sock = std::net::UdpSocket::bind(addr).unwrap();
         sock.set_nonblocking(true).unwrap();
         let bound = sock.local_addr().unwrap();
-        let fd = sock.into_raw_fd();
 
         let sa = sockaddr(bound);
         let wildcard = sa.is_wildcard();
 
         if wildcard {
-            let one: libc::c_int = 1;
-            let rc = unsafe { libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, &one as *const _ as *const libc::c_void, 4) };
-            assert_eq!(rc, 0);
+            nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true).unwrap();
         }
+
+        let fd = registered(sock);
 
         let mut ls = Listening::new(sa, Log::new(LogChain::new()));
         ls.ty = libc::SOCK_DGRAM;
@@ -1382,11 +1349,10 @@ mod tests {
             let sock = std::net::UdpSocket::bind("[::]:0").unwrap();
             sock.set_nonblocking(true).unwrap();
             let bound = sock.local_addr().unwrap();
-            let fd = sock.into_raw_fd();
 
-            let one: libc::c_int = 1;
-            let rc = unsafe { libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, &one as *const _ as *const libc::c_void, 4) };
-            assert_eq!(rc, 0);
+            nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::Ipv6RecvPacketInfo, &true).unwrap();
+
+            let fd = registered(sock);
 
             let mut ls = Listening::new(sockaddr(bound), Log::new(LogChain::new()));
             ls.ty = libc::SOCK_DGRAM;
@@ -1429,7 +1395,7 @@ mod tests {
 
             let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
             sock.set_nonblocking(true).unwrap();
-            let fd = sock.into_raw_fd();
+            let fd = registered(sock);
 
             let spath = path.to_str().unwrap().as_bytes().to_vec();
             let mut ls = Listening::new(SockAddr::Unix(spath.clone()), Log::new(LogChain::new()));
@@ -1487,6 +1453,49 @@ mod tests {
     }
 
     #[test]
+    fn unix_client_with_a_path_filling_sun_path() {
+        run(async {
+            let dir = std::env::temp_dir().join(format!("ngx-udp-sun-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("listen.sock");
+
+            let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let fd = registered(sock);
+
+            let mut ls = Listening::new(SockAddr::Unix(path.to_str().unwrap().as_bytes().to_vec()), Log::new(LogChain::new()));
+            ls.ty = libc::SOCK_DGRAM;
+            ls.fd.set(fd);
+
+            let conns: Conns = Rc::new(RefCell::new(Vec::new()));
+            let cc = conns.clone();
+            let handler: ListenHandler = Rc::new(move |c: Rc<Connection>| cc.borrow_mut().push(c));
+            *ls.handler.borrow_mut() = Some(handler);
+            let ls = Rc::new(ls);
+
+            crate::event::spawn(recvmsg_loop(ls.clone(), read_event(&ls)));
+
+            // a client bound to a path of all 108 bytes of sun_path: the
+            // kernel returns it without a NUL
+            let mut name = dir.to_str().unwrap().as_bytes().to_vec();
+            name.push(b'/');
+            name.resize(108, b'c');
+            let client = rustix::net::socket(rustix::net::AddressFamily::UNIX, rustix::net::SocketType::DGRAM, None).unwrap();
+            rustix::net::bind(&client, &rustix::net::SocketAddrUnix::new(name.as_slice()).unwrap()).unwrap();
+            rustix::net::sendto(&client, b"full", rustix::net::SendFlags::empty(), &rustix::net::SocketAddrUnix::new(path.as_path()).unwrap()).unwrap();
+
+            wait_for(|| conns.borrow().len() == 1).await;
+            assert_eq!(*conns.borrow()[0].sockaddr.borrow(), SockAddr::Unix(name.clone()));
+            assert_eq!(&*conns.borrow()[0].buffer.borrow(), b"full");
+
+            stop_recvmsg(&ls);
+            os::close(ls.fd.get());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
     fn truncated_datagram_is_dropped() {
         run(async {
             let dir = std::env::temp_dir().join(format!("ngx-udp-trunc-{}", std::process::id()));
@@ -1497,7 +1506,7 @@ mod tests {
 
             let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
             sock.set_nonblocking(true).unwrap();
-            let fd = sock.into_raw_fd();
+            let fd = registered(sock);
 
             // the listening's log, kept
 
@@ -1571,7 +1580,7 @@ mod tests {
         s.connect(backend).unwrap();
         s.set_nonblocking(true).unwrap();
 
-        let pc = Connection::peer(s.into_raw_fd(), libc::SOCK_DGRAM, sockaddr(backend), &c.log).unwrap();
+        let pc = Connection::peer(registered(s), libc::SOCK_DGRAM, sockaddr(backend), &c.log).unwrap();
 
         let mut requests = 1;
         let mut responses = 0;
@@ -1685,7 +1694,7 @@ mod tests {
             let caddr = s.local_addr().unwrap();
 
             let log = Log::new(LogChain::new());
-            let c = Connection::peer(s.into_raw_fd(), libc::SOCK_DGRAM, sockaddr(saddr), &log).unwrap();
+            let c = Connection::peer(registered(s), libc::SOCK_DGRAM, sockaddr(saddr), &log).unwrap();
             assert_eq!(c.ty, libc::SOCK_DGRAM);
             assert!(!c.is_udp_shared());
 
@@ -1723,7 +1732,7 @@ mod tests {
             s.set_nonblocking(true).unwrap();
 
             let log = Log::new(LogChain::new());
-            let c = Connection::peer(s.into_raw_fd(), libc::SOCK_DGRAM, sockaddr(dead), &log).unwrap();
+            let c = Connection::peer(registered(s), libc::SOCK_DGRAM, sockaddr(dead), &log).unwrap();
 
             c.send(b"x").await.unwrap();
 
@@ -1750,68 +1759,58 @@ mod tests {
 
     #[test]
     fn srcaddr_cmsg() {
-        let mut buf = CmsgBuf([0; 64]);
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_control = buf.0.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space_addrinfo() as _;
-
         // ngx_set_srcaddr_cmsg: IP_PKTINFO with ipi_spec_dst
 
         let local = SockAddr::v4(Ipv4Addr::new(127, 0, 0, 2), 8999);
 
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            let len = set_srcaddr_cmsg(cmsg, &local);
-            assert_eq!(len, libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize);
-            assert_eq!((*cmsg).cmsg_level, libc::IPPROTO_IP);
-            assert_eq!((*cmsg).cmsg_type, libc::IP_PKTINFO);
-            let pkt = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo);
-            assert_eq!(u32::from_be(pkt.ipi_spec_dst.s_addr), u32::from(Ipv4Addr::new(127, 0, 0, 2)));
-            assert_eq!(pkt.ipi_addr.s_addr, 0);
-            assert_eq!(pkt.ipi_ifindex, 0);
+        match set_srcaddr_cmsg(&local) {
+            Some(m @ SrcAddrCmsg::V4(pkt)) => {
+                assert_eq!(u32::from_be(pkt.ipi_spec_dst.s_addr), u32::from(Ipv4Addr::new(127, 0, 0, 2)));
+                assert_eq!(pkt.ipi_addr.s_addr, 0);
+                assert_eq!(pkt.ipi_ifindex, 0);
+                assert!(matches!(m.cmsg(), ControlMessage::Ipv4PacketInfo(_)));
+            }
+            _ => panic!("IP_PKTINFO"),
         }
 
         // ngx_get_srcaddr_cmsg: ipi_addr into the local address, the port kept
 
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            let mut pkt: libc::in_pktinfo = std::mem::zeroed();
-            pkt.ipi_addr.s_addr = u32::from(Ipv4Addr::new(10, 1, 2, 3)).to_be();
-            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo, pkt);
+        let pkt = libc::in_pktinfo { ipi_ifindex: 0, ipi_spec_dst: libc::in_addr { s_addr: 0 }, ipi_addr: libc::in_addr { s_addr: u32::from(Ipv4Addr::new(10, 1, 2, 3)).to_be() } };
+        let cmsg = ControlMessageOwned::Ipv4PacketInfo(pkt);
 
-            let mut l = SockAddr::v4(Ipv4Addr::UNSPECIFIED, 53);
-            assert_eq!(get_srcaddr_cmsg(cmsg, &mut l), NGX_OK);
-            assert_eq!(l, SockAddr::v4(Ipv4Addr::new(10, 1, 2, 3), 53));
+        let mut l = SockAddr::v4(Ipv4Addr::UNSPECIFIED, 53);
+        assert_eq!(get_srcaddr_cmsg(&cmsg, &mut l), NGX_OK);
+        assert_eq!(l, SockAddr::v4(Ipv4Addr::new(10, 1, 2, 3), 53));
 
-            // another family: declined
-            let mut l6 = SockAddr::v6(Ipv6Addr::UNSPECIFIED, 53);
-            assert_eq!(get_srcaddr_cmsg(cmsg, &mut l6), NGX_DECLINED);
-            assert_eq!(l6, SockAddr::v6(Ipv6Addr::UNSPECIFIED, 53));
-        }
+        // another family: declined
+        let mut l6 = SockAddr::v6(Ipv6Addr::UNSPECIFIED, 53);
+        assert_eq!(get_srcaddr_cmsg(&cmsg, &mut l6), NGX_DECLINED);
+        assert_eq!(l6, SockAddr::v6(Ipv6Addr::UNSPECIFIED, 53));
 
         // IPv6: IPV6_PKTINFO both ways
 
-        let mut buf6 = CmsgBuf([0; 64]);
-        msg.msg_control = buf6.0.as_mut_ptr() as *mut libc::c_void;
-
         let ip6: Ipv6Addr = "2001:db8::1".parse().unwrap();
 
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            let len = set_srcaddr_cmsg(cmsg, &SockAddr::v6(ip6, 8999));
-            assert_eq!(len, libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize);
-            assert_eq!((*cmsg).cmsg_level, libc::IPPROTO_IPV6);
-            assert_eq!((*cmsg).cmsg_type, libc::IPV6_PKTINFO);
+        let pkt6 = match set_srcaddr_cmsg(&SockAddr::v6(ip6, 8999)) {
+            Some(m @ SrcAddrCmsg::V6(pkt6)) => {
+                assert_eq!(pkt6.ipi6_addr.s6_addr, ip6.octets());
+                assert_eq!(pkt6.ipi6_ifindex, 0);
+                assert!(matches!(m.cmsg(), ControlMessage::Ipv6PacketInfo(_)));
+                pkt6
+            }
+            _ => panic!("IPV6_PKTINFO"),
+        };
 
-            let mut l = SockAddr::v6(Ipv6Addr::UNSPECIFIED, 8999);
-            assert_eq!(get_srcaddr_cmsg(cmsg, &mut l), NGX_OK);
-            assert_eq!(l, SockAddr::v6(ip6, 8999));
+        let cmsg6 = ControlMessageOwned::Ipv6PacketInfo(pkt6);
 
-            let mut l4 = SockAddr::v4(Ipv4Addr::UNSPECIFIED, 1);
-            assert_eq!(get_srcaddr_cmsg(cmsg, &mut l4), NGX_DECLINED);
+        let mut l = SockAddr::v6(Ipv6Addr::UNSPECIFIED, 8999);
+        assert_eq!(get_srcaddr_cmsg(&cmsg6, &mut l), NGX_OK);
+        assert_eq!(l, SockAddr::v6(ip6, 8999));
 
-            // no source address for a unix socket
-            assert_eq!(set_srcaddr_cmsg(cmsg, &SockAddr::Unix(b"/tmp/x".to_vec())), 0);
-        }
+        let mut l4 = SockAddr::v4(Ipv4Addr::UNSPECIFIED, 1);
+        assert_eq!(get_srcaddr_cmsg(&cmsg6, &mut l4), NGX_DECLINED);
+
+        // no source address for a unix socket
+        assert!(set_srcaddr_cmsg(&SockAddr::Unix(b"/tmp/x".to_vec())).is_none());
     }
 }

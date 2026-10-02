@@ -386,8 +386,6 @@ pub(crate) struct TestReading {
 
 impl TestReading {
     pub(crate) fn new(r: &R) -> TestReading {
-        use std::os::fd::FromRawFd;
-
         if let Some(qs) = ngx_core::quic::streams::ngx_quic_stream(&r.connection) {
             return TestReading { afd: None, quic: Some((r.connection.clone(), qs)) };
         }
@@ -396,15 +394,17 @@ impl TestReading {
             return TestReading { afd: None, quic: None };
         }
 
-        // SAFETY: dup() of the connection's open socket, owned (and
-        // closed) by the OwnedFd
-        let dup = unsafe { libc::dup(r.connection.fd.get()) };
+        // a dup() of the connection's open socket, owned (and closed) by
+        // the OwnedFd
+        let dup = match ngx_core::fd::get(r.connection.fd.get()) {
+            Ok(s) => rustix::io::fcntl_dupfd_cloexec(&s, 0),
+            Err(_) => return TestReading { afd: None, quic: None },
+        };
 
-        if dup < 0 {
-            return TestReading { afd: None, quic: None };
-        }
-
-        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+        let owned = match dup {
+            Ok(owned) => owned,
+            Err(_) => return TestReading { afd: None, quic: None },
+        };
 
         TestReading { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), quic: None }
     }
@@ -412,8 +412,6 @@ impl TestReading {
     /// Resolves with the pending socket error (0 if none) when the client
     /// has closed the connection (rev->pending_eof).
     pub(crate) async fn closed(&self) -> i32 {
-        use std::os::fd::AsRawFd;
-
         if let Some((c, qs)) = &self.quic {
             ngx_core::quic::streams::wait_stream(qs, || qs.read_error.get()).await;
             c.error.set(true);
@@ -439,15 +437,10 @@ impl TestReading {
         }
 
         // getsockopt(SO_ERROR): a pending error, if any
-        let mut err: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-
-        // SAFETY: err and len are valid for an int to be written
-        unsafe {
-            libc::getsockopt(afd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
+        match rustix::net::sockopt::socket_error(afd.get_ref()) {
+            Ok(Err(err)) => err.raw_os_error(),
+            _ => 0,
         }
-
-        err
     }
 }
 

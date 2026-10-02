@@ -309,11 +309,9 @@ pub enum ResolveStart {
     NoResolver,
 }
 
+/// ngx_random(): random() of glibc
 fn random() -> u64 {
-    extern "C" {
-        fn random() -> libc::c_long;
-    }
-    unsafe { random() as u64 }
+    crate::random::random() as u64
 }
 
 fn now() -> i64 {
@@ -1282,8 +1280,7 @@ fn send_udp_query(r: &Rc<Resolver>, i: usize, query: &[u8]) -> i64 {
     // ngx_send: UDP sockets are always ready to write, the reactor has no
     // write readiness for a new one yet
     let fd = std::os::unix::io::AsRawFd::as_raw_fd(&*udp.sock);
-    let rc = unsafe { libc::send(fd, query.as_ptr() as *const libc::c_void, query.len(), 0) };
-    let sent = if rc == -1 { Err(std::io::Error::last_os_error()) } else { Ok(rc as usize) };
+    let sent = nix::sys::socket::send(fd, query, nix::sys::socket::MsgFlags::empty()).map_err(std::io::Error::from);
 
     match sent {
         Ok(n) if n == query.len() => NGX_OK,
@@ -1441,26 +1438,37 @@ fn udp_connect(r: &Rc<Resolver>, i: usize) -> i64 {
     let rec = &r.connections[i];
     let log = rec_log(r, i);
 
-    let (sa, len) = rec.sockaddr.to_libc();
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::from_raw(rec.sockaddr.family() as rustix::net::RawAddressFamily),
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::NONBLOCK | rustix::net::SocketFlags::CLOEXEC,
+        None,
+    );
 
-    let s = unsafe { libc::socket(sa.ss_family as i32, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    let s = match &socket {
+        Ok(s) => std::os::unix::io::AsRawFd::as_raw_fd(s),
+        Err(_) => -1,
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "UDP socket {}", s);
 
-    if s == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "socket() failed");
-        return NGX_ERROR;
-    }
+    // owned by the std socket made of it, closed if dropped on an error
+    let socket = match socket {
+        Ok(socket) => socket,
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(e.raw_os_error()), "socket() failed");
+            return NGX_ERROR;
+        }
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, log, "connect to {}, fd:{}", B(&rec.server), s);
 
-    if unsafe { libc::connect(s, &sa as *const libc::sockaddr_storage as *const libc::sockaddr, len) } == -1 {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(errno()), "connect() failed");
-        unsafe { libc::close(s) };
+    if let Err(e) = nix::sys::socket::connect(s, rec.sockaddr.to_nix().as_dyn()) {
+        ngx_log_error!(NGX_LOG_CRIT, log, Some(e as i32), "connect() failed");
         return NGX_ERROR;
     }
 
-    let std_sock = unsafe { <std::net::UdpSocket as std::os::unix::io::FromRawFd>::from_raw_fd(s) };
+    let std_sock = std::net::UdpSocket::from(socket);
 
     let sock = match tokio::net::UdpSocket::from_std(std_sock) {
         Ok(s) => Rc::new(s),

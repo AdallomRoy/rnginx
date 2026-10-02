@@ -2,9 +2,13 @@
 //! (ngx_event_connect_peer after pc->get chose the peer).
 
 use std::io;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::rc::Rc;
 
+use nix::fcntl::{FcntlArg, OFlag};
+
 use crate::connection::Connection;
+use crate::fd;
 use crate::inet::SockAddr;
 use crate::log::*;
 use crate::string::B;
@@ -44,12 +48,11 @@ pub enum PeerConnect {
     Error,
 }
 
-fn setsockopt_int(s: i32, level: i32, name: i32, value: i32) -> io::Result<()> {
-    let r = unsafe { libc::setsockopt(s, level, name, &value as *const i32 as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t) };
-    if r == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+/// An option of the socket `s`; Err(errno).
+fn sockopt<E: Into<io::Error>>(s: i32, op: impl FnOnce(BorrowedFd<'_>) -> Result<(), E>) -> Result<(), i32> {
+    let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+    let f = fd::get(s).map_err(errno)?;
+    op(f.as_fd()).map_err(|e| errno(e.into()))
 }
 
 /// ngx_event_connect_set_transparent
@@ -58,14 +61,14 @@ fn set_transparent(p: &PeerSocket, s: i32) -> Result<(), ()> {
 
     match local.sockaddr {
         SockAddr::V4(_) => {
-            if setsockopt_int(s, libc::IPPROTO_IP, libc::IP_TRANSPARENT, 1).is_err() {
-                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(IP_TRANSPARENT) failed");
+            if let Err(e) = sockopt(s, |f| socket2::SockRef::from(&f).set_ip_transparent_v4(true)) {
+                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(IP_TRANSPARENT) failed");
                 return Err(());
             }
         }
         SockAddr::V6(_) => {
-            if setsockopt_int(s, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, 1).is_err() {
-                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(IPV6_TRANSPARENT) failed");
+            if let Err(e) = sockopt(s, |f| socket2::SockRef::from(&f).set_ip_transparent_v6(true)) {
+                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(IPV6_TRANSPARENT) failed");
                 return Err(());
             }
         }
@@ -82,35 +85,55 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
 
     let family = p.sockaddr.family();
 
-    let s = unsafe { libc::socket(family, ty | libc::SOCK_CLOEXEC, 0) };
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::from_raw(family as rustix::net::RawAddressFamily),
+        rustix::net::SocketType::from_raw(ty as rustix::net::RawSocketType),
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    );
+
+    let s = match &socket {
+        Ok(s) => std::os::fd::AsRawFd::as_raw_fd(s),
+        Err(_) => -1,
+    };
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, p.log, "{} socket {}", if ty == libc::SOCK_STREAM { "stream" } else { "dgram" }, s);
 
-    if s == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "socket() failed");
-        return PeerConnect::Error;
-    }
+    let s = match socket {
+        Ok(s) => fd::register(s),
+        Err(e) => {
+            ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e.raw_os_error()), "socket() failed");
+            return PeerConnect::Error;
+        }
+    };
 
     let c = match Connection::peer(s, ty, p.sockaddr.clone(), p.log) {
         Some(c) => c,
         None => {
-            if unsafe { libc::close(s) } == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "close() socket failed");
+            if let Err(e) = os::close_fd(s) {
+                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "close() socket failed");
             }
             return PeerConnect::Error;
         }
     };
 
-    if p.rcvbuf != 0 && setsockopt_int(s, libc::SOL_SOCKET, libc::SO_RCVBUF, p.rcvbuf).is_err() {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(SO_RCVBUF, {}) failed, ignored", p.rcvbuf);
+    // the int as is (socket2 passes `size as c_int`)
+    if p.rcvbuf != 0 {
+        if let Err(e) = sockopt(s, |f| socket2::SockRef::from(&f).set_recv_buffer_size(p.rcvbuf as usize)) {
+            ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(SO_RCVBUF, {}) failed, ignored", p.rcvbuf);
+        }
     }
 
-    if p.sndbuf != 0 && setsockopt_int(s, libc::SOL_SOCKET, libc::SO_SNDBUF, p.sndbuf).is_err() {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(SO_SNDBUF, {}) failed, ignored", p.sndbuf);
+    if p.sndbuf != 0 {
+        if let Err(e) = sockopt(s, |f| socket2::SockRef::from(&f).set_send_buffer_size(p.sndbuf as usize)) {
+            ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(SO_SNDBUF, {}) failed, ignored", p.sndbuf);
+        }
     }
 
-    if p.so_keepalive && setsockopt_int(s, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1).is_err() {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(SO_KEEPALIVE) failed, ignored");
+    if p.so_keepalive {
+        if let Err(e) = sockopt(s, |f| rustix::net::sockopt::set_socket_keepalive(f, true)) {
+            ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(SO_KEEPALIVE) failed, ignored");
+        }
     }
 
     let failed = |c: &Rc<Connection>| {
@@ -118,9 +141,11 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
         PeerConnect::Error
     };
 
-    let flags = unsafe { libc::fcntl(s, libc::F_GETFL) };
-    if flags == -1 || unsafe { libc::fcntl(s, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "fcntl(O_NONBLOCK) failed");
+    let nonblocking = nix::fcntl::fcntl(s, FcntlArg::F_GETFL)
+        .and_then(|flags| nix::fcntl::fcntl(s, FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK)));
+
+    if let Err(e) = nonblocking {
+        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e as i32), "fcntl(O_NONBLOCK) failed");
         return failed(&c);
     }
 
@@ -133,23 +158,22 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
 
         if !p.sockaddr.is_unix() && port == 0 {
             // IP_BIND_ADDRESS_NO_PORT
-            if let Err(e) = setsockopt_int(s, libc::IPPROTO_IP, libc::IP_BIND_ADDRESS_NO_PORT, 1) {
-                let err = e.raw_os_error().unwrap_or(0);
+            if let Err(err) = sockopt(s, |f| nix::sys::socket::setsockopt(&f, nix::sys::socket::sockopt::IpBindAddressNoPort, &true)) {
                 if err != libc::EOPNOTSUPP && err != libc::ENOPROTOOPT {
                     ngx_log_error!(NGX_LOG_ALERT, p.log, Some(err), "setsockopt(IP_BIND_ADDRESS_NO_PORT) failed, ignored");
                 }
             }
         }
 
-        if p.ty == libc::SOCK_DGRAM && port != 0 && setsockopt_int(s, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).is_err() {
-            ngx_log_error!(NGX_LOG_ALERT, p.log, Some(os::errno()), "setsockopt(SO_REUSEADDR) failed");
-            return failed(&c);
+        if p.ty == libc::SOCK_DGRAM && port != 0 {
+            if let Err(e) = sockopt(s, |f| rustix::net::sockopt::set_socket_reuseaddr(f, true)) {
+                ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "setsockopt(SO_REUSEADDR) failed");
+                return failed(&c);
+            }
         }
 
-        let (ss, len) = local.sockaddr.to_libc();
-
-        if unsafe { libc::bind(s, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) } == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, p.log, Some(os::errno()), "bind({}) failed", B(&local.name));
+        if let Err(e) = nix::sys::socket::bind(s, local.sockaddr.to_nix().as_dyn()) {
+            ngx_log_error!(NGX_LOG_CRIT, p.log, Some(e as i32), "bind({}) failed", B(&local.name));
             return failed(&c);
         }
     }
@@ -163,12 +187,8 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
 
     ngx_log_debug!(NGX_LOG_DEBUG_EVENT, p.log, "connect to {}, fd:{} #{}", B(p.name), s, c.number);
 
-    let (ss, len) = p.sockaddr.to_libc();
-
-    let rc = unsafe { libc::connect(s, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) };
-
-    if rc == -1 {
-        let err = os::errno();
+    if let Err(e) = nix::sys::socket::connect(s, p.sockaddr.to_nix().as_dyn()) {
+        let err = e as i32;
 
         if err != libc::EINPROGRESS {
             let level = if [libc::ECONNREFUSED, libc::EAGAIN, libc::ECONNRESET, libc::ENETDOWN, libc::ENETUNREACH, libc::EHOSTDOWN, libc::EHOSTUNREACH].contains(&err) {
@@ -194,14 +214,17 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
     PeerConnect::Ok(c)
 }
 
-/// The pending error of a connect() in progress (SO_ERROR), 0 if connected.
+/// The pending error of a connect() in progress (SO_ERROR), 0 if connected;
+/// the error of getsockopt() if it fails.
 pub fn connect_error(c: &Connection) -> i32 {
-    let mut err: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let s = match fd::get(c.fd.get()) {
+        Ok(s) => s,
+        Err(e) => return e.raw_os_error().unwrap_or(libc::EBADF),
+    };
 
-    if unsafe { libc::getsockopt(c.fd.get(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len) } == -1 {
-        err = os::errno();
+    match rustix::net::sockopt::socket_error(&s) {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => err.raw_os_error(),
+        Err(e) => e.raw_os_error(),
     }
-
-    err
 }

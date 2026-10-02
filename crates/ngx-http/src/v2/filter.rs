@@ -650,13 +650,10 @@ fn take_from(b: &mut ngx_core::buf::Buf, n: usize, out: &mut Vec<u8>) -> Result<
         out.resize(start + n, 0);
         let mut done = 0;
         while done < n {
-            let rc = unsafe {
-                libc::pread(f.fd, out[start + done..].as_mut_ptr() as *mut libc::c_void, n - done, (b.file_pos + done as i64) as libc::off_t)
-            };
-            if rc <= 0 {
-                return Err(());
+            match ngx_core::os::pread(f.fd, &mut out[start + done..start + n], b.file_pos + done as i64) {
+                Ok(rc) if rc > 0 => done += rc,
+                _ => return Err(()),
             }
-            done += rc as usize;
         }
         b.file_pos += n as i64;
         return Ok(());

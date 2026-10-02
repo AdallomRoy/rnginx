@@ -8,12 +8,13 @@ use std::rc::Rc;
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
-use ngx_core::rbtree::*;
 use ngx_core::rc::*;
 use ngx_core::shm::ShmZone;
-use ngx_core::slab::SlabPool;
+use ngx_core::shmem::rbtree::{self as rb, RbTree, ShmRbtree};
+use ngx_core::shmem::slab::SlabPool;
+use ngx_core::shmem::ShmMem;
 use ngx_core::string::B;
-use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
+use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error, shm_struct};
 
 use crate::request::*;
 use crate::script::ComplexValue;
@@ -40,40 +41,95 @@ impl SessKey {
     }
 }
 
-/// ngx_http_upstream_sticky_sess_shared_t
-#[repr(C)]
-struct SessShared {
-    rbtree: Rbtree,
-    sentinel: RbtreeNode,
+shm_struct! {
+    /// ngx_http_upstream_sticky_sess_shared_t: the sessions by key, and
+    /// by expiry, each tree with its sentinel
+    struct SessShared {
+        rbtree_root: usize,
+        rbtree_sentinel: usize,
+        rbtree_insert: usize,
+        sentinel_key: usize,
+        sentinel_left: usize,
+        sentinel_right: usize,
+        sentinel_parent: usize,
+        sentinel_color: u8,
+        sentinel_data: u8,
 
-    exp_rbtree: Rbtree,
-    exp_sentinel: RbtreeNode,
+        exp_rbtree_root: usize,
+        exp_rbtree_sentinel: usize,
+        exp_rbtree_insert: usize,
+        exp_sentinel_key: usize,
+        exp_sentinel_left: usize,
+        exp_sentinel_right: usize,
+        exp_sentinel_parent: usize,
+        exp_sentinel_color: u8,
+        exp_sentinel_data: u8,
+    }
 }
 
-/// ngx_http_upstream_sticky_sess_node_t: session data, mapping of
-/// session ID hash to server ID
-#[repr(C)]
-struct SessNode {
-    rbnode: RbtreeNode,
-    enode: RbtreeNode,
+shm_struct! {
+    /// ngx_http_upstream_sticky_sess_node_t: session data, mapping of
+    /// session ID hash to server ID; a node of both trees
+    struct SessNode {
+        rbnode_key: usize,
+        rbnode_left: usize,
+        rbnode_right: usize,
+        rbnode_parent: usize,
+        rbnode_color: u8,
+        rbnode_data: u8,
 
-    md5: [u8; 16],
+        enode_key: usize,
+        enode_left: usize,
+        enode_right: usize,
+        enode_parent: usize,
+        enode_color: u8,
+        enode_data: u8,
 
-    last: u64,
+        /// u.md5[16] (its first word is u.hash)
+        md5: u64,
+        md5_tail: u64,
 
-    sid_len: u8,
-    sid: [u8; NGX_HTTP_UPSTREAM_SID_LEN],
+        last: u64,
+
+        sid_len: u8,
+        /// sid[NGX_HTTP_UPSTREAM_SID_LEN]
+        sid: u8,
+    }
 }
+
+/// sizeof(ngx_http_upstream_sticky_sess_node_t)
+const SESS_NODE_SIZE: usize = (SessNode::sid.off + NGX_HTTP_UPSTREAM_SID_LEN + 7) & !7;
+
+/// &sn->enode
+const ENODE: usize = SessNode::enode_key.off;
 
 /// ngx_http_upstream_sticky_sess_t: the sessions zone of a process
 struct StickySess {
-    sh: Cell<*mut SessShared>,
-    shpool: Cell<*mut SlabPool>,
+    /// sess->sh: the offset of the shared trees in the zone
+    sh: Cell<usize>,
+    /// the zone's memory, its slab pool at the start (sess->shpool)
+    mem: RefCell<Option<Rc<ShmMem>>>,
     host: Vec<u8>,
 
     timeout: u64,
     /// sess->event.timer_set
     timer_set: Cell<bool>,
+}
+
+impl StickySess {
+    fn mem(&self) -> Rc<ShmMem> {
+        self.mem.borrow().clone().expect("sticky zone memory")
+    }
+
+    /// &sess->sh->rbtree
+    fn rbtree<'a>(&self, mem: &'a ShmMem) -> ShmRbtree<'a> {
+        ShmRbtree::at(mem, self.sh.get() + SessShared::rbtree_root.off)
+    }
+
+    /// &sess->sh->exp_rbtree
+    fn exp_rbtree<'a>(&self, mem: &'a ShmMem) -> ShmRbtree<'a> {
+        ShmRbtree::at(mem, self.sh.get() + SessShared::exp_rbtree_root.off)
+    }
 }
 
 /// ngx_http_upstream_sticky_srv_conf_t: per-upstream sticky configuration
@@ -210,16 +266,17 @@ impl PeerBalancer for StickyPeerData {
 
             let key = sess_init_key(&self.id);
 
-            let shpool = unsafe { &*sess.shpool.get() };
+            let mem = sess.mem();
+            let shpool = SlabPool::of(&mem);
 
             shpool.lock();
 
-            let sn = unsafe { sess_lookup(&sess, &key) };
+            let sn = sess_lookup(&sess, &mem, &key);
 
-            if sn.is_null() {
+            if sn == 0 {
                 ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: session \"{}\" not found", B(&self.id));
             } else {
-                let sid = unsafe { (&(*sn).sid)[..(*sn).sid_len as usize].to_vec() };
+                let sid = sess_sid(&mem, sn);
 
                 ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: session \"{}\", SID \"{}\"", B(&self.id), B(&sid));
 
@@ -317,45 +374,45 @@ impl StickyPeerData {
 
         let key = sess_init_key(&sess_id);
 
-        let shpool = unsafe { &*sess.shpool.get() };
+        let mem = sess.mem();
+        let shpool = SlabPool::of(&mem);
 
         shpool.lock();
 
-        unsafe {
-            let sh = sess.sh.get();
+        let exp = sess.exp_rbtree(&mem);
 
-            let sn = sess_lookup(&sess, &key);
+        let sn = sess_lookup(&sess, &mem, &key);
 
-            if !sn.is_null() {
-                if sid.len() != (*sn).sid_len as usize || sid.as_slice() != &(&(*sn).sid)[..(*sn).sid_len as usize] {
-                    ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: session \"{}\" reused for SID \"{}\"", B(&sess_id), B(sid));
+        if sn != 0 {
+            let s = SessNode::at(&mem, sn);
 
-                    (*sn).sid_len = sid.len() as u8;
-                    (&mut (*sn).sid)[..sid.len()].copy_from_slice(sid);
-                }
+            if sid.len() != s.get(SessNode::sid_len) as usize || !mem.eq_bytes(s.field(SessNode::sid), sid) {
+                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: session \"{}\" reused for SID \"{}\"", B(&sess_id), B(sid));
 
-                (*sh).exp_rbtree.delete(&mut (*sn).enode);
-                (*sn).last = now;
-                (*sn).enode.key = (*sn).last as usize;
-                (*sh).exp_rbtree.insert(&mut (*sn).enode);
-
-                shpool.unlock();
-                return;
+                sess_set_sid(&mem, sn, sid);
             }
 
-            if create {
-                ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: creating session \"{}\", SID \"{}\"", B(&sess_id), B(sid));
+            rb::delete(&exp, sn + ENODE);
+            s.set(SessNode::last, now);
+            exp.set_key(sn + ENODE, now as usize);
+            rb::insert(&exp, sn + ENODE, rb::insert_timer_value);
 
-                let sn = sess_create(&sess, &key, sid);
+            shpool.unlock();
+            return;
+        }
 
-                if !sn.is_null() {
-                    (*sn).last = now;
-                    (*sn).enode.key = (*sn).last as usize;
-                    (*sh).exp_rbtree.insert(&mut (*sn).enode);
+        if create {
+            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, pc.log, "sticky: creating session \"{}\", SID \"{}\"", B(&sess_id), B(sid));
 
-                    if !sess.timer_set.get() {
-                        sess_add_timer(&sess, sess.timeout);
-                    }
+            let sn = sess_create(&sess, &mem, &key, sid);
+
+            if sn != 0 {
+                SessNode::at(&mem, sn).set(SessNode::last, now);
+                exp.set_key(sn + ENODE, now as usize);
+                rb::insert(&exp, sn + ENODE, rb::insert_timer_value);
+
+                if !sess.timer_set.get() {
+                    sess_add_timer(&sess, sess.timeout);
                 }
             }
         }
@@ -473,39 +530,59 @@ fn samesite_check(value: &[u8]) -> i64 {
     NGX_ERROR
 }
 
-/// ngx_http_upstream_sticky_sess_lookup
-unsafe fn sess_lookup(sess: &StickySess, key: &SessKey) -> *mut SessNode {
-    let sh = sess.sh.get();
+/// sn->sid, sn->sid_len
+fn sess_sid(mem: &ShmMem, sn: usize) -> Vec<u8> {
+    let s = SessNode::at(mem, sn);
+    mem.bytes(s.field(SessNode::sid), s.get(SessNode::sid_len) as usize)
+}
+
+/// sn->sid_len = sid->len; ngx_memcpy(sn->sid, sid->data, sid->len)
+fn sess_set_sid(mem: &ShmMem, sn: usize, sid: &[u8]) {
+    let sid = &sid[..sid.len().min(NGX_HTTP_UPSTREAM_SID_LEN)];
+    let s = SessNode::at(mem, sn);
+
+    s.set(SessNode::sid_len, sid.len() as u8);
+    mem.write(s.field(SessNode::sid), sid);
+}
+
+/// ngx_memcmp(key->md5, sn->u.md5, 16)
+fn md5_cmp(mem: &ShmMem, md5: &[u8; 16], sn: usize) -> std::cmp::Ordering {
+    mem.cmp_bytes(sn + SessNode::md5.off, md5).reverse()
+}
+
+/// ngx_http_upstream_sticky_sess_lookup: the node of the key, or 0
+fn sess_lookup(sess: &StickySess, mem: &ShmMem, key: &SessKey) -> usize {
+    let tree = sess.rbtree(mem);
 
     let hash = key.hash();
-    let mut node = (*sh).rbtree.root;
-    let sentinel = (*sh).rbtree.sentinel;
+    let mut node = tree.root();
+    let sentinel = tree.sentinel();
 
     while node != sentinel {
-        if hash < (*node).key {
-            node = (*node).left;
+        let k = tree.key(node);
+
+        if hash < k {
+            node = tree.left(node);
             continue;
         }
 
-        if hash > (*node).key {
-            node = (*node).right;
+        if hash > k {
+            node = tree.right(node);
             continue;
         }
 
         // hash == node->key
 
         loop {
-            let sn = node as *mut SessNode;
-
-            let rc = key.md5.cmp(&(*sn).md5);
+            let rc = md5_cmp(mem, &key.md5, node);
 
             if rc == std::cmp::Ordering::Equal {
-                return sn;
+                return node;
             }
 
-            node = if rc == std::cmp::Ordering::Less { (*node).left } else { (*node).right };
+            node = if rc == std::cmp::Ordering::Less { tree.left(node) } else { tree.right(node) };
 
-            if !(node != sentinel && hash == (*node).key) {
+            if !(node != sentinel && hash == tree.key(node)) {
                 break;
             }
         }
@@ -513,18 +590,18 @@ unsafe fn sess_lookup(sess: &StickySess, key: &SessKey) -> *mut SessNode {
         break;
     }
 
-    std::ptr::null_mut()
+    0
 }
 
-/// ngx_http_upstream_sticky_sess_create
-unsafe fn sess_create(sess: &StickySess, key: &SessKey, sid: &[u8]) -> *mut SessNode {
-    let n = std::mem::size_of::<SessNode>();
+/// ngx_http_upstream_sticky_sess_create: a session node in the tree, or 0
+fn sess_create(sess: &StickySess, mem: &ShmMem, key: &SessKey, sid: &[u8]) -> usize {
+    let n = SESS_NODE_SIZE;
 
-    let shpool = &*sess.shpool.get();
+    let shpool = SlabPool::of(mem);
 
-    let mut sn = shpool.alloc_locked(n) as *mut SessNode;
+    let mut sn = shpool.alloc_locked(n);
 
-    if sn.is_null() {
+    if sn == 0 {
         let log = ngx_core::cycle::cycle().log.clone();
 
         ngx_log_error!(
@@ -532,61 +609,47 @@ unsafe fn sess_create(sess: &StickySess, key: &SessKey, sid: &[u8]) -> *mut Sess
             log,
             None,
             "could not allocate node{}, expiring least recently used session",
-            B(shpool.log_ctx())
+            B(&shpool.log_ctx())
         );
 
-        let _ = sess_expire(sess, true);
+        let _ = sess_expire(sess, mem, true);
 
-        sn = shpool.alloc_locked(n) as *mut SessNode;
-        if sn.is_null() {
-            ngx_log_error!(NGX_LOG_ALERT, log, None, "could not allocate node{}", B(shpool.log_ctx()));
-            return std::ptr::null_mut();
+        sn = shpool.alloc_locked(n);
+        if sn == 0 {
+            ngx_log_error!(NGX_LOG_ALERT, log, None, "could not allocate node{}", B(&shpool.log_ctx()));
+            return 0;
         }
     }
 
-    (*sn).md5 = key.md5;
+    mem.write(sn + SessNode::md5.off, &key.md5);
 
-    (*sn).sid_len = sid.len() as u8;
-    (&mut (*sn).sid)[..sid.len()].copy_from_slice(sid);
+    sess_set_sid(mem, sn, sid);
 
-    let node = &mut (*sn).rbnode as *mut RbtreeNode;
-    (*node).key = key.hash();
+    let tree = sess.rbtree(mem);
 
-    (*sess.sh.get()).rbtree.insert(node);
+    tree.set_key(sn, key.hash());
+
+    rb::insert(&tree, sn, sess_rbtree_insert_value);
 
     sn
 }
 
 /// ngx_http_upstream_sticky_sess_rbtree_insert_value
-unsafe fn sess_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let mut p: *mut *mut RbtreeNode;
+fn sess_rbtree_insert_value(tree: &ShmRbtree<'_>, temp: usize, node: usize, sentinel: usize) {
+    rb::insert_by(tree, temp, node, sentinel, |t, node, temp| {
+        let (nk, tk) = (t.key(node), t.key(temp));
 
-    loop {
-        if (*node).key < (*temp).key {
-            p = &mut (*temp).left;
-        } else if (*node).key > (*temp).key {
-            p = &mut (*temp).right;
-        } else {
-            // node->key == temp->key
-
-            let sn = node as *mut SessNode;
-            let snt = temp as *mut SessNode;
-
-            p = if (*sn).md5 < (*snt).md5 { &mut (*temp).left } else { &mut (*temp).right };
+        if nk != tk {
+            return nk < tk;
         }
 
-        if *p == sentinel {
-            break;
-        }
+        // node->key == temp->key: ngx_memcmp(sn->u.md5, snt->u.md5, 16) < 0
 
-        temp = *p;
-    }
+        let mut md5 = [0u8; 16];
+        t.mem.read(node + SessNode::md5.off, &mut md5);
 
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
+        md5_cmp(t.mem, &md5, temp) == std::cmp::Ordering::Less
+    });
 }
 
 /// ngx_add_timer(&sess->event, timer)
@@ -608,11 +671,12 @@ fn sess_timer_handler(sess: &Rc<StickySess>) {
         ngx_log_debug!(NGX_LOG_DEBUG_EVENT, c.log, "sticky: session timer");
     }
 
-    let shpool = unsafe { &*sess.shpool.get() };
+    let mem = sess.mem();
+    let shpool = SlabPool::of(&mem);
 
     shpool.lock();
 
-    let wait = unsafe { sess_expire(sess, false) };
+    let wait = sess_expire(sess, &mem, false);
 
     shpool.unlock();
 
@@ -629,25 +693,28 @@ fn sess_rearm(sess: &Rc<StickySess>, wait: i64) {
 
 /// ngx_http_upstream_sticky_sess_expire: the time till the next session
 /// expires, as ngx_msec_int_t.
-unsafe fn sess_expire(sess: &StickySess, force: bool) -> i64 {
+fn sess_expire(sess: &StickySess, mem: &ShmMem, force: bool) -> i64 {
     let mut wait: i64 = 0;
 
     let now = ngx_core::times::msec() as i64;
 
-    let sh = sess.sh.get();
-    let shpool = &*sess.shpool.get();
+    let shpool = SlabPool::of(mem);
 
-    if (*sh).exp_rbtree.root == (*sh).exp_rbtree.sentinel {
+    let tree = sess.rbtree(mem);
+    let exp = sess.exp_rbtree(mem);
+
+    if exp.root() == exp.sentinel() {
         return 0;
     }
 
     let mut force = force;
 
-    let mut node = rbtree_min((*sh).exp_rbtree.root, (*sh).exp_rbtree.sentinel);
+    let mut node = rb::min(&exp, exp.root());
 
-    while !node.is_null() {
-        let sn = (node as *mut u8).sub(std::mem::offset_of!(SessNode, enode)) as *mut SessNode;
-        wait = (*sn).last as i64 + sess.timeout as i64 - now;
+    while node != 0 {
+        let sn = node - ENODE;
+
+        wait = SessNode::at(mem, sn).get(SessNode::last) as i64 + sess.timeout as i64 - now;
 
         if !force && wait > 0 {
             break;
@@ -655,13 +722,13 @@ unsafe fn sess_expire(sess: &StickySess, force: bool) -> i64 {
 
         force = false;
 
-        let next = rbtree_next(&(*sh).exp_rbtree, node);
+        let next = rb::next(&exp, node);
 
         // remove node
-        (*sh).exp_rbtree.delete(&mut (*sn).enode);
+        rb::delete(&exp, sn + ENODE);
 
-        (*sh).rbtree.delete(&mut (*sn).rbnode);
-        shpool.free_locked(sn as *mut u8);
+        rb::delete(&tree, sn);
+        shpool.free_locked(sn);
 
         node = next;
     }
@@ -691,38 +758,38 @@ fn sess_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Result<(
         }
 
         sess.sh.set(old_sess.sh.get());
-        sess.shpool.set(old_sess.shpool.get());
+        *sess.mem.borrow_mut() = old_sess.mem.borrow().clone();
         return Ok(());
     }
 
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
-    sess.shpool.set(shpool);
+    let mem = shm_zone.mem();
+    let shpool = SlabPool::of(&mem);
 
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            sess.sh.set((*shpool).data as *mut SessShared);
-            return Ok(());
-        }
+    *sess.mem.borrow_mut() = Some(mem.clone());
 
-        let sh = (*shpool).alloc(std::mem::size_of::<SessShared>()) as *mut SessShared;
-        if sh.is_null() {
-            return Err(());
-        }
-
-        sess.sh.set(sh);
-
-        (*shpool).data = sh as *mut u8;
-
-        (*sh).rbtree.init(&mut (*sh).sentinel, sess_rbtree_insert_value);
-
-        (*sh).exp_rbtree.init(&mut (*sh).exp_sentinel, rbtree_insert_timer_value);
-
-        let ctx = format!(" in sticky session zone \"{}\"", B(shm_zone.name()));
-
-        (*shpool).set_log_ctx(ctx.as_bytes())?;
-
-        (*shpool).log_nomem = false;
+    if shm_zone.shm.exists.get() {
+        sess.sh.set(shpool.data());
+        return Ok(());
     }
+
+    let sh = shpool.alloc(SessShared::SIZE);
+    if sh == 0 {
+        return Err(());
+    }
+
+    sess.sh.set(sh);
+
+    shpool.set_data(sh);
+
+    sess.rbtree(&mem).init(sh + SessShared::sentinel_key.off);
+
+    sess.exp_rbtree(&mem).init(sh + SessShared::exp_sentinel_key.off);
+
+    let ctx = format!(" in sticky session zone \"{}\"", B(shm_zone.name()));
+
+    shpool.set_log_ctx(ctx.as_bytes())?;
+
+    shpool.set_log_nomem(false);
 
     Ok(())
 }
@@ -931,17 +998,13 @@ fn sticky_learn(cf: &mut Conf, stcf: &mut StickySrvConf, us: &Rc<UpstreamSrvConf
 
     let shm_zone = ngx_core::cycle::shared_memory_add(cf, &name, zone_size, "ngx_http_upstream_sticky_module")?;
 
+    shm_zone.safe_pool.set(true);
+
     if let Some(sess) = shm_zone.data::<StickySess>() {
         return Err(cf.emerg(format_args!("sticky zone \"{}\" is already used in upstream \"{}\"", B(&name), B(&sess.host))));
     }
 
-    let sess = Rc::new(StickySess {
-        sh: Cell::new(std::ptr::null_mut()),
-        shpool: Cell::new(std::ptr::null_mut()),
-        host: us.host.clone(),
-        timeout,
-        timer_set: Cell::new(false),
-    });
+    let sess = Rc::new(StickySess { sh: Cell::new(0), mem: RefCell::new(None), host: us.host.clone(), timeout, timer_set: Cell::new(false) });
 
     *shm_zone.init.borrow_mut() = Some(Rc::new(sess_init_zone));
     *shm_zone.data.borrow_mut() = Some(sess);
@@ -983,11 +1046,12 @@ fn init_worker(cycle: &Rc<ngx_core::cycle::Cycle>) -> Result<(), ()> {
             None => continue,
         };
 
-        let shpool = unsafe { &*sess.shpool.get() };
+        let mem = sess.mem();
+        let shpool = SlabPool::of(&mem);
 
         shpool.lock();
 
-        let wait = unsafe { sess_expire(&sess, false) };
+        let wait = sess_expire(&sess, &mem, false);
 
         shpool.unlock();
 
@@ -1002,4 +1066,107 @@ pub fn upstream_sticky_module() -> ModuleDef {
     let mut m = http_module_def("ngx_http_upstream_sticky_module", HttpModuleDef::default(), commands);
     m.init_process = Some(init_worker);
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layouts_are_c() {
+        assert_eq!(SessShared::SIZE, 128);
+        assert_eq!(SessShared::exp_rbtree_root.off, 64);
+        assert_eq!(SessNode::enode_key.off, 40);
+        assert_eq!(SessNode::md5.off, 80);
+        assert_eq!(SessNode::last.off, 96);
+        assert_eq!(SessNode::sid_len.off, 104);
+        assert_eq!(SessNode::sid.off, 105);
+        assert_eq!(SESS_NODE_SIZE, 144);
+    }
+
+    /// A sessions zone of a process, as sess_init_zone makes it.
+    fn sessions(timeout: u64) -> Rc<StickySess> {
+        let mem = Rc::new(ShmMem::private(64 << 10).unwrap());
+        SlabPool::init_zone(&mem);
+
+        let zone = ShmZone::new(b"sticky".to_vec(), mem.len(), "ngx_http_upstream_sticky_module");
+        zone.shm.attach(mem);
+
+        let sess = Rc::new(StickySess { sh: Cell::new(0), mem: RefCell::new(None), host: b"u".to_vec(), timeout, timer_set: Cell::new(false) });
+        *zone.data.borrow_mut() = Some(sess.clone());
+
+        sess_init_zone(&zone, None).unwrap();
+
+        sess
+    }
+
+    fn learn(sess: &StickySess, id: &[u8], sid: &[u8], last: u64) -> usize {
+        let mem = sess.mem();
+        let key = sess_init_key(id);
+        let sn = sess_create(sess, &mem, &key, sid);
+        assert!(sn != 0);
+        let exp = sess.exp_rbtree(&mem);
+        SessNode::at(&mem, sn).set(SessNode::last, last);
+        exp.set_key(sn + ENODE, last as usize);
+        rb::insert(&exp, sn + ENODE, rb::insert_timer_value);
+        sn
+    }
+
+    #[test]
+    fn sessions_lookup_and_expire() {
+        let sess = sessions(1000);
+        let mem = sess.mem();
+        let pfree = SlabPool::of(&mem).pfree();
+
+        let now = ngx_core::times::msec();
+
+        for i in 0..100u64 {
+            let id = format!("session-{}", i);
+            let sid = format!("sid{}", i % 7);
+            // the older half expired already
+            let last = if i < 50 { now - 5000 } else { now + 5000 };
+            learn(&sess, id.as_bytes(), sid.as_bytes(), last);
+        }
+
+        for i in 0..100u64 {
+            let id = format!("session-{}", i);
+            let sn = sess_lookup(&sess, &mem, &sess_init_key(id.as_bytes()));
+            assert!(sn != 0, "{}", id);
+            assert_eq!(sess_sid(&mem, sn), format!("sid{}", i % 7).into_bytes());
+        }
+
+        assert_eq!(sess_lookup(&sess, &mem, &sess_init_key(b"unknown")), 0);
+
+        let wait = sess_expire(&sess, &mem, false);
+        assert!(wait > 0, "the next one expires later: {}", wait);
+
+        for i in 0..100u64 {
+            let id = format!("session-{}", i);
+            let found = sess_lookup(&sess, &mem, &sess_init_key(id.as_bytes())) != 0;
+            assert_eq!(found, i >= 50, "{}", id);
+        }
+
+        // forced: the least recently used one goes even if not expired
+        sess_expire(&sess, &mem, true);
+        let left = rb::walk(&sess.rbtree(&mem)).len();
+        assert_eq!(left, 49);
+
+        // all of them
+        while sess.exp_rbtree(&mem).root() != sess.exp_rbtree(&mem).sentinel() {
+            sess_expire(&sess, &mem, true);
+        }
+        assert!(rb::walk(&sess.rbtree(&mem)).is_empty());
+        assert_eq!(SlabPool::of(&mem).pfree(), pfree);
+    }
+
+    #[test]
+    fn session_sid_replaced() {
+        let sess = sessions(1000);
+        let mem = sess.mem();
+        let sn = learn(&sess, b"id", b"0123456789abcdef0123456789abcdef", 1);
+        assert_eq!(sess_sid(&mem, sn).len(), 32);
+        sess_set_sid(&mem, sn, b"route2");
+        assert_eq!(sess_sid(&mem, sn), b"route2");
+        assert_eq!(SessNode::at(&mem, sn).get(SessNode::last), 1, "the neighbours are kept");
+    }
 }

@@ -142,9 +142,8 @@ impl TempFile {
             }
         }
 
-        // SAFETY: the file descriptor is owned by this temp file.
-        if unsafe { libc::close(self.fd) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(os::errno()), "close() \"{}\" failed", B(&self.name));
+        if let Err(err) = os::close_fd(self.fd) {
+            ngx_log_error!(NGX_LOG_ALERT, self.log, Some(err), "close() \"{}\" failed", B(&self.name));
         }
 
         self.fd = -1;
@@ -236,22 +235,21 @@ pub fn write_file(fd: i32, name: &[u8], data: &[u8], offset: i64, log: &Log) -> 
     let mut written = 0usize;
 
     while written < data.len() {
-        // SAFETY: the rest of `data` is valid for reading.
-        let n = unsafe { libc::pwrite(fd, data[written..].as_ptr() as *const libc::c_void, data.len() - written, offset + written as i64) };
+        let n = match os::pwrite(fd, &data[written..], offset + written as i64) {
+            Ok(n) => n,
 
-        if n == -1 {
-            let err = os::errno();
-
-            if err == libc::EINTR {
+            Err(err) if err == libc::EINTR => {
                 ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "pwrite() was interrupted");
                 continue;
             }
 
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwrite() \"{}\" failed", B(name));
-            return Err(());
-        }
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwrite() \"{}\" failed", B(name));
+                return Err(());
+            }
+        };
 
-        written += n as usize;
+        written += n;
     }
 
     Ok(written as i64)
@@ -263,25 +261,22 @@ fn writev_file(fd: i32, name: &[u8], bufs: &[&[u8]], offset: i64, log: &Log) -> 
 
     ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "writev: {}, {}, {}", fd, size, offset);
 
-    let iovs: Vec<libc::iovec> = bufs.iter().map(|b| libc::iovec { iov_base: b.as_ptr() as *mut libc::c_void, iov_len: b.len() }).collect();
-
     loop {
-        // SAFETY: the iovecs point to live buffers of `bufs`.
-        let n = unsafe { libc::pwritev(fd, iovs.as_ptr(), iovs.len() as libc::c_int, offset) };
+        let n = match os::pwritev(fd, bufs, offset) {
+            Ok(n) => n,
 
-        if n == -1 {
-            let err = os::errno();
-
-            if err == libc::EINTR {
+            Err(err) if err == libc::EINTR => {
                 ngx_log_debug!(NGX_LOG_DEBUG_CORE, log, "pwritev() was interrupted");
                 continue;
             }
 
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwritev() \"{}\" failed", B(name));
-            return Err(());
-        }
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwritev() \"{}\" failed", B(name));
+                return Err(());
+            }
+        };
 
-        if n as usize != size {
+        if n != size {
             ngx_log_error!(NGX_LOG_CRIT, log, None, "pwritev() \"{}\" has written only {} of {}", B(name), n, size);
             return Err(());
         }

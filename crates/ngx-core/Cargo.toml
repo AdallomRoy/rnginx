@@ -26,3 +26,4 @@ signal-hook.workspace = true
 chrono.workspace = true
 pwhash.workspace = true
 blowfish.workspace = true
+vm-memory.workspace = true

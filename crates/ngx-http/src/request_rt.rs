@@ -1225,8 +1225,7 @@ fn read_ready(c: &Connection) -> bool {
 
 fn socket_has_data(c: &Connection) -> bool {
     let mut b = [0u8; 1];
-    let n = unsafe { libc::recv(c.fd.get(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-    n > 0
+    matches!(nix::sys::socket::recv(c.fd.get(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT), Ok(n) if n > 0)
 }
 
 /// ngx_http_close_request for fatal paths before a response is produced.
@@ -1466,12 +1465,11 @@ pub async fn wait_delay_or_close(r: &R, delay: u64) -> bool {
             loop {
                 if c.readable().await.is_err() { return true; }
                 let mut b = [0u8;1];
-                let n = unsafe { libc::recv(c.fd.get(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-                if n == 0 { return true; }
-                if n < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::WouldBlock { tokio::time::sleep(Duration::from_millis(10)).await; continue; }
-                    return true;
+                match nix::sys::socket::recv(c.fd.get(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT) {
+                    Ok(0) => return true,
+                    Err(nix::errno::Errno::EAGAIN) => { tokio::time::sleep(Duration::from_millis(10)).await; continue; }
+                    Err(_) => return true,
+                    Ok(_) => {}
                 }
                 // data is pending (pipelined); keep waiting
                 tokio::time::sleep(Duration::from_millis(delay)).await;

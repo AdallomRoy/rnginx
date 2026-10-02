@@ -41,6 +41,7 @@ signal-hook = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 pwhash = "1"
 blowfish = { version = "0.7", features = ["bcrypt"] }
+vm-memory = { version = "0.16", features = ["backend-mmap"] }
 
 [profile.dev]
 opt-level = 1

@@ -13,8 +13,8 @@ use ngx_core::log::*;
 use ngx_core::module::*;
 use ngx_core::os;
 use ngx_core::radix_tree::{RadixTree, NGX_RADIX_NO_VALUE};
-use ngx_core::rbtree::*;
 use ngx_core::rc::*;
+use ngx_core::shmem::rbtree::{self as rb, LocalRbtree, RbTree};
 use ngx_core::string::B;
 use ngx_core::{cmd_fn, ngx_log_debug, ngx_log_error};
 
@@ -71,24 +71,22 @@ pub struct GeoCtx {
     pub values: Vec<VariableValue>,
 }
 
-/// The contexts of the geo blocks, the variables' data point to them (the
-/// configuration pool in C; the C module has no main conf).
+/// The contexts of the geo blocks (the configuration pool in C; the C
+/// module has no main conf): the data of a geo variable is the index of
+/// its context here.
 #[derive(Default)]
 pub struct GeoMainConf {
     pub geos: Vec<Rc<GeoCtx>>,
 }
 
-/// ngx_str_node_t
-#[repr(C)]
-struct StrNode {
-    node: RbtreeNode,
-    str: Vec<u8>,
-}
-
-/// ngx_stream_geo_variable_value_node_t
-#[repr(C)]
+/// ngx_stream_geo_variable_value_node_t: a node of the tree of the values,
+/// an ngx_str_node_t (the crc32 of the string is the node's key) with the
+/// value and its offset in the binary base being created
+#[derive(Debug)]
 struct GeoValueNode {
-    sn: StrNode,
+    /// sn.str
+    str: Vec<u8>,
+    /// the value: an index in GeoConfCtx::values
     value: usize,
     offset: usize,
 }
@@ -105,10 +103,8 @@ struct GeoConfCtx {
     tree: Option<RadixTree>,
     tree6: Option<RadixTree>,
 
-    /// the values by their text (ngx_str_rbtree), nodes owned by the ctx
-    rbtree: Rbtree,
-    sentinel: *mut RbtreeNode,
-    nodes: Vec<*mut GeoValueNode>,
+    /// the values by their text (an rbtree of ngx_str_node_t)
+    rbtree: LocalRbtree<GeoValueNode>,
 
     values: Vec<VariableValue>,
 
@@ -127,13 +123,6 @@ struct GeoConfCtx {
 
 impl GeoConfCtx {
     fn new() -> GeoConfCtx {
-        let sentinel = Box::into_raw(Box::new(RbtreeNode::new(0)));
-
-        let mut rbtree = Rbtree { root: std::ptr::null_mut(), sentinel: std::ptr::null_mut(), insert: None };
-
-        // the sentinel is owned by the ctx and freed in drop()
-        unsafe { rbtree.init(sentinel, str_rbtree_insert_value) };
-
         GeoConfCtx {
             value: 0,
             net: Vec::new(),
@@ -141,9 +130,7 @@ impl GeoConfCtx {
             high_default: None,
             tree: None,
             tree6: None,
-            rbtree,
-            sentinel,
-            nodes: Vec::new(),
+            rbtree: LocalRbtree::new(),
             values: vec![null_value()],
             data_size: HEADER_SIZE + VV_SIZE + 0x10000 * PTR,
             include_name: Vec::new(),
@@ -158,76 +145,59 @@ impl GeoConfCtx {
     }
 }
 
-impl Drop for GeoConfCtx {
-    fn drop(&mut self) {
-        // the nodes and the sentinel were allocated with Box::into_raw()
-        // and are referenced only by the tree, which dies with the ctx
-        for p in self.nodes.drain(..) {
-            drop(unsafe { Box::from_raw(p) });
+/// ngx_str_rbtree_insert_value: by the hash, then by the length, then by
+/// the bytes of the strings
+fn str_rbtree_insert_value(tree: &LocalRbtree<GeoValueNode>, temp: usize, node: usize, sentinel: usize) {
+    rb::insert_by(tree, temp, node, sentinel, |t, node, temp| {
+        let (nk, tk) = (t.key(node), t.key(temp));
+
+        if nk != tk {
+            return nk < tk;
         }
-        drop(unsafe { Box::from_raw(self.sentinel) });
-    }
+
+        let (n, tv) = (t.value(node), t.value(temp));
+
+        if n.str.len() != tv.str.len() {
+            return n.str.len() < tv.str.len();
+        }
+
+        n.str < tv.str
+    });
 }
 
-/// ngx_str_rbtree_insert_value: all nodes of the tree are StrNodes
-unsafe fn str_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let mut p: *mut *mut RbtreeNode;
-
-    loop {
-        let n: &Vec<u8> = &(*(node as *mut StrNode)).str;
-        let t: &Vec<u8> = &(*(temp as *mut StrNode)).str;
-
-        if (*node).key != (*temp).key {
-            p = if (*node).key < (*temp).key { &mut (*temp).left } else { &mut (*temp).right };
-        } else if n.len() != t.len() {
-            p = if n.len() < t.len() { &mut (*temp).left } else { &mut (*temp).right };
-        } else {
-            p = if n < t { &mut (*temp).left } else { &mut (*temp).right };
-        }
-
-        if *p == sentinel {
-            break;
-        }
-
-        temp = *p;
-    }
-
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
-}
-
-/// ngx_str_rbtree_lookup
-unsafe fn str_rbtree_lookup(rbtree: &Rbtree, val: &[u8], hash: u32) -> *mut StrNode {
-    let mut node = rbtree.root;
-    let sentinel = rbtree.sentinel;
+/// ngx_str_rbtree_lookup: the node of the string, 0 if none
+fn str_rbtree_lookup(tree: &LocalRbtree<GeoValueNode>, val: &[u8], hash: u32) -> usize {
+    let mut node = tree.root();
+    let sentinel = tree.sentinel();
 
     let hash = hash as usize;
 
     while node != sentinel {
-        let n = node as *mut StrNode;
-        let nstr: &Vec<u8> = &(*n).str;
+        let key = tree.key(node);
 
-        if hash != (*node).key {
-            node = if hash < (*node).key { (*node).left } else { (*node).right };
+        if hash != key {
+            node = if hash < key { tree.left(node) } else { tree.right(node) };
             continue;
         }
 
-        if val.len() != nstr.len() {
-            node = if val.len() < nstr.len() { (*node).left } else { (*node).right };
-            continue;
-        }
+        let rc = {
+            let n = tree.value(node);
 
-        match val.cmp(&nstr[..]) {
-            std::cmp::Ordering::Less => node = (*node).left,
-            std::cmp::Ordering::Greater => node = (*node).right,
-            std::cmp::Ordering::Equal => return n,
+            if val.len() != n.str.len() {
+                val.len().cmp(&n.str.len())
+            } else {
+                val.cmp(&n.str[..])
+            }
+        };
+
+        match rc {
+            std::cmp::Ordering::Less => node = tree.left(node),
+            std::cmp::Ordering::Greater => node = tree.right(node),
+            std::cmp::Ordering::Equal => return node,
         }
     }
 
-    std::ptr::null_mut()
+    0
 }
 
 /// ngx_align
@@ -244,23 +214,24 @@ fn v4mapped(p: &[u8; 16]) -> Option<u32> {
     None
 }
 
-/// The geo module ctx of a variable's data.
-fn geo_ctx(data: usize) -> &'static GeoCtx {
-    // data is Rc::as_ptr() of a GeoCtx kept alive by the module's main conf
-    // of the configuration the session uses (s->main_conf holds it)
-    unsafe { &*(data as *const GeoCtx) }
+/// The geo module ctx of a variable: its data is the index of the ctx in
+/// the module's main conf of the configuration the session uses.
+fn geo_ctx(s: &Session, data: usize) -> Rc<GeoCtx> {
+    let gmcf = s.main_conf::<GeoMainConf>(ctx_index());
+    let ctx = gmcf.borrow().geos[data].clone();
+    ctx
 }
 
 /// ngx_stream_geo_cidr_variable
 fn geo_cidr_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
-    let ctx = geo_ctx(data);
+    let ctx = geo_ctx(s, data);
 
     let (tree, tree6) = match &ctx.u {
         GeoU::Trees { tree, tree6 } => (tree, tree6),
         GeoU::High(_) => return NGX_ERROR,
     };
 
-    let vv = match geo_addr(s, ctx) {
+    let vv = match geo_addr(s, &ctx) {
         None => tree.find32(INADDR_NONE),
 
         Some(SockAddr::V6(sin6)) => {
@@ -289,7 +260,7 @@ fn geo_cidr_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
 
 /// ngx_stream_geo_range_variable
 fn geo_range_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
-    let ctx = geo_ctx(data);
+    let ctx = geo_ctx(s, data);
 
     let high = match &ctx.u {
         GeoU::High(h) => h,
@@ -298,7 +269,7 @@ fn geo_range_variable(s: &Session, v: &mut VariableValue, data: usize) -> i64 {
 
     *v = ctx.values[high.default_value].clone();
 
-    let inaddr = match geo_addr(s, ctx) {
+    let inaddr = match geo_addr(s, &ctx) {
         Some(SockAddr::V6(sin6)) => v4mapped(&sin6.ip().octets()).unwrap_or(INADDR_NONE),
         Some(SockAddr::Unix(_)) => INADDR_NONE,
         Some(SockAddr::V4(sin)) => u32::from(*sin.ip()),
@@ -426,7 +397,7 @@ fn geo_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
             ctx.data_size += data_size;
 
             if ctx.allow_binary_include && !ctx.outside_entries && ctx.entries > 100000 && ctx.includes == 1 {
-                geo_create_binary_base(cf, &mut ctx);
+                geo_create_binary_base(&cf.log, &mut ctx);
             }
         }
 
@@ -458,12 +429,12 @@ fn geo_block(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfRe
         GeoCtx { u: GeoU::Trees { tree, tree6 }, index, values: std::mem::take(&mut ctx.values) }
     };
 
-    let geo = Rc::new(geo);
-
-    var.data.set(Rc::as_ptr(&geo) as usize);
-
     let gmcf = conf_rc::<GeoMainConf>(conf.as_ref().expect("geo conf"));
-    gmcf.borrow_mut().geos.push(geo);
+    let mut g = gmcf.borrow_mut();
+
+    // var->data: the ctx, by its index in the main conf
+    var.data.set(g.geos.len());
+    g.geos.push(Rc::new(geo));
 
     Ok(())
 }
@@ -867,23 +838,19 @@ fn value_data(values: &[VariableValue], v: usize) -> &[u8] {
 fn geo_value(ctx: &mut GeoConfCtx, value: &[u8]) -> usize {
     let hash = crc32fast::hash(value);
 
-    let gvvn = unsafe { str_rbtree_lookup(&ctx.rbtree, value, hash) };
+    let gvvn = str_rbtree_lookup(&ctx.rbtree, value, hash);
 
-    if !gvvn.is_null() {
-        // the tree nodes are GeoValueNodes
-        return unsafe { (*(gvvn as *mut GeoValueNode)).value };
+    if gvvn != 0 {
+        return ctx.rbtree.value(gvvn).value;
     }
 
     let index = ctx.values.len();
 
     ctx.values.push(VariableValue { data: value.to_vec(), valid: true, no_cacheable: false, not_found: false });
 
-    let node = Box::into_raw(Box::new(GeoValueNode { sn: StrNode { node: RbtreeNode::new(hash as usize), str: value.to_vec() }, value: index, offset: 0 }));
+    let node = ctx.rbtree.alloc(hash as usize, GeoValueNode { str: value.to_vec(), value: index, offset: 0 });
 
-    ctx.nodes.push(node);
-
-    // the node lives until the ctx is dropped, as the tree
-    unsafe { ctx.rbtree.insert(node as *mut RbtreeNode) };
+    rb::insert(&ctx.rbtree, node, str_rbtree_insert_value);
 
     ctx.data_size += align(VV_SIZE + value.len(), PTR);
 
@@ -1108,18 +1075,18 @@ fn geo_include_binary_base(cf: &mut Conf, ctx: &Rc<RefCell<GeoConfCtx>>, name: &
 
             let mut base = vec![0u8; size];
 
-            ngx_log_debug!(NGX_LOG_DEBUG_CORE, cf.log, "read: {}, {:p}, {}, 0", fd, base.as_ptr(), size);
+            ngx_log_debug!(NGX_LOG_DEBUG_CORE, cf.log, "read: {}, {:p}, {}, 0", fd, base.as_slice(), size);
 
-            let n = unsafe { libc::pread(fd, base.as_mut_ptr() as *mut libc::c_void, size, 0) };
+            let n = match os::pread(fd, &mut base, 0) {
+                Ok(n) => n,
+                Err(err) => {
+                    ngx_log_error!(NGX_LOG_CRIT, cf.log, Some(err), "pread() \"{}\" failed", B(name));
+                    cf.log_error(NGX_LOG_CRIT, Some(err), format_args!("pread() \"{}\" failed", B(name)));
+                    break 'failed;
+                }
+            };
 
-            if n == -1 {
-                let err = os::errno();
-                ngx_log_error!(NGX_LOG_CRIT, cf.log, Some(err), "pread() \"{}\" failed", B(name));
-                cf.log_error(NGX_LOG_CRIT, Some(err), format_args!("pread() \"{}\" failed", B(name)));
-                break 'failed;
-            }
-
-            if n as usize != size {
+            if n != size {
                 cf.log_error(NGX_LOG_CRIT, None, format_args!("pread() \"{}\" returned only {} bytes instead of {}", B(name), n, size));
                 break 'failed;
             }
@@ -1180,25 +1147,25 @@ fn geo_include_binary_base(cf: &mut Conf, ctx: &Rc<RefCell<GeoConfCtx>>, name: &
         NGX_DECLINED
     };
 
-    if unsafe { libc::close(fd) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, cf.log, Some(os::errno()), "close() \"{}\" failed", B(name));
+    if let Err(err) = os::close_fd(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, cf.log, Some(err), "close() \"{}\" failed", B(name));
     }
 
     rc
 }
 
-/// ngx_stream_geo_create_binary_base
-fn geo_create_binary_base(cf: &Conf, ctx: &mut GeoConfCtx) {
+/// ngx_stream_geo_create_binary_base: C maps the new file and builds the
+/// base in the mapping; here the base is built in memory, then written to
+/// the file where C unmaps it.
+fn geo_create_binary_base(log: &Log, ctx: &mut GeoConfCtx) {
     let mut name = ctx.include_name.clone();
     name.extend_from_slice(b".bin");
 
     let size = ctx.data_size;
 
-    let log = &cf.log;
-
     ngx_log_error!(NGX_LOG_NOTICE, log, None, "creating binary geo range base \"{}\"", B(&name));
 
-    // ngx_create_file_mapping
+    // ngx_create_file_mapping: the file of the size of the base
 
     let fd = match os::open(&name, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644) {
         Ok(fd) => fd,
@@ -1209,33 +1176,57 @@ fn geo_create_binary_base(cf: &Conf, ctx: &mut GeoConfCtx) {
     };
 
     let close = |fd: i32| {
-        if unsafe { libc::close(fd) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(os::errno()), "close() \"{}\" failed", B(&name));
+        if let Err(err) = os::close_fd(fd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "close() \"{}\" failed", B(&name));
         }
     };
 
-    if unsafe { libc::ftruncate(fd, size as libc::off_t) } == -1 {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(os::errno()), "ftruncate() \"{}\" failed", B(&name));
+    if let Err(err) = os::ftruncate(fd, size as i64) {
+        ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "ftruncate() \"{}\" failed", B(&name));
         close(fd);
         return;
     }
 
-    let addr = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
+    // the base: size zero bytes, filled as in the mapping
 
-    if addr == libc::MAP_FAILED {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(os::errno()), "mmap({}) \"{}\" failed", size, B(&name));
-        close(fd);
-        return;
+    let mut base = vec![0u8; size];
+
+    geo_write_binary_base(&mut base, ctx);
+
+    // ngx_close_file_mapping: the base goes to the file
+
+    write_file(fd, &name, &base, log);
+
+    close(fd);
+}
+
+/// ngx_write_file() of `data` at the start of the file: pwrite() until all
+/// is written, again if interrupted
+fn write_file(fd: i32, name: &[u8], data: &[u8], log: &Log) {
+    let mut written = 0;
+
+    while written < data.len() {
+        match os::pwrite(fd, &data[written..], written as i64) {
+            Ok(n) => written += n,
+            Err(libc::EINTR) => continue,
+            Err(err) => {
+                ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "pwrite() \"{}\" failed", B(name));
+                return;
+            }
+        }
     }
+}
 
-    // the mapping of the new file: size zero bytes, unmapped below
-    let base = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, size) };
+/// The contents of the binary base (ngx_stream_geo_create_binary_base after
+/// the file mapping): base is ctx.data_size zero bytes.
+fn geo_write_binary_base(base: &mut [u8], ctx: &mut GeoConfCtx) {
+    let size = base.len();
 
     base[..12].copy_from_slice(&geo_header());
 
     let mut p = HEADER_SIZE;
 
-    p = unsafe { geo_copy_values(base, p, ctx.rbtree.root, ctx.rbtree.sentinel, &ctx.values) };
+    p = geo_copy_values(base, p, &ctx.rbtree, ctx.rbtree.root(), &ctx.values);
 
     p += VV_SIZE;
 
@@ -1256,8 +1247,8 @@ fn geo_create_binary_base(cf: &Conf, ctx: &mut GeoConfCtx) {
             let hash = crc32fast::hash(s);
 
             // the values of the ranges are in the tree
-            let gvvn = unsafe { str_rbtree_lookup(&ctx.rbtree, s, hash) as *mut GeoValueNode };
-            let offset = unsafe { (*gvvn).offset };
+            let gvvn = str_rbtree_lookup(&ctx.rbtree, s, hash);
+            let offset = ctx.rbtree.value(gvvn).offset;
 
             put_ptr(base, p, offset);
             base[p + PTR..p + PTR + 2].copy_from_slice(&range.start.to_ne_bytes());
@@ -1273,49 +1264,43 @@ fn geo_create_binary_base(cf: &Conf, ctx: &mut GeoConfCtx) {
 
     let crc = crc32fast::hash(&base[HEADER_SIZE..size]);
     base[12..16].copy_from_slice(&crc.to_ne_bytes());
-
-    // ngx_close_file_mapping
-
-    if unsafe { libc::munmap(addr, size) } == -1 {
-        ngx_log_error!(NGX_LOG_CRIT, log, Some(os::errno()), "munmap({}) \"{}\" failed", size, B(&name));
-    }
-
-    close(fd);
 }
 
 /// ngx_stream_geo_copy_values: the values of the tree in preorder
-unsafe fn geo_copy_values(base: &mut [u8], mut p: usize, node: *mut RbtreeNode, sentinel: *mut RbtreeNode, values: &[VariableValue]) -> usize {
-    if node == sentinel {
+fn geo_copy_values(base: &mut [u8], mut p: usize, tree: &LocalRbtree<GeoValueNode>, node: usize, values: &[VariableValue]) -> usize {
+    if node == tree.sentinel() {
         return p;
     }
 
-    let gvvn = node as *mut GeoValueNode;
+    {
+        let mut gvvn = tree.value_mut(node);
 
-    (*gvvn).offset = p;
+        gvvn.offset = p;
 
-    let vv = &values[(*gvvn).value];
+        let vv = &values[gvvn.value];
 
-    let bits = (vv.data.len() as u32 & 0x0fffffff) | (vv.valid as u32) << 28 | (vv.no_cacheable as u32) << 29 | (vv.not_found as u32) << 30;
+        let bits = (vv.data.len() as u32 & 0x0fffffff) | (vv.valid as u32) << 28 | (vv.no_cacheable as u32) << 29 | (vv.not_found as u32) << 30;
 
-    base[p..p + 4].copy_from_slice(&bits.to_ne_bytes());
+        base[p..p + 4].copy_from_slice(&bits.to_ne_bytes());
 
-    let data = p + PTR;
+        let data = p + PTR;
 
-    p += VV_SIZE;
+        p += VV_SIZE;
 
-    put_ptr(base, data, p);
+        put_ptr(base, data, p);
 
-    let str: &Vec<u8> = &(*gvvn).sn.str;
+        let str = &gvvn.str;
 
-    base[p..p + str.len()].copy_from_slice(str);
+        base[p..p + str.len()].copy_from_slice(str);
 
-    p += str.len();
+        p += str.len();
 
-    p = align(p, PTR);
+        p = align(p, PTR);
+    }
 
-    p = geo_copy_values(base, p, (*node).left, sentinel, values);
+    p = geo_copy_values(base, p, tree, tree.left(node), values);
 
-    geo_copy_values(base, p, (*node).right, sentinel, values)
+    geo_copy_values(base, p, tree, tree.right(node), values)
 }
 
 pub fn geo_module() -> ModuleDef {
@@ -1372,5 +1357,126 @@ mod tests {
         let h = geo_header();
         assert_eq!(&h[..6], b"GEORNG");
         assert_eq!(h[7] as usize, PTR);
+    }
+
+    /// The strings of the values' tree in preorder (the root, its left
+    /// subtree, its right subtree).
+    fn preorder(tree: &LocalRbtree<GeoValueNode>, node: usize, out: &mut Vec<Vec<u8>>) {
+        if node == tree.sentinel() {
+            return;
+        }
+        out.push(tree.value(node).str.clone());
+        preorder(tree, tree.left(node), out);
+        preorder(tree, tree.right(node), out);
+    }
+
+    #[test]
+    fn str_tree_order_as_c() {
+        // ngx_str_rbtree_insert_value: the key, then the length, then the
+        // bytes
+        let tree: LocalRbtree<GeoValueNode> = LocalRbtree::new();
+        let strs: [(usize, &[u8]); 8] = [(5, b"bb"), (5, b"a"), (5, b"ab"), (3, b"zzz"), (5, b"b"), (9, b""), (5, b"aaa"), (3, b"y")];
+
+        for (i, (key, s)) in strs.iter().enumerate() {
+            let n = tree.alloc(*key, GeoValueNode { str: s.to_vec(), value: i, offset: 0 });
+            rb::insert(&tree, n, str_rbtree_insert_value);
+        }
+
+        let walked: Vec<(usize, Vec<u8>)> = rb::walk(&tree).into_iter().map(|n| (tree.key(n), tree.value(n).str.clone())).collect();
+        let want: Vec<(usize, Vec<u8>)> = [(3, &b"y"[..]), (3, b"zzz"), (5, b"a"), (5, b"b"), (5, b"ab"), (5, b"bb"), (5, b"aaa"), (9, b"")].iter().map(|(k, s)| (*k, s.to_vec())).collect();
+        assert_eq!(walked, want);
+
+        for (i, (key, s)) in strs.iter().enumerate() {
+            let n = str_rbtree_lookup(&tree, s, *key as u32);
+            assert!(n != 0, "{:?}", s);
+            assert_eq!(tree.value(n).value, i);
+        }
+
+        assert_eq!(str_rbtree_lookup(&tree, b"c", 5), 0);
+        assert_eq!(str_rbtree_lookup(&tree, b"a", 3), 0);
+    }
+
+    #[test]
+    fn binary_base_roundtrip() {
+        let mut ctx = ctx_with_ranges();
+
+        let names: Vec<Vec<u8>> = (0..40).map(|i| format!("value{}", i * 7 % 40).into_bytes()).collect();
+        let idx: Vec<usize> = names.iter().map(|n| geo_value(&mut ctx, n)).collect();
+
+        {
+            let low = ctx.high_low.as_mut().unwrap();
+            for (i, v) in idx.iter().enumerate() {
+                low[0x7f00 + i] = Some(vec![GeoRange { value: *v, start: 0, end: 1 }, GeoRange { value: idx[0], start: 2, end: 0xffff }]);
+            }
+        }
+
+        ctx.data_size += names.len() * (2 * RANGE_SIZE + PTR);
+
+        let mut base = vec![0u8; ctx.data_size];
+        geo_write_binary_base(&mut base, &mut ctx);
+
+        let crc = u32::from_ne_bytes(base[12..16].try_into().unwrap());
+        assert_eq!(crc32fast::hash(&base[HEADER_SIZE..]), crc);
+        assert_eq!(base[..12], geo_header());
+
+        // the values follow the header in the preorder of the tree
+        let mut want = Vec::new();
+        preorder(&ctx.rbtree, ctx.rbtree.root(), &mut want);
+        assert_eq!(want.len(), 40);
+
+        let mut values = Vec::new();
+        let low = geo_parse_binary_base(&base, &mut values).expect("valid base");
+        let got: Vec<Vec<u8>> = values.iter().map(|v| v.data.clone()).collect();
+        assert_eq!(got, want);
+        assert!(values.iter().all(|v| v.valid && !v.no_cacheable && !v.not_found));
+
+        for (i, n) in names.iter().enumerate() {
+            let r = low[0x7f00 + i].as_ref().unwrap();
+            assert_eq!(r.len(), 2);
+            assert_eq!((r[0].start, r[0].end, &values[r[0].value].data), (0, 1, n));
+            assert_eq!((r[1].start, r[1].end, &values[r[1].value].data), (2, 0xffff, &names[0]));
+        }
+
+        assert!(low[0x7eff].is_none());
+
+        // a truncated base is rejected
+        let mut values = Vec::new();
+        assert!(geo_parse_binary_base(&base[..HEADER_SIZE + 8], &mut values).is_none());
+    }
+
+    #[test]
+    fn binary_base_file() {
+        let dir = std::env::temp_dir().join(format!("rnginx-stream-geo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let log = Log::stderr(NGX_LOG_EMERG);
+
+        let mut ctx = ctx_with_ranges();
+        let a = geo_value(&mut ctx, b"one");
+        let b = geo_value(&mut ctx, b"two");
+        {
+            let low = ctx.high_low.as_mut().unwrap();
+            low[0x0a00] = Some(vec![GeoRange { value: a, start: 1, end: 2 }, GeoRange { value: b, start: 3, end: 0x10 }]);
+        }
+        ctx.data_size += 2 * RANGE_SIZE + PTR;
+
+        use std::os::unix::ffi::OsStrExt;
+        ctx.include_name = dir.join("geo.conf").as_os_str().as_bytes().to_vec();
+
+        geo_create_binary_base(&log, &mut ctx);
+
+        let file = std::fs::read(dir.join("geo.conf.bin")).unwrap();
+        assert_eq!(file.len(), ctx.data_size);
+
+        let mut want = vec![0u8; ctx.data_size];
+        geo_write_binary_base(&mut want, &mut ctx);
+        assert_eq!(file, want);
+
+        // no such directory: logged, nothing made
+        ctx.include_name = dir.join("none/geo.conf").as_os_str().as_bytes().to_vec();
+        geo_create_binary_base(&log, &mut ctx);
+        assert!(!dir.join("none").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

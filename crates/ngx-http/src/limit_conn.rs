@@ -2,19 +2,19 @@
 //! processed) per key, counted in a shared memory zone.
 
 use std::any::Any;
-use std::cell::Cell;
-use std::ptr::addr_of_mut;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use ngx_core::conf::*;
 use ngx_core::log::*;
 use ngx_core::module::ModuleDef;
-use ngx_core::rbtree::*;
 use ngx_core::rc::*;
 use ngx_core::shm::ShmZone;
-use ngx_core::slab::SlabPool;
+use ngx_core::shmem::rbtree::{self as rb, RbNode, RbTree, ShmRbtree};
+use ngx_core::shmem::slab::SlabPool;
+use ngx_core::shmem::ShmMem;
 use ngx_core::string::B;
-use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error};
+use ngx_core::{cmd, cmd_fn, ngx_log_debug, ngx_log_error, shm_struct};
 
 use crate::core::*;
 use crate::request::*;
@@ -30,33 +30,56 @@ const NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN: u32 = 3;
 
 const TAG: &str = "ngx_http_limit_conn_module";
 
-/// ngx_http_limit_conn_node_t: it starts at the color of the rbtree node
-#[repr(C)]
-struct LimitConnNode {
-    color: u8,
-    len: u8,
-    conn: u16,
-    data: [u8; 1],
+shm_struct! {
+    /// ngx_http_limit_conn_node_t: it starts at the color of the rbtree node
+    struct LimitConnNode {
+        color: u8,
+        len: u8,
+        conn: u16,
+        /// the key, len bytes
+        data: u8,
+    }
 }
 
 /// ngx_http_limit_conn_cleanup_t
 struct LimitConnCleanup {
     shm_zone: Rc<ShmZone>,
-    node: *mut RbtreeNode,
+    node: usize,
 }
 
-/// ngx_http_limit_conn_shctx_t
-#[repr(C)]
-struct LimitConnShctx {
-    rbtree: Rbtree,
-    sentinel: RbtreeNode,
+shm_struct! {
+    /// ngx_http_limit_conn_shctx_t: the rbtree, then its sentinel node
+    struct LimitConnShctx {
+        rbtree_root: usize,
+        rbtree_sentinel: usize,
+        rbtree_insert: usize,
+        sentinel_key: usize,
+        sentinel_left: usize,
+        sentinel_right: usize,
+        sentinel_parent: usize,
+        sentinel_color: u8,
+        sentinel_data: u8,
+    }
 }
 
 /// ngx_http_limit_conn_ctx_t
 pub struct LimitConnCtx {
-    sh: Cell<*mut LimitConnShctx>,
-    shpool: Cell<*mut SlabPool>,
+    /// ctx->sh: the offset of the shctx in the zone
+    sh: Cell<usize>,
+    /// the zone's memory, its slab pool at the start (ctx->shpool)
+    mem: RefCell<Option<Rc<ShmMem>>>,
     key: ComplexValue,
+}
+
+impl LimitConnCtx {
+    fn mem(&self) -> Rc<ShmMem> {
+        self.mem.borrow().clone().expect("limit_conn zone memory")
+    }
+
+    /// &ctx->sh->rbtree
+    fn rbtree<'a>(&self, mem: &'a ShmMem) -> ShmRbtree<'a> {
+        ShmRbtree::at(mem, self.sh.get() + LimitConnShctx::rbtree_root.off)
+    }
 }
 
 /// ngx_http_limit_conn_limit_t
@@ -81,21 +104,38 @@ static LIMIT_CONN_VARS: &[VarDef] = &[VarDef { name: "limit_conn_status", set: N
 
 static LIMIT_CONN_STATUS: [&str; 3] = ["PASSED", "REJECTED", "REJECTED_DRY_RUN"];
 
-const COLOR_OFF: usize = std::mem::offset_of!(RbtreeNode, color);
+const COLOR_OFF: usize = RbNode::color.off;
 
-const DATA_OFF: usize = std::mem::offset_of!(LimitConnNode, data);
+const DATA_OFF: usize = LimitConnNode::data.off;
 
 /// (ngx_http_limit_conn_node_t *) &node->color
-unsafe fn lc_of(node: *mut RbtreeNode) -> *mut LimitConnNode {
-    (node as *mut u8).add(COLOR_OFF) as *mut LimitConnNode
+fn lc_of(mem: &ShmMem, node: usize) -> LimitConnNode<'_> {
+    LimitConnNode::at(mem, node + COLOR_OFF)
 }
 
 /// lc->data, lc->len
-unsafe fn lc_data<'a>(lc: *mut LimitConnNode) -> &'a [u8] {
-    std::slice::from_raw_parts((lc as *const u8).add(DATA_OFF), (*lc).len as usize)
+fn lc_data(lc: LimitConnNode<'_>) -> Vec<u8> {
+    lc.mem.bytes(lc.field(LimitConnNode::data), lc.get(LimitConnNode::len) as usize)
 }
 
-/// ngx_memn2cmp
+/// ngx_memn2cmp(key, lc->data, key.len, lc->len), without copying lc->data
+fn lc_cmp(key: &[u8], lc: LimitConnNode<'_>) -> i32 {
+    let len = lc.get(LimitConnNode::len) as usize;
+    let n = key.len().min(len);
+
+    match lc.mem.cmp_bytes(lc.field(LimitConnNode::data), &key[..n]) {
+        std::cmp::Ordering::Greater => -1,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => match key.len().cmp(&len) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        },
+    }
+}
+
+/// ngx_memn2cmp (lc_cmp() is the one on the zone's bytes)
+#[cfg(test)]
 fn memn2cmp(s1: &[u8], s2: &[u8]) -> i32 {
     let (n, z) = if s1.len() <= s2.len() { (s1.len(), -1) } else { (s2.len(), 1) };
 
@@ -153,78 +193,74 @@ async fn limit_conn_handler(r: R) -> i64 {
 
         let hash = crc32fast::hash(&key);
 
-        // SAFETY: shpool was set by the zone init to the zone's slab pool
-        let shpool = unsafe { &*ctx.shpool.get() };
+        let mem = ctx.mem();
+        let shpool = SlabPool::of(&mem);
 
         shpool.lock();
 
-        // SAFETY: the zone's rbtree and its nodes are used under its mutex
-        let node = unsafe {
-            let sh = ctx.sh.get();
+        // the zone's rbtree and its nodes are used under its mutex
+        let tree = ctx.rbtree(&mem);
 
-            let mut node = limit_conn_lookup(&(*sh).rbtree, &key, hash);
+        let mut node = limit_conn_lookup(&tree, &key, hash);
 
-            if node.is_null() {
-                let n = COLOR_OFF + DATA_OFF + key.len();
+        if node == 0 {
+            let n = COLOR_OFF + DATA_OFF + key.len();
 
-                node = shpool.alloc_locked(n) as *mut RbtreeNode;
+            node = shpool.alloc_locked(n);
 
-                if node.is_null() {
-                    shpool.unlock();
-                    limit_conn_cleanup_all(&mut cleanups);
+            if node == 0 {
+                shpool.unlock();
+                limit_conn_cleanup_all(&mut cleanups);
 
-                    if *lccf.dry_run {
-                        main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
-                        return NGX_DECLINED;
-                    }
-
-                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
-
-                    return *lccf.status_code;
+                if *lccf.dry_run {
+                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
+                    return NGX_DECLINED;
                 }
 
-                let lc = lc_of(node);
+                main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
 
-                (*node).key = hash as usize;
-                (*lc).len = key.len() as u8;
-                (*lc).conn = 1;
-                std::ptr::copy_nonoverlapping(key.as_ptr(), (lc as *mut u8).add(DATA_OFF), key.len());
-
-                (*sh).rbtree.insert(node);
-            } else {
-                let lc = lc_of(node);
-
-                if (*lc).conn as usize >= limit.conn {
-                    shpool.unlock();
-
-                    ngx_log_error!(
-                        *lccf.log_level,
-                        r.connection.log,
-                        None,
-                        "limiting connections{} by zone \"{}\"",
-                        if *lccf.dry_run { ", dry run," } else { "" },
-                        B(limit.shm_zone.name())
-                    );
-
-                    limit_conn_cleanup_all(&mut cleanups);
-
-                    if *lccf.dry_run {
-                        main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
-                        return NGX_DECLINED;
-                    }
-
-                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
-
-                    return *lccf.status_code;
-                }
-
-                (*lc).conn = (*lc).conn.wrapping_add(1);
+                return *lccf.status_code;
             }
 
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit conn: {:08X} {}", (*node).key, (*lc_of(node)).conn);
+            let lc = lc_of(&mem, node);
 
-            node
-        };
+            tree.set_key(node, hash as usize);
+            lc.set(LimitConnNode::len, key.len() as u8);
+            lc.set(LimitConnNode::conn, 1);
+            mem.write(lc.field(LimitConnNode::data), &key);
+
+            rb::insert(&tree, node, limit_conn_rbtree_insert_value);
+        } else {
+            let lc = lc_of(&mem, node);
+
+            if lc.get(LimitConnNode::conn) as usize >= limit.conn {
+                shpool.unlock();
+
+                ngx_log_error!(
+                    *lccf.log_level,
+                    r.connection.log,
+                    None,
+                    "limiting connections{} by zone \"{}\"",
+                    if *lccf.dry_run { ", dry run," } else { "" },
+                    B(limit.shm_zone.name())
+                );
+
+                limit_conn_cleanup_all(&mut cleanups);
+
+                if *lccf.dry_run {
+                    main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED_DRY_RUN);
+                    return NGX_DECLINED;
+                }
+
+                main.limit_conn_status.set(NGX_HTTP_LIMIT_CONN_REJECTED);
+
+                return *lccf.status_code;
+            }
+
+            lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn).wrapping_add(1));
+        }
+
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, r.connection.log, "limit conn: {:08X} {}", tree.key(node), lc_of(&mem, node).get(LimitConnNode::conn));
 
         shpool.unlock();
 
@@ -253,71 +289,52 @@ fn pool_cleanup_add(r: &R, mut cleanups: Vec<LimitConnCleanup>) {
 }
 
 /// ngx_http_limit_conn_rbtree_insert_value
-unsafe fn limit_conn_rbtree_insert_value(mut temp: *mut RbtreeNode, node: *mut RbtreeNode, sentinel: *mut RbtreeNode) {
-    let p: *mut *mut RbtreeNode = loop {
-        let p = if (*node).key < (*temp).key {
-            addr_of_mut!((*temp).left)
-        } else if (*node).key > (*temp).key {
-            addr_of_mut!((*temp).right)
-        } else {
-            // node->key == temp->key
+fn limit_conn_rbtree_insert_value(tree: &ShmRbtree<'_>, temp: usize, node: usize, sentinel: usize) {
+    rb::insert_by(tree, temp, node, sentinel, |t, node, temp| {
+        let (nk, tk) = (t.key(node), t.key(temp));
 
-            let lcn = lc_of(node);
-            let lcnt = lc_of(temp);
-
-            if memn2cmp(lc_data(lcn), lc_data(lcnt)) < 0 {
-                addr_of_mut!((*temp).left)
-            } else {
-                addr_of_mut!((*temp).right)
-            }
-        };
-
-        if *p == sentinel {
-            break p;
+        if nk != tk {
+            return nk < tk;
         }
 
-        temp = *p;
-    };
+        // node->key == temp->key
 
-    *p = node;
-    (*node).parent = temp;
-    (*node).left = sentinel;
-    (*node).right = sentinel;
-    rbt_red(node);
+        lc_cmp(&lc_data(lc_of(t.mem, node)), lc_of(t.mem, temp)) < 0
+    });
 }
 
-/// ngx_http_limit_conn_lookup
-unsafe fn limit_conn_lookup(rbtree: &Rbtree, key: &[u8], hash: u32) -> *mut RbtreeNode {
-    let mut node = rbtree.root;
-    let sentinel = rbtree.sentinel;
+/// ngx_http_limit_conn_lookup: the node of the key, or 0
+fn limit_conn_lookup(rbtree: &ShmRbtree<'_>, key: &[u8], hash: u32) -> usize {
+    let mut node = rbtree.root();
+    let sentinel = rbtree.sentinel();
 
     let hash = hash as usize;
 
     while node != sentinel {
-        if hash < (*node).key {
-            node = (*node).left;
+        let k = rbtree.key(node);
+
+        if hash < k {
+            node = rbtree.left(node);
             continue;
         }
 
-        if hash > (*node).key {
-            node = (*node).right;
+        if hash > k {
+            node = rbtree.right(node);
             continue;
         }
 
         // hash == node->key
 
-        let lcn = lc_of(node);
-
-        let rc = memn2cmp(key, lc_data(lcn));
+        let rc = lc_cmp(key, lc_of(rbtree.mem, node));
 
         if rc == 0 {
             return node;
         }
 
-        node = if rc < 0 { (*node).left } else { (*node).right };
+        node = if rc < 0 { rbtree.left(node) } else { rbtree.right(node) };
     }
 
-    std::ptr::null_mut()
+    0
 }
 
 /// ngx_http_limit_conn_cleanup
@@ -325,28 +342,27 @@ fn limit_conn_cleanup(lccln: &LimitConnCleanup) {
     let ctx = zone_ctx(&lccln.shm_zone);
     let node = lccln.node;
 
-    // SAFETY: the node stays in the zone while its conn is not zero; it is
-    // changed under the zone's mutex
-    unsafe {
-        let lc = lc_of(node);
+    // the node stays in the zone while its conn is not zero; it is changed
+    // under the zone's mutex
+    let mem = ctx.mem();
+    let shpool = SlabPool::of(&mem);
+    let tree = ctx.rbtree(&mem);
+    let lc = lc_of(&mem, node);
 
-        let shpool = &*ctx.shpool.get();
+    shpool.lock();
 
-        shpool.lock();
-
-        if let Some(log) = lccln.shm_zone.shm.log.borrow().as_ref() {
-            ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "limit conn cleanup: {:08X} {}", (*node).key, (*lc).conn);
-        }
-
-        (*lc).conn = (*lc).conn.wrapping_sub(1);
-
-        if (*lc).conn == 0 {
-            (*ctx.sh.get()).rbtree.delete(node);
-            shpool.free_locked(node as *mut u8);
-        }
-
-        shpool.unlock();
+    if let Some(log) = lccln.shm_zone.shm.log.borrow().as_ref() {
+        ngx_log_debug!(NGX_LOG_DEBUG_HTTP, log, "limit conn cleanup: {:08X} {}", tree.key(node), lc.get(LimitConnNode::conn));
     }
+
+    lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn).wrapping_sub(1));
+
+    if lc.get(LimitConnNode::conn) == 0 {
+        rb::delete(&tree, node);
+        shpool.free_locked(node);
+    }
+
+    shpool.unlock();
 }
 
 /// ngx_http_limit_conn_cleanup_all: the cleanups the handler added, at
@@ -378,37 +394,35 @@ fn limit_conn_init_zone(shm_zone: &Rc<ShmZone>, data: Option<Rc<dyn Any>>) -> Re
         }
 
         ctx.sh.set(octx.sh.get());
-        ctx.shpool.set(octx.shpool.get());
+        *ctx.mem.borrow_mut() = octx.mem.borrow().clone();
 
         return Ok(());
     }
 
-    let shpool = shm_zone.shm.addr.get() as *mut SlabPool;
+    let mem = shm_zone.mem();
+    let shpool = SlabPool::of(&mem);
 
-    ctx.shpool.set(shpool);
+    *ctx.mem.borrow_mut() = Some(mem.clone());
 
-    // SAFETY: the zone is mapped, with its slab pool at the start
-    unsafe {
-        if shm_zone.shm.exists.get() {
-            ctx.sh.set((*shpool).data as *mut LimitConnShctx);
-            return Ok(());
-        }
-
-        let sh = (*shpool).alloc(std::mem::size_of::<LimitConnShctx>()) as *mut LimitConnShctx;
-        if sh.is_null() {
-            return Err(());
-        }
-
-        ctx.sh.set(sh);
-
-        (*shpool).data = sh as *mut u8;
-
-        (*sh).rbtree.init(addr_of_mut!((*sh).sentinel), limit_conn_rbtree_insert_value);
-
-        let log_ctx = format!(" in limit_conn_zone \"{}\"", B(shm_zone.name()));
-
-        (*shpool).set_log_ctx(log_ctx.as_bytes())?;
+    if shm_zone.shm.exists.get() {
+        ctx.sh.set(shpool.data());
+        return Ok(());
     }
+
+    let sh = shpool.alloc(LimitConnShctx::SIZE);
+    if sh == 0 {
+        return Err(());
+    }
+
+    ctx.sh.set(sh);
+
+    shpool.set_data(sh);
+
+    ctx.rbtree(&mem).init(LimitConnShctx::at(&mem, sh).field(LimitConnShctx::sentinel_key));
+
+    let log_ctx = format!(" in limit_conn_zone \"{}\"", B(shm_zone.name()));
+
+    shpool.set_log_ctx(log_ctx.as_bytes())?;
 
     Ok(())
 }
@@ -495,8 +509,9 @@ fn limit_conn_zone(cf: &mut Conf, cmd: &Command, _conf: Option<Rc<dyn Any>>) -> 
         return Err(cf.emerg(format_args!("{} \"{}\" is already bound to key \"{}\"", cmd.name, B(&name), B(&ctx.key.value))));
     }
 
-    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(std::ptr::null_mut()), shpool: Cell::new(std::ptr::null_mut()), key });
+    let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key });
 
+    shm_zone.safe_pool.set(true);
     *shm_zone.init.borrow_mut() = Some(Rc::new(limit_conn_init_zone));
     *shm_zone.data.borrow_mut() = Some(ctx);
 
@@ -576,29 +591,16 @@ pub fn limit_conn_module() -> ModuleDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
-    use ngx_core::shmtx::ShmTx;
+    /// A zone with its slab pool, initialized by the zone init.
+    fn zone() -> Rc<ShmZone> {
+        let mem = Rc::new(ShmMem::private(1 << 19).unwrap());
+        SlabPool::init_zone(&mem);
 
-    /// A zone with its slab pool in `mem`, initialized by the zone init.
-    fn zone(mem: &mut Vec<u64>) -> Rc<ShmZone> {
-        let size = mem.len() * 8;
-        let zone = ShmZone::new(b"test".to_vec(), size, TAG);
+        let zone = ShmZone::new(b"test".to_vec(), mem.len(), TAG);
+        zone.shm.attach(mem);
 
-        // SAFETY: as ngx_init_zone_pool does, on memory of the given size
-        unsafe {
-            ngx_core::slab::sizes_init();
-            let addr = mem.as_mut_ptr() as *mut u8;
-            let sp = addr as *mut SlabPool;
-            (*sp).end = addr.add(size);
-            (*sp).min_shift = 3;
-            (*sp).addr = addr;
-            std::ptr::write(addr_of_mut!((*sp).mutex), ShmTx::create(addr_of_mut!((*sp).lock) as *mut AtomicUsize));
-            ngx_core::slab::slab_init(sp);
-            zone.shm.addr.set(addr);
-        }
-
-        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(std::ptr::null_mut()), shpool: Cell::new(std::ptr::null_mut()), key: ComplexValue::constant(b"$binary_remote_addr") });
+        let ctx = Rc::new(LimitConnCtx { sh: Cell::new(0), mem: RefCell::new(None), key: ComplexValue::constant(b"$binary_remote_addr") });
 
         *zone.data.borrow_mut() = Some(ctx);
 
@@ -610,38 +612,38 @@ mod tests {
     /// The part of ngx_http_limit_conn_handler for one limit and key.
     fn acquire(zone: &Rc<ShmZone>, key: &[u8], hash: u32, max: usize) -> Option<LimitConnCleanup> {
         let ctx = zone_ctx(zone);
-        unsafe {
-            let sh = ctx.sh.get();
-            let shpool = &*ctx.shpool.get();
-            let mut node = limit_conn_lookup(&(*sh).rbtree, key, hash);
-            if node.is_null() {
-                node = shpool.alloc_locked(COLOR_OFF + DATA_OFF + key.len()) as *mut RbtreeNode;
-                assert!(!node.is_null());
-                let lc = lc_of(node);
-                (*node).key = hash as usize;
-                (*lc).len = key.len() as u8;
-                (*lc).conn = 1;
-                std::ptr::copy_nonoverlapping(key.as_ptr(), (lc as *mut u8).add(DATA_OFF), key.len());
-                (*sh).rbtree.insert(node);
-            } else {
-                if (*lc_of(node)).conn as usize >= max {
-                    return None;
-                }
-                (*lc_of(node)).conn += 1;
+        let mem = ctx.mem();
+        let shpool = SlabPool::of(&mem);
+        let tree = ctx.rbtree(&mem);
+
+        let mut node = limit_conn_lookup(&tree, key, hash);
+        if node == 0 {
+            node = shpool.alloc_locked(COLOR_OFF + DATA_OFF + key.len());
+            assert!(node != 0);
+            let lc = lc_of(&mem, node);
+            tree.set_key(node, hash as usize);
+            lc.set(LimitConnNode::len, key.len() as u8);
+            lc.set(LimitConnNode::conn, 1);
+            mem.write(lc.field(LimitConnNode::data), key);
+            rb::insert(&tree, node, limit_conn_rbtree_insert_value);
+        } else {
+            let lc = lc_of(&mem, node);
+            if lc.get(LimitConnNode::conn) as usize >= max {
+                return None;
             }
-            Some(LimitConnCleanup { shm_zone: zone.clone(), node })
+            lc.set(LimitConnNode::conn, lc.get(LimitConnNode::conn) + 1);
         }
+        Some(LimitConnCleanup { shm_zone: zone.clone(), node })
     }
 
     fn conn(zone: &Rc<ShmZone>, key: &[u8], hash: u32) -> Option<u16> {
         let ctx = zone_ctx(zone);
-        unsafe {
-            let node = limit_conn_lookup(&(*ctx.sh.get()).rbtree, key, hash);
-            if node.is_null() {
-                None
-            } else {
-                Some((*lc_of(node)).conn)
-            }
+        let mem = ctx.mem();
+        let node = limit_conn_lookup(&ctx.rbtree(&mem), key, hash);
+        if node == 0 {
+            None
+        } else {
+            Some(lc_of(&mem, node).get(LimitConnNode::conn))
         }
     }
 
@@ -649,6 +651,8 @@ mod tests {
     fn node_layout_as_c() {
         assert_eq!(COLOR_OFF, 32);
         assert_eq!(DATA_OFF, 4);
+        assert_eq!(LimitConnShctx::SIZE, 64);
+        assert_eq!(LimitConnShctx::sentinel_key.off, 24);
     }
 
     #[test]
@@ -657,14 +661,22 @@ mod tests {
         assert!(memn2cmp(b"k", b"k1") < 0);
         assert!(memn2cmp(b"k10", b"k1") > 0);
         assert!(memn2cmp(b"a9", b"b") < 0);
+
+        let mem = ShmMem::private(4096).unwrap();
+        let lc = LimitConnNode::at(&mem, 64);
+        for (a, b) in [(&b"k1"[..], &b"k1"[..]), (b"k", b"k1"), (b"k10", b"k1"), (b"a9", b"b"), (b"b", b"a9")] {
+            lc.set(LimitConnNode::len, b.len() as u8);
+            mem.write(lc.field(LimitConnNode::data), b);
+            assert_eq!(lc_cmp(a, lc), memn2cmp(a, b), "{:?} {:?}", a, b);
+        }
     }
 
     #[test]
     fn count_and_cleanup() {
-        let mut mem = vec![0u64; 1 << 16];
-        let zone = zone(&mut mem);
+        let zone = zone();
         let ctx = zone_ctx(&zone);
-        let pfree = unsafe { (*ctx.shpool.get()).pfree };
+        let mem = ctx.mem();
+        let pfree = SlabPool::of(&mem).pfree();
 
         let c1 = acquire(&zone, b"127.0.0.1", 5, 2).unwrap();
         let c2 = acquire(&zone, b"127.0.0.1", 5, 2).unwrap();
@@ -685,17 +697,14 @@ mod tests {
         assert_eq!(conn(&zone, b"127.0.0.1", 5), None);
         assert_eq!(conn(&zone, b"127.0.0.2", 5), None);
 
-        unsafe {
-            let sh = ctx.sh.get();
-            assert_eq!((*sh).rbtree.root, (*sh).rbtree.sentinel);
-            assert_eq!((*ctx.shpool.get()).pfree, pfree);
-        }
+        let tree = ctx.rbtree(&mem);
+        assert_eq!(tree.root(), tree.sentinel());
+        assert_eq!(SlabPool::of(&mem).pfree(), pfree);
     }
 
     #[test]
     fn lookup_many_keys() {
-        let mut mem = vec![0u64; 1 << 16];
-        let zone = zone(&mut mem);
+        let zone = zone();
 
         let keys: Vec<Vec<u8>> = (0..200u32).map(|i| format!("{}", i * 37 % 200).into_bytes()).collect();
 

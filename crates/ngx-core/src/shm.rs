@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::log::*;
 use crate::ngx_log_error;
+use crate::shmem::ShmMem;
 
 pub struct Shm {
     pub addr: Cell<*mut u8>,
@@ -16,35 +17,51 @@ pub struct Shm {
     pub log: RefCell<Option<Log>>,
 }
 
+thread_local! {
+    /// The zones' mappings of the process, found by their addresses
+    /// (shm.addr): a zone reused by a new cycle gets the address only.
+    static MAPPINGS: RefCell<Vec<Rc<ShmMem>>> = const { RefCell::new(Vec::new()) };
+}
+
 impl Shm {
+    /// ngx_shm_alloc: mmap(MAP_ANON|MAP_SHARED) of the zone's size.
     pub fn alloc(&self, log: &Log) -> Result<(), ()> {
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                self.size.get(),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_SHARED,
-                -1,
-                0,
-            )
+        let mem = match ShmMem::shared(self.size.get()) {
+            Ok(m) => Rc::new(m),
+            Err(e) => {
+                ngx_log_error!(NGX_LOG_ALERT, log, e.raw_os_error(), "mmap(MAP_ANON|MAP_SHARED, {}) failed", self.size.get());
+                return Err(());
+            }
         };
-        if p == libc::MAP_FAILED {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "mmap(MAP_ANON|MAP_SHARED, {}) failed", self.size.get());
-            return Err(());
-        }
-        self.addr.set(p as *mut u8);
+        self.addr.set(mem.addr());
+        MAPPINGS.with(|m| m.borrow_mut().push(mem));
         Ok(())
     }
 
-    pub fn free(&self, log: &Log) {
+    /// ngx_shm_free: the mapping goes (munmap()) when the last user of it
+    /// in the process drops it.
+    pub fn free(&self, _log: &Log) {
         let p = self.addr.get();
         if p.is_null() {
             return;
         }
-        if unsafe { libc::munmap(p as *mut libc::c_void, self.size.get()) } == -1 {
-            ngx_log_error!(NGX_LOG_ALERT, log, Some(errno()), "munmap({:p}, {}) failed", p, self.size.get());
-        }
+        MAPPINGS.with(|m| m.borrow_mut().retain(|mem| mem.addr() != p));
         self.addr.set(std::ptr::null_mut());
+    }
+
+    /// Makes `mem` the zone's memory (tests: a private mapping).
+    pub fn attach(&self, mem: Rc<ShmMem>) {
+        self.addr.set(mem.addr());
+        MAPPINGS.with(|m| m.borrow_mut().push(mem));
+    }
+
+    /// The memory of the zone, once allocated.
+    pub fn mem(&self) -> Option<Rc<ShmMem>> {
+        let p = self.addr.get();
+        if p.is_null() {
+            return None;
+        }
+        MAPPINGS.with(|m| m.borrow().iter().find(|mem| mem.addr() == p).cloned())
     }
 }
 
@@ -62,6 +79,10 @@ pub struct ShmZone {
     pub conf: RefCell<Option<Rc<dyn Any>>>,
     pub noreuse: Cell<bool>,
     pub sync: Cell<bool>,
+    /// The zone's users work on the safe pool (shmem::slab::SlabPool):
+    /// ngx_init_zone_pool makes that one (set by converted modules when
+    /// they add the zone; the zones of the others get the old pool).
+    pub safe_pool: Cell<bool>,
 }
 
 impl ShmZone {
@@ -74,6 +95,7 @@ impl ShmZone {
             conf: RefCell::new(None),
             noreuse: Cell::new(false),
             sync: Cell::new(false),
+            safe_pool: Cell::new(false),
         })
     }
 
@@ -87,6 +109,12 @@ impl ShmZone {
 
     pub fn conf<T: 'static>(&self) -> Option<Rc<T>> {
         self.conf.borrow().clone().and_then(|d| d.downcast::<T>().ok())
+    }
+
+    /// The memory of the zone (allocated when the cycle is initialized,
+    /// before the zone's init callback).
+    pub fn mem(&self) -> Rc<ShmMem> {
+        self.shm.mem().unwrap_or_else(|| panic!("shared zone \"{}\" has no memory", crate::string::B(&self.shm.name)))
     }
 
     /// Slab pool at the start of the zone.

@@ -916,16 +916,11 @@ fn file_access(fi: &libc::stat) -> u32 {
     fi.st_mode & 0o777
 }
 
-/// ngx_delete_dir
+/// ngx_delete_dir: rmdir() (the unlinkat(AT_REMOVEDIR) of rustix)
 fn delete_dir(name: &[u8]) -> Result<(), i32> {
     let c = ngx_core::os::cstr(name);
 
-    // SAFETY: c is a NUL-terminated string that outlives the call
-    if unsafe { libc::rmdir(c.as_ptr()) } == -1 {
-        return Err(ngx_core::os::errno());
-    }
-
-    Ok(())
+    rustix::fs::unlinkat(rustix::fs::CWD, c.as_c_str(), rustix::fs::AtFlags::REMOVEDIR).map_err(|e| e.raw_os_error())
 }
 
 /// ngx_rename_file
@@ -933,24 +928,14 @@ fn rename_file(from: &[u8], to: &[u8]) -> Result<(), i32> {
     let f = ngx_core::os::cstr(from);
     let t = ngx_core::os::cstr(to);
 
-    // SAFETY: both are NUL-terminated strings that outlive the call
-    if unsafe { libc::rename(f.as_ptr(), t.as_ptr()) } == -1 {
-        return Err(ngx_core::os::errno());
-    }
-
-    Ok(())
+    rustix::fs::rename(f.as_c_str(), t.as_c_str()).map_err(|e| e.raw_os_error())
 }
 
 /// ngx_change_file_access
 fn change_file_access(name: &[u8], access: u32) -> Result<(), i32> {
     let c = ngx_core::os::cstr(name);
 
-    // SAFETY: c is a NUL-terminated string that outlives the call
-    if unsafe { libc::chmod(c.as_ptr(), access as libc::mode_t) } == -1 {
-        return Err(ngx_core::os::errno());
-    }
-
-    Ok(())
+    rustix::fs::chmod(c.as_c_str(), rustix::fs::Mode::from_raw_mode(access)).map_err(|e| e.raw_os_error())
 }
 
 /// ngx_set_file_time: utimes() with the current time as the access time
@@ -958,17 +943,10 @@ fn change_file_access(name: &[u8], access: u32) -> Result<(), i32> {
 fn set_file_time(name: &[u8], _fd: i32, s: i64) -> Result<(), i32> {
     let c = ngx_core::os::cstr(name);
 
-    let tv = [
-        libc::timeval { tv_sec: ngx_core::times::time() as libc::time_t, tv_usec: 0 },
-        libc::timeval { tv_sec: s as libc::time_t, tv_usec: 0 },
-    ];
+    let atime = nix::sys::time::TimeVal::new(ngx_core::times::time(), 0);
+    let mtime = nix::sys::time::TimeVal::new(s, 0);
 
-    // SAFETY: c is a NUL-terminated string, tv an array of two timevals
-    if unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) } == -1 {
-        return Err(ngx_core::os::errno());
-    }
-
-    Ok(())
+    nix::sys::stat::utimes(c.as_c_str(), &atime, &mtime).map_err(|e| e as i32)
 }
 
 /// ngx_create_full_path: creates the directories of the path up to its
@@ -1168,15 +1146,15 @@ fn copy_file(from: &[u8], to: &[u8], cf: &CopyFile) -> i64 {
                 len = size as usize;
             }
 
-            // SAFETY: buf has at least len bytes
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, len) };
+            let n = match ngx_core::os::read(fd, &mut buf[..len]) {
+                Ok(n) => n,
+                Err(err) => {
+                    ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "read() \"{}\" failed", B(from));
+                    break 'failed NGX_ERROR;
+                }
+            };
 
-            if n == -1 {
-                ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "read() \"{}\" failed", B(from));
-                break 'failed NGX_ERROR;
-            }
-
-            if n as usize != len {
+            if n != len {
                 ngx_log_error!(NGX_LOG_ALERT, log, None, "read() has read only {} of {} from {}", n, size, B(from));
                 break 'failed NGX_ERROR;
             }
@@ -1205,14 +1183,14 @@ fn copy_file(from: &[u8], to: &[u8], cf: &CopyFile) -> i64 {
         NGX_OK
     };
 
-    // SAFETY: the descriptors were opened above and are closed once
-    if nfd != -1 && unsafe { libc::close(nfd) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "close() \"{}\" failed", B(to));
+    if nfd != -1 {
+        if let Err(err) = ngx_core::os::close_fd(nfd) {
+            ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "close() \"{}\" failed", B(to));
+        }
     }
 
-    // SAFETY: as above
-    if unsafe { libc::close(fd) } == -1 {
-        ngx_log_error!(NGX_LOG_ALERT, log, Some(ngx_core::os::errno()), "close() \"{}\" failed", B(from));
+    if let Err(err) = ngx_core::os::close_fd(fd) {
+        ngx_log_error!(NGX_LOG_ALERT, log, Some(err), "close() \"{}\" failed", B(from));
     }
 
     rc

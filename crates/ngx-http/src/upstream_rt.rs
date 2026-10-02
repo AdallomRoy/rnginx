@@ -451,29 +451,31 @@ fn try_send_chain(c: &ngx_core::connection::Connection, chain: &mut Chain) -> st
             let size = (b.file_last - b.file_pos) as usize;
 
             if c.ssl.borrow().is_none() {
-                let mut off = b.file_pos as libc::off_t;
+                // the off_t of sendfile(), as unsigned
+                let mut off = b.file_pos as u64;
 
-                // SAFETY: a non-blocking sendfile() from an open file to the
+                // a non-blocking sendfile() from an open file to the
                 // connection's socket
-                let n = unsafe { libc::sendfile(c.fd.get(), fd, &mut off, size) };
+                let n = ngx_core::fd::get(c.fd.get())
+                    .and_then(|s| ngx_core::fd::get(fd).map(|file| (s, file)))
+                    .and_then(|(s, file)| rustix::fs::sendfile(&s, &file, Some(&mut off), size).map_err(std::io::Error::from));
 
-                if n < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
+                if let Ok(n) = n {
                     c.sent.set(c.sent.get() + n as u64);
-                    Ok(n as usize)
                 }
+
+                n
             } else {
                 let mut data = vec![0u8; size.min(16384)];
 
-                // SAFETY: pread() into data of the file's open descriptor
-                let n = unsafe { libc::pread(fd, data.as_mut_ptr() as *mut libc::c_void, data.len(), b.file_pos) };
+                // pread() into data of the file's open descriptor
+                let n = match ngx_core::os::pread(fd, &mut data, b.file_pos) {
+                    Ok(0) => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                    Ok(n) => n,
+                    Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
+                };
 
-                if n <= 0 {
-                    return Err(if n < 0 { std::io::Error::last_os_error() } else { std::io::Error::from_raw_os_error(libc::EIO) });
-                }
-
-                c.try_send(&data[..n as usize])
+                c.try_send(&data[..n])
             }
         } else {
             let data = match &b.data {
@@ -823,8 +825,6 @@ pub struct ClientWatch {
 
 impl ClientWatch {
     pub fn new(r: &R, stream: Option<&Rc<crate::v2::StreamWatch>>) -> ClientWatch {
-        use std::os::fd::FromRawFd;
-
         if let Some(w) = stream {
             return ClientWatch { afd: None, stream: Some(w.clone()), quic: None };
         }
@@ -837,15 +837,17 @@ impl ClientWatch {
             return ClientWatch { afd: None, stream: None, quic: None };
         }
 
-        // SAFETY: dup() of the connection's open socket; the duplicate is
-        // owned (and closed) by the OwnedFd.
-        let dup = unsafe { libc::dup(r.connection.fd.get()) };
+        // dup() of the connection's open socket; the duplicate is owned
+        // (and closed) by the OwnedFd.
+        let dup = match ngx_core::fd::get(r.connection.fd.get()) {
+            Ok(s) => rustix::io::fcntl_dupfd_cloexec(&s, 0),
+            Err(_) => return ClientWatch { afd: None, stream: None, quic: None },
+        };
 
-        if dup < 0 {
-            return ClientWatch { afd: None, stream: None, quic: None };
-        }
-
-        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+        let owned = match dup {
+            Ok(owned) => owned,
+            Err(_) => return ClientWatch { afd: None, stream: None, quic: None },
+        };
 
         ClientWatch { afd: tokio::io::unix::AsyncFd::with_interest(owned, tokio::io::Interest::READABLE).ok(), stream: None, quic: None }
     }
@@ -882,31 +884,23 @@ impl ClientWatch {
                 break;
             }
 
+            // a one byte peek on the duplicate socket
             let mut b = [0u8; 1];
-            // SAFETY: a one byte peek into b on the duplicate socket.
-            let n = unsafe { libc::recv(afd.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
 
-            if n == 0 {
-                break;
-            }
-
-            if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
-                break;
+            match nix::sys::socket::recv(afd.as_raw_fd(), &mut b, nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT) {
+                Ok(0) => break,
+                Err(e) if e != nix::errno::Errno::EAGAIN => break,
+                _ => {}
             }
 
             guard.clear_ready();
         }
 
         // getsockopt(SO_ERROR): the pending error, if any
-        let mut err: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-
-        // SAFETY: err and len are valid for getsockopt to write an int into.
-        unsafe {
-            libc::getsockopt(afd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len);
+        match rustix::net::sockopt::socket_error(afd.get_ref()) {
+            Ok(Err(err)) => err.raw_os_error(),
+            _ => 0,
         }
-
-        err
     }
 }
 
@@ -1222,15 +1216,10 @@ pub fn chain_bytes(chain: &Chain) -> Vec<u8> {
                 let mut off = 0usize;
 
                 while off < size {
-                    // SAFETY: buf has size bytes, off < size, and f.fd is an
-                    // open file.
-                    let n = unsafe { libc::pread(f.fd, buf[off..].as_mut_ptr() as *mut libc::c_void, size - off, b.file_pos + off as i64) };
-
-                    if n <= 0 {
-                        break;
+                    match ngx_core::os::pread(f.fd, &mut buf[off..], b.file_pos + off as i64) {
+                        Ok(n) if n > 0 => off += n,
+                        _ => break,
                     }
-
-                    off += n as usize;
                 }
 
                 out.extend_from_slice(&buf[..off]);
@@ -1395,7 +1384,7 @@ async fn init_request(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule) -> i6
     // the addresses the resolver finds), or of u->conf->upstream
 
     let conf = u.conf.clone();
-    let tag = Rc::as_ptr(&conf) as *const () as usize;
+    let tag = Rc::as_ptr(&conf).cast::<()>().addr();
 
     let watch = u.watch.clone();
 
@@ -4447,11 +4436,8 @@ fn store(r: &R, u: &mut Upstream, p: &mut crate::event_pipe::EventPipe) {
 
     if time != -1 {
         // ngx_set_file_time(): the times of the temporary file
-        let tv = [libc::timeval { tv_sec: time as libc::time_t, tv_usec: 0 }, libc::timeval { tv_sec: time as libc::time_t, tv_usec: 0 }];
-
-        // SAFETY: fd is the open temporary file, tv two timevals.
-        if unsafe { libc::futimes(fd, tv.as_ptr()) } == -1 {
-            ngx_log_error!(NGX_LOG_CRIT, log, Some(ngx_core::os::errno()), "futimes() \"{}\" failed", B(&name));
+        if let Err(err) = ngx_core::os::futimes(fd, time) {
+            ngx_log_error!(NGX_LOG_CRIT, log, Some(err), "futimes() \"{}\" failed", B(&name));
         }
     }
 

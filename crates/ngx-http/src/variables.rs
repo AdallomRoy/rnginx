@@ -1181,17 +1181,24 @@ fn var_proxy_protocol_tlv(r: &R, v: &mut VariableValue, d: usize) -> i64 {
 }
 
 fn var_tcpinfo(r: &R, v: &mut VariableValue, d: usize) -> i64 {
-    let mut ti: libc::tcp_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-    if unsafe { libc::getsockopt(r.connection.fd.get(), libc::IPPROTO_TCP, libc::TCP_INFO, &mut ti as *mut _ as *mut libc::c_void, &mut len) } == -1 {
-        v.not_found = true;
-        return NGX_OK;
-    }
+    use std::os::fd::AsFd;
+
+    let ti = match ngx_core::fd::get(r.connection.fd.get()) {
+        Ok(s) => ngx_sys::os::tcp_info(s.as_fd()),
+        Err(e) => Err(e),
+    };
+    let ti = match ti {
+        Ok(ti) => ti,
+        Err(_) => {
+            v.not_found = true;
+            return NGX_OK;
+        }
+    };
     let val = match d {
-        0 => ti.tcpi_rtt,
-        1 => ti.tcpi_rttvar,
-        2 => ti.tcpi_snd_cwnd,
-        _ => ti.tcpi_rcv_space,
+        0 => ti.rtt,
+        1 => ti.rttvar,
+        2 => ti.snd_cwnd,
+        _ => ti.rcv_space,
     };
     set_str(v, val.to_string().as_bytes());
     NGX_OK
