@@ -1259,11 +1259,26 @@ impl Connection {
             return Ok(0);
         }
         let afd = self.afd()?;
-        let iovs: Vec<IoSlice<'_>> = iov.iter().filter(|s| !s.is_empty()).map(|s| IoSlice::new(s)).collect();
+        // the iovecs on the stack, as ngx_writev_chain has them; a Vec
+        // only for more than fit there (at most IOV_MAX of them)
+        let mut stack = [IoSlice::new(&[]); 16];
+        let mut n = 0;
+        let mut more: Vec<IoSlice<'_>> = Vec::new();
+        for s in iov.iter().filter(|s| !s.is_empty()) {
+            if n < stack.len() {
+                stack[n] = IoSlice::new(s);
+                n += 1;
+                continue;
+            }
+            if more.is_empty() {
+                more.extend_from_slice(&stack);
+            }
+            more.push(IoSlice::new(s));
+        }
+        let iovs: &[IoSlice<'_>] = if more.is_empty() { &stack[..n] } else { &more[..more.len().min(1024)] };
         if iovs.is_empty() {
             return Ok(0);
         }
-        let iovs = &iovs[..iovs.len().min(1024)];
         loop {
             let mut guard = afd.writable().await?;
             match guard.try_io(|inner| nix::sys::uio::writev(inner.get_ref(), iovs).map_err(io::Error::from)) {
@@ -2388,6 +2403,32 @@ mod tests {
             drop(late);
             peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
             assert_eq!(std::io::Read::read(&mut &peer, &mut b).unwrap(), 0, "closed with the registration");
+        });
+    }
+
+    #[test]
+    fn writev_slices() {
+        run_local(async {
+            let (c, mut peer) = tcp_pair(None);
+
+            // a few, empty ones skipped
+            let n = c.writev(&[b"ab", b"", b"cde", b""]).await.unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(c.writev(&[b"", b""]).await.unwrap(), 0);
+
+            // more than the stack holds
+            let parts: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'a' + i % 26; i as usize % 3 + 1]).collect();
+            let slices: Vec<&[u8]> = parts.iter().flat_map(|p| [p.as_slice(), b"".as_slice()]).collect();
+            let total: usize = parts.iter().map(|p| p.len()).sum();
+            assert_eq!(c.writev(&slices).await.unwrap(), total);
+
+            let mut got = vec![0u8; 5 + total];
+            std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+            assert_eq!(&got[..5], b"abcde");
+            assert_eq!(got[5..], parts.concat()[..]);
+            assert_eq!(c.sent.get(), (5 + total) as u64);
+
+            c.close();
         });
     }
 
