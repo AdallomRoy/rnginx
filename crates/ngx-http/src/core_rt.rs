@@ -916,8 +916,10 @@ fn send_response_discarded(r: &R, rc: i64, status: i64, ct: Option<&[u8]>, cv: &
             }
         }
     }
-    let mut b = Buf::from_vec(val.clone());
-    b.memory = !val.is_empty();
+    // the value is the response body: the buffer takes it
+    let memory = !val.is_empty();
+    let mut b = Buf::from_vec(val);
+    b.memory = memory;
     b.last_buf = r.is_main();
     b.last_in_chain = true;
     b.sync = !(b.last_buf || b.memory);
