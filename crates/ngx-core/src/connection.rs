@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::io;
 use std::io::IoSlice;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -146,7 +145,9 @@ pub fn init_shared_stats(log: &Log) {
 }
 
 thread_local! {
-    static CONNECTIONS: RefCell<HashMap<u64, Weak<Connection>>> = RefCell::new(HashMap::new());
+    /// the connection objects, by slot (the cycle->connections array: a
+    /// slot freed is the next one taken)
+    static CONNECTIONS: RefCell<LinkedSlab<Weak<Connection>>> = const { RefCell::new(LinkedSlab::new()) };
     static ACTIVE: Cell<usize> = const { Cell::new(0) };
     /// the connections taken of connection_n, from ngx_get_connection() to
     /// ngx_free_connection() (cycle->free_connection_n is what is left)
@@ -247,7 +248,8 @@ pub fn close_notify() -> Rc<tokio::sync::Notify> {
 }
 
 pub fn for_each_connection(mut f: impl FnMut(&Rc<Connection>)) {
-    let conns: Vec<Rc<Connection>> = CONNECTIONS.with(|c| c.borrow().values().filter_map(|w| w.upgrade()).collect());
+    // in the order of their slots, as C walks cycle->connections
+    let conns: Vec<Rc<Connection>> = CONNECTIONS.with(|c| c.borrow().items().filter_map(|w| w.upgrade()).collect());
     for c in conns {
         f(&c);
     }
@@ -357,6 +359,11 @@ impl<T> LinkedSlab<T> {
 
         self.nodes[self.tail as usize - 1].item.as_ref().map(|item| (self.tail, item))
     }
+
+    /// The items in the order of their nodes in the slab (of their keys).
+    fn items(&self) -> impl Iterator<Item = &T> {
+        self.nodes.iter().filter_map(|n| n.item.as_ref())
+    }
 }
 
 pub struct Connection {
@@ -407,6 +414,8 @@ pub struct Connection {
     /// the connection's own Rc, weak (none for a per-stream copy of an
     /// HTTP/2 connection)
     this: Weak<Connection>,
+    /// the key of the connection in CONNECTIONS, 0 if not there
+    slot_key: Cell<u32>,
     /// the connection holds one of connection_n (ngx_free_connection()
     /// not called yet)
     slot: Cell<bool>,
@@ -485,7 +494,7 @@ impl Connection {
             clog.set_connection(number);
             clog
         };
-        let now = crate::times::cached();
+        let (now_sec, now_msec) = crate::times::with_cached(|t| (t.sec, t.msec));
         let c = Rc::new_cyclic(|this| Connection {
             fd: Cell::new(fd),
             afd: RefCell::new(None),
@@ -503,8 +512,8 @@ impl Connection {
             buffer: RefCell::new(Vec::new()),
             sent: Cell::new(0),
             requests: Cell::new(0),
-            start_time: Cell::new(now.sec),
-            start_msec: Cell::new(now.sec as u64 * 1000 + now.msec),
+            start_time: Cell::new(now_sec),
+            start_msec: Cell::new(now_sec as u64 * 1000 + now_msec),
             timedout: Cell::new(false),
             error: Cell::new(false),
             destroyed: Cell::new(false),
@@ -522,6 +531,7 @@ impl Connection {
             reusable: Cell::new(false),
             queue: Cell::new(0),
             this: this.clone(),
+            slot_key: Cell::new(0),
             slot: Cell::new(true),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -543,7 +553,7 @@ impl Connection {
         });
         USED.with(|u| u.set(u.get() + 1));
         ACTIVE.with(|a| a.set(a.get() + 1));
-        CONNECTIONS.with(|m| m.borrow_mut().insert(number, Rc::downgrade(&c)));
+        c.slot_key.set(CONNECTIONS.with(|m| m.borrow_mut().insert_head(Rc::downgrade(&c))));
         Some(c)
     }
 
@@ -624,6 +634,7 @@ impl Connection {
             reusable: Cell::new(false),
             queue: Cell::new(0),
             this: Weak::new(),
+            slot_key: Cell::new(0),
             slot: Cell::new(false),
             close_handler: RefCell::new(None),
             pipeline: Cell::new(false),
@@ -1562,7 +1573,10 @@ impl Drop for Connection {
         self.unqueue();
         self.free_connection();
         ACTIVE.with(|a| a.set(a.get().saturating_sub(1)));
-        CONNECTIONS.with(|m| m.borrow_mut().remove(&self.number));
+        let key = self.slot_key.replace(0);
+        if key != 0 {
+            CONNECTIONS.with(|m| m.borrow_mut().remove(key));
+        }
         wake_exiting_cycle();
     }
 }
@@ -2375,6 +2389,42 @@ mod tests {
             c5.close();
             assert_eq!(REUSABLE.with(|q| q.borrow().len()), 0);
             set_connection_n(saved);
+        });
+    }
+
+    #[test]
+    fn connections_by_slot() {
+        run_local(async {
+            let numbers = || {
+                let mut v = Vec::new();
+                for_each_connection(|c| v.push(c.number));
+                v
+            };
+            let before = numbers();
+
+            let (a, _pa) = tcp_pair(None);
+            let (b, _pb) = tcp_pair(None);
+            let (c, _pc) = tcp_pair(None);
+            assert_eq!(numbers()[before.len()..], [a.number, b.number, c.number]);
+
+            // a freed slot is the next one taken
+            let bn = b.number;
+            b.close();
+            drop(b);
+            assert!(!numbers().contains(&bn));
+            let (d, _pd) = tcp_pair(None);
+            assert_eq!(numbers()[before.len()..], [a.number, d.number, c.number]);
+
+            // a per-stream copy of HTTP/2 is not one of them
+            let fake = Connection::new_fake(&a);
+            assert_eq!(numbers().len(), before.len() + 3);
+            drop(fake);
+            assert_eq!(numbers().len(), before.len() + 3);
+
+            for x in [a, c, d] {
+                x.close();
+            }
+            assert_eq!(numbers(), before, "dropped: gone");
         });
     }
 
