@@ -59,7 +59,7 @@ fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
     if !r.chunked.get() || input.is_empty() || !r.has_ctx(ctx_index()) {
         return next(r, input);
     }
-    let mut out = Chain::new();
+    let mut out = alloc_chain();
     let mut size: i64 = 0;
     let mut has_last = false;
     let mut flush_or_sync = false;
@@ -124,7 +124,10 @@ fn chunked_body_filter(r: R, mut input: Chain, next: &BodyFilter) -> Step {
     } else if flush_or_sync && size == 0 && out.is_empty() {
         out.push_back(Buf::special());
     }
+    // the input's links are all taken
+    free_chain(input);
     if out.is_empty() {
+        free_chain(out);
         return Step::Ready(NGX_OK);
     }
     next(r, out)

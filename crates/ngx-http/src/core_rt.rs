@@ -940,7 +940,7 @@ fn send_response_body(r: &R, rc: i64, b: Buf) -> Step {
     if rc == NGX_ERROR || rc > NGX_OK || r.header_only.get() {
         return Step::Ready(rc);
     }
-    let mut out = Chain::new();
+    let mut out = alloc_chain();
     out.push_back(b);
     output_filter(r, out).into_step()
 }

@@ -171,7 +171,7 @@ fn static_body(r: R, rc: i64, file: StaticFile) -> Step {
     b.last_buf = r.is_main();
     b.last_in_chain = true;
     b.sync = !(b.last_buf || b.in_file);
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     chain.push_back(b);
     let out = output_filter(&r, chain);
     match out.done() {

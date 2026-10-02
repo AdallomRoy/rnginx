@@ -92,6 +92,7 @@ pub fn write_filter(r: R, mut input: Chain) -> Step {
             out.append(&mut input);
         }
     }
+    free_chain(input);
     http_debug!(r, "http write filter: l:{} f:{} s:{}", last as i32, flush as i32, size);
     let clcf = r.clcf();
     let postpone = *clcf.borrow().postpone_output;
@@ -301,9 +302,11 @@ fn sent(r: &R, s: &Send, before: u64) -> Option<i64> {
 /// r->out sent: its buffers are free (the memory of copy buffers for the
 /// next copies)
 fn free_out(r: &R) {
-    for b in r.out.borrow_mut().drain(..) {
+    let mut out = std::mem::take(&mut *r.out.borrow_mut());
+    for b in out.drain(..) {
         crate::copy_filter::recycle(b);
     }
+    free_chain(out);
 }
 
 /// The send failed (ngx_writev() and others log the error)
@@ -647,7 +650,7 @@ pub(crate) fn test_reading_closed(r: &R, err: i32) -> i64 {
 
 /// Force out any pending buffered output (called at request end).
 pub fn flush(r: &R) -> Step {
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     let mut b = Buf::special();
     b.flush = true;
     chain.push_back(b);

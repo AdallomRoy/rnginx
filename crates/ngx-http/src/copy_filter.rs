@@ -137,7 +137,10 @@ fn output_chain(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: Chain, next: &BodyFilt
 
     loop {
         let (out, copies) = match fill(r, ctx, &mut input, last) {
-            Fill::Done(rc) => return Step::Ready(rc),
+            Fill::Done(rc) => {
+                free_chain(input);
+                return Step::Ready(rc);
+            }
             Fill::Out(out, copies) => (out, copies),
         };
 
@@ -165,7 +168,10 @@ fn output_chain(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: Chain, next: &BodyFilt
                         let out;
 
                         (out, copies) = match fill(&r, &ctx, &mut input, last) {
-                            Fill::Done(rc) => return rc,
+                            Fill::Done(rc) => {
+                                free_chain(input);
+                                return rc;
+                            }
                             Fill::Out(out, copies) => (out, copies),
                         };
 
@@ -189,16 +195,17 @@ enum Fill {
 /// go as they are, and copies of the others, as long as there are buffers
 /// to copy into. `last` is the result of the last call of the next filter.
 fn fill(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: &mut Chain, last: i64) -> Fill {
-    let mut out = Chain::new();
     let mut copies: Vec<CopyBuf> = Vec::new();
 
     // every buffer goes as it is: the input is the output
-    if !input.is_empty() && {
+    let mut out = if !input.is_empty() && {
         let c = ctx.borrow();
         input.iter().all(|b| as_is(&c, b) && (b.buf_size() > 0 || (b.buf_size() == 0 && b.special_buf())))
     } {
-        std::mem::swap(&mut out, input);
-    }
+        std::mem::take(input)
+    } else {
+        alloc_chain()
+    };
 
     while let Some(src) = input.front_mut() {
         let bsize = src.buf_size();
@@ -277,6 +284,7 @@ fn fill(r: &R, ctx: &Rc<RefCell<CopyCtx>>, input: &mut Chain, last: i64) -> Fill
     }
 
     if out.is_empty() && last != NGX_NONE {
+        free_chain(out);
         return Fill::Done(last);
     }
 

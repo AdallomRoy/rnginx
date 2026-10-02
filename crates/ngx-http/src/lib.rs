@@ -354,6 +354,37 @@ impl Future for Step {
     }
 }
 
+thread_local! {
+    /// The free chain links of ngx_alloc_chain_link (pool->chain): output
+    /// chains done with, emptied, their memory kept for the next ones
+    static FREE_CHAINS: RefCell<Vec<ngx_core::buf::Chain>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The free chains kept
+const FREE_CHAINS_KEPT: usize = 32;
+
+/// ngx_alloc_chain_link: an empty chain, a free one if there is one
+pub fn alloc_chain() -> ngx_core::buf::Chain {
+    FREE_CHAINS.with(|f| f.borrow_mut().pop()).unwrap_or_default()
+}
+
+/// ngx_free_chain: a chain done with is kept for the next output (its
+/// buffers, if any are left, are dropped)
+pub fn free_chain(mut chain: ngx_core::buf::Chain) {
+    if chain.capacity() == 0 {
+        return;
+    }
+
+    chain.clear();
+
+    FREE_CHAINS.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() < FREE_CHAINS_KEPT {
+            f.push(chain);
+        }
+    });
+}
+
 pub type HeaderFilter = Rc<dyn Fn(R) -> Step>;
 pub type BodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> Step>;
 pub type RequestBodyFilter = Rc<dyn Fn(R, ngx_core::buf::Chain) -> BoxFut<i64>>;

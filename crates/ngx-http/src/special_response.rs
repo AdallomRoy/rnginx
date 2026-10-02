@@ -235,7 +235,7 @@ async fn send_special_response(r: &R, code: i64) -> i64 {
         None => return send_special(r, true).await,
         Some(b) => b,
     };
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     let mut b1 = Buf::from_vec(body);
     b1.memory = true;
     chain.push_back(b1);
@@ -291,7 +291,7 @@ async fn send_refresh(r: &R) -> i64 {
     let mut b = Buf::from_vec(body);
     b.last_buf = r.is_main();
     b.last_in_chain = true;
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     chain.push_back(b);
     output_filter(r, chain).await
 }
@@ -309,7 +309,7 @@ pub async fn send_special(r: &R, last: bool) -> i64 {
     } else {
         b.flush = true;
     }
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     chain.push_back(b);
     output_filter(r, chain).await
 }

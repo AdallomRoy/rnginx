@@ -78,7 +78,7 @@ pub fn early_hints_filter(r: R) -> Step {
     let mut b = Buf::from_vec(out);
     b.flush = true;
 
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     chain.push_back(b);
 
     crate::write_filter::write_filter(r, chain)
@@ -163,7 +163,7 @@ pub fn header_filter(r: R) -> Step {
     let mut b = Buf::from_vec(out);
     b.last_buf = r.header_only.get();
     b.flush = r.header_only.get();
-    let mut chain = Chain::new();
+    let mut chain = alloc_chain();
     chain.push_back(b);
     // Header bytes go directly to the write filter (they bypass body filters like range/gzip/sub).
     crate::write_filter::write_filter(r, chain)
