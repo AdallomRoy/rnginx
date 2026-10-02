@@ -372,17 +372,13 @@ dependencies = [
 name = "nginx"
 version = "1.31.7"
 dependencies = [
- "libc",
  "memchr",
  "ngx-core",
  "ngx-http",
  "ngx-mail",
  "ngx-stream",
- "ngx-sys",
  "nix 0.29.0",
  "rustix",
- "socket2",
- "tokio",
 ]
 
 [[package]]
@@ -392,7 +388,6 @@ dependencies = [
  "blowfish",
  "bytes",
  "crc32fast",
- "foreign-types",
  "libc",
  "md-5 0.10.6",
  "memchr",
@@ -400,7 +395,6 @@ dependencies = [
  "ngx-sys",
  "nix 0.29.0",
  "openssl",
- "openssl-sys",
  "pcre2",
  "pwhash",
  "rustix",
@@ -418,7 +412,6 @@ version = "1.31.7"
 dependencies = [
  "crc32fast",
  "flate2",
- "foreign-types",
  "libc",
  "md-5 0.10.6",
  "memchr",
@@ -426,10 +419,7 @@ dependencies = [
  "ngx-sys",
  "nix 0.29.0",
  "openssl",
- "openssl-sys",
  "rustix",
- "sha1",
- "socket2",
  "tokio",
 ]
 
@@ -439,11 +429,6 @@ version = "1.31.7"
 dependencies = [
  "libc",
  "ngx-core",
- "ngx-sys",
- "nix 0.29.0",
- "openssl",
- "rustix",
- "socket2",
  "tokio",
 ]
 
@@ -453,14 +438,10 @@ version = "1.31.7"
 dependencies = [
  "crc32fast",
  "flate2",
- "foreign-types",
  "libc",
  "ngx-core",
  "ngx-sys",
- "nix 0.29.0",
  "openssl",
- "rustix",
- "socket2",
  "tokio",
 ]
 
