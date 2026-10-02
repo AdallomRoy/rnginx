@@ -1259,6 +1259,53 @@ mod tests {
         }
     }
 
+    /// A log keeping its lines (info and above).
+    fn memory_log() -> (Log, Rc<std::cell::RefCell<Vec<String>>>) {
+        let lines = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keep = lines.clone();
+        let chain = LogChain::new();
+
+        chain.insert(LogEntry::new(NGX_LOG_INFO, LogWriter::Custom(Rc::new(move |_, line: &[u8]| keep.borrow_mut().push(String::from_utf8_lossy(line).trim_end().to_string())))));
+
+        (Log::new(chain), lines)
+    }
+
+    /// The errors the openssl crate takes off OpenSSL's queue are reported
+    /// by ngx_ssl_error() as in the C, and none are made up.
+    #[test]
+    fn errors_as_ngx_ssl_error() {
+        let _ = ErrorStack::get();
+        let (log, lines) = memory_log();
+
+        // EVP_CTRL_AEAD_SET_IVLEN 0: the provider queues "invalid iv length"
+        let mut s = QuicSecret::default();
+        let key = QuicMd::from(&[1; 16]);
+        assert_eq!(ngx_quic_crypto_init(Cipher::aes_128_gcm(), &mut s, &key, 1, &log), NGX_ERROR);
+        assert!(s.ctx.is_none());
+
+        {
+            let lines = lines.borrow();
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("[info] "), "{}", lines[0]);
+            assert!(lines[0].contains("EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_IVLEN) failed (SSL: error:"), "{}", lines[0]);
+            assert!(lines[0].ends_with("invalid iv length)"), "{}", lines[0]);
+        }
+
+        assert_eq!(ErrorStack::get().errors().len(), 0, "the queue is emptied as by the C");
+
+        // a tag that does not match: GCM queues no error
+        lines.borrow_mut().clear();
+        s.iv.len = NGX_QUIC_IV_LEN;
+        assert_eq!(ngx_quic_crypto_init(Cipher::aes_128_gcm(), &mut s, &key, 0, &log), NGX_OK);
+
+        let mut out = Vec::new();
+        assert_eq!(ngx_quic_crypto_open(&s, &mut out, &[0; NGX_QUIC_IV_LEN], &[0; 20], b"ad", &log), NGX_ERROR);
+
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("[info] EVP_CipherFinal_ex failed") || lines[0].ends_with(": EVP_CipherFinal_ex failed"), "{}", lines[0]);
+    }
+
     #[test]
     fn no_keys() {
         let s = QuicSecret::default();
