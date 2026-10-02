@@ -415,6 +415,90 @@ pub fn log_error_handler(r: &R, sr: &R, buf: &mut Vec<u8>) {
     }
 }
 
+/// The contexts kept inline in RequestCtx.
+const CTX_INLINE: usize = 4;
+
+/// The key of a free inline slot of RequestCtx.
+const CTX_FREE: usize = usize::MAX;
+
+/// r->ctx: the modules' contexts of a request, by module index. C has an
+/// array of ngx_http_max_module pointers, zeroed with the request; a
+/// request sets a few of them, which are kept here inline, the others in a
+/// vector allocated only when more are set. Indexing gives a module's slot
+/// (an index not set reads as None, and is added when written), iter_mut()
+/// the slots set (ngx_memzero(r->ctx) sets them all to None).
+pub struct RequestCtx {
+    inline: [(usize, Option<Rc<dyn Any>>); CTX_INLINE],
+    more: Vec<(usize, Option<Rc<dyn Any>>)>,
+    /// what an index not set reads as
+    none: Option<Rc<dyn Any>>,
+}
+
+impl RequestCtx {
+    pub fn new() -> RequestCtx {
+        RequestCtx { inline: [(CTX_FREE, None), (CTX_FREE, None), (CTX_FREE, None), (CTX_FREE, None)], more: Vec::new(), none: None }
+    }
+
+    fn slot(&self, idx: usize) -> Option<&Option<Rc<dyn Any>>> {
+        self.inline.iter().chain(self.more.iter()).find(|(k, _)| *k == idx).map(|(_, v)| v)
+    }
+
+    /// The context of a module, if set.
+    pub fn get(&self, idx: usize) -> Option<&Rc<dyn Any>> {
+        self.slot(idx).and_then(|v| v.as_ref())
+    }
+
+    /// The slots set, to read or reset.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<Rc<dyn Any>>> {
+        self.inline.iter_mut().chain(self.more.iter_mut()).filter(|(k, _)| *k != CTX_FREE).map(|(_, v)| v)
+    }
+}
+
+impl Default for RequestCtx {
+    fn default() -> Self {
+        RequestCtx::new()
+    }
+}
+
+impl std::ops::Index<usize> for RequestCtx {
+    type Output = Option<Rc<dyn Any>>;
+
+    fn index(&self, idx: usize) -> &Option<Rc<dyn Any>> {
+        self.slot(idx).unwrap_or(&self.none)
+    }
+}
+
+impl std::ops::IndexMut<usize> for RequestCtx {
+    fn index_mut(&mut self, idx: usize) -> &mut Option<Rc<dyn Any>> {
+        let pos = self.inline.iter().position(|(k, _)| *k == idx);
+        if let Some(i) = pos {
+            return &mut self.inline[i].1;
+        }
+        let pos = self.more.iter().position(|(k, _)| *k == idx);
+        if let Some(i) = pos {
+            return &mut self.more[i].1;
+        }
+        // a new slot: a free one, or one reset to None
+        let pos = self.inline.iter().position(|(_, v)| v.is_none());
+        if let Some(i) = pos {
+            self.inline[i].0 = idx;
+            return &mut self.inline[i].1;
+        }
+        let pos = self.more.iter().position(|(_, v)| v.is_none());
+        let i = match pos {
+            Some(i) => {
+                self.more[i].0 = idx;
+                i
+            }
+            None => {
+                self.more.push((idx, None));
+                self.more.len() - 1
+            }
+        };
+        &mut self.more[i].1
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HttpState {
     InitializingRequest = 0,
@@ -431,7 +515,7 @@ pub enum HttpState {
 pub struct Request {
     pub connection: Rc<Connection>,
     pub http_connection: Rc<HttpConnection>,
-    pub ctx: RefCell<Vec<Option<Rc<dyn Any>>>>,
+    pub ctx: RefCell<RequestCtx>,
     pub main_conf: RefCell<Rc<ConfSlots>>,
     pub srv_conf: RefCell<Rc<ConfSlots>>,
     pub loc_conf: RefCell<Rc<ConfSlots>>,
@@ -645,7 +729,7 @@ impl Request {
     }
 
     pub fn get_ctx<T: 'static>(&self, idx: usize) -> Option<Rc<RefCell<T>>> {
-        self.ctx.borrow()[idx].clone().and_then(|c| c.downcast::<RefCell<T>>().ok())
+        self.ctx.borrow().get(idx).cloned().and_then(|c| c.downcast::<RefCell<T>>().ok())
     }
 
     pub fn set_ctx<T: 'static>(&self, idx: usize, v: T) -> Rc<RefCell<T>> {
@@ -656,11 +740,14 @@ impl Request {
 
     /// A module context is set (ngx_http_get_module_ctx() != NULL)
     pub fn has_ctx(&self, idx: usize) -> bool {
-        self.ctx.borrow()[idx].is_some()
+        self.ctx.borrow().get(idx).is_some()
     }
 
     pub fn clear_ctx(&self, idx: usize) {
-        self.ctx.borrow_mut()[idx] = None;
+        let mut ctx = self.ctx.borrow_mut();
+        if ctx.get(idx).is_some() {
+            ctx[idx] = None;
+        }
     }
 
     pub fn add_cleanup(&self, f: CleanupFn) {
@@ -778,7 +865,7 @@ pub fn alloc_request(c: &Rc<Connection>, hc: &Rc<HttpConnection>, log_ctx: &Rc<H
     let r = Rc::new(Request {
         connection: c.clone(),
         http_connection: hc.clone(),
-        ctx: RefCell::new(vec![None; http_max_module()]),
+        ctx: RefCell::new(RequestCtx::new()),
         main_conf: RefCell::new(ctx.main.clone().unwrap()),
         srv_conf: RefCell::new(ctx.srv.clone().unwrap()),
         loc_conf: RefCell::new(ctx.loc.clone().unwrap()),
@@ -972,6 +1059,34 @@ mod tests {
         assert_eq!(h.hash.get(), 42);
         assert_eq!(h.lowcase_key, b"x-foo");
         assert!(!h.null.get());
+    }
+
+    #[test]
+    fn request_ctx_slots() {
+        let mut ctx = RequestCtx::new();
+        assert!(ctx.get(3).is_none());
+        assert!(ctx[70].is_none());
+        // more contexts than are kept inline
+        for i in 0..7 {
+            ctx[i * 10] = Some(Rc::new(RefCell::new(i)) as Rc<dyn Any>);
+        }
+        for i in 0..7 {
+            let v = ctx.get(i * 10).unwrap().clone().downcast::<RefCell<usize>>().unwrap();
+            assert_eq!(*v.borrow(), i);
+        }
+        assert!(ctx.get(5).is_none());
+        assert_eq!(ctx.iter_mut().count(), 7);
+        // ngx_memzero(r->ctx)
+        for c in ctx.iter_mut() {
+            *c = None;
+        }
+        assert!((0..7).all(|i| ctx.get(i * 10).is_none()));
+        // the slots reset are reused
+        ctx[33] = Some(Rc::new(RefCell::new(33usize)) as Rc<dyn Any>);
+        assert!(ctx.get(33).is_some());
+        assert_eq!(ctx.more.len(), 3);
+        ctx[33] = None;
+        assert!(ctx.get(33).is_none());
     }
 
     #[test]
