@@ -86,7 +86,7 @@ fn copy_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
             let conf = r.loc_conf::<CopyConf>(ctx_index());
             let clcf = r.clcf();
 
-            let ctx = r.set_ctx(ctx_index(), CopyCtx {
+            let ctx = CopyCtx {
                 sendfile: r.connection.sendfile.get(),
                 need_in_memory: r.main_filter_need_in_memory.get() || r.filter_need_in_memory.get(),
                 need_in_temp: r.filter_need_temporary.get(),
@@ -96,21 +96,37 @@ fn copy_filter(r: R, input: Chain, next: &BodyFilter) -> Step {
                 allocated: 0,
                 free: Vec::new(),
                 busy: VecDeque::new(),
-            });
+            };
 
             if input.front().is_some_and(|b| b.buf_size() != 0) {
                 r.request_output.set(true);
             }
 
-            ctx
+            // the whole response at once, all of it going as it is (the
+            // short path, or the loop moving every buffer to the output):
+            // nothing is left for a later call, the context is not kept
+            if input.iter().any(|b| b.last_buf) && input.iter().all(|b| as_is(&ctx, b) && (b.buf_size() > 0 || (b.buf_size() == 0 && b.special_buf()))) {
+                let step = next(r.clone(), input);
+                return copy_filter_done(r, step);
+            }
+
+            r.set_ctx(ctx_index(), ctx)
         }
     };
 
-    match output_chain(&r, &ctx, input, next) {
+    let step = output_chain(&r, &ctx, input, next);
+    copy_filter_done(r, step)
+}
+
+/// The end of ngx_http_copy_filter, once the output chain is done
+fn copy_filter_done(r: R, step: Step) -> Step {
+    match step {
         Step::Ready(rc) => {
             http_debug!(r, "http copy filter: {} \"{}?{}\"", rc, B(&r.uri.borrow()), B(&r.args.borrow()));
             Step::Ready(rc)
         }
+        // the debug message once done: without it, the step as it is
+        Step::Pending(fut) if !r.connection.log.debug_enabled(NGX_LOG_DEBUG_HTTP) => Step::Pending(fut),
         Step::Pending(fut) => Step::boxed(async move {
             let rc = fut.await;
             http_debug!(r, "http copy filter: {} \"{}?{}\"", rc, B(&r.uri.borrow()), B(&r.args.borrow()));
@@ -459,6 +475,14 @@ fn take_buf(size: usize) -> Vec<u8> {
 /// A buffer sent or consumed: a copy buffer's memory is free again
 /// (ngx_chain_update_chains() moves the copy filter's buffers to ctx->free)
 pub fn recycle(b: Buf) {
+    if b.tag == crate::header_filter::HEADER_BUF_TAG {
+        // a response header sent
+        if let BufData::Memory(v) = b.data {
+            crate::header_filter::free_header_buf(v);
+        }
+        return;
+    }
+
     if b.tag != COPY_BUF_TAG {
         return;
     }

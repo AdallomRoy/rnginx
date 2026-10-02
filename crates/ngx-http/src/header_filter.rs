@@ -161,6 +161,7 @@ pub fn header_filter(r: R) -> Step {
     http_debug!(r, "{}", B(&out).to_string().trim_end_matches("\r\n").replace("\r\n", "\n"));
     r.header_size.set(out.len());
     let mut b = Buf::from_vec(out);
+    b.tag = HEADER_BUF_TAG;
     b.last_buf = r.header_only.get();
     b.flush = r.header_only.get();
     let mut chain = alloc_chain();
@@ -315,7 +316,7 @@ fn build_header(r: &R) -> Vec<u8> {
         len += h.key.len() + 2 + h.value.borrow().len() + 2;
     }
 
-    let mut out: Vec<u8> = Vec::with_capacity(len);
+    let mut out = take_header_buf(len);
 
     out.extend_from_slice(b"HTTP/1.1 ");
     if !ho.status_line.is_empty() {
@@ -424,6 +425,50 @@ fn build_header(r: &R) -> Vec<u8> {
     out.extend_from_slice(b"\r\n");
     debug_assert!(out.len() <= len, "header {} of {}", out.len(), len);
     out
+}
+
+/// buf->tag of the header buffers: their memory is kept once they are sent
+pub const HEADER_BUF_TAG: usize = 0x6e67_785f_6864_7273;
+
+/// The free header buffers kept, and the largest one kept
+const FREE_HEADER_BUFS: usize = 16;
+const FREE_HEADER_BUF_SIZE: usize = 4096;
+
+thread_local! {
+    /// The memory of the response headers sent, for the next ones (C
+    /// allocates them from the request's pool)
+    static FREE_HEADERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An empty header buffer of at least `len` bytes: a free one, or a new one
+fn take_header_buf(len: usize) -> Vec<u8> {
+    let free = FREE_HEADERS.with(|f| {
+        let mut f = f.borrow_mut();
+        let i = f.iter().rposition(|v| v.capacity() >= len)?;
+        Some(f.swap_remove(i))
+    });
+
+    match free {
+        Some(mut v) => {
+            v.clear();
+            v
+        }
+        None => Vec::with_capacity(len),
+    }
+}
+
+/// The memory of a header buffer sent, kept for the next header
+pub fn free_header_buf(v: Vec<u8>) {
+    if v.capacity() > FREE_HEADER_BUF_SIZE {
+        return;
+    }
+
+    FREE_HEADERS.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() < FREE_HEADER_BUFS {
+            f.push(v);
+        }
+    });
 }
 
 /// `v` in decimal ("%d" of ngx_sprintf)
