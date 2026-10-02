@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use ngx_core::buf::{Buf, Chain};
+use ngx_core::buf::Buf;
 use ngx_core::conf::{Conf, ConfResult};
 use ngx_core::module::ModuleDef;
 use ngx_core::rc::*;

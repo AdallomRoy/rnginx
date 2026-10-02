@@ -1,6 +1,6 @@
 //! ngx_http_special_response.c: error pages.
 
-use ngx_core::buf::{Buf, Chain};
+use ngx_core::buf::Buf;
 use ngx_core::rc::*;
 use ngx_core::string::B;
 
