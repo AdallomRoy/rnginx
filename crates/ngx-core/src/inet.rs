@@ -313,6 +313,40 @@ impl SockAddr {
         v
     }
 
+    /// The address in the bytes of a sockaddr (raw_bytes(), or a copy of
+    /// one kept in shared memory), read as from_libc() reads the structure:
+    /// None for another family, or bytes too short for the family's
+    /// structure (an inet one), an empty path for a unix address of no
+    /// more than its family.
+    pub fn from_raw_bytes(b: &[u8]) -> Option<SockAddr> {
+        if b.len() < SUN_PATH_OFFSET {
+            return None;
+        }
+
+        let family = libc::sa_family_t::from_ne_bytes([b[0], b[1]]) as i32;
+        let u16_be = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+        let u32_ne = |i: usize| u32::from_ne_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+
+        match family {
+            libc::AF_INET if b.len() >= std::mem::size_of::<libc::sockaddr_in>() => {
+                Some(SockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(b[4], b[5], b[6], b[7]), u16_be(2))))
+            }
+
+            libc::AF_INET6 if b.len() >= std::mem::size_of::<libc::sockaddr_in6>() => {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&b[8..24]);
+                Some(SockAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), u16_be(2), u32_ne(4), u32_ne(24))))
+            }
+
+            libc::AF_UNIX => {
+                let path = &b[SUN_PATH_OFFSET..b.len().min(SUN_PATH_OFFSET + SUN_PATH_LEN)];
+                Some(SockAddr::Unix(path.iter().copied().take_while(|&c| c != 0).collect()))
+            }
+
+            _ => None,
+        }
+    }
+
     /// ngx_cmp_sockaddr
     pub fn cmp(&self, other: &SockAddr, cmp_port: bool) -> bool {
         match (self, other) {
@@ -1215,6 +1249,16 @@ mod tests {
         assert_eq!(b.len(), std::mem::size_of::<libc::sockaddr_un>());
         assert_eq!(b[2 + 106], b'a');
         assert_eq!(b[2 + 107], 0);
+
+        // and back
+        for sa in [v4, v6, un, SockAddr::Unix(Vec::new())] {
+            assert_eq!(SockAddr::from_raw_bytes(&sa.raw_bytes()), Some(sa));
+        }
+        assert_eq!(SockAddr::from_raw_bytes(&long.raw_bytes()), Some(SockAddr::Unix(vec![b'a'; 107])));
+        assert_eq!(SockAddr::from_raw_bytes(&[libc::AF_UNIX as u8, 0]), Some(SockAddr::Unix(Vec::new())));
+        assert_eq!(SockAddr::from_raw_bytes(&SockAddr::v4(Ipv4Addr::LOCALHOST, 1).raw_bytes()[..8]), None);
+        assert_eq!(SockAddr::from_raw_bytes(&[0, 0, 0, 0]), None);
+        assert_eq!(SockAddr::from_raw_bytes(&[]), None);
     }
 
     #[test]
