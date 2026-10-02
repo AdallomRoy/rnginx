@@ -1204,13 +1204,38 @@ impl Connection {
         }
     }
 
-    /// Write everything in `buf`.
+    /// Write everything in `buf`: c->send (ngx_unix_send) until all is
+    /// sent, as ngx_http_upstream_process_upgraded does. A send shorter
+    /// than asked found the socket full and sets wev->ready = 0 there: the
+    /// next one waits for a write event instead of failing with EAGAIN (an
+    /// SSL write, ngx_ssl_write, keeps the readiness).
     pub async fn send_all(&self, mut buf: &[u8]) -> io::Result<()> {
         while !buf.is_empty() {
             let n = self.send(buf).await?;
+            if n < buf.len() && self.plain_stream() {
+                self.write_drained();
+            }
             buf = &buf[n..];
         }
         Ok(())
+    }
+
+    /// A TCP or unix stream socket read and written directly (not SSL, not
+    /// a QUIC stream, not UDP).
+    fn plain_stream(&self) -> bool {
+        self.ty == libc::SOCK_STREAM && !self.fake && !self.is_quic_stream() && self.ssl.borrow().is_none() && !self.is_udp_shared()
+    }
+
+    /// c->write->ready = 0: a write found the socket full (a send shorter
+    /// than asked, ngx_unix_send). The write readiness kept since the last
+    /// event is cleared, so the next wait blocks for a new event instead of
+    /// trying a write that fails with EAGAIN; tokio keeps the closed bits,
+    /// so an error or a reset still wakes the writer. (ngx_linux_sendfile_chain
+    /// clears it only on EAGAIN: it retries a short writev() or sendfile().)
+    pub fn write_drained(&self) {
+        if let Some(afd) = self.afd.borrow().as_ref() {
+            let _ = afd.try_io(Interest::WRITABLE, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
+        }
     }
 
     pub fn setsockopt_int(&self, level: i32, name: i32, value: i32) -> io::Result<()> {
@@ -2041,5 +2066,114 @@ mod tests {
         os::close(pipe[1]);
         os::close(netlink);
         os::close(tcp);
+    }
+
+    fn run_local<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, f);
+    }
+
+    /// A connection of the accepted end of a TCP pair (non-blocking, in
+    /// the descriptor table), and the other end.
+    fn tcp_pair(sndbuf: Option<usize>) -> (Rc<Connection>, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        s.set_nonblocking(true).unwrap();
+        if let Some(n) = sndbuf {
+            socket2::SockRef::from(&s).set_send_buffer_size(n).unwrap();
+        }
+        let (log, _) = capture();
+        let c = Connection::get(fd::register(OwnedFd::from(s)), &log).unwrap();
+        (c, peer)
+    }
+
+    /// c->write->ready
+    fn write_ready(c: &Connection) -> bool {
+        c.afd.borrow().as_ref().is_some_and(|a| a.try_io(Interest::WRITABLE, |_| Ok(())).is_ok())
+    }
+
+    #[test]
+    fn read_ready_is_the_kept_readiness() {
+        run_local(async {
+            let (c, mut peer) = tcp_pair(None);
+
+            // never waited for
+            assert!(!c.read_ready());
+
+            c.writable().await.unwrap();
+            assert!(!c.read_ready());
+
+            std::io::Write::write_all(&mut peer, b"abc").unwrap();
+            c.readable().await.unwrap();
+            assert!(c.read_ready());
+            assert!(c.read_ready(), "testing does not clear it");
+
+            // a short read drained the socket
+            let mut buf = [0u8; 16];
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 3);
+            assert!(!c.read_ready());
+
+            // the data of a new event, then the end of the stream: a
+            // pending EOF stays ready after a read drained the data
+            std::io::Write::write_all(&mut peer, b"de").unwrap();
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            c.readable().await.unwrap();
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 2);
+            assert!(c.read_ready());
+            assert_eq!(c.try_recv(&mut buf).unwrap(), 0);
+
+            c.close();
+        });
+    }
+
+    #[test]
+    fn write_drained_waits_for_a_new_event() {
+        run_local(async {
+            let (c, _peer) = tcp_pair(None);
+
+            c.writable().await.unwrap();
+            assert!(write_ready(&c));
+
+            c.write_drained();
+            assert!(!write_ready(&c));
+
+            // the socket is still writable, but no new event comes
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), c.writable()).await.is_err());
+            assert_eq!(c.try_send(b"x").unwrap(), 1, "the socket itself is untouched");
+
+            c.close();
+        });
+    }
+
+    #[test]
+    fn send_all_through_short_sends() {
+        run_local(async {
+            let (c, peer) = tcp_pair(Some(4096));
+            peer.set_nonblocking(true).unwrap();
+            let mut peer = tokio::net::TcpStream::from_std(peer).unwrap();
+
+            let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+
+            let reader = async {
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; 8192];
+                while got.len() < data.len() {
+                    let n = tokio::io::AsyncReadExt::read(&mut peer, &mut buf).await.unwrap();
+                    assert!(n > 0);
+                    got.extend_from_slice(&buf[..n]);
+                    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                }
+                got
+            };
+
+            let (sent, got) = tokio::join!(c.send_all(&data), reader);
+            sent.unwrap();
+            assert!(got == data);
+            assert_eq!(c.sent.get(), data.len() as u64);
+
+            c.close();
+        });
     }
 }
