@@ -55,6 +55,17 @@ BINS["rust-lto-jemalloc"] = BINS["rust-lto"]
 # the Phase 1 build on the distro's jemalloc 5.2 and mimalloc 2.0
 BINS["rust-p1-jemalloc"] = BINS["rust-p1"]
 BINS["rust-p1-mimalloc"] = BINS["rust-p1"]
+# PLAN.md Phase 0 item 3 on the Phase 1 code (§1.5), all with the release
+# profile's fat LTO, codegen-units=1 and panic=abort: -lto-je is the default
+# build (jemalloc 5.3 for the Rust code's allocations), -lto has
+# --no-default-features (glibc), -lto-je-all --features jemalloc-all, -lto-mi
+# and -lto-mi-all --no-default-features --features mimalloc / mimalloc-all
+# (mimalloc 3); "-all" is for the whole process, OpenSSL, PCRE2 and zlib too
+BINS["rust-p0-lto"] = f"{B}/bin/nginx-rust-p0-lto"
+BINS["rust-p0-lto-je"] = f"{B}/bin/nginx-rust-p0-lto-je"
+BINS["rust-p0-lto-je-all"] = f"{B}/bin/nginx-rust-p0-lto-je-all"
+BINS["rust-p0-lto-mi"] = f"{B}/bin/nginx-rust-p0-lto-mi"
+BINS["rust-p0-lto-mi-all"] = f"{B}/bin/nginx-rust-p0-lto-mi-all"
 JEMALLOC = "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
 MIMALLOC = "/usr/lib/x86_64-linux-gnu/libmimalloc.so.2"
 ENVS = {"rust-jemalloc": {"LD_PRELOAD": JEMALLOC},

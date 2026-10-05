@@ -117,7 +117,7 @@ The reviews still found three hot-path costs on safe that Phase 0 removes. Each 
 No added costs were found in the TLS/QUIC crypto or shared-memory accessors.
 
 ### 1.4 After Phase 1 (master `85adcd1`)
-Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six Phase 1 workstreams. The build profile and allocator (Phase 0 item 3) are not applied yet. Run on 2026-10-02 (`results/phase1-20261002.jsonl`): medians of 3, the three servers interleaved in each rep, spread between reps ≤ 5%, no errors. Ratios to C:
+Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six Phase 1 workstreams. The build profile and allocator (Phase 0 item 3) came after it (§1.5). Run on 2026-10-02 (`results/phase1-20261002.jsonl`): medians of 3, the three servers interleaved in each rep, spread between reps ≤ 5%, no errors. Ratios to C:
 
 | Scenario | C req/s | before | after | after/before ¹ | user µs per request, C / before / after | kernel µs, C / before / after |
 |---|--:|--:|--:|--:|--:|--:|
@@ -140,7 +140,36 @@ Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six P
 - Phase 1 cut user CPU per request by 19–31% and kernel CPU by 2–10%.
 - Allocations per request: `return 200` 37.2 → 14.0 (milestone ≤ 16: met), proxy 1 KB 160.4 → 74.4 (≤ 70: not quite). An idle HTTP/1.1 connection holds 2.5 KB (was 11.4; C 0.5).
 - What is left is user space: 2.1–4.0× C's user CPU per request (geomean 3.1×; `return 200` 5.9 µs against the ~4.5 projected in §4). Kernel CPU is 1.2–1.3× C's on HTTP/1.1, h3 and proxy, with the same syscalls per request as C (`analyze.py syscalls` at 2000 req/s: `h1-return` 2.90 against 2.95, `proxy-1k-keepalive` 6.74 against 6.82): the extra kernel time is not extra calls. HTTP/2 stays below C's kernel time because the driver batches frames (REPORT.md); that alone puts `h2c-1k` ahead of C.
-- These 12 are the small-request scenarios, where the gap is widest, so 0.61× is not the milestones' 35-scenario geomean. The build gain measured on master (+14–29%, report §10) would put them at about 0.70–0.79×; to be measured.
+- These 12 are the small-request scenarios, where the gap is widest, so 0.61× is not the milestones' 35-scenario geomean. The build gain measured on master (+14–29%, report §10) would put them at about 0.70–0.79×; §1.5 measured +26% on seven of them, 0.74×.
+
+### 1.5 After Phase 0 item 3: build profile and allocator
+The Phase 1 code of §1.4 in five builds, all with fat LTO, `codegen-units = 1` and `panic = "abort"`: on glibc's malloc, or with jemalloc 5.3 or mimalloc 3 linked in, either for the Rust code's allocations or for the whole process (`-all`: OpenSSL, PCRE2 and zlib too). Run on 2026-10-05 (`results/p0-build-20261005.jsonl`): C, the Phase 1 build and the five builds alternating in each rep, 5 reps, no invalid runs. Ratios to C, medians of the per-rep ratios:
+
+| Scenario | C req/s | Phase 1 | LTO | + jemalloc | + jemalloc-all | + mimalloc | + mimalloc-all |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `h1-return` | 241k | 0.57× | 0.68× | 0.73× | 0.73× | 0.72× | 0.72× |
+| `h1-static-1k` | 123k | 0.62× | 0.72× | 0.75× | 0.75× | 0.75× | 0.75× |
+| `tls-h1-1k` | 101k | 0.63× | 0.74× | 0.75× | 0.76× | 0.76× | 0.75× |
+| `h2-tls-1k` | 126k | 0.81× | 0.95× | 1.08× | 1.09× | 1.11× | 1.10× |
+| `h3-1k` | 86k | 0.48× | 0.61× | 0.65× | 0.65× | 0.66× | 0.63× |
+| `proxy-1k-keepalive` | 100k | 0.51× | 0.60× | 0.65× | 0.65× | 0.63× | 0.64× |
+| `proxy-post-10k` | 84k | 0.53× | 0.62× | 0.65× | 0.65× | 0.66× | 0.66× |
+| **geomean** | | **0.58×** | **0.69×** | **0.74×** | **0.74×** | **0.74×** | **0.74×** |
+| per-rep ratio to Phase 1, geomean | | 1 | 1.177 | 1.260 | 1.265 | 1.265 | 1.262 |
+
+| KB per idle connection (PSS) | C | Phase 1 | LTO | + jemalloc | + jemalloc-all | + mimalloc | + mimalloc-all |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `idle-10k-h1` | 0.56 | 2.36 | 2.36 | 2.34 | 2.35 | 2.99 | 3.22 |
+| `idle-10k-tls` | 15.00 | 16.63 | 16.63 | 16.62 | 17.37 | 18.08 | 18.60 |
+| `idle-10k-h2` | 15.47 | 24.21 | 24.21 | 23.12 | 23.91 | 27.32 | 28.54 |
+
+- LTO alone gives +18% (+13% on `h1-static-1k` to +27% on `h3-1k`), as much as on master (report §10): Phase 1 did not take away what inlining across the crates saves.
+- An allocator adds 2–3% (`tls-h1-1k`) to 14–17% (`h2-tls-1k`) on top of LTO. jemalloc and mimalloc tie on throughput; mimalloc holds 9–27% more memory per idle connection, jemalloc as much as glibc or less. Replacing malloc for the C libraries too (`-all`) gains nothing, and costs 0.75 KB per idle TLS connection with jemalloc.
+- CPU per request: user −25 to −36% (`h1-return` 6.1 → 3.9 µs, C 1.6), kernel −6 to −12% for the same syscalls (`h1-return` 8.4 → 7.5 µs, C 6.7; `h3-1k` 17.0 → 14.9, C 13.1). The kernel drop fits §1.2's attribution of the extra kernel time to Rust's user-space footprint.
+- **Chosen:** LTO, and jemalloc for the Rust code's allocations: `[profile.release]` and the nginx crate's default feature. The other variants stay as features: `jemalloc-all`, and `mimalloc`/`mimalloc-all` with `--no-default-features`.
+- Costs: a rebuild after touching `ngx-http` takes 79 s instead of 24 s; a panic ends the worker (the master starts another) instead of one connection's task; libmcount sees glibc's malloc only, so allocation counts need a `--no-default-features` build, and `analyze.py` refuses others.
+- nginx-tests: all five builds pass the same 455 files as the Phase 1 build; `cargo test --workspace` passes.
+- On these seven small-request scenarios, 0.74× is inside §1.4's 0.70–0.79×. The milestones' 35-scenario geomean is item 4.
 
 ## 2. Target and how progress is measured
 
@@ -156,7 +185,7 @@ Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six P
 - The crates remain `#![forbid(unsafe_code)]`; anything that really needs `unsafe` goes into `ngx-sys` as a small safe function.
 
 **Leading indicators**, cheaper than full runs and recorded per change in a budget table:
-- allocations per request (`analyze.py` / `tools/mcount`);
+- allocations per request (`analyze.py` / `tools/mcount`, on a `--no-default-features` build: the counter sees glibc's malloc only);
 - syscalls per request (`perf stat` on the `raw_syscalls` tracepoints);
 - user µs per request.
 
@@ -191,6 +220,7 @@ Master `85adcd1` is safe + perf-fixes (`8dcf1ef`, "before" below) plus the six P
 - `#[global_allocator]`: mimalloc or jemalloc via the safe crates, chosen by measurement.
 - Measured on master: +14 to +29% from LTO plus jemalloc (report §10).
 - Measured again on the Phase 1 build (`results/alloc-preload-20261002.jsonl`: the distro's allocators by LD_PRELOAD, 3 interleaved reps). jemalloc 5.2: +6% `h1-return`, +12% `h2-tls-1k`, +3% `h3-1k`, +6% `proxy-1k-keepalive`; idle memory per HTTP/1.1 connection unchanged (2.33 KB, glibc 2.37). mimalloc 2.0: −10 to −17%, and 3.02 KB per idle connection. Part of that may be the preload itself (a shared library's thread-local storage is slower), and the crate ships mimalloc 3: builds that link each allocator decide.
+- **Done** (§1.5): +26% on the Phase 1 code. Linked in, mimalloc ties with jemalloc on throughput but holds 9–27% more memory per idle connection; jemalloc, for the Rust code's allocations, is the nginx crate's default feature.
 
 **4. Re-baseline:** the full benchmark of the merged branch against C.
 
