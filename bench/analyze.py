@@ -703,8 +703,21 @@ def profile(scenarios, servers, seconds=6):
     return res
 
 
+def glibc_malloc(binary):
+    """libmcount counts calls to glibc's malloc: a binary with its own allocator
+    (jemalloc, the default build since PLAN.md Phase 0, or mimalloc) would show
+    next to no allocations."""
+    syms = subprocess.run(["nm", binary], capture_output=True, text=True).stdout
+    return not re.search(r" [Tt] (malloc|_rjem_malloc|mi_malloc\w*)$", syms, re.M)
+
+
 def main():
     what, scen, servers = sys.argv[1], sys.argv[2].split(","), sys.argv[3].split(",")
+    if what in ("allocs", "allocsites", "idle"):
+        own = [s for s in servers if not glibc_malloc(BINS[s])]
+        if own:
+            sys.exit(f"{', '.join(own)}: not on glibc's malloc, which libmcount counts; "
+                     "build with cargo build --release --no-default-features")
     with open(f"{B}/run/post10k.lua", "w") as f:
         f.write(POST_LUA)
     be = Backends()

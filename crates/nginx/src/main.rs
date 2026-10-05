@@ -10,6 +10,19 @@ use ngx_core::module::*;
 use ngx_core::string::B;
 use ngx_core::{ngx_log_error, ngx_log_stderr, process};
 
+// the allocator: jemalloc by default, glibc's malloc with --no-default-features
+// (features in Cargo.toml)
+#[cfg(all(feature = "jemalloc", feature = "mimalloc"))]
+compile_error!("mimalloc needs --no-default-features: jemalloc is the default allocator");
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const NGX_COMPILER: &str = "rustc 1.96.1";
 const NGX_CONFIGURE: &str = " --with-debug --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module --with-http_addition_module --with-http_geoip_module --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-http_json_module --with-control-api --with-mail --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module --with-stream_ssl_preread_module --with-threads --with-file-aio";
 

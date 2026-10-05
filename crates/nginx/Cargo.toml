@@ -8,6 +8,17 @@ license.workspace = true
 name = "nginx"
 path = "src/main.rs"
 
+[features]
+# The allocator (bench/PLAN.md, Phase 0): jemalloc by default, for the
+# allocations of the Rust code; "-all" for the whole process, the C libraries
+# (OpenSSL, PCRE2, zlib) included. --no-default-features gives glibc's malloc,
+# the one bench/analyze.py counts allocations of; mimalloc needs it too.
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+jemalloc-all = ["jemalloc", "tikv-jemallocator/override_allocator_on_supported_platforms"]
+mimalloc = ["dep:mimalloc"]
+mimalloc-all = ["mimalloc", "mimalloc/override"]
+
 [dependencies]
 ngx-core.workspace = true
 ngx-http.workspace = true
@@ -16,3 +27,5 @@ ngx-mail.workspace = true
 nix.workspace = true
 memchr.workspace = true
 rustix.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }

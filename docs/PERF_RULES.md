@@ -24,7 +24,7 @@ Cut what each request costs in user space: heap allocations, copies, boxed futur
 ## Measuring
 
 **Allocations per request.** The main indicator: deterministic, and cheap to measure.
-- Build release: `cargo build --release`.
+- Build release on glibc's malloc, the one the counter sees: `cargo build --release --no-default-features` (the default build links jemalloc).
 - Then run, from /home/ubuntu/rnginx/bench (the main checkout: a worktree's bench/ has no binaries or data):
   `NGX_BENCH_BIN=$PWD_OF_YOUR_WORKTREE/target/release/nginx flock /tmp/nginx-bench.lock python3 analyze.py allocs <scenarios> custom`
   - Scenarios are names from `python3 bench.py --list`, comma-separated.

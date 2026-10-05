@@ -41,6 +41,8 @@ signal-hook = "0.3"
 pwhash = "1"
 blowfish = { version = "0.7", features = ["bcrypt"] }
 vm-memory = { version = "0.16", features = ["backend-mmap"] }
+tikv-jemallocator = "0.7"
+mimalloc = "0.1"
 
 [profile.dev]
 opt-level = 1
@@ -49,3 +51,8 @@ debug = 1
 [profile.release]
 opt-level = 3
 debug = 1
+# one optimization across all the crates (bench/PLAN.md, Phase 0); a panic
+# ends the worker, which the master replaces, like a crashed C worker
+lto = "fat"
+codegen-units = 1
+panic = "abort"
