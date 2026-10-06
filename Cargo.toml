@@ -20,7 +20,7 @@ nix = { version = "0.29", features = ["fs", "process", "signal", "socket", "uio"
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros", "signal"] }
 openssl = "0.10"
 openssl-sys = "0.9"
-foreign-types = "0.3"
+foreign-types = "0.5"
 pcre2 = "0.2"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 md-5 = "0.10"
