@@ -26,7 +26,7 @@ Unless stated otherwise:
 | `h2-tls-1k` | 129k | 0.49× | 0.64× | = master |
 | `proxy-1k-keepalive` | 104k | 0.30× | 0.38× | = master |
 
-The C, master and perf-fixes figures are from the 2026-10-01 runs. §1.3 has the 2026-10-02 re-run, where all four were measured together.
+The C, master and perf-fixes figures are from the 2026-10-01 runs. §1.3 has the 2026-10-02 re-run, where all four were measured together. The latest full run, after Phase 0, is §1.6.
 
 ### 1.1 What `perf-fixes` already did (9 commits, not on master)
 - request body forwarded without the per-byte copy;
@@ -171,6 +171,79 @@ The Phase 1 code of §1.4 in five builds, all with fat LTO, `codegen-units = 1` 
 - nginx-tests: all five builds pass the same 455 files as the Phase 1 build; `cargo test --workspace` passes.
 - On these seven small-request scenarios, 0.74× is inside §1.4's 0.70–0.79×. The milestones' 35-scenario geomean is item 4.
 
+### 1.6 After Phase 0: the full run (master `aabbd30`)
+Every scenario of `bench.py` with C, the Phase 1 build and master `aabbd30` (the Phase 0 build of §1.5) alternating in each rep, 3 reps, on 2026-10-05 (`results/p0-full-20261005.jsonl`); no invalid runs. `7f01d41` is REPORT.md's run of 2026-10-01. Ratios to C of the medians:
+
+| Geomean | `7f01d41` | Phase 1 | Phase 0 |
+|---|--:|--:|--:|
+| 35 saturation scenarios (report.py's: wrk and h2load) | 0.52× | 0.74× | **0.87×** |
+| the same without `h1-sub-filter-sendfile` | 0.49× | 0.71× | **0.83×** |
+| the 12 small-request scenarios of §1.4 | 0.36× | 0.61× | **0.77×** |
+| CPU per request, 35 saturation scenarios | 1.99× | 1.38× | **1.17×** |
+
+| Scenario | C req/s | `7f01d41` | Phase 1 | **Phase 0** | Phase 0 ÷ Phase 1 ¹ | CPU µs/req, C / Phase 0 |
+|---|--:|--:|--:|--:|--:|--:|
+| `h1-return` | 244k | 0.35× | 0.58× | **0.72×** | 1.25 | 8.2 / 11.4 |
+| `h1-static-1k` | 125k | 0.38× | 0.61× | **0.74×** | 1.21 | 16.0 / 21.4 |
+| `h1-static-100k` | 86.0k | 0.47× | 0.71× | **0.82×** | 1.15 | 23.2 / 28.4 |
+| `h1-static-1m` | 16.5k | 1.03× | 0.99× | **1.00×** | 1.00 | 56.0 / 61.5 |
+| `h1-conn-close` | 72.3k | 0.40× | 0.60× | **0.74×** | 1.23 | 27.5 / 37.1 |
+| `h1-2k-conns` | 122k | 0.32× | 0.62× | **0.74×** | 1.18 | 16.3 / 22.1 |
+| `h1-regex-rewrite` | 201k | 0.30× | 0.54× | **0.67×** | 1.25 | 9.9 / 14.8 |
+| `h1-access-log` | 115k | 0.36× | 0.62× | **0.74×** | 1.20 | 17.3 / 23.3 |
+| `h1-gzip` | 2.26k | 0.94× | 0.97× | **0.98×** | 1.01 | 885.3 / 902.3 |
+| `h1-sub-filter` | 7.43k | 0.62× | 0.72× | **0.80×** | 1.11 | 269.3 / 338.1 |
+| `h1-sub-filter-sendfile` | 1.51k | 3.18× | 3.55× | **3.91×** | 1.10 | 1262.8 / 339.8 |
+| `h1-limit-req` | 118k | 0.37× | 0.61× | **0.75×** | 1.19 | 16.9 / 22.6 |
+| `tls-h1-1k` | 100k | 0.38× | 0.64× | **0.75×** | 1.17 | 19.8 / 26.5 |
+| `tls-h1-1m` | 2.24k | 0.83× | 0.93× | **0.95×** | 1.02 | 893.3 / 938.0 |
+| `tls-resume-ecdsa` | 6.59k | 0.83× | 0.86× | **0.92×** | 1.07 | 302.8 / 329.9 |
+| `tls-handshake-ecdsa` | 4.22k | 1.00× | 1.00× | **0.98×** | 1.01 | 328.4 / 354.3 |
+| `tls-handshake-rsa` | 3.24k | 0.92× | 0.94× | **0.97×** | 1.03 | 616.5 / 636.8 |
+| `h2-tls-1k` | 130k | 0.48× | 0.81× | **1.06×** | 1.32 | 15.4 / 14.6 |
+| `h2-tls-100k` | 17.3k | 0.64× | 0.82× | **0.90×** | 1.11 | 115.9 / 128.5 |
+| `h2c-1k` | 109k | 0.63× | 1.09× | **1.46×** | 1.33 | 18.4 / 12.6 |
+| `h2-tls-return` | 266k | 0.42× | 0.85× | **1.22×** | 1.42 | 7.5 / 6.1 |
+| `h3-1k` ² | 86.1k | 0.31× | 0.47× | **0.65×** | 1.38 | 23.1 / 35.9 |
+| `h3-100k` ² | 4.87k | 0.61× | 0.70× | **0.81×** | 1.15 | 409.7 / 508.2 |
+| `proxy-1k-keepalive` | 102k | 0.30× | 0.50× | **0.63×** | 1.27 | 19.5 / 30.8 |
+| `proxy-1k-no-keepalive` | 34.3k | 0.52× | 0.62× | **0.75×** | 1.20 | 58.1 / 77.7 |
+| `proxy-100k` | 18.6k | 0.47× | 0.74× | **0.84×** | 1.14 | 107.7 / 128.2 |
+| `proxy-1m` | 1.73k | 0.60× | 0.85× | **0.90×** | 1.06 | 1155.2 / 1281.2 |
+| `proxy-post-10k` | 82.8k | 0.25× | 0.54× | **0.67×** | 1.26 | 24.1 / 36.0 |
+| `proxy-tls-terminate` | 77.9k | 0.33× | 0.52× | **0.66×** | 1.25 | 25.5 / 39.1 |
+| `proxy-to-tls-upstream` | 77.6k | 0.34× | 0.54× | **0.66×** | 1.23 | 25.7 / 39.2 |
+| `proxy-h2-frontend` | 76.3k | 0.39× | 0.62× | **0.78×** | 1.29 | 26.2 / 33.4 |
+| `proxy-cache-hit` | 102k | 0.33× | 0.54× | **0.69×** | 1.28 | 19.5 / 28.4 |
+| `proxy-h2-upstream` | 75.6k | 0.34× | 0.51× | **0.65×** | 1.28 | 26.4 / 40.4 |
+| `grpc-pass` | 65.7k | 0.37× | 0.58× | **0.75×** | 1.30 | 30.5 / 40.4 |
+| `fastcgi-1k` | 39.6k | 0.73× | 1.04× | **1.03×** | 0.99 | 31.3 / 38.2 |
+| `stream-tcp-proxy` | 146k | 0.80× | 0.84× | **0.88×** | 1.04 | 13.7 / 15.5 |
+| `stream-tls-terminate` | 111k | 0.75× | 0.85× | **0.86×** | 1.03 | 17.9 / 20.7 |
+| `stream-bulk-iperf` ² | 11.8 Gbit/s | 0.95× | 0.95× | **0.95×** | 1.01 | - |
+
+¹ Median of the per-rep ratios. ² Not in the saturation geomean (oha, iperf3).
+
+| Fixed rate, 10k req/s | C CPU % | `7f01d41` CPU ÷ C | Phase 1 | **Phase 0** | p99 ms, C / Phase 0 |
+|---|--:|--:|--:|--:|--:|
+| `rate-h1-static-1k` | 18 | 2.70× | 1.63× | **1.36×** | 0.23 / 0.29 |
+| `rate-tls-1k` | 23 | 2.54× | 1.59× | **1.33×** | 0.29 / 0.34 |
+| `rate-h2-1k` | 21 | 2.34× | 1.61× | **1.22×** | 0.48 / 0.54 |
+| `rate-proxy-1k` | 21 | 3.41× | 2.01× | **1.55×** | 0.39 / 0.55 |
+
+| KB per idle connection | C | `7f01d41` | Phase 1 | **Phase 0** | Phase 0 ÷ C |
+|---|--:|--:|--:|--:|--:|
+| `idle-10k-h1` | 0.55 | 11.71 | 2.36 | **2.33** | 4.2× |
+| `idle-10k-tls` | 14.99 | 26.00 | 16.63 | **16.62** | 1.1× |
+| `idle-10k-h2` | 15.46 | 24.91 | 24.19 | **23.19** | 1.5× |
+
+- **Phase 0 is done.** 0.87× passes the Phase 0 milestone (0.65×) and the geomean thresholds of Phase 1 (0.72×) and Phase 2 (0.8×), but it overstates how far the small requests have come. 13 of the 35 are at 0.9× or more (bulk transfers, handshakes, gzip, h2, `fastcgi-1k`), and `h1-sub-filter-sendfile` alone, at 3.91× because C is slow there, lifts the geomean by 4%. The small-request scenarios other than h2 are at 0.63–0.78×; their geomean (the 12 of §1.4: 0.77×), with allocations per request, measures the remaining work better.
+- h2 is ahead of C on small responses (1.06–1.46×): the driver batches frames into fewer writes, so it spends less kernel time than C (§1.4).
+- `fastcgi-1k` does not move with the build (0.99): most likely the Go FastCGI backend is the limit.
+- At a fixed 10k req/s, Rust uses 1.22–1.55× C's CPU (from 2.3–3.4×), with p99 latency 0.05–0.16 ms above C's.
+- Memory per idle connection: TLS, at 1.1× C, meets §2's 1.2×; HTTP/1.1 (4.2×, target 2×) and h2 (1.5×, target 1.2×) do not.
+- Run health: req/s spread above 10% between reps in 6 of the 135 server-scenario pairs, C's included; iperf3's connection resets at the end of `stream-bulk-iperf` are in all three servers' error logs.
+
 ## 2. Target and how progress is measured
 
 **Target:**
@@ -222,7 +295,7 @@ The Phase 1 code of §1.4 in five builds, all with fat LTO, `codegen-units = 1` 
 - Measured again on the Phase 1 build (`results/alloc-preload-20261002.jsonl`: the distro's allocators by LD_PRELOAD, 3 interleaved reps). jemalloc 5.2: +6% `h1-return`, +12% `h2-tls-1k`, +3% `h3-1k`, +6% `proxy-1k-keepalive`; idle memory per HTTP/1.1 connection unchanged (2.33 KB, glibc 2.37). mimalloc 2.0: −10 to −17%, and 3.02 KB per idle connection. Part of that may be the preload itself (a shared library's thread-local storage is slower), and the crate ships mimalloc 3: builds that link each allocator decide.
 - **Done** (§1.5): +26% on the Phase 1 code. Linked in, mimalloc ties with jemalloc on throughput but holds 9–27% more memory per idle connection; jemalloc, for the Rust code's allocations, is the nginx crate's default feature.
 
-**4. Re-baseline:** the full benchmark of the merged branch against C.
+**4. Re-baseline:** the full benchmark of the merged branch against C. Done (§1.6): 0.87× on the 35 saturation scenarios, 0.77× on the 12 small-request ones.
 
 **Expected:** about 0.65–0.72× geomean. perf-fixes' +32–40% applies to the ~25 small-request scenarios, the build gain of +14–29% was measured on those too, and bulk/handshake scenarios gain little. `h1-return` is about 0.58×.
 

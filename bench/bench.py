@@ -42,6 +42,9 @@ BINS["rust-safe"] = f"{B}/bin/nginx-rust-safe"
 BINS["rust-merged"] = f"{B}/bin/nginx-rust-merged"
 # master after phase 1 of the performance plan (six workstreams, 85adcd1)
 BINS["rust-p1"] = f"{B}/bin/nginx-rust-p1"
+# master after phase 0 (aabbd30): the release profile's fat LTO, codegen-units=1
+# and panic=abort, jemalloc
+BINS["rust-p0"] = f"{B}/bin/nginx-rust-p0"
 # any build, by path: NGX_BENCH_BIN=/path/to/nginx ... --servers custom
 # (serialize runs that share the machine: flock /tmp/nginx-bench.lock python3 ...)
 BINS["custom"] = os.environ.get("NGX_BENCH_BIN", BINS["rust"])
