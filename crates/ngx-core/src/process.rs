@@ -1059,7 +1059,9 @@ fn set_cloexec(fd: i32, on: bool) {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
     let flags = if on { FdFlag::FD_CLOEXEC } else { FdFlag::empty() };
-    let _ = fcntl(fd, FcntlArg::F_SETFD(flags));
+    if let Ok(f) = fd::get(fd) {
+        let _ = fcntl(&f, FcntlArg::F_SETFD(flags));
+    }
 }
 
 /// ngx_exec_new_binary: start a new binary with inherited listening sockets.

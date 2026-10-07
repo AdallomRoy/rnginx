@@ -21,8 +21,9 @@
 //! returns NULL, so the "crypt_r() failed" message of ngx_libc_crypt()
 //! cannot happen.
 
-use md5::Md5;
-use sha1::{Digest, Sha1};
+// md-5 and sha1 are on different digest versions: each its own trait
+use md5::{Digest as _, Md5};
+use sha1::{Digest as _, Sha1};
 
 mod gost;
 mod gost_tables;
@@ -1248,7 +1249,7 @@ fn bf_crypt(key: &[u8], setting: &[u8], min: u32) -> Option<Vec<u8>> {
         let (mut l, mut r) = (BF_MAGIC_W[i], BF_MAGIC_W[i + 1]);
 
         for _ in 0..64 {
-            (l, r) = state.bc_encrypt(l, r);
+            [l, r] = state.bc_encrypt([l, r]);
         }
 
         out[4 * i..4 * i + 4].copy_from_slice(&l.to_be_bytes());

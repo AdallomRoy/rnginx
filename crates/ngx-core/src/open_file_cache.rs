@@ -705,7 +705,9 @@ fn open_and_stat_file(name: &[u8], of: &mut OpenFileInfo, log: &Log) -> Result<(
                 of.fd = fd;
 
                 if of.read_ahead > 0 && st.st_size as usize > NGX_MIN_READ_AHEAD {
-                    let _ = nix::fcntl::posix_fadvise(fd, 0, st.st_size, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
+                    if let Ok(f) = crate::fd::get(fd) {
+                        let _ = nix::fcntl::posix_fadvise(&f, 0, st.st_size, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
+                    }
                 }
 
                 if of.directio > 0 && st.st_size as usize >= of.directio {
@@ -759,9 +761,9 @@ fn openat_file_owner(at_fd: i32, name: &[u8], mode: i32, create: i32, access: u3
     let fd = openat_file(at_fd, name, mode, create, access)?;
 
     let err = 'failed: {
-        let atfi = match nix::sys::stat::fstatat(Some(at_fd), name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+        let atfi = match os::fstatat(at_fd, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(st) => st,
-            Err(e) => break 'failed e as i32,
+            Err(e) => break 'failed e,
         };
 
         let fi = match file_o_path_info(fd, log) {
@@ -792,9 +794,9 @@ thread_local! {
 /// with AT_EMPTY_PATH on kernels before 3.6; Err(errno)
 fn file_o_path_info(fd: i32, log: &Log) -> Result<libc::stat, i32> {
     if USE_FSTAT.with(|u| u.get()) {
-        match nix::sys::stat::fstat(fd) {
+        match os::fstat(fd) {
             Ok(fi) => return Ok(fi),
-            Err(e) if e != nix::errno::Errno::EBADF => return Err(e as i32),
+            Err(e) if e != libc::EBADF => return Err(e),
             Err(_) => {}
         }
 
@@ -803,7 +805,7 @@ fn file_o_path_info(fd: i32, log: &Log) -> Result<libc::stat, i32> {
         USE_FSTAT.with(|u| u.set(false));
     }
 
-    nix::sys::stat::fstatat(Some(fd), "", nix::fcntl::AtFlags::AT_EMPTY_PATH).map_err(|e| e as i32)
+    os::fstatat(fd, b"", nix::fcntl::AtFlags::AT_EMPTY_PATH)
 }
 
 /// ngx_open_file_wrapper: without disable_symlinks, open(); with it, the

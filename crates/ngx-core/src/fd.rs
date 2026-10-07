@@ -278,8 +278,8 @@ mod tests {
         drop(h2);
 
         let mut buf = [0u8; 4];
-        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 3);
-        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 0, "the write end is closed");
+        assert_eq!(nix::unistd::read(get(rn).unwrap(), &mut buf).unwrap(), 3);
+        assert_eq!(nix::unistd::read(get(rn).unwrap(), &mut buf).unwrap(), 0, "the write end is closed");
 
         close(rn).unwrap();
         assert_eq!(close(1 << 20).err().and_then(|e| e.raw_os_error()), Some(libc::EBADF));
@@ -300,13 +300,13 @@ mod tests {
 
         // the descriptor was closed: the read end sees the end
         let mut buf = [0u8; 1];
-        assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 0);
+        assert_eq!(nix::unistd::read(get(rn).unwrap(), &mut buf).unwrap(), 0);
 
         // with a handle alive, closed when it goes
         let h = get(rn).unwrap();
         assert!(close_registered(rn).unwrap().is_ok());
         assert!(!contains(rn));
-        assert_eq!(nix::unistd::read(h.as_raw_fd(), &mut buf).unwrap(), 0, "still open");
+        assert_eq!(nix::unistd::read(&h, &mut buf).unwrap(), 0, "still open");
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
             // closed with it
             assert_eq!(nix::unistd::write(get(wn2).unwrap(), b"x").unwrap(), 1);
             let mut buf = [0u8; 1];
-            assert_eq!(nix::unistd::read(rn, &mut buf).unwrap(), 1);
+            assert_eq!(nix::unistd::read(get(rn).unwrap(), &mut buf).unwrap(), 1);
         }
         close(n2).unwrap();
         close(wn2).unwrap();
@@ -380,7 +380,7 @@ mod tests {
         let wn2 = register(w2);
         assert_eq!(nix::unistd::write(get(wn2).unwrap(), b"x").unwrap(), 1);
         let mut buf = [0u8; 1];
-        assert_eq!(nix::unistd::read(rn2, &mut buf).unwrap(), 1);
+        assert_eq!(nix::unistd::read(get(rn2).unwrap(), &mut buf).unwrap(), 1);
 
         // lent when closed: not kept, closed with the last handle
         let f = free();

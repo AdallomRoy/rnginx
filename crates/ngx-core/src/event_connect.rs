@@ -141,11 +141,14 @@ pub fn event_connect_peer(p: &PeerSocket) -> PeerConnect {
         PeerConnect::Error
     };
 
-    let nonblocking = nix::fcntl::fcntl(s, FcntlArg::F_GETFL)
-        .and_then(|flags| nix::fcntl::fcntl(s, FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK)));
+    let nonblocking = fd::get(s).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF)).and_then(|f| {
+        nix::fcntl::fcntl(&f, FcntlArg::F_GETFL)
+            .and_then(|flags| nix::fcntl::fcntl(&f, FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK)))
+            .map_err(|e| e as i32)
+    });
 
     if let Err(e) = nonblocking {
-        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e as i32), "fcntl(O_NONBLOCK) failed");
+        ngx_log_error!(NGX_LOG_ALERT, p.log, Some(e), "fcntl(O_NONBLOCK) failed");
         return failed(&c);
     }
 

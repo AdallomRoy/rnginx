@@ -362,7 +362,8 @@ pub fn write_fd(fd: i32, buf: &[u8]) -> Result<usize, i32> {
 }
 
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
-    nix::unistd::read(fd, buf).map_err(|e| e as i32)
+    let f = fd::get(fd).map_err(io_errno)?;
+    nix::unistd::read(&f, buf).map_err(|e| e as i32)
 }
 
 pub fn pread(fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, i32> {
@@ -407,7 +408,8 @@ pub fn chmod(name: &[u8], mode: u32) -> Result<(), i32> {
 }
 
 pub fn fchmod(fd: i32, mode: u32) -> Result<(), i32> {
-    nix::sys::stat::fchmod(fd, Mode::from_bits_retain(mode)).map_err(|e| e as i32)
+    let f = fd::get(fd).map_err(io_errno)?;
+    nix::sys::stat::fchmod(&f, Mode::from_bits_retain(mode)).map_err(|e| e as i32)
 }
 
 fn owner(uid: u32, gid: u32) -> (Option<Uid>, Option<Gid>) {
@@ -422,7 +424,8 @@ pub fn chown(name: &[u8], uid: u32, gid: u32) -> Result<(), i32> {
 
 pub fn fchown(fd: i32, uid: u32, gid: u32) -> Result<(), i32> {
     let (u, g) = owner(uid, gid);
-    nix::unistd::fchown(fd, u, g).map_err(|e| e as i32)
+    let f = fd::get(fd).map_err(io_errno)?;
+    nix::unistd::fchown(&f, u, g).map_err(|e| e as i32)
 }
 
 /// utimes(): the access and modification times of a file set to `sec`.
@@ -434,8 +437,9 @@ pub fn utimes(name: &[u8], sec: i64) -> Result<(), i32> {
 /// futimes(): the access and modification times of an open file set to
 /// `sec`.
 pub fn futimes(fd: i32, sec: i64) -> Result<(), i32> {
+    let f = fd::get(fd).map_err(io_errno)?;
     let t = nix::sys::time::TimeSpec::new(sec, 0);
-    nix::sys::stat::futimens(fd, &t, &t).map_err(|e| e as i32)
+    nix::sys::stat::futimens(&f, &t, &t).map_err(|e| e as i32)
 }
 
 pub fn stat(name: &[u8]) -> Result<libc::stat, i32> {
@@ -443,7 +447,19 @@ pub fn stat(name: &[u8]) -> Result<libc::stat, i32> {
 }
 
 pub fn fstat(fd: i32) -> Result<libc::stat, i32> {
-    nix::sys::stat::fstat(fd).map_err(|e| e as i32)
+    let f = fd::get(fd).map_err(io_errno)?;
+    nix::sys::stat::fstat(&f).map_err(|e| e as i32)
+}
+
+/// fstatat() relative to the open directory `dir`, or to the current
+/// directory for AT_FDCWD.
+pub fn fstatat(dir: i32, name: &[u8], flags: nix::fcntl::AtFlags) -> Result<libc::stat, i32> {
+    if dir == libc::AT_FDCWD {
+        return nix::sys::stat::fstatat(nix::fcntl::AT_FDCWD, path(name), flags).map_err(|e| e as i32);
+    }
+
+    let d = fd::get(dir).map_err(io_errno)?;
+    nix::sys::stat::fstatat(&d, path(name), flags).map_err(|e| e as i32)
 }
 
 pub fn lstat(name: &[u8]) -> Result<libc::stat, i32> {
@@ -514,12 +530,16 @@ pub const DIRECTIO_ON_N: &str = "fcntl(O_DIRECT)";
 /// The file status flags with `set` added and `clear` taken off; -1 on
 /// error, with errno set by the failed fcntl().
 fn change_flags(fd: i32, set: OFlag, clear: OFlag) -> i32 {
-    let flags = match nix::fcntl::fcntl(fd, FcntlArg::F_GETFL) {
-        Ok(f) => OFlag::from_bits_retain(f),
+    let Ok(f) = fd::get(fd).map_err(io_errno) else {
+        return -1;
+    };
+
+    let flags = match nix::fcntl::fcntl(&f, FcntlArg::F_GETFL) {
+        Ok(bits) => OFlag::from_bits_retain(bits),
         Err(_) => return -1,
     };
 
-    match nix::fcntl::fcntl(fd, FcntlArg::F_SETFL((flags | set) & !clear)) {
+    match nix::fcntl::fcntl(&f, FcntlArg::F_SETFL((flags | set) & !clear)) {
         Ok(rc) => rc,
         Err(_) => -1,
     }
@@ -539,7 +559,8 @@ pub fn directio_off(fd: i32) -> i32 {
 }
 
 pub fn set_cloexec(fd: i32) -> Result<(), i32> {
-    nix::fcntl::fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map(|_| ()).map_err(|e| e as i32)
+    let f = fd::get(fd).map_err(io_errno)?;
+    nix::fcntl::fcntl(&f, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map(|_| ()).map_err(|e| e as i32)
 }
 
 pub fn kill(pid: i32, sig: i32) -> Result<(), i32> {

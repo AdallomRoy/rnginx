@@ -91,7 +91,8 @@ struct Control {
 fn set_async(fd: i32) -> Result<(), i32> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
-    fcntl(fd, FcntlArg::F_SETFL(OFlag::O_ASYNC | OFlag::O_NONBLOCK)).map(drop).map_err(|e| e as i32)
+    let f = crate::fd::get(fd).map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
+    fcntl(&f, FcntlArg::F_SETFL(OFlag::O_ASYNC | OFlag::O_NONBLOCK)).map(drop).map_err(|e| e as i32)
 }
 
 /// poll() of the descriptors with a zero timeout: the number of those
@@ -361,7 +362,9 @@ fn inherit(log: &Log) -> Result<(), ()> {
     // the descriptor the old binary passed, taken into the table; not
     // close-on-exec, as it is passed on to a next binary
     let fd = crate::process::adopt_inherited(fd);
-    let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+    if let Ok(f) = crate::fd::get(fd) {
+        let _ = nix::fcntl::fcntl(&f, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()));
+    }
 
     if let Err(e) = crate::process::set_owner(fd, os::getpid()) {
         ngx_log_error!(NGX_LOG_ALERT, log, Some(e), "control: fcntl(F_SETOWN) failed");
