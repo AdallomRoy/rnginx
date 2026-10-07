@@ -461,7 +461,7 @@ dependencies = [
  "combine",
  "libc",
  "mach2",
- "nix",
+ "nix 0.30.1",
  "sysctl",
  "thiserror 2.0.21",
  "widestring",
@@ -478,7 +478,7 @@ dependencies = [
  "ngx-http",
  "ngx-mail",
  "ngx-stream",
- "nix",
+ "nix 0.31.3",
  "rustix",
  "tikv-jemallocator",
 ]
@@ -495,7 +495,7 @@ dependencies = [
  "memchr",
  "mmap-rs",
  "ngx-sys",
- "nix",
+ "nix 0.31.3",
  "openssl",
  "pcre2",
  "pwhash",
@@ -519,7 +519,7 @@ dependencies = [
  "memchr",
  "ngx-core",
  "ngx-sys",
- "nix",
+ "nix 0.31.3",
  "openssl",
  "rustix",
  "tokio",
@@ -562,6 +562,18 @@ name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags",
  "cfg-if",
