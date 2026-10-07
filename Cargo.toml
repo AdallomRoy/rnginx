@@ -39,7 +39,7 @@ mmap-rs = "0.7"
 zerocopy = { version = "0.8", features = ["derive"] }
 signal-hook = "0.3"
 pwhash = "1"
-blowfish = { version = "0.7", features = ["bcrypt"] }
+blowfish = { version = "0.10", features = ["bcrypt"] }
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 tikv-jemallocator = "0.7"
 mimalloc = "0.1"
