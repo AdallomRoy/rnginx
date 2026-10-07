@@ -14,3 +14,8 @@ updates:
       # implements: they must be openssl's version (0.3 for openssl 0.10)
       - dependency-name: "foreign-types"
         versions: [">= 0.4"]
+  # the actions of .github/workflows, pinned by commit
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
