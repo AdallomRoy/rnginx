@@ -16,7 +16,7 @@ license = "BSD-2-Clause"
 
 [workspace.dependencies]
 libc = "0.2"
-nix = { version = "0.29", features = ["fs", "process", "signal", "socket", "uio", "mman", "user", "sched", "resource", "poll", "net", "time", "term"] }
+nix = { version = "0.30", features = ["fs", "process", "signal", "socket", "uio", "mman", "user", "sched", "resource", "poll", "net", "time", "term"] }
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros", "signal"] }
 openssl = "0.10"
 openssl-sys = "0.9"
