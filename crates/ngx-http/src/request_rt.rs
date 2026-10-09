@@ -123,9 +123,15 @@ async fn connection_task(c: Rc<Connection>) {
     };
 
     // a plain HTTP connection reads and writes through the worker's ring
-    // where there is one (docs/IO_URING_PLAN.md)
+    // where there is one (docs/IO_URING_PLAN.md); one passed from a plain
+    // stream session (ngx_stream_pass_module) to a TLS listener leaves it,
+    // as OpenSSL reads the socket itself
     if !hc.addr_conf.ssl {
         c.use_uring();
+    } else if !c.try_leave_uring() {
+        ngx_log_error!(NGX_LOG_ALERT, c.log, None, "io_uring connection passed with data received");
+        c.close();
+        return;
     }
 
     if hc.addr_conf.ssl {

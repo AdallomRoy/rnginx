@@ -107,7 +107,7 @@ pub fn merge_sent(c: &Connection, chain: &mut Chain, res: io::Result<usize>, mut
 /// ngx_output_chain_to_iovec), sendfile() of the file ones, each tried
 /// only while the socket is write-ready.
 fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
-    if c.is_uring() {
+    if c.is_uring() && !ngx_core::uring::sync_writes() {
         return uring_send_chain_pass(c, chain, limit, total);
     }
 
@@ -272,7 +272,7 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
             continue;
         }
 
-        let (nbufs, gathered, file_next) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), |_| {});
+        let (nbufs, gathered, file_next) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), ngx_core::buf::URING_IOVS, |_| {});
 
         if nbufs == 0 {
             return Ok(Pass::Done);
@@ -286,6 +286,44 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
         if gathered == 0 {
             update_sent(chain, 0);
             continue;
+        }
+
+        if ngx_core::uring::hybrid_writes() {
+            // a writev() at once; the ring for what the socket does not
+            // take now (it waits for room in the kernel)
+            let mut iovs = [IoSlice::new(&[]); NGX_IOVS_PREALLOCATE];
+            let mut niovs = 0;
+            let (_, want, _) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), NGX_IOVS_PREALLOCATE, |s| {
+                iovs[niovs] = IoSlice::new(s);
+                niovs += 1;
+            });
+
+            match writev(c, &iovs[..niovs]) {
+                Ok(n) => {
+                    *total += n as i64;
+                    update_sent(chain, n as i64);
+                    if n == want {
+                        continue;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+
+            let budget = limit - *total;
+            let (_, rest, _) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), ngx_core::buf::URING_IOVS, |_| {});
+
+            if rest == 0 {
+                continue;
+            }
+
+            return match c.start_send(std::mem::take(chain), rest) {
+                Ok(()) => Ok(Pass::InFlight),
+                Err((e, back)) => {
+                    *chain = back;
+                    Err(e)
+                }
+            };
         }
 
         return match c.start_send(std::mem::take(chain), gathered) {

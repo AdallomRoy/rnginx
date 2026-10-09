@@ -185,6 +185,18 @@ impl PeerConn {
         let sc = c.ssl.borrow().clone();
         let dst = buf.initialize_unfilled();
 
+        if c.is_uring() {
+            // io_uring mode (a plain connection): the ring's receive
+            return match c.poll_recv(cx, dst) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(n)) => {
+                    buf.advance(n);
+                    Poll::Ready(Ok(()))
+                }
+            };
+        }
+
         let rc = match sc {
             // OpenSSL may hold records the socket no longer shows, unless its
             // last read found the socket drained (c->read->ready = 0)
@@ -210,6 +222,12 @@ impl PeerConn {
         }
 
         let c = &self.c;
+
+        if c.is_uring() {
+            // io_uring mode (a plain connection): a send by the ring
+            return c.poll_send(cx, data);
+        }
+
         let sc = c.ssl.borrow().clone();
 
         let rc = match sc {

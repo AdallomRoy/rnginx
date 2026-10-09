@@ -579,6 +579,12 @@ async fn connect_once(s: &S) -> Connected {
 
     *u.connection.borrow_mut() = Some(pc.clone());
 
+    // a plain upstream connection reads and writes through the worker's
+    // ring (docs/IO_URING_PLAN.md), in receives of a large provided buffer
+    if !*pscf.borrow().ssl_enable && pc.use_uring() {
+        pc.set_uring_recv_len(16384);
+    }
+
     if rc == NGX_AGAIN {
         // ngx_stream_proxy_connect_handler, on the write event or its
         // timer. A timer of 0 expires at the end of the event loop

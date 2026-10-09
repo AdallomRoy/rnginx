@@ -103,46 +103,46 @@ pub struct BufGroup(u16);
 
 /// What the kernel may touch while an operation is in flight, and the
 /// descriptor it names.
-struct InFlight {
+struct InFlight<K> {
     /// the caller's tag, handed back with the completion
     tag: u64,
     /// the owner of the descriptor
-    keeper: Box<dyn Any>,
+    keeper: K,
     /// Box::into_raw() of the send source or receive target
     payload: Option<*mut dyn Any>,
-    /// Box::into_raw() of the iovecs of the payload
-    iov: Option<*mut [libc::iovec]>,
-    /// Box::into_raw() of the msghdr pointing at the iovecs
-    msg: Option<*mut libc::msghdr>,
     /// the group of a buffer-select receive
     group: Option<u16>,
 }
 
-impl InFlight {
-    /// The payload back, the iovecs and the msghdr freed: once the kernel
-    /// is done with them (a final completion, or never submitted).
-    fn release(self) -> (Box<dyn Any>, Option<Box<dyn Any>>) {
-        // SAFETY: each pointer comes from Box::into_raw() of this
+impl<K> InFlight<K> {
+    /// The descriptor's owner and the payload back: once the kernel is
+    /// done with them (a final completion, or never submitted).
+    fn release(self) -> (K, Option<Box<dyn Any>>) {
+        // SAFETY: the payload comes from Box::into_raw() of this
         // operation's own allocation, and the kernel is done with it.
-        unsafe {
-            if let Some(msg) = self.msg {
-                drop(Box::from_raw(msg));
-            }
-            if let Some(iov) = self.iov {
-                drop(Box::from_raw(iov));
-            }
-            (self.keeper, self.payload.map(|p| Box::from_raw(p)))
-        }
+        (self.keeper, self.payload.map(|p| unsafe { Box::from_raw(p) }))
     }
 }
 
-struct Slot {
+/// The msghdr and iovecs of a slot's sends and receives, which the kernel
+/// reads (and a receive's msghdr writes) while the operation is in
+/// flight: made once per slot, filled again by each operation of the slot.
+struct SlotMem {
+    msg: libc::msghdr,
+    iov: Vec<libc::iovec>,
+}
+
+struct Slot<K> {
     gen: u32,
-    op: Option<InFlight>,
+    op: Option<InFlight<K>>,
+    /// Box::into_raw() of the slot's SlotMem, made by its first send or
+    /// vectored receive (null before), freed with the ring (leaked if the
+    /// kernel might still read it)
+    mem: *mut SlotMem,
 }
 
 /// The completion of an operation.
-pub struct Completion {
+pub struct Completion<K> {
     /// the tag the operation was pushed with
     pub tag: u64,
     /// the operation
@@ -151,12 +151,12 @@ pub struct Completion {
     pub result: i32,
     /// the completion's flags (IORING_CQE_F_*)
     pub flags: u32,
-    keeper: Option<Box<dyn Any>>,
+    keeper: Option<K>,
     payload: Option<Box<dyn Any>>,
     buffer: Option<BufToken>,
 }
 
-impl Completion {
+impl<K> Completion<K> {
     /// The result as io::Result.
     pub fn res(&self) -> io::Result<usize> {
         if self.result < 0 {
@@ -177,7 +177,7 @@ impl Completion {
     }
 
     /// The descriptor owner the operation was pushed with.
-    pub fn take_keeper(&mut self) -> Option<Box<dyn Any>> {
+    pub fn take_keeper(&mut self) -> Option<K> {
         self.keeper.take()
     }
 
@@ -270,25 +270,29 @@ impl Group {
 
 static RING_IDS: AtomicU64 = AtomicU64::new(1);
 
-/// An io_uring instance of the calling thread.
-pub struct Ring {
+/// An io_uring instance of the calling thread, its operations naming
+/// their descriptors by owners of type K.
+pub struct Ring<K: AsFd + 'static = std::os::fd::OwnedFd> {
     ring: IoUring,
     id: u64,
-    slots: Vec<Slot>,
+    slots: Vec<Slot<K>>,
     free: Vec<u32>,
     in_flight: usize,
     groups: Vec<Group>,
     /// the provided buffers given back (group index, bid), not yet the
     /// kernel's again
     returned: Rc<RefCell<Vec<(u16, u16)>>>,
+    /// the capacity of the vectors lending a payload's slices (empty)
+    lend: Vec<IoSlice<'static>>,
+    lend_mut: Vec<IoSliceMut<'static>>,
 }
 
-impl Ring {
+impl<K: AsFd + 'static> Ring<K> {
     /// A ring of `entries` submission entries (completion queue twice
     /// that), set up for one thread (SINGLE_ISSUER, COOP_TASKRUN with the
     /// TASKRUN flag, SUBMIT_ALL). Fails unless the kernel has everything
     /// the plan uses: RECV, SENDMSG, RECVMSG, POLL_ADD and ASYNC_CANCEL.
-    pub fn new(entries: u32) -> io::Result<Ring> {
+    pub fn new(entries: u32) -> io::Result<Ring<K>> {
         let ring: IoUring = IoUring::builder()
             .setup_single_issuer()
             .setup_coop_taskrun()
@@ -313,6 +317,8 @@ impl Ring {
             in_flight: 0,
             groups: Vec::new(),
             returned: Rc::new(RefCell::new(Vec::new())),
+            lend: Vec::new(),
+            lend_mut: Vec::new(),
         })
     }
 
@@ -401,7 +407,7 @@ impl Ring {
         let index = match self.free.pop() {
             Some(i) => i,
             None => {
-                self.slots.push(Slot { gen: 0, op: None });
+                self.slots.push(Slot { gen: 0, op: None, mem: ptr::null_mut() });
                 (self.slots.len() - 1) as u32
             }
         };
@@ -418,10 +424,34 @@ impl Ring {
         OpId::new(index, slot.gen)
     }
 
+    /// The msghdr of a free slot, its iovecs those of `slices`.
+    fn fill_msghdr(&mut self, op: OpId, slices: impl Iterator<Item = (*mut libc::c_void, usize)>) -> *mut libc::msghdr {
+        if self.slots[op.index()].mem.is_null() {
+            // SAFETY: msghdr is plain data, all zeros valid
+            let msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            self.slots[op.index()].mem = Box::into_raw(Box::new(SlotMem { msg, iov: Vec::new() }));
+        }
+
+        let mem = self.slots[op.index()].mem;
+
+        // SAFETY: the slot is free (just allocated): no operation of it is
+        // in flight, so the kernel reads nothing of its memory, which only
+        // the ring reaches (through this pointer, from Box::into_raw()).
+        unsafe {
+            let m = &mut *mem;
+            m.iov.clear();
+            m.iov.extend(slices.take(MAX_IOVECS).map(|(base, len)| libc::iovec { iov_base: base, iov_len: len }));
+            m.msg = std::mem::zeroed();
+            m.msg.msg_iov = m.iov.as_mut_ptr();
+            m.msg.msg_iovlen = m.iov.len() as _;
+            ptr::addr_of_mut!((*mem).msg)
+        }
+    }
+
     /// Queues the entry of an operation whose slot holds what it
     /// references; on failure the slot is emptied and what it held handed
     /// back.
-    fn push_op(&mut self, op: OpId, sqe: squeue::Entry, inflight: InFlight) -> Result<OpId, InFlight> {
+    fn push_op(&mut self, op: OpId, sqe: squeue::Entry, inflight: InFlight<K>) -> Result<OpId, InFlight<K>> {
         self.slots[op.index()].op = Some(inflight);
 
         if self.push_entry(&sqe.user_data(op.0)).is_err() {
@@ -437,7 +467,7 @@ impl Ring {
     /// Queues an entry, submitting the queued ones if the queue is full.
     fn push_entry(&mut self, sqe: &squeue::Entry) -> io::Result<()> {
         for _ in 0..2 {
-            // SAFETY: the memory an entry references (iovecs, msghdr,
+            // SAFETY: the memory an entry references (msghdr and iovecs,
             // payload, provided buffers) is held by its slot, or the ring,
             // until its final completion is reaped, and drop() waits for
             // every operation (or leaks what is left); its descriptor is
@@ -452,9 +482,13 @@ impl Ring {
         Err(io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full"))
     }
 
+    fn queue_full() -> io::Error {
+        io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full")
+    }
+
     /// recv(2) of at most `len` bytes (at most the group's buffer size)
     /// into a provided buffer of `group`, lent by the completion.
-    pub fn push_recv<K: AsFd + 'static>(&mut self, fd: K, len: usize, group: BufGroup, tag: u64) -> io::Result<OpId> {
+    pub fn push_recv(&mut self, fd: K, len: usize, group: BufGroup, tag: u64) -> io::Result<OpId> {
         let g = &self.groups[group.0 as usize];
         let len = len.min(g.size) as u32;
         let bgid = g.bgid;
@@ -463,116 +497,102 @@ impl Ring {
 
         let sqe = opcode::Recv::new(types::Fd(raw), ptr::null_mut(), len).buf_group(bgid).build().flags(squeue::Flags::BUFFER_SELECT);
 
-        let inflight = InFlight { tag, keeper: Box::new(fd), payload: None, iov: None, msg: None, group: Some(group.0) };
+        let inflight = InFlight { tag, keeper: fd, payload: None, group: Some(group.0) };
 
         self.push_op(op, sqe, inflight).map_err(|f| {
             drop(f.release());
-            io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full")
+            Self::queue_full()
         })
-    }
-
-    /// The iovecs and msghdr of a payload's slices.
-    fn msghdr(slices: &[(*mut libc::c_void, usize)]) -> (*mut [libc::iovec], *mut libc::msghdr) {
-        let iov: Box<[libc::iovec]> = slices.iter().take(MAX_IOVECS).map(|&(base, len)| libc::iovec { iov_base: base, iov_len: len }).collect();
-        let n = iov.len();
-        let iov = Box::into_raw(iov);
-
-        // SAFETY: msghdr is plain data, all zeros valid (no name, no
-        // control); the iovecs pointer is that of the allocation just made.
-        let msg = unsafe {
-            let mut m: libc::msghdr = std::mem::zeroed();
-            m.msg_iov = iov as *mut libc::iovec;
-            m.msg_iovlen = n as _;
-            m
-        };
-
-        (iov, Box::into_raw(Box::new(msg)))
     }
 
     /// sendmsg(2) of what `src` lends, with `flags` (MSG_NOSIGNAL, ...);
     /// the completion hands `src` back. On failure to queue, `src` comes
     /// back with the error.
-    pub fn push_send<K: AsFd + 'static, S: SendSource>(&mut self, fd: K, src: S, flags: i32, tag: u64) -> Result<OpId, (io::Error, S)> {
+    pub fn push_send<S: SendSource>(&mut self, fd: K, src: S, flags: i32, tag: u64) -> Result<OpId, (io::Error, S)> {
         let raw = fd.as_fd().as_raw_fd();
         let p: *mut S = Box::into_raw(Box::new(src));
+        let op = self.alloc();
 
-        let mut slices: Vec<(*mut libc::c_void, usize)> = Vec::new();
+        // an empty vector of the lifetime of the borrow below, with the
+        // capacity kept (an in-place collect of an empty vector)
+        let mut lend: Vec<IoSlice<'_>> = std::mem::take(&mut self.lend).into_iter().map(|_| unreachable!()).collect();
 
-        {
+        let msg = {
             // SAFETY: p comes from Box::into_raw() and nothing else refers
             // to it; this borrow ends with the block.
             let s: &S = unsafe { &*p };
-            let mut v: Vec<IoSlice<'_>> = Vec::new();
-            s.slices(&mut v);
-            slices.extend(v.iter().map(|sl| (sl.as_ptr() as *mut libc::c_void, sl.len())));
-        }
+            s.slices(&mut lend);
+            // The slices lent are memory the boxed object owns (or
+            // 'static): safe code can lend nothing else for as long as the
+            // borrow of the object, and the object is not touched until
+            // the completion, so the memory stays valid and unwritten while
+            // the kernel reads it.
+            let it = lend.drain(..).map(|sl| (sl.as_ptr() as *mut libc::c_void, sl.len()));
+            self.fill_msghdr(op, it)
+        };
 
-        // The slices lent are memory the boxed object owns (or 'static):
-        // safe code can lend nothing else for as long as the borrow of the
-        // object, and the object is not touched until the completion, so
-        // the memory stays valid and unwritten while the kernel reads it.
-        let (iov, msg) = Self::msghdr(&slices);
-        let op = self.alloc();
+        self.lend = lend.into_iter().map(|_| unreachable!()).collect();
 
         let sqe = opcode::SendMsg::new(types::Fd(raw), msg).flags(flags as u32).build();
 
-        let inflight = InFlight { tag, keeper: Box::new(fd), payload: Some(p as *mut dyn Any), iov: Some(iov), msg: Some(msg), group: None };
+        let inflight = InFlight { tag, keeper: fd, payload: Some(p as *mut dyn Any), group: None };
 
         self.push_op(op, sqe, inflight).map_err(|f| {
             let (_, payload) = f.release();
             let src = *payload.expect("the payload of a send").downcast::<S>().expect("the payload's type");
-            (io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full"), src)
+            (Self::queue_full(), src)
         })
     }
 
     /// recvmsg(2) into what `dst` lends, with `flags`; the completion hands
     /// `dst` back. On failure to queue, `dst` comes back with the error.
-    pub fn push_recv_into<K: AsFd + 'static, T: RecvTarget>(&mut self, fd: K, dst: T, flags: i32, tag: u64) -> Result<OpId, (io::Error, T)> {
+    pub fn push_recv_into<T: RecvTarget>(&mut self, fd: K, dst: T, flags: i32, tag: u64) -> Result<OpId, (io::Error, T)> {
         let raw = fd.as_fd().as_raw_fd();
         let p: *mut T = Box::into_raw(Box::new(dst));
+        let op = self.alloc();
 
-        let mut slices: Vec<(*mut libc::c_void, usize)> = Vec::new();
+        let mut lend: Vec<IoSliceMut<'_>> = std::mem::take(&mut self.lend_mut).into_iter().map(|_| unreachable!()).collect();
 
-        {
+        let msg = {
             // SAFETY: p comes from Box::into_raw() and nothing else refers
             // to it; this borrow ends with the block.
             let t: &mut T = unsafe { &mut *p };
-            let mut v: Vec<IoSliceMut<'_>> = Vec::new();
-            t.slices_mut(&mut v);
-            slices.extend(v.iter_mut().map(|sl| (sl.as_mut_ptr() as *mut libc::c_void, sl.len())));
-        }
+            t.slices_mut(&mut lend);
+            // The slices lent are memory only the boxed object reaches
+            // (safe code can lend nothing else mutably for as long as the
+            // borrow of the object), and the object is not touched until
+            // the completion, so only the kernel writes the memory
+            // meanwhile.
+            let it = lend.drain(..).map(|mut sl| (sl.as_mut_ptr() as *mut libc::c_void, sl.len()));
+            self.fill_msghdr(op, it)
+        };
 
-        // The slices lent are memory only the boxed object reaches (safe
-        // code can lend nothing else mutably for as long as the borrow of
-        // the object), and the object is not touched until the completion,
-        // so only the kernel writes the memory meanwhile.
-        let (iov, msg) = Self::msghdr(&slices);
-        let op = self.alloc();
+        self.lend_mut = lend.into_iter().map(|_| unreachable!()).collect();
 
         let sqe = opcode::RecvMsg::new(types::Fd(raw), msg).flags(flags as u32).build();
 
-        let inflight = InFlight { tag, keeper: Box::new(fd), payload: Some(p as *mut dyn Any), iov: Some(iov), msg: Some(msg), group: None };
+        let inflight = InFlight { tag, keeper: fd, payload: Some(p as *mut dyn Any), group: None };
 
         self.push_op(op, sqe, inflight).map_err(|f| {
             let (_, payload) = f.release();
             let dst = *payload.expect("the payload of a receive").downcast::<T>().expect("the payload's type");
-            (io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full"), dst)
+            (Self::queue_full(), dst)
         })
     }
 
     /// poll(2) of the descriptor for `events` (POLLIN, POLLOUT, POLLRDHUP,
     /// ...), once: the completion's result is the events that came.
-    pub fn push_poll<K: AsFd + 'static>(&mut self, fd: K, events: u32, tag: u64) -> io::Result<OpId> {
+    pub fn push_poll(&mut self, fd: K, events: u32, tag: u64) -> io::Result<OpId> {
         let raw = fd.as_fd().as_raw_fd();
         let op = self.alloc();
 
         let sqe = opcode::PollAdd::new(types::Fd(raw), events).build();
 
-        let inflight = InFlight { tag, keeper: Box::new(fd), payload: None, iov: None, msg: None, group: None };
+        let inflight = InFlight { tag, keeper: fd, payload: None, group: None };
 
         self.push_op(op, sqe, inflight).map_err(|f| {
             drop(f.release());
-            io::Error::new(io::ErrorKind::WouldBlock, "io_uring submission queue full")
+            Self::queue_full()
         })
     }
 
@@ -642,7 +662,7 @@ impl Ring {
     }
 
     /// Reaps the completions waiting, giving each to `f`; returns how many.
-    pub fn reap(&mut self, mut f: impl FnMut(Completion)) -> usize {
+    pub fn reap(&mut self, mut f: impl FnMut(Completion<K>)) -> usize {
         let mut n = 0;
 
         let id = self.id;
@@ -701,7 +721,7 @@ impl Ring {
     }
 }
 
-impl Drop for Ring {
+impl<K: AsFd + 'static> Drop for Ring<K> {
     fn drop(&mut self) {
         if self.in_flight > 0 {
             let cancel = opcode::AsyncCancel2::new(types::CancelBuilder::any()).build().user_data(NO_SLOT);
@@ -716,8 +736,8 @@ impl Drop for Ring {
             }
 
             if self.in_flight > 0 {
-                // the kernel may still touch the payloads and the buffers:
-                // leaked, never freed
+                // the kernel may still touch the payloads, the slots'
+                // memory and the buffers: leaked, never freed
                 for slot in self.slots.drain(..) {
                     std::mem::forget(slot);
                 }
@@ -725,6 +745,14 @@ impl Drop for Ring {
                     std::mem::forget(g);
                 }
                 return;
+            }
+        }
+
+        for slot in self.slots.drain(..) {
+            if !slot.mem.is_null() {
+                // SAFETY: no operation is in flight: the kernel no longer
+                // reads the slot's memory, from Box::into_raw()
+                drop(unsafe { Box::from_raw(slot.mem) });
             }
         }
 
@@ -751,7 +779,7 @@ mod tests {
     /// A ring, or None (the test is skipped) where io_uring is not
     /// available (seccomp, sysctl, old kernel).
     fn ring() -> Option<Ring> {
-        match Ring::new(64) {
+        match Ring::<OwnedFd>::new(64) {
             Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("io_uring not available, test skipped: {e}");
@@ -772,7 +800,7 @@ mod tests {
     }
 
     /// Submits and reaps until `n` completions came.
-    fn wait(r: &mut Ring, n: usize) -> Vec<Completion> {
+    fn wait(r: &mut Ring, n: usize) -> Vec<Completion<OwnedFd>> {
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while out.len() < n {

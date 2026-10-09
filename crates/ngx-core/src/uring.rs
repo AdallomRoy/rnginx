@@ -25,9 +25,14 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-use ngx_sys::uring::{BufGroup, BufToken, Completion, OpId, RecvTarget, Ring, SendSource};
+use ngx_sys::uring::{BufGroup, BufToken, OpId, RecvTarget, SendSource};
 
 use crate::fd::{self, Fd};
+
+/// The ring of a worker: its operations name sockets by handles of the
+/// descriptor table.
+type Ring = ngx_sys::uring::Ring<Fd>;
+type Completion = ngx_sys::uring::Completion<Fd>;
 
 /// The submission queue's entries (the completion queue has twice as many).
 const RING_ENTRIES: u32 = 4096;
@@ -271,6 +276,36 @@ impl Driver {
 /// Whether this process runs its sockets' I/O through io_uring.
 pub fn enabled() -> bool {
     DRIVER.try_with(|d| d.borrow().is_some()).unwrap_or(false)
+}
+
+/// How the output chains of connections in io_uring mode are written
+/// (RNGINX_URING_WRITES, an experiment, read by the master with the
+/// configuration, as the workers' environment is cleared): 0 sent by the
+/// ring (ring), 1 by writev() at once (sync), 2 by writev() at once and the
+/// ring for what the socket does not take (hybrid)
+static WRITES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Reads RNGINX_URING_WRITES (the master, with the configuration).
+pub fn read_env() {
+    let mode = match std::env::var_os("RNGINX_URING_WRITES") {
+        Some(v) if v == "sync" => 1,
+        Some(v) if v == "hybrid" => 2,
+        _ => 0,
+    };
+
+    WRITES.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The output of connections in io_uring mode is written by system calls
+/// (RNGINX_URING_WRITES=sync), not sent by the ring.
+pub fn sync_writes() -> bool {
+    WRITES.load(std::sync::atomic::Ordering::Relaxed) == 1
+}
+
+/// A writev() at once first, the ring for what the socket does not take
+/// (RNGINX_URING_WRITES=hybrid).
+pub fn hybrid_writes() -> bool {
+    WRITES.load(std::sync::atomic::Ordering::Relaxed) == 2
 }
 
 /// What the driver did so far.

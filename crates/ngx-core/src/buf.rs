@@ -155,10 +155,11 @@ pub const NGX_IOVS_PREALLOCATE: usize = 64;
 /// What one writev() of ngx_linux_sendfile_chain sends from the front of
 /// `chain`, as ngx_output_chain_to_iovec gathers it: the memory buffers,
 /// special ones skipped, up to a buffer in a file, `budget` bytes and
-/// NGX_IOVS_PREALLOCATE buffers. `slice` gets each non-empty slice; returns
-/// the buffers gathered (empty ones included), the bytes, and whether a
-/// buffer in a file came next (TCP_CORK before a header).
-pub fn chain_gather<'a>(chain: &'a Chain, budget: usize, mut slice: impl FnMut(&'a [u8])) -> (usize, usize, bool) {
+/// `max_bufs` buffers (NGX_IOVS_PREALLOCATE for a writev()). `slice` gets
+/// each non-empty slice; returns the buffers gathered (empty ones
+/// included), the bytes, and whether a buffer in a file came next (TCP_CORK
+/// before a header).
+pub fn chain_gather<'a>(chain: &'a Chain, budget: usize, max_bufs: usize, mut slice: impl FnMut(&'a [u8])) -> (usize, usize, bool) {
     let mut nbufs = 0;
     let mut gathered = 0;
     let mut file_next = false;
@@ -184,13 +185,17 @@ pub fn chain_gather<'a>(chain: &'a Chain, budget: usize, mut slice: impl FnMut(&
         }
         nbufs += 1;
         gathered += take;
-        if nbufs >= NGX_IOVS_PREALLOCATE {
+        if nbufs >= max_bufs {
             break;
         }
     }
 
     (nbufs, gathered, file_next)
 }
+
+/// The buffers of one send by the ring: as many as a sendmsg() takes
+/// (IOV_MAX), as a send waits for its completion before the next one.
+pub const URING_IOVS: usize = 1024;
 
 /// An output chain sent by an io_uring operation (docs/IO_URING_PLAN.md),
 /// which owns it until the completion: it lends what chain_gather() gathers
@@ -202,7 +207,7 @@ pub struct ChainSource {
 
 impl ngx_sys::uring::SendSource for ChainSource {
     fn slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
-        chain_gather(&self.chain, self.budget, |s| out.push(std::io::IoSlice::new(s)));
+        chain_gather(&self.chain, self.budget, URING_IOVS, |s| out.push(std::io::IoSlice::new(s)));
     }
 }
 

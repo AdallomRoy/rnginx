@@ -388,10 +388,18 @@ struct UringIo {
     error: Option<i32>,
     /// the receive in flight (one at a time)
     rx: Option<crate::uring::Recv>,
-    /// the tasks waiting for it besides the one polling it
+    /// the task the receive wakes (the one that polled it last)
+    rx_owner: Option<std::task::Waker>,
+    /// the other tasks waiting for it (rarely any)
     rx_waiters: Vec<std::task::Waker>,
     /// the send in flight (one at a time)
     tx: Option<crate::uring::Send<crate::buf::ChainSource>>,
+    /// the send of poll_send() in flight (a copy of its bytes)
+    txb: Option<crate::uring::Send<Vec<u8>>>,
+    /// the poll of poll_peek_close() (an idle connection's close handler)
+    watch: Option<crate::uring::PollFd>,
+    /// the size of a receive
+    recv_len: usize,
 }
 
 /// Bytes received and not read yet.
@@ -446,15 +454,36 @@ impl UringIo {
         self.stash.is_some() || self.eof || self.error.is_some() || self.more
     }
 
-    /// The receive's outcome, kept for the reads.
+    /// The receive's outcome, kept for the reads: after what is stashed
+    /// already, if anything (peek_more() asks for more before reading).
     fn received(&mut self, res: io::Result<crate::uring::Received>) {
         match res {
             Ok(r) if r.is_empty() => self.eof = true,
             Ok(r) => {
-                self.more = r.len() >= URING_RECV;
-                self.stash = Some(Stash::Ring(r, 0));
+                self.more = r.len() >= self.recv_len;
+                self.stash = Some(match self.stash.take() {
+                    None => Stash::Ring(r, 0),
+                    Some(Stash::Ring(old, pos)) => {
+                        let mut v = old.with(|b| b[pos..].to_vec());
+                        r.with(|b| v.extend_from_slice(b));
+                        Stash::Heap(v, 0)
+                    }
+                    Some(Stash::Heap(mut v, pos)) => {
+                        r.with(|b| v.extend_from_slice(b));
+                        Stash::Heap(v, pos)
+                    }
+                });
             }
             Err(e) => self.error = Some(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    /// The bytes stashed.
+    fn stashed(&self) -> usize {
+        match &self.stash {
+            Some(Stash::Ring(r, pos)) => r.len() - pos,
+            Some(Stash::Heap(v, pos)) => v.len() - pos,
+            None => 0,
         }
     }
 }
@@ -1054,16 +1083,45 @@ impl Connection {
             eof: false,
             error: None,
             rx: None,
+            rx_owner: None,
             rx_waiters: Vec::new(),
             tx: None,
+            txb: None,
+            watch: None,
+            recv_len: URING_RECV,
         }));
 
         true
     }
 
+    /// The size of the receives of a connection in io_uring mode: larger
+    /// than a request head's for an upstream's responses (at most the
+    /// large provided buffers' 16 KB).
+    pub fn set_uring_recv_len(&self, len: usize) {
+        if let Some(u) = self.uring.borrow_mut().as_mut() {
+            u.recv_len = len;
+        }
+    }
+
     /// Whether the socket's I/O goes through the worker's ring.
     pub fn is_uring(&self) -> bool {
         self.uring.borrow().is_some()
+    }
+
+    /// Leaves io_uring mode if nothing is in flight and nothing received
+    /// is left unread: the socket's next reader gets all its data (a peek,
+    /// OpenSSL reading the socket itself). False if the mode is kept.
+    pub fn try_leave_uring(&self) -> bool {
+        let mut g = self.uring.borrow_mut();
+
+        match g.as_ref() {
+            None => true,
+            Some(u) if u.rx.is_none() && u.tx.is_none() && u.txb.is_none() && u.stash.is_none() && !u.eof && u.error.is_none() => {
+                *g = None;
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// Leaves io_uring mode: the connection goes on with the reactor (as
@@ -1136,6 +1194,190 @@ impl Connection {
         })
     }
 
+    /// A receive into several buffers in io_uring mode (readv()): what is
+    /// stashed first, a readv() at once while more may wait, else
+    /// WouldBlock.
+    fn uring_try_recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        let mut g = self.uring.borrow_mut();
+        let u = g.as_mut().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+
+        if u.stash.is_some() {
+            let mut n = 0;
+            for b in bufs.iter_mut() {
+                if b.is_empty() {
+                    continue;
+                }
+                match u.read_stash(b) {
+                    Some(k) => {
+                        n += k;
+                        if k < b.len() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            return Ok(n);
+        }
+
+        if let Some(e) = u.error.take() {
+            u.eof = true;
+            return Err(io::Error::from_raw_os_error(e));
+        }
+
+        if u.eof {
+            self.read_eof.set(true);
+            return Ok(0);
+        }
+
+        if u.rx.is_some() || !u.more {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+
+        let size: usize = bufs.iter().map(|b| b.len()).sum();
+
+        match nix::sys::uio::readv(&u.fd, bufs) {
+            Ok(0) => {
+                u.more = false;
+                u.eof = true;
+                self.read_eof.set(true);
+                Ok(0)
+            }
+            Ok(n) => {
+                if n < size {
+                    u.more = false;
+                }
+                Ok(n)
+            }
+            Err(Errno::EAGAIN) => {
+                u.more = false;
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// c->recv() for a poll-based reader (an upstream connection's
+    /// AsyncRead): in io_uring mode, the stash or the connection's receive;
+    /// Ok(0) is the end of the stream.
+    pub fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+
+        loop {
+            match self.uring_try_recv(buf, false) {
+                Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Some(r) => return Poll::Ready(r),
+                None => return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EINVAL))),
+            }
+
+            let mut waiting = false;
+
+            match self.poll_uring_readable(cx, &mut waiting) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+    }
+
+    /// c->recv_chain (ngx_readv_chain) for a poll-based reader in io_uring
+    /// mode: into several buffers, the stash first.
+    pub fn poll_recv_vectored(&self, cx: &mut std::task::Context<'_>, bufs: &mut [io::IoSliceMut<'_>]) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+
+        loop {
+            match self.uring_try_recv_vectored(bufs) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => return Poll::Ready(r),
+            }
+
+            let mut waiting = false;
+
+            match self.poll_uring_readable(cx, &mut waiting) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+    }
+
+    /// c->send() for a poll-based writer (an upstream connection's
+    /// AsyncWrite) in io_uring mode: a copy of `data` is sent by the ring;
+    /// the caller polls again with the same bytes until the result.
+    pub fn poll_send(&self, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else {
+            return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EINVAL)));
+        };
+
+        if u.txb.is_none() {
+            if u.tx.is_some() {
+                return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
+            }
+            u.watch = None;
+            match crate::uring::send(&u.fd, data.to_vec()) {
+                Ok(tx) => u.txb = Some(tx),
+                Err((e, _)) => return Poll::Ready(Err(e)),
+            }
+        }
+
+        match std::future::Future::poll(std::pin::Pin::new(u.txb.as_mut().expect("a send")), cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((res, _)) => {
+                u.txb = None;
+                drop(g);
+                if let Ok(n) = res {
+                    self.sent.set(self.sent.get() + n as u64);
+                }
+                Poll::Ready(res)
+            }
+        }
+    }
+
+    /// The close handler of an idle connection in io_uring mode: Ready
+    /// when a peek finds data, the end of the stream or an error; the poll
+    /// is the connection's, so a wait given up keeps it.
+    fn poll_uring_peek_close(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+
+        loop {
+            let mut g = self.uring.borrow_mut();
+
+            let Some(u) = g.as_mut() else { return Poll::Ready(()) };
+
+            if u.stash.is_some() || u.eof || u.error.is_some() {
+                return Poll::Ready(());
+            }
+
+            if u.watch.is_none() {
+                match crate::uring::poll_fd(&u.fd, (libc::POLLIN | libc::POLLRDHUP) as u32) {
+                    Ok(p) => u.watch = Some(p),
+                    Err(_) => return Poll::Ready(()),
+                }
+            }
+
+            match std::future::Future::poll(std::pin::Pin::new(u.watch.as_mut().expect("a poll")), cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => {
+                    u.watch = None;
+                    return Poll::Ready(());
+                }
+                Poll::Ready(Ok(_)) => u.watch = None,
+            }
+
+            drop(g);
+
+            // a stale event leaves the connection idle (ev->ready = 0)
+            match self.peek_byte() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                _ => return Poll::Ready(()),
+            }
+        }
+    }
+
     /// readable() in io_uring mode: Ready once a read would not wait; the
     /// connection's receive is started if none is in flight.
     fn poll_uring_readable(&self, cx: &mut std::task::Context<'_>, waiting: &mut bool) -> std::task::Poll<io::Result<()>> {
@@ -1155,7 +1397,9 @@ impl Connection {
         }
 
         if u.rx.is_none() {
-            match crate::uring::recv(&u.fd, URING_RECV) {
+            // an idle connection's close handler is done: it is read again
+            u.watch = None;
+            match crate::uring::recv(&u.fd, u.recv_len) {
                 Ok(r) => u.rx = Some(r),
                 Err(e) => {
                     *waiting = false;
@@ -1167,23 +1411,34 @@ impl Connection {
         match std::future::Future::poll(std::pin::Pin::new(u.rx.as_mut().expect("a receive")), cx) {
             Poll::Ready(res) => {
                 u.rx = None;
+                u.rx_owner = None;
                 u.received(res);
                 *waiting = false;
 
                 // the other tasks waiting
-                let others: Vec<_> = u.rx_waiters.drain(..).filter(|w| !w.will_wake(cx.waker())).collect();
+                let others = std::mem::take(&mut u.rx_waiters);
                 drop(g);
                 for w in others {
-                    w.wake();
+                    if !w.will_wake(cx.waker()) {
+                        w.wake();
+                    }
                 }
 
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                // the receive wakes the task that polled it last
+                // the receive wakes the task that polled it last: another
+                // task that polled it before waits in the list
                 *waiting = true;
-                if !u.rx_waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                    u.rx_waiters.push(cx.waker().clone());
+                match &u.rx_owner {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => {
+                        if let Some(prev) = u.rx_owner.replace(cx.waker().clone()) {
+                            if !u.rx_waiters.iter().any(|w| w.will_wake(&prev)) {
+                                u.rx_waiters.push(prev);
+                            }
+                        }
+                    }
                 }
                 Poll::Pending
             }
@@ -1203,9 +1458,16 @@ impl Connection {
                 }
 
                 // given up while the receive is in flight: the other tasks
-                // waiting, if any, poll it from now on
+                // waiting, if any, poll it from now on (one of them takes
+                // over the receive's wakeup)
                 let others = match self.c.uring.try_borrow_mut() {
-                    Ok(mut g) => g.as_mut().map(|u| std::mem::take(&mut u.rx_waiters)).unwrap_or_default(),
+                    Ok(mut g) => g
+                        .as_mut()
+                        .map(|u| {
+                            u.rx_owner = None;
+                            std::mem::take(&mut u.rx_waiters)
+                        })
+                        .unwrap_or_default(),
                     Err(_) => Vec::new(),
                 };
 
@@ -1339,9 +1601,11 @@ impl Connection {
             return Err((io::Error::from_raw_os_error(libc::EINVAL), chain));
         };
 
-        if u.tx.is_some() {
+        if u.tx.is_some() || u.txb.is_some() {
             return Err((io::Error::from_raw_os_error(libc::EBUSY), chain));
         }
+
+        u.watch = None;
 
         match crate::uring::send(&u.fd, crate::buf::ChainSource { chain, budget }) {
             Ok(tx) => {
@@ -1550,6 +1814,22 @@ impl Connection {
     /// event, as epoll ET re-arming does after NGX_AGAIN in C. Waiting with
     /// readable() / writable() alone keeps the stale readiness and spins.
     pub async fn drive_io<T>(&self, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+        if self.is_uring() {
+            let mut step = op();
+            loop {
+                match step {
+                    IoStep::Done(v) => return Ok(v),
+                    IoStep::WantRead => {
+                        self.read_drained();
+                        self.uring_poll(libc::POLLIN | libc::POLLRDHUP).await?;
+                    }
+                    IoStep::WantWrite => {
+                        self.uring_poll(libc::POLLOUT).await?;
+                    }
+                }
+                step = op();
+            }
+        }
         let mut step = op();
         loop {
             match step {
@@ -1832,6 +2112,10 @@ impl Connection {
     pub fn poll_peek_close(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         use std::task::Poll;
 
+        if self.is_uring() {
+            return self.poll_uring_peek_close(cx);
+        }
+
         let afd = match self.afd() {
             Ok(a) => a,
             Err(_) => return Poll::Ready(()),
@@ -1860,7 +2144,10 @@ impl Connection {
     /// Peek without consuming.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
-        if self.is_uring() {
+        // a peek leaves the data in the socket (MSG_PEEK) for whoever reads
+        // next, OpenSSL included: on the reactor, unless something received
+        // is stashed already
+        if self.is_uring() && !self.try_leave_uring() {
             loop {
                 {
                     let mut g = self.uring.borrow_mut();
@@ -1901,6 +2188,51 @@ impl Connection {
     /// blocks for a new event, as the edge-triggered epoll does in C.
     pub async fn peek_more(&self, buf: &mut [u8], have: usize) -> io::Result<(usize, bool)> {
         self.fake_io_error()?;
+        // a peek leaves the data in the socket (MSG_PEEK) for whoever reads
+        // next, OpenSSL included: on the reactor, unless something received
+        // is stashed already
+        if self.is_uring() && !self.try_leave_uring() {
+            loop {
+                let wait = {
+                    let mut g = self.uring.borrow_mut();
+                    let u = g.as_mut().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+                    if let Some(e) = u.error {
+                        return Err(io::Error::from_raw_os_error(e));
+                    }
+                    let n = u.peek_stash(buf).unwrap_or(0);
+                    if n == 0 && u.eof || n > have || u.eof {
+                        return Ok((n, u.eof || n == 0));
+                    }
+                    if n >= buf.len() {
+                        return Ok((n, false));
+                    }
+                    // more than what is stashed: a receive appends to it
+                    u.more = false;
+                    if u.rx.is_none() {
+                        u.watch = None;
+                        let len = u.recv_len.min(buf.len() - u.stashed().min(buf.len())).max(1);
+                        u.rx = Some(crate::uring::recv(&u.fd, len)?);
+                    }
+                    true
+                };
+                if wait {
+                    std::future::poll_fn(|cx| {
+                        let mut g = self.uring.borrow_mut();
+                        let Some(u) = g.as_mut() else { return std::task::Poll::Ready(()) };
+                        let Some(rx) = u.rx.as_mut() else { return std::task::Poll::Ready(()) };
+                        match std::future::Future::poll(std::pin::Pin::new(rx), cx) {
+                            std::task::Poll::Ready(res) => {
+                                u.rx = None;
+                                u.received(res);
+                                std::task::Poll::Ready(())
+                            }
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
         if let Some(udp) = self.udp_conn() {
             return udp.peek_more(self, buf, have).await;
         }

@@ -1234,6 +1234,11 @@ async fn connect_peer(r: &R, u: &mut Upstream, sockaddr: &SockAddr, opts: &PeerO
     // else uses it)
     if ssl.is_some() {
         g.u.attach(&c);
+    } else if c.use_uring() {
+        // a plain upstream connection reads and writes through the
+        // worker's ring (docs/IO_URING_PLAN.md), its responses in receives
+        // of a large provided buffer
+        c.set_uring_recv_len(16384);
     }
 
     let mut deadline = None;
@@ -5246,6 +5251,33 @@ fn poll_pipe_recv_conn(pc: &crate::upstream_ssl::PeerConn, cx: &mut std::task::C
     use std::task::Poll;
 
     let c = &pc.c;
+
+    if c.is_uring() {
+        // io_uring mode: what the ring received, into all the raw buffers
+        let mut iov: Vec<std::io::IoSliceMut<'_>> = Vec::with_capacity(chain.len().min(64));
+        let mut size = 0;
+
+        for b in chain.iter_mut() {
+            if iov.len() == 64 || (limit > 0 && size >= limit) {
+                break;
+            }
+            let mut room = b.room();
+            if room == 0 {
+                continue;
+            }
+            if limit > 0 {
+                room = room.min(limit - size);
+            }
+            iov.push(std::io::IoSliceMut::new(&mut b.unfilled_mut()[..room]));
+            size += room;
+        }
+
+        return match c.poll_recv_vectored(cx, &mut iov) {
+            std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok((n, size))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        };
+    }
 
     if c.ssl.borrow().is_none() {
         let mut size = 0;

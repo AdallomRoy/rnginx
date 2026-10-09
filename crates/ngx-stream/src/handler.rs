@@ -61,6 +61,17 @@ pub fn init_connection(c: Rc<Connection>) {
 
     s.ssl.set(addr_conf.ssl);
 
+    // a plain TCP session reads and writes through the worker's ring where
+    // there is one (docs/IO_URING_PLAN.md); one passed to a TLS listener
+    // leaves it, as OpenSSL reads the socket itself
+    if !addr_conf.ssl {
+        c.use_uring();
+    } else if !c.try_leave_uring() {
+        ngx_log_error!(NGX_LOG_ALERT, c.log, None, "io_uring connection passed with data received");
+        c.close();
+        return;
+    }
+
     let buffered = c.buffer.borrow().len();
     if buffered > 0 {
         s.received.set(s.received.get() + buffered as i64);

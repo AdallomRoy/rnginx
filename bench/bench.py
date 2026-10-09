@@ -83,6 +83,12 @@ BINS["rust-uring"] = f"{B}/bin/nginx-rust-uring"
 BINS["rust-uring-epoll"] = BINS["rust-uring"]
 ENVS["rust-uring"] = {"RNGINX_EVENTS": "io_uring"}
 ENVS["rust-uring-epoll"] = {"RNGINX_EVENTS": "epoll"}
+# its write modes (RNGINX_URING_WRITES): writev() at once and the ring for
+# what the socket does not take (hybrid), writev() only (sync)
+BINS["rust-uring-hybrid"] = BINS["rust-uring"]
+BINS["rust-uring-sync"] = BINS["rust-uring"]
+ENVS["rust-uring-hybrid"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "hybrid"}
+ENVS["rust-uring-sync"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "sync"}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")

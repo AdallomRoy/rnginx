@@ -180,6 +180,7 @@ fn init_event_conf(cf: &mut Conf, conf: &Rc<dyn Any>) -> ConfResult {
     ecf.connections.init(DEFAULT_CONNECTIONS);
     ecf.use_.init(b"epoll".to_vec());
     // RNGINX_EVENTS=io_uring|epoll overrides "use" (nginx-tests, bench.py)
+    crate::uring::read_env();
     if let Some(m) = std::env::var_os("RNGINX_EVENTS") {
         let m = m.as_encoded_bytes();
         if m == b"io_uring" || m == b"epoll" {
