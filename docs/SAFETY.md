@@ -59,6 +59,20 @@ no raw pointer crosses the crate's API (descriptors are `BorrowedFd`, except
 channels and the control API), `setproctitle` (the "nginx: master process"
 titles, written over the argument strings), `clearenv`.
 
+`uring.rs`: io_uring (docs/IO_URING_PLAN.md), on the io-uring crate. The
+ring owns everything the kernel may touch while an operation is in flight,
+until its completion is reaped:
+- the descriptor's owner (any `AsFd` value, which keeps the number open);
+- the send source or receive target, boxed, which lends its memory once
+  through safe traits (`SendSource`, `RecvTarget`);
+- the iovecs and msghdr;
+- the provided buffers, lent by a completion through a token that gives
+  the buffer back when dropped.
+
+That memory is held through raw pointers, never a Box or a reference,
+while the kernel uses it. Dropping the ring cancels and waits, and leaks
+what it could not wait for.
+
 `ssl.rs`: what the openssl crate has no (sound) safe API for:
 - SSL I/O on the socket (SSL_set_fd, SSL_read/write/peek/shutdown,
   SSL_do_handshake, early data, SSL_sendfile/kTLS), so that errno, the

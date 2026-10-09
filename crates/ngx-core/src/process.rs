@@ -393,8 +393,11 @@ fn signal_handler(signo: i32, pid: i32, log: &Log) {
     }
 }
 
-/// The event loop blocks in epoll_wait().
+/// The event loop blocks in epoll_wait(): what the tasks queued on the
+/// ring goes to the kernel first, and the tasks of what completed are
+/// woken, so the thread does not block (docs/IO_URING_PLAN.md).
 pub fn events_park() {
+    crate::uring::flush();
     INTERRUPTED.store(false, Ordering::SeqCst);
 }
 

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 libc.workspace = true
+io-uring.workspace = true
 openssl.workspace = true
 openssl-sys.workspace = true
 foreign-types.workspace = true

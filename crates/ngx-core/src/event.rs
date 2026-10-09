@@ -63,6 +63,12 @@ thread_local! {
     static WORKER: Cell<i64> = const { Cell::new(0) };
 }
 
+/// "use io_uring": the sockets' I/O of the workers goes through io_uring
+/// (docs/IO_URING_PLAN.md), where the kernel allows it.
+pub fn io_uring_selected() -> bool {
+    event_conf().is_some_and(|c| c.borrow().use_.as_slice() == b"io_uring")
+}
+
 pub fn event_conf() -> Option<Rc<RefCell<EventConf>>> {
     EVENT_CONF.with(|e| e.borrow().clone())
 }
@@ -173,6 +179,13 @@ fn init_event_conf(cf: &mut Conf, conf: &Rc<dyn Any>) -> ConfResult {
     let mut ecf = cell.borrow_mut();
     ecf.connections.init(DEFAULT_CONNECTIONS);
     ecf.use_.init(b"epoll".to_vec());
+    // RNGINX_EVENTS=io_uring|epoll overrides "use" (nginx-tests, bench.py)
+    if let Some(m) = std::env::var_os("RNGINX_EVENTS") {
+        let m = m.as_encoded_bytes();
+        if m == b"io_uring" || m == b"epoll" {
+            ecf.use_ = Val::set(m.to_vec());
+        }
+    }
     ecf.multi_accept.init(false);
     ecf.accept_mutex.init(false);
     ecf.accept_mutex_delay.init(500);
@@ -205,7 +218,7 @@ fn set_use(cf: &mut Conf, _cmd: &Command, conf: Option<Rc<dyn Any>>) -> ConfResu
     if ecf.use_.is_set() {
         return Err(msg("is duplicate"));
     }
-    if cf.args[1] != b"epoll" {
+    if cf.args[1] != b"epoll" && cf.args[1] != b"io_uring" {
         return Err(cf.emerg(format_args!("invalid event type \"{}\"", B(&cf.args[1]))));
     }
     ecf.use_ = Val::set(cf.args[1].clone());
@@ -1293,7 +1306,13 @@ fn block_on_events<F: std::future::Future>(rt: &tokio::runtime::Runtime, local: 
             crate::times::update();
         }
 
-        run.as_mut().poll(cx)
+        let r = run.as_mut().poll(cx);
+
+        // what the tasks queued on the ring goes to the kernel, and the
+        // tasks of what completed are woken (docs/IO_URING_PLAN.md)
+        crate::uring::flush();
+
+        r
     }))
 }
 
@@ -1377,6 +1396,11 @@ fn run_event_loop(cycle: Rc<Cycle>, single: bool) -> ! {
     let c2 = cycle.clone();
     block_on_events(&rt, &local, async move {
         let mut cycle = c2;
+        if io_uring_selected() {
+            if let Err(e) = crate::uring::init() {
+                ngx_log_error!(NGX_LOG_NOTICE, cycle.log, None, "io_uring is not available ({}), using epoll", e);
+            }
+        }
         spawn(control_task(cycle.clone(), single));
         spawn_posted_tasks();
         start_accepting(&cycle);
