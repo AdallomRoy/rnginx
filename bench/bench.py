@@ -76,6 +76,13 @@ ENVS = {"rust-jemalloc": {"LD_PRELOAD": JEMALLOC},
         "rust-lto-jemalloc": {"LD_PRELOAD": JEMALLOC},
         "rust-p1-jemalloc": {"LD_PRELOAD": JEMALLOC},
         "rust-p1-mimalloc": {"LD_PRELOAD": MIMALLOC}}
+# docs/IO_URING_PLAN.md: a build of the io-uring branch, its plain HTTP client
+# connections read and written through io_uring (RNGINX_EVENTS=io_uring), and
+# the same build on epoll
+BINS["rust-uring"] = f"{B}/bin/nginx-rust-uring"
+BINS["rust-uring-epoll"] = BINS["rust-uring"]
+ENVS["rust-uring"] = {"RNGINX_EVENTS": "io_uring"}
+ENVS["rust-uring-epoll"] = {"RNGINX_EVENTS": "epoll"}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")

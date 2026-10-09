@@ -149,6 +149,63 @@ impl Buf {
 
 pub type Chain = VecDeque<Buf>;
 
+/// NGX_IOVS_PREALLOCATE: the iovecs of one writev()
+pub const NGX_IOVS_PREALLOCATE: usize = 64;
+
+/// What one writev() of ngx_linux_sendfile_chain sends from the front of
+/// `chain`, as ngx_output_chain_to_iovec gathers it: the memory buffers,
+/// special ones skipped, up to a buffer in a file, `budget` bytes and
+/// NGX_IOVS_PREALLOCATE buffers. `slice` gets each non-empty slice; returns
+/// the buffers gathered (empty ones included), the bytes, and whether a
+/// buffer in a file came next (TCP_CORK before a header).
+pub fn chain_gather<'a>(chain: &'a Chain, budget: usize, mut slice: impl FnMut(&'a [u8])) -> (usize, usize, bool) {
+    let mut nbufs = 0;
+    let mut gathered = 0;
+    let mut file_next = false;
+
+    for b in chain.iter() {
+        if b.special_buf() {
+            continue;
+        }
+        if !b.in_memory() {
+            file_next = b.in_file;
+            break;
+        }
+        if gathered >= budget {
+            break;
+        }
+        let data = match &b.data {
+            BufData::Memory(v) => &v[b.pos..b.last],
+            _ => break,
+        };
+        let take = (budget - gathered).min(data.len());
+        if take > 0 {
+            slice(&data[..take]);
+        }
+        nbufs += 1;
+        gathered += take;
+        if nbufs >= NGX_IOVS_PREALLOCATE {
+            break;
+        }
+    }
+
+    (nbufs, gathered, file_next)
+}
+
+/// An output chain sent by an io_uring operation (docs/IO_URING_PLAN.md),
+/// which owns it until the completion: it lends what chain_gather() gathers
+/// of its front, `budget` bytes at most.
+pub struct ChainSource {
+    pub chain: Chain,
+    pub budget: usize,
+}
+
+impl ngx_sys::uring::SendSource for ChainSource {
+    fn slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
+        chain_gather(&self.chain, self.budget, |s| out.push(std::io::IoSlice::new(s)));
+    }
+}
+
 pub fn chain_update_sent(chain: &mut Chain, mut sent: i64) {
     while !chain.is_empty() {
         let buf = &mut chain[0];

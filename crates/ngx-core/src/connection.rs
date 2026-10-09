@@ -366,9 +366,105 @@ impl<T> LinkedSlab<T> {
     }
 }
 
+/// The receive of a read wait in io_uring mode: one small provided buffer.
+const URING_RECV: usize = 2048;
+
+/// The state of a connection in io_uring mode. Its receive and its send
+/// in flight belong to the connection, not to the futures waiting for
+/// them: a wait given up (a select!, a timeout) loses nothing, as a wait
+/// for an epoll event consumes nothing; they are cancelled when the
+/// connection closes or leaves the mode.
+struct UringIo {
+    /// the descriptor's handle the operations name
+    fd: fd::Fd,
+    /// received, not read yet
+    stash: Option<Stash>,
+    /// the last receive filled what it asked for: more may wait in the
+    /// socket (rev->ready)
+    more: bool,
+    /// a receive found the end of the stream (rev->pending_eof)
+    eof: bool,
+    /// the error of a receive, returned by the next read
+    error: Option<i32>,
+    /// the receive in flight (one at a time)
+    rx: Option<crate::uring::Recv>,
+    /// the tasks waiting for it besides the one polling it
+    rx_waiters: Vec<std::task::Waker>,
+    /// the send in flight (one at a time)
+    tx: Option<crate::uring::Send<crate::buf::ChainSource>>,
+}
+
+/// Bytes received and not read yet.
+enum Stash {
+    /// in a provided buffer of the ring, read from the offset on
+    Ring(crate::uring::Received, usize),
+    /// what was left of one once partly read: the buffer went back
+    Heap(Vec<u8>, usize),
+}
+
+impl UringIo {
+    /// Copies stashed bytes into `buf` (not empty); None if nothing is
+    /// stashed. A provided buffer read partly goes back to the kernel at
+    /// once, its rest kept here.
+    fn read_stash(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let (n, rest) = match self.stash.as_mut()? {
+            Stash::Ring(r, pos) => {
+                let n = r.copy_to(*pos, buf);
+                *pos += n;
+                let rest = if *pos < r.len() { Some(r.with(|b| b[*pos..].to_vec())) } else { None };
+                (n, rest.map(|v| Stash::Heap(v, 0)))
+            }
+            Stash::Heap(v, pos) => {
+                let n = (v.len() - *pos).min(buf.len());
+                buf[..n].copy_from_slice(&v[*pos..*pos + n]);
+                *pos += n;
+                let rest = if *pos < v.len() { Some(Stash::Heap(std::mem::take(v), *pos)) } else { None };
+                (n, rest)
+            }
+        };
+
+        self.stash = rest;
+
+        Some(n)
+    }
+
+    /// Copies stashed bytes into `buf` without reading them.
+    fn peek_stash(&self, buf: &mut [u8]) -> Option<usize> {
+        match self.stash.as_ref()? {
+            Stash::Ring(r, pos) => Some(r.copy_to(*pos, buf)),
+            Stash::Heap(v, pos) => {
+                let n = (v.len() - *pos).min(buf.len());
+                buf[..n].copy_from_slice(&v[*pos..*pos + n]);
+                Some(n)
+            }
+        }
+    }
+
+    /// A read would not wait: bytes stashed, the end of the stream or an
+    /// error to return, or more that may wait in the socket.
+    fn read_ready(&self) -> bool {
+        self.stash.is_some() || self.eof || self.error.is_some() || self.more
+    }
+
+    /// The receive's outcome, kept for the reads.
+    fn received(&mut self, res: io::Result<crate::uring::Received>) {
+        match res {
+            Ok(r) if r.is_empty() => self.eof = true,
+            Ok(r) => {
+                self.more = r.len() >= URING_RECV;
+                self.stash = Some(Stash::Ring(r, 0));
+            }
+            Err(e) => self.error = Some(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+}
+
 pub struct Connection {
     pub fd: Cell<RawFd>,
     afd: RefCell<Option<Rc<AsyncFd<fd::Fd>>>>,
+    /// io_uring mode (docs/IO_URING_PLAN.md): the socket's reads and writes
+    /// go through the worker's ring, and the reactor never sees it
+    uring: RefCell<Option<Box<UringIo>>>,
     pub number: u64,
     pub log: Log,
     pub listening: Option<Rc<Listening>>,
@@ -498,6 +594,7 @@ impl Connection {
         let c = Rc::new_cyclic(|this| Connection {
             fd: Cell::new(fd),
             afd: RefCell::new(None),
+            uring: RefCell::new(None),
             number,
             log: clog,
             listening,
@@ -601,6 +698,7 @@ impl Connection {
         Rc::new(Connection {
             fd: Cell::new(-1),
             afd: RefCell::new(None),
+            uring: RefCell::new(None),
             number: c.number,
             log,
             listening: c.listening.clone(),
@@ -668,6 +766,7 @@ impl Connection {
         let Connection {
             fd,
             afd,
+            uring,
             number,
             log,
             listening,
@@ -728,6 +827,7 @@ impl Connection {
 
         fd.set(-1);
         *afd.borrow_mut() = None;
+        *uring.borrow_mut() = None;
 
         // log: a fork of c's (c.log.fork() and the connection number)
         log.inner.level.set(c.log.inner.level.get());
@@ -906,6 +1006,11 @@ impl Connection {
         if let Some(a) = self.afd.borrow().as_ref() {
             return Ok(a.clone());
         }
+        if self.is_uring() {
+            // a path not converted to the ring: it must not mix the reactor in
+            ngx_log_error!(NGX_LOG_ALERT, self.log, None, "io_uring connection used with the reactor");
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         let fd = self.fd.get();
         if fd < 0 || self.is_udp_shared() {
             // the socket of a pseudo connection is the listening's, read
@@ -921,8 +1026,393 @@ impl Connection {
         Ok(a)
     }
 
+    /// Moves the socket's reads and writes to the worker's ring
+    /// (docs/IO_URING_PLAN.md): a plain TCP stream not yet registered with
+    /// the reactor, in a worker whose ring is up. Returns whether it did.
+    pub fn use_uring(&self) -> bool {
+        if !crate::uring::enabled()
+            || self.ty != libc::SOCK_STREAM
+            || self.fake
+            || self.is_quic_stream()
+            || self.is_udp_shared()
+            || self.ssl.borrow().is_some()
+            || self.afd.borrow().is_some()
+            || self.uring.borrow().is_some()
+        {
+            return false;
+        }
+
+        let fd = match fd::get(self.fd.get()) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+
+        *self.uring.borrow_mut() = Some(Box::new(UringIo {
+            fd,
+            stash: None,
+            more: false,
+            eof: false,
+            error: None,
+            rx: None,
+            rx_waiters: Vec::new(),
+            tx: None,
+        }));
+
+        true
+    }
+
+    /// Whether the socket's I/O goes through the worker's ring.
+    pub fn is_uring(&self) -> bool {
+        self.uring.borrow().is_some()
+    }
+
+    /// Leaves io_uring mode: the connection goes on with the reactor (as
+    /// HTTP/2). What was received and not read yet comes back; the end of
+    /// the stream or an error a receive found, the socket reports again.
+    pub fn leave_uring(&self) -> Vec<u8> {
+        let Some(mut u) = self.uring.borrow_mut().take() else { return Vec::new() };
+
+        let mut v = Vec::new();
+
+        match u.stash.take() {
+            Some(Stash::Ring(r, pos)) => r.with(|b| v.extend_from_slice(&b[pos..])),
+            Some(Stash::Heap(h, pos)) => v.extend_from_slice(&h[pos..]),
+            None => {}
+        }
+
+        v
+    }
+
+    /// try_recv() in io_uring mode (None in the other modes): what is
+    /// stashed, the end of the stream or the error a receive found, a
+    /// recv() at once while more may wait (rev->ready), else WouldBlock.
+    fn uring_try_recv(&self, buf: &mut [u8], raw: bool) -> Option<io::Result<usize>> {
+        let mut g = self.uring.borrow_mut();
+        let u = g.as_mut()?;
+
+        if buf.is_empty() {
+            return Some(Ok(0));
+        }
+
+        if let Some(n) = u.read_stash(buf) {
+            return Some(Ok(n));
+        }
+
+        if let Some(e) = u.error.take() {
+            // the error once, the end of the stream next
+            u.eof = true;
+            return Some(Err(io::Error::from_raw_os_error(e)));
+        }
+
+        if u.eof {
+            self.read_eof.set(true);
+            return Some(Ok(0));
+        }
+
+        // a receive in flight gets the next bytes: a recv() now could
+        // return later ones first
+        if u.rx.is_some() || !(u.more || raw) {
+            return Some(Err(io::ErrorKind::WouldBlock.into()));
+        }
+
+        Some(match nix::sys::socket::recv(u.fd.as_raw_fd(), buf, MsgFlags::MSG_DONTWAIT) {
+            Ok(0) => {
+                u.more = false;
+                u.eof = true;
+                self.read_eof.set(true);
+                Ok(0)
+            }
+            Ok(n) => {
+                if n < buf.len() {
+                    u.more = false;
+                }
+                Ok(n)
+            }
+            Err(Errno::EAGAIN) => {
+                u.more = false;
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            Err(e) => Err(e.into()),
+        })
+    }
+
+    /// readable() in io_uring mode: Ready once a read would not wait; the
+    /// connection's receive is started if none is in flight.
+    fn poll_uring_readable(&self, cx: &mut std::task::Context<'_>, waiting: &mut bool) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else {
+            // left the mode: the reactor's readiness from now on
+            *waiting = false;
+            return Poll::Ready(Ok(()));
+        };
+
+        if u.read_ready() {
+            *waiting = false;
+            return Poll::Ready(Ok(()));
+        }
+
+        if u.rx.is_none() {
+            match crate::uring::recv(&u.fd, URING_RECV) {
+                Ok(r) => u.rx = Some(r),
+                Err(e) => {
+                    *waiting = false;
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+
+        match std::future::Future::poll(std::pin::Pin::new(u.rx.as_mut().expect("a receive")), cx) {
+            Poll::Ready(res) => {
+                u.rx = None;
+                u.received(res);
+                *waiting = false;
+
+                // the other tasks waiting
+                let others: Vec<_> = u.rx_waiters.drain(..).filter(|w| !w.will_wake(cx.waker())).collect();
+                drop(g);
+                for w in others {
+                    w.wake();
+                }
+
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                // the receive wakes the task that polled it last
+                *waiting = true;
+                if !u.rx_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    u.rx_waiters.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn uring_readable(&self) -> io::Result<()> {
+        struct Wait<'a> {
+            c: &'a Connection,
+            waiting: bool,
+        }
+
+        impl Drop for Wait<'_> {
+            fn drop(&mut self) {
+                if !self.waiting {
+                    return;
+                }
+
+                // given up while the receive is in flight: the other tasks
+                // waiting, if any, poll it from now on
+                let others = match self.c.uring.try_borrow_mut() {
+                    Ok(mut g) => g.as_mut().map(|u| std::mem::take(&mut u.rx_waiters)).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+
+                for w in others {
+                    w.wake();
+                }
+            }
+        }
+
+        let mut w = Wait { c: self, waiting: false };
+
+        std::future::poll_fn(|cx| {
+            let c = w.c;
+            c.poll_uring_readable(cx, &mut w.waiting)
+        })
+        .await
+    }
+
+    /// The read event in io_uring mode: what is stashed or was found
+    /// first, else a poll of the socket for data or its end.
+    async fn uring_read_event(&self) -> io::Result<tokio::io::Ready> {
+        use tokio::io::Ready;
+
+        let p = {
+            let g = self.uring.borrow();
+            let u = g.as_ref().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+
+            if u.stash.is_some() {
+                return Ok(Ready::READABLE);
+            }
+            if u.eof {
+                return Ok(Ready::READ_CLOSED);
+            }
+            if u.error.is_some() {
+                return Ok(Ready::ERROR);
+            }
+
+            crate::uring::poll_fd(&u.fd, (libc::POLLIN | libc::POLLRDHUP) as u32)?
+        };
+
+        let ev = p.await? as i16;
+        let mut r = Ready::EMPTY;
+
+        if ev & libc::POLLIN != 0 {
+            r |= Ready::READABLE;
+        }
+        if ev & (libc::POLLRDHUP | libc::POLLHUP) != 0 {
+            r |= Ready::READ_CLOSED;
+        }
+        if ev & libc::POLLERR != 0 {
+            r |= Ready::ERROR;
+        }
+
+        Ok(r)
+    }
+
+    /// A poll of the socket in io_uring mode, for `events`.
+    async fn uring_poll(&self, events: i16) -> io::Result<u32> {
+        let p = {
+            let g = self.uring.borrow();
+            let u = g.as_ref().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+            crate::uring::poll_fd(&u.fd, events as u16 as u32)?
+        };
+
+        p.await
+    }
+
+    /// getsockopt(SO_ERROR): the socket's pending error, 0 if none.
+    pub fn so_error(&self) -> i32 {
+        match fd::get(self.fd.get()).map(|f| rustix::net::sockopt::socket_error(&f)) {
+            Ok(Ok(Err(e))) => e.raw_os_error(),
+            _ => 0,
+        }
+    }
+
+    /// recv(MSG_PEEK) of a byte without waiting, bytes stashed in io_uring
+    /// mode included: 1 if there is data, 0 at the end of the stream,
+    /// WouldBlock if nothing.
+    pub fn peek_byte(&self) -> io::Result<usize> {
+        let fd = {
+            let g = self.uring.borrow();
+            match g.as_ref() {
+                Some(u) if u.stash.is_some() => return Ok(1),
+                Some(u) if u.eof => return Ok(0),
+                Some(u) => u.fd.as_raw_fd(),
+                None => self.fd.get(),
+            }
+        };
+
+        let mut b = [0u8; 1];
+
+        nix::sys::socket::recv(fd, &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
+    }
+
+    /// ngx_http_test_reading and ngx_http_upstream_check_broken_connection
+    /// in io_uring mode: resolves with the socket's pending error (0 if
+    /// none) once the client has closed the connection (rev->pending_eof);
+    /// data from the client is left for its readers. Never resolves if the
+    /// socket cannot be watched.
+    pub async fn uring_wait_closed(&self) -> i32 {
+        loop {
+            match self.uring_read_event().await {
+                Ok(r) if r.is_read_closed() || r.is_error() => return self.so_error(),
+                Ok(_) => {}
+                Err(_) => return std::future::pending().await,
+            }
+
+            // a read event without the end of the stream: data, or nothing
+            match self.peek_byte() {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Ok(n) if n > 0 => break,
+                _ => return self.so_error(),
+            }
+        }
+
+        // data from the client: the end of the stream alone is waited for
+        match self.uring_poll(libc::POLLRDHUP).await {
+            Ok(_) => self.so_error(),
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    /// Starts sending, by the ring, what chain_gather() gathers of the
+    /// front of `chain`, `budget` bytes at most: the chain is the
+    /// operation's until finish_send() or settle_send() gives it back. One
+    /// send at a time; the chain comes back with the error otherwise.
+    pub fn start_send(&self, chain: crate::buf::Chain, budget: usize) -> Result<(), (io::Error, crate::buf::Chain)> {
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else {
+            return Err((io::Error::from_raw_os_error(libc::EINVAL), chain));
+        };
+
+        if u.tx.is_some() {
+            return Err((io::Error::from_raw_os_error(libc::EBUSY), chain));
+        }
+
+        match crate::uring::send(&u.fd, crate::buf::ChainSource { chain, budget }) {
+            Ok(tx) => {
+                u.tx = Some(tx);
+                Ok(())
+            }
+            Err((e, src)) => Err((e, src.chain)),
+        }
+    }
+
+    /// A send started by start_send() is in flight.
+    pub fn send_in_flight(&self) -> bool {
+        self.uring.borrow().as_ref().is_some_and(|u| u.tx.is_some())
+    }
+
+    /// The send in flight, completed: its result and the chain (None if no
+    /// send is in flight). Given up, the send is cancelled.
+    pub async fn finish_send(&self) -> Option<(io::Result<usize>, crate::buf::Chain)> {
+        let tx = self.uring.borrow_mut().as_mut()?.tx.take()?;
+        let (res, src) = tx.await;
+
+        Some((res, src.chain))
+    }
+
+    /// The send in flight, if it completed in the flush that submitted it
+    /// (it never waited, as a write that does not block in C); None once
+    /// it is known to wait for room in the socket, or if none is in
+    /// flight.
+    pub async fn settle_send(&self) -> Option<(io::Result<usize>, crate::buf::Chain)> {
+        std::future::poll_fn(|cx| {
+            let mut g = self.uring.borrow_mut();
+
+            let Some(tx) = g.as_mut().and_then(|u| u.tx.as_mut()) else {
+                return std::task::Poll::Ready(None);
+            };
+
+            match tx.poll_settled(cx) {
+                std::task::Poll::Ready(Some((res, src))) => {
+                    if let Some(u) = g.as_mut() {
+                        u.tx = None;
+                    }
+                    std::task::Poll::Ready(Some((res, src.chain)))
+                }
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// send(2) of a copy of `data` by the ring, in io_uring mode.
+    async fn uring_send(&self, data: &[u8]) -> io::Result<usize> {
+        let tx = {
+            let g = self.uring.borrow();
+            let u = g.as_ref().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+            crate::uring::send(&u.fd, data.to_vec()).map_err(|(e, _)| e)?
+        };
+
+        let (res, _) = tx.await;
+        let n = res?;
+
+        self.sent.set(self.sent.get() + n as u64);
+
+        Ok(n)
+    }
+
     /// Wait until the socket is readable.
     pub async fn readable(&self) -> io::Result<()> {
+        if self.is_uring() {
+            return self.uring_readable().await;
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::readable(self).await;
         }
@@ -953,6 +1443,10 @@ impl Connection {
     /// and tokio keeps the closed bits, so a pending EOF still wakes the
     /// reader.
     pub fn read_drained(&self) {
+        if let Some(u) = self.uring.borrow_mut().as_mut() {
+            u.more = false;
+            return;
+        }
         if let Some(afd) = self.afd.borrow().as_ref() {
             let _ = afd.try_io(Interest::READABLE, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
         }
@@ -963,6 +1457,9 @@ impl Connection {
     /// pending EOF keeps it, as rev->pending_eof keeps rev->ready in
     /// ngx_unix_recv. False for a socket never waited for.
     pub fn read_ready(&self) -> bool {
+        if let Some(u) = self.uring.borrow().as_ref() {
+            return u.read_ready();
+        }
         match self.afd.borrow().as_ref() {
             Some(afd) => afd.try_io(Interest::READABLE, |_| Ok(())).is_ok(),
             None => false,
@@ -974,6 +1471,9 @@ impl Connection {
     /// a handler that only looks at the event, as
     /// ngx_http_upstream_check_broken_connection does at rev->pending_eof
     pub async fn read_event(&self) -> io::Result<tokio::io::Ready> {
+        if self.is_uring() {
+            return self.uring_read_event().await;
+        }
         let afd = self.afd()?;
         let guard = afd.readable().await?;
         Ok(guard.ready())
@@ -981,6 +1481,9 @@ impl Connection {
 
     /// Wait until the socket is writable.
     pub async fn writable(&self) -> io::Result<()> {
+        if self.is_uring() {
+            return self.uring_poll(libc::POLLOUT).await.map(drop);
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::writable(self).await;
         }
@@ -1009,6 +1512,10 @@ impl Connection {
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.try_send(self, buf);
         }
+        if self.send_in_flight() {
+            // one send at a time on a socket in io_uring mode: in order
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let n = nix::sys::socket::send(self.fd.get(), buf, MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT)?;
         self.sent.set(self.sent.get() + n as u64);
         Ok(n)
@@ -1019,6 +1526,15 @@ impl Connection {
     /// from `op` clears the readiness (wev->ready = 0).
     pub fn try_write_io<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
         self.fake_io_error()?;
+        let uring_fd = self.uring.borrow().as_ref().map(|u| (u.fd.clone(), u.tx.is_some()));
+        if let Some((fd, in_flight)) = uring_fd {
+            // io_uring mode: at once, unless the ring sends (in order); a
+            // WouldBlock is waited for with writable()
+            if in_flight {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            return op(fd.as_fd());
+        }
         let afd = self.afd()?;
         afd.try_io(Interest::WRITABLE, |inner| op(inner.as_fd()))
     }
@@ -1177,6 +1693,9 @@ impl Connection {
     /// readable() is not budgeted, so a caller alternating readable() and
     /// try_recv() would then loop forever without yielding to the runtime.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(r) = self.uring_try_recv(buf, false) {
+            return r;
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::try_recv(self, buf);
         }
@@ -1234,6 +1753,9 @@ impl Connection {
 
     /// Non-blocking recv (plain sockets). Returns WouldBlock as an error.
     pub fn try_recv_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(r) = self.uring_try_recv(buf, true) {
+            return r;
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::try_recv(self, buf);
         }
@@ -1255,6 +1777,14 @@ impl Connection {
 
     /// ngx_unix_recv equivalent: read some bytes, awaiting readiness. Ok(0) is EOF.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.is_uring() {
+            loop {
+                match self.try_recv(buf) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.uring_readable().await?,
+                    r => return r,
+                }
+            }
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::recv(self, buf).await;
         }
@@ -1330,6 +1860,26 @@ impl Connection {
     /// Peek without consuming.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
+        if self.is_uring() {
+            loop {
+                {
+                    let mut g = self.uring.borrow_mut();
+                    let u = g.as_mut().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+                    if let Some(n) = u.peek_stash(buf) {
+                        return Ok(n);
+                    }
+                    if u.eof {
+                        return Ok(0);
+                    }
+                    if let Some(e) = u.error {
+                        return Err(io::Error::from_raw_os_error(e));
+                    }
+                    // more may wait: a receive gets it into the stash
+                    u.more = false;
+                }
+                self.uring_readable().await?;
+            }
+        }
         if let Some(udp) = self.udp_conn() {
             return udp.peek(self, buf).await;
         }
@@ -1375,6 +1925,9 @@ impl Connection {
 
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.is_uring() {
+            return self.uring_send(buf).await;
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::send(self, &[buf]).await;
         }
@@ -1401,6 +1954,9 @@ impl Connection {
 
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
+        if self.is_uring() {
+            return self.uring_send(&iov.concat()).await;
+        }
         if self.is_quic_stream() {
             return crate::quic::streams::send(self, iov).await;
         }
@@ -1454,6 +2010,23 @@ impl Connection {
     /// sendfile(2) from `file_fd` at `offset` for up to `count` bytes.
     pub async fn sendfile(&self, file_fd: RawFd, offset: i64, count: usize) -> io::Result<usize> {
         self.fake_io_error()?;
+        if self.is_uring() {
+            loop {
+                let r = self.try_write_io(|s| {
+                    let file = fd::get(file_fd)?;
+                    let mut off = offset as u64;
+                    rustix::fs::sendfile(s, &file, Some(&mut off), count).map_err(io::Error::from)
+                });
+                match r {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.writable().await?,
+                    Err(e) => return Err(e),
+                    Ok(n) => {
+                        self.sent.set(self.sent.get() + n as u64);
+                        return Ok(n);
+                    }
+                }
+            }
+        }
         let afd = self.afd()?;
         loop {
             let mut guard = afd.writable().await?;
@@ -1673,8 +2246,12 @@ impl Connection {
                 }
             }
         }
-        // deregister from reactor before closing
+        // deregister from reactor before closing; in io_uring mode the
+        // operations in flight are cancelled, and the socket closes once
+        // the last one has completed (they hold its descriptor)
         self.afd.borrow_mut().take();
+        let uring = self.uring.borrow_mut().take();
+        drop(uring);
         self.reusable_connection(false);
         // the connection is free for others at once, even if the Rust
         // Rc<Connection> is dropped later

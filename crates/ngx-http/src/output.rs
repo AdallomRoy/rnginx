@@ -28,6 +28,9 @@ pub enum Pass {
     SslAgain { want_read: bool, pos: SslChainPos },
     /// not tried: an SSL object ngx_ssl does not run (none is made so)
     Async,
+    /// io_uring mode: the ring sends the front of the chain, which is the
+    /// send's until it completes (finish_send(), merge_sent())
+    InFlight,
 }
 
 /// One pass of c->send_chain() without waiting: as much of `chain` as the
@@ -70,13 +73,33 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
     let mut total: i64 = 0;
 
     loop {
-        if plain_send_chain_pass(c, chain, limit, &mut total)? == Pass::Done {
-            return Ok(total);
+        // io_uring mode: the send in flight completes first (one at a time)
+        if let Some((res, sent)) = c.finish_send().await {
+            total += merge_sent(c, chain, res, sent)? as i64;
         }
 
-        // NGX_AGAIN: the write event
-        c.writable().await?;
+        match plain_send_chain_pass(c, chain, limit, &mut total)? {
+            Pass::Done => return Ok(total),
+            Pass::InFlight => continue,
+            // NGX_AGAIN: the write event
+            _ => c.writable().await?,
+        }
     }
+}
+
+/// The completion of a send by the ring: the chain it took back in front
+/// of what was queued meanwhile, the bytes sent taken off it
+/// (ngx_chain_update_sent) and counted (c->sent).
+pub fn merge_sent(c: &Connection, chain: &mut Chain, res: io::Result<usize>, mut sent: Chain) -> io::Result<usize> {
+    sent.extend(chain.drain(..));
+    *chain = sent;
+
+    let n = res?;
+
+    c.sent.set(c.sent.get() + n as u64);
+    update_sent(chain, n as i64);
+
+    Ok(n)
 }
 
 /// A pass of ngx_linux_sendfile_chain on a plain socket: writev() of the
@@ -84,6 +107,10 @@ pub async fn send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
 /// ngx_output_chain_to_iovec), sendfile() of the file ones, each tried
 /// only while the socket is write-ready.
 fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
+    if c.is_uring() {
+        return uring_send_chain_pass(c, chain, limit, total);
+    }
+
     let limit = if limit <= 0 { i64::MAX } else { limit };
 
     loop {
@@ -189,6 +216,85 @@ fn plain_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
 
         // a partial write: the next attempt finds out whether the socket
         // takes more
+    }
+}
+
+/// plain_send_chain_pass() in io_uring mode (docs/IO_URING_PLAN.md): the
+/// writev() of the memory buffers becomes a send by the ring, which takes
+/// the chain until it completes (Pass::InFlight); sendfile() of the file
+/// buffers stays a system call, made when no send is in flight.
+fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
+    let limit = if limit <= 0 { i64::MAX } else { limit };
+
+    if c.send_in_flight() {
+        return Ok(Pass::InFlight);
+    }
+
+    loop {
+        // drop empty non-special buffers at the front
+        while let Some(b) = chain.front() {
+            if b.buf_size() == 0 {
+                recycle(chain.pop_front().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        let first = match chain.front() {
+            Some(b) => b,
+            None => return Ok(Pass::Done),
+        };
+
+        if *total >= limit {
+            return Ok(Pass::Done);
+        }
+
+        let budget = limit - *total;
+
+        if first.in_file && !first.in_memory() {
+            let (fd, off, size) = match &first.data {
+                BufData::File(f) => (f.fd, first.file_pos, (first.file_last - first.file_pos).min(budget)),
+                _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+
+            let n = match sendfile(c, fd, off, size as usize) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Pass::Again),
+                Err(e) => return Err(e),
+            };
+
+            if n == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+
+            *total += n as i64;
+            update_sent(chain, n as i64);
+            continue;
+        }
+
+        let (nbufs, gathered, file_next) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), |_| {});
+
+        if nbufs == 0 {
+            return Ok(Pass::Done);
+        }
+
+        // TCP_CORK if there is a header before a file
+        if file_next && c.tcp_nopush.get() == TcpNopush::Unset {
+            tcp_nopush(c)?;
+        }
+
+        if gathered == 0 {
+            update_sent(chain, 0);
+            continue;
+        }
+
+        return match c.start_send(std::mem::take(chain), gathered) {
+            Ok(()) => Ok(Pass::InFlight),
+            Err((e, back)) => {
+                *chain = back;
+                Err(e)
+            }
+        };
     }
 }
 

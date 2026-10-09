@@ -122,6 +122,12 @@ async fn connection_task(c: Rc<Connection>) {
         }
     };
 
+    // a plain HTTP connection reads and writes through the worker's ring
+    // where there is one (docs/IO_URING_PLAN.md)
+    if !hc.addr_conf.ssl {
+        c.use_uring();
+    }
+
     if hc.addr_conf.ssl {
         hc.ssl.set(true);
         c.log.set_action(Some("SSL handshaking"));
@@ -158,14 +164,17 @@ async fn connection_task(c: Rc<Connection>) {
                 }
                 Ok(Waited::Http2) => {
                     // ngx_http_v2_init takes over, with the buffered bytes
+                    // (and those received by the ring and not read yet: the
+                    // HTTP/2 driver runs on the reactor)
                     let preread = {
                         let mut b = hc.buffer.borrow_mut();
-                        let v = b.unread().to_vec();
+                        let mut v = b.unread().to_vec();
                         b.pos = 0;
                         b.last = 0;
                         let data = std::mem::take(&mut b.data);
                         drop(b);
                         free_header_buffer(data);
+                        v.extend_from_slice(&c.leave_uring());
                         v
                     };
                     Box::pin(crate::v2::connection::init(c.clone(), hc.clone(), preread)).await;

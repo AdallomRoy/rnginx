@@ -54,7 +54,10 @@ pub struct Stats {
 
 enum State {
     Free,
-    Waiting { op: OpId, waker: Option<Waker> },
+    /// in flight; `flushed`: submitted, and not complete after the flush
+    /// that submitted it (it waits in the kernel); `settle`: its future
+    /// wants to know that (poll_settled)
+    Waiting { op: OpId, waker: Option<Waker>, flushed: bool, settle: bool },
     Done(Completion),
     /// the future went away before the completion
     Ignored,
@@ -80,6 +83,8 @@ struct Driver {
     graveyard: Vec<Completion>,
     /// the completions of a reap (kept for its capacity)
     reaped: Vec<Completion>,
+    /// the operations started since the last flush
+    pushed: Vec<u64>,
 }
 
 fn tag(index: u32, gen: u32) -> u64 {
@@ -123,7 +128,8 @@ impl Driver {
 
         match push(&mut self.ring, tag) {
             Ok(op) => {
-                self.slots[index as usize].state = State::Waiting { op, waker: None };
+                self.slots[index as usize].state = State::Waiting { op, waker: None, flushed: false, settle: false };
+                self.pushed.push(tag);
                 Ok(tag)
             }
             Err(e) => {
@@ -134,10 +140,22 @@ impl Driver {
     }
 
     fn poll(&mut self, tag: u64, cx: &mut Context<'_>) -> Poll<Completion> {
+        match self.poll_settled(tag, cx, false) {
+            Poll::Ready(Some(c)) => Poll::Ready(c),
+            _ => Poll::Pending,
+        }
+    }
+
+    /// The completion, or, with `settle`, None once the operation is known
+    /// to wait in the kernel (not complete after the flush that submitted
+    /// it).
+    fn poll_settled(&mut self, tag: u64, cx: &mut Context<'_>, settle: bool) -> Poll<Option<Completion>> {
         let slot = self.slot(tag).expect("the slot of an operation");
 
         match &mut slot.state {
-            State::Waiting { waker, .. } => {
+            State::Waiting { flushed: true, .. } if settle => Poll::Ready(None),
+            State::Waiting { waker, settle: s, .. } => {
+                *s |= settle;
                 match waker {
                     Some(w) if w.will_wake(cx.waker()) => {}
                     _ => *waker = Some(cx.waker().clone()),
@@ -147,7 +165,7 @@ impl Driver {
             State::Done(_) => {
                 let State::Done(c) = std::mem::replace(&mut slot.state, State::Free) else { unreachable!() };
                 self.free.push(tag as u32);
-                Poll::Ready(c)
+                Poll::Ready(Some(c))
             }
             _ => unreachable!("an operation polled after its end"),
         }
@@ -175,7 +193,9 @@ impl Driver {
     }
 
     fn flush(&mut self) {
-        if self.ring.needs_submit() {
+        let submitted = self.ring.needs_submit();
+
+        if submitted {
             self.stats.submits += 1;
 
             if let Err(e) = self.ring.submit() {
@@ -189,6 +209,28 @@ impl Driver {
         }
 
         self.reap();
+
+        // what was submitted (by this submit, or by a push that found the
+        // queue full) and did not complete waits in the kernel
+        let mut pushed = std::mem::take(&mut self.pushed);
+
+        for tag in pushed.drain(..) {
+            let mut settled = None;
+
+            if let Some(Slot { state: State::Waiting { waker, flushed, settle, .. }, .. }) = self.slot(tag) {
+                *flushed = true;
+
+                if *settle {
+                    settled = waker.clone();
+                }
+            }
+
+            if let Some(w) = settled {
+                self.wake.push(w);
+            }
+        }
+
+        self.pushed = pushed;
     }
 
     fn reap(&mut self) {
@@ -258,6 +300,7 @@ pub fn init() -> io::Result<()> {
             wake: Vec::new(),
             graveyard: Vec::new(),
             reaped: Vec::new(),
+            pushed: Vec::new(),
         })
     });
 
@@ -339,6 +382,16 @@ impl Op {
         let r = DRIVER.with(|d| d.borrow_mut().as_mut().expect("the io_uring driver").poll(self.tag, cx));
 
         if r.is_ready() {
+            self.done = true;
+        }
+
+        r
+    }
+
+    fn poll_settled(&mut self, cx: &mut Context<'_>) -> Poll<Option<Completion>> {
+        let r = DRIVER.with(|d| d.borrow_mut().as_mut().expect("the io_uring driver").poll_settled(self.tag, cx, true));
+
+        if let Poll::Ready(Some(_)) = r {
             self.done = true;
         }
 
@@ -473,6 +526,21 @@ pub fn send<S: SendSource>(fd: &Fd, src: S) -> Result<Send<S>, (io::Error, S)> {
     });
 
     r.map(|tag| Send { op: Op { tag, done: false }, _source: PhantomData })
+}
+
+impl<S: SendSource> Send<S> {
+    /// The send's output if it completed in the flush that submitted it,
+    /// or None once it is known to wait in the kernel for room in the
+    /// socket (as C's NGX_AGAIN): the caller then awaits the future.
+    pub fn poll_settled(&mut self, cx: &mut Context<'_>) -> Poll<Option<(io::Result<usize>, S)>> {
+        match std::task::ready!(self.op.poll_settled(cx)) {
+            Some(mut c) => {
+                let src = c.take_payload::<S>().expect("the source of a send");
+                Poll::Ready(Some((c.res(), src)))
+            }
+            None => Poll::Ready(None),
+        }
+    }
 }
 
 impl<S: SendSource> Future for Send<S> {

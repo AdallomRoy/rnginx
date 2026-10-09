@@ -952,6 +952,10 @@ impl ClientWatch {
             None => return std::future::pending().await,
         };
 
+        if c.is_uring() {
+            return c.uring_wait_closed().await;
+        }
+
         if self.afd.borrow().is_none() {
             loop {
                 match c.read_event().await {

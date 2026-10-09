@@ -254,9 +254,10 @@ fn iteration(r: &R, s: &Send) -> Iteration {
 
     match pass {
         Ok(Pass::Done) => {}
-        Ok(Pass::Again) | Ok(Pass::Async) => {
+        Ok(Pass::Again) | Ok(Pass::Async) | Ok(Pass::InFlight) => {
             // what the pass sent counts against the limit of the send
-            // (less than the limit here)
+            // (less than the limit here); a send by the ring in flight
+            // counts once it completes
             let limit = if limit <= 0 { 0 } else { limit - total };
             return Iteration::Wait(Resume::Send { limit, before, ssl: None });
         }
@@ -425,8 +426,39 @@ enum Sent {
 /// ngx_http_test_reading as its read event handler if test_reading_on():
 /// the client closing the connection ends the request, before the write
 /// fails, as epoll reports the read event of a connection first.
-async fn send_out(r: &R, out: &mut Chain, limit: i64, send_timeout: u64, ssl: Option<(bool, ngx_core::event_openssl::SslChainPos)>) -> Sent {
+async fn send_out(r: &R, out: &mut Chain, mut limit: i64, send_timeout: u64, ssl: Option<(bool, ngx_core::event_openssl::SslChainPos)>) -> Sent {
     let h2 = r.stream.borrow().is_some();
+
+    // io_uring mode: the send of the iteration is in flight. Completed in
+    // the flush that submitted it, it never waited: a write that does not
+    // block in C arms no send_timeout timer and no ngx_http_test_reading.
+    if !h2 && r.connection.send_in_flight() {
+        if let Some((res, sent)) = r.connection.settle_send().await {
+            let n = match crate::output::merge_sent(&r.connection, out, res, sent) {
+                Ok(n) => n as i64,
+                Err(e) => return Sent::Done(Ok(Err(e))),
+            };
+
+            if limit > 0 {
+                limit -= n;
+                if limit <= 0 {
+                    return Sent::Done(Ok(Ok(n)));
+                }
+            }
+
+            // the rest, without waiting if it needs no wait
+            let mut total = 0;
+            match crate::output::send_chain_pass(&r.connection, out, limit, &mut total) {
+                Ok(Pass::Done) => return Sent::Done(Ok(Ok(n + total))),
+                Ok(_) => {
+                    if limit > 0 {
+                        limit -= total;
+                    }
+                }
+                Err(e) => return Sent::Done(Ok(Err(e))),
+            }
+        }
+    }
 
     let chain = async {
         if h2 {
@@ -554,6 +586,10 @@ impl TestReading {
             Some(c) => c,
             None => return std::future::pending().await,
         };
+
+        if c.is_uring() {
+            return c.uring_wait_closed().await;
+        }
 
         if self.dup.borrow().is_none() {
             loop {
