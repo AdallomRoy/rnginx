@@ -202,6 +202,19 @@ stay. We take the architecture, not the crate, for these reasons:
   Rejected: completing writes optimistically (write-behind). It would move
   `c->sent` ahead of the kernel, report errors after the request is logged,
   and change `send_timeout`.
+- **Recycled buffers are written at once.** A chain holding `b->recycled`
+  buffers (the event pipe's, the copy filter's) is written by `writev()` at
+  once, and the ring takes only what the socket refuses. C flushes such
+  buffers so that the producer gets them back. A ring send keeps them busy a
+  tick longer, and the event pipe, short of free buffers meanwhile, spilled
+  proxied responses to temporary files where C does not (measured: −17% on
+  `proxy-100k`, plus warnings C does not log).
+- **Sends belong to the connection, as receives do.** A future dropped by a
+  `select!` after the kernel took the bytes must not lose that fact. The
+  in-flight send is the connection's, and a later call with the same pending
+  bytes collects its result. Otherwise the HTTP/2 driver, whose
+  `write_output` is dropped by its `select!`, sent DATA twice. System-call
+  sends wait while any ring send is in flight.
 - **Ownership.** The output chain's buffers (`BufData::Memory(Vec<u8>)`) go
   into the operation with the chain, and come back with the completion:
   - `update_sent(chain, n)` runs as today;
@@ -223,8 +236,12 @@ stay. We take the architecture, not the crate, for these reasons:
     `send_timeout` timer and no client watch;
   - one still in flight after that flush gets both.
 - **Boxing.** Phase 1 boxes `write_loop` for every response (one allocation
-  each). Phase 1b gives `Step` a variant holding the write continuation, so
-  the common case allocates nothing.
+  each). Callers up the filter chain box a pending `Step` again anyway, so a
+  `Step` variant would save little; ring writes still beat `writev()` on small
+  responses (measured, §7).
+- **Batching.** A ring send gathers up to IOV_MAX buffers (a `writev()`
+  gathers 64): each send waits for its completion before the next one, and
+  sub_filter's hundreds of small buffers took a dozen round trips otherwise.
 
 ### 2.5 Readiness without epoll
 Sockets in io_uring mode are never registered in epoll, so `afd()` is not
@@ -233,8 +250,16 @@ called for them. The few waits that do not read become POLL_ADD operations:
 - `read_event()`, TestReading and ClientWatch: POLLIN|POLLRDHUP, then a
   peek, as now. The wait for the end of the stream becomes POLLRDHUP alone
   on the socket itself, replacing today's `dup()` and second registration;
-- the keepalive cache's close handler (`poll_peek_close`):
-  POLLIN|POLLRDHUP;
+- the keepalive cache's close handler (`poll_peek_close`): the
+  connection's own receive. If data or the end arrives while the connection
+  is idle, it is closed, as nginx's handler does after its peek; if the
+  connection is used first, the receive is already armed for the response,
+  so nothing is cancelled (a poll cost an operation and its cancellation per
+  request);
+- peeks (`peek`, `peek_more`: stream preread, TLS detection) leave the mode
+  first when nothing was received, as C's MSG_PEEK leaves the data for the
+  next reader, which may be OpenSSL (a stream session passed to a TLS
+  listener);
 - the TLS handshake and non-kTLS TLS I/O (Phase 4): POLLIN/POLLOUT driving
   OpenSSL's retries (`drive_io`).
 
@@ -374,3 +399,77 @@ items stay.
 - **Availability.** Containers and older kernels are handled by the probe
   and the epoll fallback. nginx-tests and the benchmarks run on this VM's
   7.0 kernel.
+
+## 7. Status (2026-10-09, branch `io-uring`)
+
+Done:
+- **Phase 0** (`94d9cfb`): the ring and its driver.
+- **Phase 1** (`141f7ac`): plain HTTP/1 client connections.
+- **Phase 3** (`653c4a2`): plain upstream and stream connections, plus one
+  allocation per send (Phase 1b).
+- **Phase 2 and fixes** (`ec2fccf`): h2c, with the driver's sends still
+  system calls; cancel-safe sends; C's flush of recycled buffers; the
+  keepalive close handler on the connection's receive.
+
+nginx-tests pass 455 files with epoll and with `RNGINX_EVENTS=io_uring`;
+`cargo test` passes 639.
+
+### Write modes
+`RNGINX_URING_WRITES` compared three modes (`results/uring-p3-modes-20261009.jsonl`):
+
+| | epoll | ring (default) | hybrid | sync |
+|---|--:|--:|--:|--:|
+| `h1-return` req/s | 169k | **228k** | 196k | 199k |
+| `h1-static-1k` req/s | 91k | **119k** | 96k | 95k |
+
+Ring writes win on small responses even with the extra wakeup and boxed
+future: the default. The hybrid path (a `writev()` at once, the ring for the
+rest) serves recycled buffers (§2.4).
+
+### Results
+C, this build on epoll, and on io_uring, alternating, 3 reps
+(`results/uring-final-20261009.jsonl`); req/s ratios to C:
+
+| Scenario | epoll | io_uring | io_uring ÷ epoll |
+|---|--:|--:|--:|
+| `h1-return` | 0.71× | **0.93×** | 1.31 |
+| `h1-static-1k` | 0.72× | **0.95×** | 1.33 |
+| `h1-regex-rewrite` | 0.66× | **0.91×** | 1.37 |
+| `h1-access-log` | 0.72× | **0.93×** | 1.30 |
+| `h1-limit-req` | 0.72× | **0.94×** | 1.30 |
+| `h1-2k-conns` | 0.75× | 0.84× | 1.13 |
+| `h1-static-100k` | 0.81× | 0.89× | 1.09 |
+| `h1-static-1m`, `h1-gzip`, `h1-sub-filter*` | 0.77–1.00× | the same | 0.99–1.00 |
+| `h1-conn-close` (accept still on epoll) | 0.74× | 0.74× | 1.00 |
+| `h2c-1k` (sends still system calls) | 1.46× | 1.48× | 1.01 |
+| `proxy-cache-hit` | 0.68× | 0.83× | 1.22 |
+| `proxy-h2-upstream` | 0.66× | 0.79× | 1.20 |
+| `proxy-to-tls-upstream` | 0.66× | 0.79× | 1.19 |
+| `proxy-1k-no-keepalive` | 0.73× | 0.85× | 1.17 |
+| `proxy-1k-keepalive` | 0.63× | 0.66× | 1.05 |
+| `proxy-post-10k` | 0.66× | 0.69× | 1.05 |
+| `proxy-100k` | 0.84× | 0.80× | 0.95 |
+| `proxy-1m` | 0.89× | 0.89× | 0.99 |
+| `stream-tcp-proxy` | 0.88× | 0.96× | 1.09 |
+| TLS fronts, `grpc-pass`, `fastcgi-1k` | | unchanged | 0.99–1.06 |
+
+Fixed rate and idle memory:
+- **`rate-h1-static-1k`**: server CPU per request goes from 26.8 µs (epoll)
+  to 22.6 µs (C 19.4). p99 is 0.36 ms against epoll's 0.32 (the completion
+  tick).
+- **`rate-proxy-1k`**: 34.2 against 33.2 µs, so slightly more.
+- **`idle-10k-h1`**: 2.86 KB per connection against 2.33 (C 0.55). An idle
+  connection holds a receive in flight: driver and ring slots, plus the
+  connection's io_uring state.
+
+### Open
+- **Proxying gains less than serving.** `proxy-1k-keepalive` gains 5% while
+  `h1-return` gains 31%, and `rate-proxy-1k` costs slightly more CPU. To be
+  profiled: the upstream request send and response receive (16 KB receives),
+  and the hybrid writes of event-pipe output (`proxy-100k` −5%).
+- **Phase 2 completion:** the HTTP/2 driver's frames as ring sends of its
+  write buffer.
+- **Phase 4:** TLS. **Phase 5:** accept, close, small files, and io_uring as
+  the default.
+- **Idle memory:** smaller driver slots (a completion stored only while it
+  waits to be polled) and a slimmer per-connection state.
