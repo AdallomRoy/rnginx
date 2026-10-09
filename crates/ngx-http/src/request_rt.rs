@@ -169,18 +169,17 @@ async fn connection_task(c: Rc<Connection>) {
                     return;
                 }
                 Ok(Waited::Http2) => {
-                    // ngx_http_v2_init takes over, with the buffered bytes
-                    // (and those received by the ring and not read yet: the
-                    // HTTP/2 driver runs on the reactor)
+                    // ngx_http_v2_init takes over, with the buffered bytes;
+                    // in io_uring mode the driver reads what the ring
+                    // received after them (docs/IO_URING_PLAN.md, Phase 2)
                     let preread = {
                         let mut b = hc.buffer.borrow_mut();
-                        let mut v = b.unread().to_vec();
+                        let v = b.unread().to_vec();
                         b.pos = 0;
                         b.last = 0;
                         let data = std::mem::take(&mut b.data);
                         drop(b);
                         free_header_buffer(data);
-                        v.extend_from_slice(&c.leave_uring());
                         v
                     };
                     Box::pin(crate::v2::connection::init(c.clone(), hc.clone(), preread)).await;

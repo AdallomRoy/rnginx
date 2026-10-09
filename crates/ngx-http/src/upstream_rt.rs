@@ -2462,7 +2462,7 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
 
         rc = m.process_header(r, u);
     } else {
-        let watch = u.watch.clone();
+        let mut watch = u.watch.clone();
 
         // u->buffer of u->conf->buffer_size
         u.resp.buf.reserve_exact(buffer_size.saturating_sub(u.resp.buf.len()));
@@ -2502,7 +2502,9 @@ async fn process_header(r: &R, u: &mut Upstream, m: &mut dyn UpstreamModule, dea
                     }
 
                     // a cacheable response: read on without the watch
+                    // (the loop's copy too, which would fire again at once)
                     u.watch = None;
+                    watch = None;
                     continue;
                 }
 

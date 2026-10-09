@@ -288,7 +288,13 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
             continue;
         }
 
-        if ngx_core::uring::hybrid_writes() {
+        // Buffers the producer wants back (b->recycled: the event pipe's,
+        // the copy filter's output buffers) are written at once, as C's
+        // write filter flushes them, and are free again at once: a send by
+        // the ring would keep them busy until its completion a tick later,
+        // and the event pipe, short of free buffers meanwhile, would spill
+        // the response to a temporary file where C does not.
+        if ngx_core::uring::hybrid_writes() || chain.iter().any(|b| b.recycled) {
             // a writev() at once; the ring for what the socket does not
             // take now (it waits for room in the kernel)
             let mut iovs = [IoSlice::new(&[]); NGX_IOVS_PREALLOCATE];

@@ -572,7 +572,9 @@ def component(sym, dso):
 # Call graphs: perf 5.15 unwinds the C binary with DWARF, but not the Rust one
 # (no frame past the first), so Rust is profiled in frame-pointer builds of
 # the same commits (-C force-frame-pointers=yes)
-PROFILE_BINS = {"rust": f"{B}/bin/nginx-rust-fp", "rust-ad69792": f"{B}/bin/nginx-rust-ad69792-fp"}
+PROFILE_BINS = {"rust": f"{B}/bin/nginx-rust-fp", "rust-ad69792": f"{B}/bin/nginx-rust-ad69792-fp",
+                # the io-uring branch: RNGINX_EVENTS from the environment of analyze.py
+                "rust-uring": f"{B}/bin/nginx-rust-uring-fp"}
 
 
 def profile_run(srv, s, label, seconds=6):
@@ -584,7 +586,7 @@ def profile_run(srv, s, label, seconds=6):
     with open(f"{prefix}/conf/nginx.conf", "w") as f:
         f.write(conf)
     data = f"{OUT}/perf-{s['name']}-{label}.data"
-    p = subprocess.Popen([PERF, "record", "-e", "cpu-clock", "-F", "999", "--call-graph", callgraph, "-o", data, "--",
+    p = subprocess.Popen([PERF, "record", "-e", "cpu-clock", "-F", os.environ.get("PERF_FREQ", "999"), "--call-graph", callgraph, "-o", data, "--",
                           "taskset", "-c", SERVER_CPUS, binary, "-p", prefix + "/", "-c", f"{prefix}/conf/nginx.conf"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + 20

@@ -396,8 +396,6 @@ struct UringIo {
     tx: Option<crate::uring::Send<crate::buf::ChainSource>>,
     /// the send of poll_send() in flight (a copy of its bytes)
     txb: Option<crate::uring::Send<Vec<u8>>>,
-    /// the poll of poll_peek_close() (an idle connection's close handler)
-    watch: Option<crate::uring::PollFd>,
     /// the size of a receive
     recv_len: usize,
 }
@@ -1087,7 +1085,6 @@ impl Connection {
             rx_waiters: Vec::new(),
             tx: None,
             txb: None,
-            watch: None,
             recv_len: URING_RECV,
         }));
 
@@ -1317,7 +1314,6 @@ impl Connection {
             if u.tx.is_some() {
                 return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
             }
-            u.watch = None;
             match crate::uring::send(&u.fd, data.to_vec()) {
                 Ok(tx) => u.txb = Some(tx),
                 Err((e, _)) => return Poll::Ready(Err(e)),
@@ -1337,44 +1333,26 @@ impl Connection {
         }
     }
 
-    /// The close handler of an idle connection in io_uring mode: Ready
-    /// when a peek finds data, the end of the stream or an error; the poll
-    /// is the connection's, so a wait given up keeps it.
+    /// The close handler of an idle connection in io_uring mode
+    /// (ngx_http_upstream_keepalive_close_handler): Ready when data, the
+    /// end of the stream or an error comes. It is the connection's own
+    /// receive: if the connection is used again first, that receive is
+    /// already there for the response, with nothing to cancel (a poll would
+    /// cost an operation and its cancellation for every request).
     fn poll_uring_peek_close(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        use std::task::Poll;
-
-        loop {
-            let mut g = self.uring.borrow_mut();
-
-            let Some(u) = g.as_mut() else { return Poll::Ready(()) };
-
-            if u.stash.is_some() || u.eof || u.error.is_some() {
-                return Poll::Ready(());
+        // the response was read whole: what comes now comes through the
+        // receive (a last read that filled its length is no sign of data)
+        if let Some(u) = self.uring.borrow_mut().as_mut() {
+            if u.stash.is_none() {
+                u.more = false;
             }
+        }
 
-            if u.watch.is_none() {
-                match crate::uring::poll_fd(&u.fd, (libc::POLLIN | libc::POLLRDHUP) as u32) {
-                    Ok(p) => u.watch = Some(p),
-                    Err(_) => return Poll::Ready(()),
-                }
-            }
+        let mut waiting = false;
 
-            match std::future::Future::poll(std::pin::Pin::new(u.watch.as_mut().expect("a poll")), cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => {
-                    u.watch = None;
-                    return Poll::Ready(());
-                }
-                Poll::Ready(Ok(_)) => u.watch = None,
-            }
-
-            drop(g);
-
-            // a stale event leaves the connection idle (ev->ready = 0)
-            match self.peek_byte() {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                _ => return Poll::Ready(()),
-            }
+        match self.poll_uring_readable(cx, &mut waiting) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
         }
     }
 
@@ -1397,8 +1375,6 @@ impl Connection {
         }
 
         if u.rx.is_none() {
-            // an idle connection's close handler is done: it is read again
-            u.watch = None;
             match crate::uring::recv(&u.fd, u.recv_len) {
                 Ok(r) => u.rx = Some(r),
                 Err(e) => {
@@ -1605,8 +1581,6 @@ impl Connection {
             return Err((io::Error::from_raw_os_error(libc::EBUSY), chain));
         }
 
-        u.watch = None;
-
         match crate::uring::send(&u.fd, crate::buf::ChainSource { chain, budget }) {
             Ok(tx) => {
                 u.tx = Some(tx);
@@ -1619,6 +1593,12 @@ impl Connection {
     /// A send started by start_send() is in flight.
     pub fn send_in_flight(&self) -> bool {
         self.uring.borrow().as_ref().is_some_and(|u| u.tx.is_some())
+    }
+
+    /// Any send by the ring is in flight: a system call sending now could
+    /// put its bytes ahead of that send's.
+    fn any_send_in_flight(&self) -> bool {
+        self.uring.borrow().as_ref().is_some_and(|u| u.tx.is_some() || u.txb.is_some())
     }
 
     /// The send in flight, completed: its result and the chain (None if no
@@ -1656,20 +1636,13 @@ impl Connection {
         .await
     }
 
-    /// send(2) of a copy of `data` by the ring, in io_uring mode.
+    /// send(2) of a copy of `data` by the ring, in io_uring mode. The send
+    /// in flight is the connection's (poll_send()): a future given up
+    /// leaves it, and the next call, with the same bytes still pending (a
+    /// caller that drops a send waits to learn what was written, as the
+    /// HTTP/2 driver), gets its result instead of sending them twice.
     async fn uring_send(&self, data: &[u8]) -> io::Result<usize> {
-        let tx = {
-            let g = self.uring.borrow();
-            let u = g.as_ref().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-            crate::uring::send(&u.fd, data.to_vec()).map_err(|(e, _)| e)?
-        };
-
-        let (res, _) = tx.await;
-        let n = res?;
-
-        self.sent.set(self.sent.get() + n as u64);
-
-        Ok(n)
+        std::future::poll_fn(|cx| self.poll_send(cx, data)).await
     }
 
     /// Wait until the socket is readable.
@@ -1776,7 +1749,7 @@ impl Connection {
         if let Some(ssl) = self.ssl.borrow().clone() {
             return ssl.try_send(self, buf);
         }
-        if self.send_in_flight() {
+        if self.any_send_in_flight() {
             // one send at a time on a socket in io_uring mode: in order
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -1790,7 +1763,7 @@ impl Connection {
     /// from `op` clears the readiness (wev->ready = 0).
     pub fn try_write_io<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
         self.fake_io_error()?;
-        let uring_fd = self.uring.borrow().as_ref().map(|u| (u.fd.clone(), u.tx.is_some()));
+        let uring_fd = self.uring.borrow().as_ref().map(|u| (u.fd.clone(), u.tx.is_some() || u.txb.is_some()));
         if let Some((fd, in_flight)) = uring_fd {
             // io_uring mode: at once, unless the ring sends (in order); a
             // WouldBlock is waited for with writable()
@@ -2209,7 +2182,6 @@ impl Connection {
                     // more than what is stashed: a receive appends to it
                     u.more = false;
                     if u.rx.is_none() {
-                        u.watch = None;
                         let len = u.recv_len.min(buf.len() - u.stashed().min(buf.len())).max(1);
                         u.rx = Some(crate::uring::recv(&u.fd, len)?);
                     }
