@@ -1,0 +1,19 @@
+[package]
+name = "uring-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+io-uring = "0.7"
+tokio = { version = "1", features = ["rt", "net"] }
+tokio-uring = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# not a member of the rnginx workspace
+[workspace]

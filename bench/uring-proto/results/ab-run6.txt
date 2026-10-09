@@ -1,0 +1,37 @@
+rep0 c                                           238163 req/s | proc user  1.48 sys  6.87 | CPU0-1  8.35 us/req ( 99% busy) | client CPU4-7  8.42 us/req ( 35%)  non2xx=0
+rep0 rust                                        172140 req/s | proc user  3.95 sys  7.63 | CPU0-1 11.58 us/req (100% busy) | client CPU4-7  8.60 us/req ( 26%)  non2xx=0
+rep0 proto-epoll                                 300150 req/s | proc user  0.21 sys  6.43 | CPU0-1  6.64 us/req (100% busy) | client CPU4-7  8.16 us/req ( 43%)  non2xx=0
+rep0 proto-uring-arc                             408225 req/s | proc user  0.05 sys  4.83 | CPU0-1  4.88 us/req (100% busy) | client CPU4-7  6.78 us/req ( 48%)  non2xx=0
+rep0 proto-tokio-epoll                           292258 req/s | proc user  0.45 sys  6.37 | CPU0-1  6.83 us/req (100% busy) | client CPU4-7  8.11 us/req ( 42%)  non2xx=0
+rep0 proto-tokio-uring                           389135 req/s | proc user  0.22 sys  4.90 | CPU0-1  5.13 us/req (100% busy) | client CPU4-7  6.69 us/req ( 44%)  non2xx=0
+rep0 proto-tokio-ring@NBUF=256                   389827 req/s | proc user  0.25 sys  4.87 | CPU0-1  5.12 us/req (100% busy) | client CPU4-7  6.69 us/req ( 45%)  non2xx=0
+rep0 proto-tokio-ring@NBUF=256,SYNCSEND=1        346809 req/s | proc user  0.30 sys  5.46 | CPU0-1  5.75 us/req (100% busy) | client CPU4-7  7.29 us/req ( 44%)  non2xx=0
+rep0 proto-tokio-ring@NBUF=256,DEFER=1           389799 req/s | proc user  0.23 sys  4.87 | CPU0-1  5.12 us/req ( 99% busy) | client CPU4-7  6.68 us/req ( 45%)  non2xx=0
+rep1 c                                           233625 req/s | proc user  1.57 sys  6.95 | CPU0-1  8.51 us/req ( 99% busy) | client CPU4-7  8.43 us/req ( 35%)  non2xx=0
+rep1 rust                                        173300 req/s | proc user  3.95 sys  7.55 | CPU0-1 11.49 us/req (100% busy) | client CPU4-7  8.77 us/req ( 27%)  non2xx=0
+rep1 proto-epoll                                 302780 req/s | proc user  0.21 sys  6.38 | CPU0-1  6.59 us/req (100% busy) | client CPU4-7  8.21 us/req ( 44%)  non2xx=0
+rep1 proto-uring-arc                             415025 req/s | proc user  0.07 sys  4.73 | CPU0-1  4.80 us/req ( 99% busy) | client CPU4-7  6.62 us/req ( 47%)  non2xx=0
+rep1 proto-tokio-epoll                           290956 req/s | proc user  0.41 sys  6.44 | CPU0-1  6.84 us/req (100% busy) | client CPU4-7  8.27 us/req ( 42%)  non2xx=0
+rep1 proto-tokio-uring                           392158 req/s | proc user  0.24 sys  4.84 | CPU0-1  5.08 us/req (100% busy) | client CPU4-7  6.74 us/req ( 45%)  non2xx=0
+rep1 proto-tokio-ring@NBUF=256                   390793 req/s | proc user  0.24 sys  4.86 | CPU0-1  5.10 us/req (100% busy) | client CPU4-7  6.60 us/req ( 44%)  non2xx=0
+rep1 proto-tokio-ring@NBUF=256,SYNCSEND=1        348483 req/s | proc user  0.29 sys  5.42 | CPU0-1  5.72 us/req (100% busy) | client CPU4-7  7.05 us/req ( 43%)  non2xx=0
+rep1 proto-tokio-ring@NBUF=256,DEFER=1           381912 req/s | proc user  0.24 sys  4.98 | CPU0-1  5.22 us/req (100% busy) | client CPU4-7  6.76 us/req ( 44%)  non2xx=0
+rep2 c                                           227916 req/s | proc user  1.69 sys  7.05 | CPU0-1  8.75 us/req (100% busy) | client CPU4-7  9.97 us/req ( 40%)  non2xx=0
+rep2 rust                                        173495 req/s | proc user  3.85 sys  7.64 | CPU0-1 11.48 us/req (100% busy) | client CPU4-7  8.65 us/req ( 26%)  non2xx=0
+rep2 proto-epoll                                 301491 req/s | proc user  0.21 sys  6.41 | CPU0-1  6.60 us/req (100% busy) | client CPU4-7  8.14 us/req ( 43%)  non2xx=0
+rep2 proto-uring-arc                             416923 req/s | proc user  0.07 sys  4.71 | CPU0-1  4.78 us/req ( 99% busy) | client CPU4-7  6.59 us/req ( 47%)  non2xx=0
+rep2 proto-tokio-epoll                           291385 req/s | proc user  0.41 sys  6.42 | CPU0-1  6.84 us/req (100% busy) | client CPU4-7  8.14 us/req ( 42%)  non2xx=0
+rep2 proto-tokio-uring                           386068 req/s | proc user  0.22 sys  4.94 | CPU0-1  5.17 us/req (100% busy) | client CPU4-7  6.73 us/req ( 44%)  non2xx=0
+rep2 proto-tokio-ring@NBUF=256                   389195 req/s | proc user  0.23 sys  4.89 | CPU0-1  5.12 us/req (100% busy) | client CPU4-7  6.72 us/req ( 45%)  non2xx=0
+rep2 proto-tokio-ring@NBUF=256,SYNCSEND=1        348772 req/s | proc user  0.31 sys  5.41 | CPU0-1  5.72 us/req (100% busy) | client CPU4-7  7.22 us/req ( 44%)  non2xx=0
+rep2 proto-tokio-ring@NBUF=256,DEFER=1           382625 req/s | proc user  0.25 sys  4.95 | CPU0-1  5.21 us/req (100% busy) | client CPU4-7  6.86 us/req ( 45%)  non2xx=0
+
+c                                        median    233625 req/s (1.00x) | proc user 1.57 sys 6.95 | CPU0-1 8.51 us/req 99% | client 8.43 us/req 35%
+rust                                     median    173300 req/s (0.74x) | proc user 3.95 sys 7.55 | CPU0-1 11.49 us/req 100% | client 8.77 us/req 27%
+proto-epoll                              median    301491 req/s (1.29x) | proc user 0.21 sys 6.41 | CPU0-1 6.60 us/req 100% | client 8.14 us/req 43%
+proto-uring-arc                          median    415025 req/s (1.78x) | proc user 0.07 sys 4.73 | CPU0-1 4.80 us/req 99% | client 6.62 us/req 47%
+proto-tokio-epoll                        median    291385 req/s (1.25x) | proc user 0.41 sys 6.42 | CPU0-1 6.84 us/req 100% | client 8.14 us/req 42%
+proto-tokio-uring                        median    389135 req/s (1.67x) | proc user 0.22 sys 4.90 | CPU0-1 5.13 us/req 100% | client 6.69 us/req 44%
+proto-tokio-ring@NBUF=256                median    389827 req/s (1.67x) | proc user 0.25 sys 4.87 | CPU0-1 5.12 us/req 100% | client 6.69 us/req 45%
+proto-tokio-ring@NBUF=256,SYNCSEND=1     median    348483 req/s (1.49x) | proc user 0.29 sys 5.42 | CPU0-1 5.72 us/req 100% | client 7.05 us/req 43%
+proto-tokio-ring@NBUF=256,DEFER=1        median    382625 req/s (1.64x) | proc user 0.25 sys 4.95 | CPU0-1 5.21 us/req 100% | client 6.86 us/req 45%

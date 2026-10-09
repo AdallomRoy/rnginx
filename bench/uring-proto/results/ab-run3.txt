@@ -1,0 +1,25 @@
+rep0 c                                           231788 req/s | proc user  1.67 sys  6.94 | CPU0-1  8.60 us/req (100% busy) | client CPU4-7  8.54 us/req ( 35%)  non2xx=0
+rep0 proto-epoll                                 300277 req/s | proc user  0.19 sys  6.44 | CPU0-1  6.63 us/req (100% busy) | client CPU4-7  8.15 us/req ( 43%)  non2xx=0
+rep0 proto-uring                                 346718 req/s | proc user  0.06 sys  5.69 | CPU0-1  5.76 us/req (100% busy) | client CPU4-7  7.85 us/req ( 48%)  non2xx=0
+rep0 proto-uring@NBUF=256                        346531 req/s | proc user  0.06 sys  5.69 | CPU0-1  5.75 us/req (100% busy) | client CPU4-7  7.85 us/req ( 48%)  non2xx=0
+rep0 proto-uring@FLAGS=default                   344125 req/s | proc user  0.05 sys  5.74 | CPU0-1  5.79 us/req (100% busy) | client CPU4-7  7.82 us/req ( 47%)  non2xx=0
+rep0 proto-uring@RECV=select,NBUF=256            319193 req/s | proc user  0.06 sys  6.18 | CPU0-1  6.25 us/req (100% busy) | client CPU4-7  8.01 us/req ( 45%)  non2xx=0
+rep0 proto-uring-arc                             411313 req/s | proc user  0.06 sys  4.79 | CPU0-1  4.85 us/req (100% busy) | client CPU4-7  6.62 us/req ( 47%)  non2xx=0
+rep0 proto-uring-arc@FLAGS=modern                415338 req/s | proc user  0.06 sys  4.75 | CPU0-1  4.81 us/req (100% busy) | client CPU4-7  6.64 us/req ( 47%)  non2xx=0
+rep1 c                                           235938 req/s | proc user  1.56 sys  6.89 | CPU0-1  8.45 us/req (100% busy) | client CPU4-7  8.53 us/req ( 35%)  non2xx=0
+rep1 proto-epoll                                 304860 req/s | proc user  0.20 sys  6.34 | CPU0-1  6.53 us/req (100% busy) | client CPU4-7  8.10 us/req ( 44%)  non2xx=0
+rep1 proto-uring                                 347806 req/s | proc user  0.07 sys  5.67 | CPU0-1  5.73 us/req (100% busy) | client CPU4-7  7.86 us/req ( 48%)  non2xx=0
+rep1 proto-uring@NBUF=256                        347256 req/s | proc user  0.06 sys  5.67 | CPU0-1  5.73 us/req ( 99% busy) | client CPU4-7  7.90 us/req ( 48%)  non2xx=0
+rep1 proto-uring@FLAGS=default                   343064 req/s | proc user  0.05 sys  5.76 | CPU0-1  5.81 us/req (100% busy) | client CPU4-7  7.80 us/req ( 47%)  non2xx=0
+rep1 proto-uring@RECV=select,NBUF=256            320472 req/s | proc user  0.07 sys  6.15 | CPU0-1  6.22 us/req (100% busy) | client CPU4-7  7.99 us/req ( 45%)  non2xx=0
+rep1 proto-uring-arc                             414109 req/s | proc user  0.05 sys  4.75 | CPU0-1  4.81 us/req (100% busy) | client CPU4-7  7.13 us/req ( 50%)  non2xx=0
+Traceback (most recent call last):
+  File "/home/ubuntu/arc-exp/ab.py", line 145, in <module>
+    main()
+  File "/home/ubuntu/arc-exp/ab.py", line 123, in main
+    reqs, rps, errs, non2xx = wrk(port, duration)
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/arc-exp/ab.py", line 104, in wrk
+    reqs = int(re.search(r"(\d+) requests in", out).group(1))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'group'

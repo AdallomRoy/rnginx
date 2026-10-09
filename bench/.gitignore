@@ -10,3 +10,5 @@
 /results/
 /local/
 __pycache__/
+/uring-proto/target/
+/uring-proto/run/

@@ -445,7 +445,7 @@ On the smallest requests (`return 200`, static 1 KB, proxy 1 KB) the remaining g
 
 ## 7. Not planned, and why
 
-- **io_uring:** Docker's default seccomp profile blocks it, submitting buffers safely needs `unsafe`, and its completion model departs from nginx's readiness pattern.
+- **io_uring:** ~~Docker's default seccomp profile blocks it, submitting buffers safely needs `unsafe`, and its completion model departs from nginx's readiness pattern.~~ Reversed on 2026-10-09: on this VM it saves 1.7 µs of server CPU per request (−25%) for the same work. The plan is `docs/IO_URING_PLAN.md`: an epoll fallback where io_uring is blocked, `unsafe` only in ngx-sys behind a sound API, and nginx's readiness structure kept on top of completions.
 - **`unsafe` arenas or pointer-based zero-copy:** the crates stay `forbid(unsafe_code)`. Every design above uses safe tools: `Bytes`, `Rc<[u8]>`, `Pin::set`, `Waker::from(Arc)`, `SmallVec`.
 - **`target-cpu=native`:** 2% or less, and it costs portability.
 

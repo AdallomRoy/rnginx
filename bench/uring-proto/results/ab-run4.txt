@@ -1,0 +1,19 @@
+rep0 proto-epoll                                 303032 req/s | proc user  0.21 sys  6.37 | CPU0-1  6.58 us/req (100% busy) | client CPU4-7  7.97 us/req ( 43%)  non2xx=0
+rep0 proto-uring-arc                             417141 req/s | proc user  0.06 sys  4.71 | CPU0-1  4.77 us/req ( 99% busy) | client CPU4-7  6.52 us/req ( 46%)  non2xx=0
+rep0 proto-uring-arc@RECV=eager                  322839 req/s | proc user  0.05 sys  6.12 | CPU0-1  6.17 us/req ( 99% busy) | client CPU4-7  7.87 us/req ( 45%)  non2xx=0
+rep0 proto-uring@RECV=select,NBUF=256            311421 req/s | proc user  0.08 sys  6.32 | CPU0-1  6.41 us/req (100% busy) | client CPU4-7  9.61 us/req ( 53%)  non2xx=0
+rep0 proto-uring@RECV=select-lazy,NBUF=256       415869 req/s | proc user  0.07 sys  4.73 | CPU0-1  4.80 us/req (100% busy) | client CPU4-7  6.52 us/req ( 46%)  non2xx=0
+rep0 proto-uring@RECV=select-lazy,NBUF=4096      400198 req/s | proc user  0.05 sys  4.92 | CPU0-1  4.98 us/req (100% busy) | client CPU4-7  6.76 us/req ( 46%)  non2xx=0
+rep1 proto-epoll                                 302550 req/s | proc user  0.20 sys  6.39 | CPU0-1  6.59 us/req (100% busy) | client CPU4-7  7.95 us/req ( 43%)  non2xx=0
+rep1 proto-uring-arc                             422551 req/s | proc user  0.06 sys  4.66 | CPU0-1  4.71 us/req (100% busy) | client CPU4-7  6.43 us/req ( 46%)  non2xx=0
+rep1 proto-uring-arc@RECV=eager                  322953 req/s | proc user  0.06 sys  6.12 | CPU0-1  6.17 us/req (100% busy) | client CPU4-7  7.92 us/req ( 45%)  non2xx=0
+rep1 proto-uring@RECV=select,NBUF=256            319205 req/s | proc user  0.06 sys  6.19 | CPU0-1  6.25 us/req (100% busy) | client CPU4-7  8.06 us/req ( 45%)  non2xx=0
+rep1 proto-uring@RECV=select-lazy,NBUF=256       414698 req/s | proc user  0.06 sys  4.75 | CPU0-1  4.82 us/req (100% busy) | client CPU4-7  6.61 us/req ( 47%)  non2xx=0
+rep1 proto-uring@RECV=select-lazy,NBUF=4096      415418 req/s | proc user  0.07 sys  4.73 | CPU0-1  4.80 us/req (100% busy) | client CPU4-7  6.55 us/req ( 46%)  non2xx=0
+
+proto-epoll                              median    303032 req/s (1.00x) | proc user 0.21 sys 6.37 | CPU0-1 6.58 us/req 100% | client 7.97 us/req 43%
+proto-uring-arc                          median    422551 req/s (1.39x) | proc user 0.06 sys 4.66 | CPU0-1 4.71 us/req 100% | client 6.43 us/req 46%
+proto-uring-arc@RECV=eager               median    322953 req/s (1.07x) | proc user 0.06 sys 6.12 | CPU0-1 6.17 us/req 100% | client 7.92 us/req 45%
+proto-uring@RECV=select,NBUF=256         median    319205 req/s (1.05x) | proc user 0.06 sys 6.19 | CPU0-1 6.25 us/req 100% | client 8.06 us/req 45%
+proto-uring@RECV=select-lazy,NBUF=256    median    415869 req/s (1.37x) | proc user 0.07 sys 4.73 | CPU0-1 4.80 us/req 100% | client 6.52 us/req 46%
+proto-uring@RECV=select-lazy,NBUF=4096   median    415418 req/s (1.37x) | proc user 0.07 sys 4.73 | CPU0-1 4.80 us/req 100% | client 6.55 us/req 46%
