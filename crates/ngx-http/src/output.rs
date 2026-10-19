@@ -272,6 +272,8 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
             continue;
         }
 
+        uring_read_small_files(chain);
+
         let (nbufs, gathered, file_next) = ngx_core::buf::chain_gather(chain, usize::try_from(budget).unwrap_or(usize::MAX), ngx_core::buf::URING_IOVS, |_| {});
 
         if nbufs == 0 {
@@ -293,8 +295,10 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
         // write filter flushes them, and are free again at once: a send by
         // the ring would keep them busy until its completion a tick later,
         // and the event pipe, short of free buffers meanwhile, would spill
-        // the response to a temporary file where C does not.
-        if ngx_core::uring::hybrid_writes() || chain.iter().any(|b| b.recycled) {
+        // the response to a temporary file where C does not. So is the last
+        // output before the connection is closed, for the end of the stream
+        // to follow it at once (Connection::close_after_write).
+        if ngx_core::uring::hybrid_writes() || c.close_after_write.get() || chain.iter().any(|b| b.recycled) {
             // a writev() at once; the ring for what the socket does not
             // take now (it waits for room in the kernel)
             let mut iovs = [IoSlice::new(&[]); NGX_IOVS_PREALLOCATE];
@@ -339,6 +343,51 @@ fn uring_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &
                 Err(e)
             }
         };
+    }
+}
+
+/// The largest file part read into memory to go in one send by the ring with
+/// the memory buffers before it (io_uring mode), and the most read so for
+/// one send.
+const URING_SMALL_FILE: i64 = 16384;
+const URING_SMALL_FILES: i64 = 65536;
+
+/// io_uring mode: the small file parts that follow memory buffers at the
+/// front of `chain` (the static file after its response header) are read
+/// into memory, so that one send by the ring takes them with the header. C
+/// sends the header by writev() and the file by sendfile() at once, with
+/// TCP_CORK around them; with a send by the ring for the header, sendfile()
+/// would wait for its completion, a tick later. A file part that cannot be
+/// read whole stays for sendfile(), which reports what it finds as in C.
+fn uring_read_small_files(chain: &mut Chain) {
+    let mut memory = false;
+    let mut read: i64 = 0;
+
+    for i in 0..chain.len() {
+        let b = &chain[i];
+
+        if b.special_buf() {
+            continue;
+        }
+
+        if b.in_memory() {
+            memory = true;
+            continue;
+        }
+
+        let size = b.buf_size();
+
+        // (the event pipe's temporary files stay its own)
+        if !memory || !b.in_file || b.temp_file || size > URING_SMALL_FILE || read + size > URING_SMALL_FILES {
+            return;
+        }
+
+        match crate::copy_filter::read_file_buf(b) {
+            Some(m) => chain[i] = m,
+            None => return,
+        }
+
+        read += size;
     }
 }
 

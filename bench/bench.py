@@ -97,6 +97,11 @@ BINS["rust-1c36048"] = f"{B}/bin/nginx-rust-1c36048"
 BINS["rust-1c36048-epoll"] = BINS["rust-1c36048"]
 ENVS["rust-1c36048"] = {"RNGINX_EVENTS": "io_uring"}
 ENVS["rust-1c36048-epoll"] = {"RNGINX_EVENTS": "epoll"}
+# master 7e50aba (the client watch, idle memory): on io_uring and on epoll
+BINS["rust-7e50aba"] = f"{B}/bin/nginx-rust-7e50aba"
+BINS["rust-7e50aba-epoll"] = BINS["rust-7e50aba"]
+ENVS["rust-7e50aba"] = {"RNGINX_EVENTS": "io_uring"}
+ENVS["rust-7e50aba-epoll"] = {"RNGINX_EVENTS": "epoll"}
 # work in progress on io_uring (docs/IO_URING_PLAN.md §7 Open), against
 # the last merged build: on io_uring and on epoll
 BINS["rust-wip"] = f"{B}/bin/nginx-rust-wip"

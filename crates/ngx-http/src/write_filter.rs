@@ -246,6 +246,10 @@ fn iteration(r: &R, s: &Send) -> Iteration {
     let pass = if r.stream.borrow().is_some() {
         Ok(Pass::Async)
     } else {
+        // the last of a response without keepalive: the connection is
+        // closed right after it (written at once in io_uring mode)
+        c.close_after_write.set(s.last && !r.keepalive.get());
+
         let mut out = std::mem::take(&mut *r.out.borrow_mut());
         let pass = crate::output::send_chain_pass(c, &mut out, limit, &mut total);
         *r.out.borrow_mut() = out;

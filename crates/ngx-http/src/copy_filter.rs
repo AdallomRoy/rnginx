@@ -507,6 +507,55 @@ pub fn recycle(b: Buf) {
     }
 }
 
+/// The file part of `b` (a file buffer, not in memory) read whole into a
+/// copy buffer, which goes back to the free ones once sent, with b's flags
+/// (io_uring mode: a small file sent with the header in one send, not by
+/// sendfile() after it). None if it cannot be read so (directio, an error,
+/// a short read): sendfile() then sends it, and reports what it finds as
+/// in C.
+pub fn read_file_buf(b: &Buf) -> Option<Buf> {
+    let file = match &b.data {
+        BufData::File(f) if b.in_file && !b.in_memory() && !f.directio => f.clone(),
+        _ => return None,
+    };
+
+    let size = usize::try_from(b.file_last - b.file_pos).ok()?;
+    let f = ngx_core::fd::get(file.fd).ok()?;
+
+    let mut v = take_buf(size);
+
+    let read = if v.is_empty() && v.capacity() == size {
+        // a new buffer: read into its memory not initialized
+        rustix::io::pread(&f, rustix::buffer::spare_capacity(&mut v), b.file_pos as u64)
+    } else {
+        // a free buffer: only what it never had is zeroed
+        v.resize(size, 0);
+        rustix::io::pread(&f, &mut v[..], b.file_pos as u64)
+    };
+
+    match read {
+        Ok(n) if n == size => {}
+        _ => {
+            FREE.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.len() < FREE_BUFS {
+                    f.push(v);
+                }
+            });
+            return None;
+        }
+    }
+
+    let mut dst = Buf::from_vec(v);
+    dst.flush = b.flush;
+    dst.sync = b.sync;
+    dst.last_buf = b.last_buf;
+    dst.last_in_chain = b.last_in_chain;
+    dst.tag = COPY_BUF_TAG;
+
+    Some(dst)
+}
+
 /// ngx_output_chain_copy_buf: `size` bytes of src at most into a copy
 /// buffer, aligned for directio (ngx_pmemalign), and src moved past them
 fn copy_buf(r: &R, src: &mut Buf, size: usize, directio: bool, alignment: usize, unaligned: bool, recycled: bool) -> Result<Buf, i64> {

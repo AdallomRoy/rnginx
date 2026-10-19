@@ -530,6 +530,13 @@ pub struct Connection {
     pub tcp_nopush: Cell<TcpNopush>,
     pub need_last_buf: Cell<bool>,
     pub need_flush_buf: Cell<bool>,
+    /// the connection is closed once the output in progress is written (the
+    /// last of a response without keepalive): io_uring mode writes it at
+    /// once by system calls, as C does, for the end of the stream to follow
+    /// the data at once. Sent by the ring, the data went out a tick before
+    /// the close, and the client, done reading, closed first (its TIME_WAIT,
+    /// not the server's).
+    pub close_after_write: Cell<bool>,
     pub sendfile: Cell<bool>,
     pub udp: Cell<bool>,
     /// Signalled to wake an idle (keepalive) connection so it closes itself.
@@ -655,6 +662,7 @@ impl Connection {
             tcp_nopush: Cell::new(TcpNopush::Unset),
             need_last_buf: Cell::new(false),
             need_flush_buf: Cell::new(false),
+            close_after_write: Cell::new(false),
             sendfile: Cell::new(false),
             udp: Cell::new(false),
             close_notify: tokio::sync::Notify::new(),
@@ -759,6 +767,7 @@ impl Connection {
             tcp_nopush: Cell::new(c.tcp_nopush.get()),
             need_last_buf: Cell::new(false),
             need_flush_buf: Cell::new(false),
+            close_after_write: Cell::new(false),
             sendfile: Cell::new(c.sendfile.get()),
             udp: Cell::new(false),
             close_notify: tokio::sync::Notify::new(),
@@ -827,6 +836,7 @@ impl Connection {
             tcp_nopush,
             need_last_buf,
             need_flush_buf,
+            close_after_write,
             sendfile,
             udp,
             close_notify,
@@ -898,6 +908,7 @@ impl Connection {
         tcp_nopush.set(c.tcp_nopush.get());
         need_last_buf.set(false);
         need_flush_buf.set(false);
+        close_after_write.set(false);
         sendfile.set(c.sendfile.get());
         udp.set(false);
 
