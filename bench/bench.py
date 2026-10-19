@@ -92,6 +92,17 @@ ENVS["rust-uring-sync"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "
 # the same branch, built with -C force-frame-pointers=yes (profiles)
 BINS["rust-uring-fp"] = f"{B}/bin/nginx-rust-uring-fp"
 ENVS["rust-uring-fp"] = {"RNGINX_EVENTS": "io_uring"}
+# master 1c36048 (io_uring Phase 2 completed): on io_uring and on epoll
+BINS["rust-1c36048"] = f"{B}/bin/nginx-rust-1c36048"
+BINS["rust-1c36048-epoll"] = BINS["rust-1c36048"]
+ENVS["rust-1c36048"] = {"RNGINX_EVENTS": "io_uring"}
+ENVS["rust-1c36048-epoll"] = {"RNGINX_EVENTS": "epoll"}
+# work in progress on io_uring (docs/IO_URING_PLAN.md §7 Open), against
+# the last merged build: on io_uring and on epoll
+BINS["rust-wip"] = f"{B}/bin/nginx-rust-wip"
+BINS["rust-wip-epoll"] = BINS["rust-wip"]
+ENVS["rust-wip"] = {"RNGINX_EVENTS": "io_uring"}
+ENVS["rust-wip-epoll"] = {"RNGINX_EVENTS": "epoll"}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")

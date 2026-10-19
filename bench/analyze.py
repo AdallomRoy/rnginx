@@ -6,6 +6,8 @@
     analyze.py idle     SCENARIOS SERVERS   heap blocks/bytes held per idle connection (idle-10k-* scenarios)
     analyze.py syscalls SCENARIOS SERVERS   syscalls per request (strace -f -c, nginx run as its child)
     analyze.py sysstat  SCENARIOS SERVERS   syscalls per request at full load (perf stat, syscall tracepoints)
+    analyze.py uringstat SCENARIOS SERVERS  io_uring operations (by opcode, how many waited) and syscalls
+                                            per request at full load, servers run with their ENVS
     analyze.py profile  SCENARIOS SERVERS   perf profile with call graphs (frame-pointer builds),
                                             CPU time broken down into components
 
@@ -17,6 +19,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -24,7 +27,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench import (B, BINS, CLIENT_CPUS, SCENARIOS, SERVER_CONF, SERVER_CPUS, Backends, Nginx,  # noqa: E402
+from bench import (B, BINS, CLIENT_CPUS, ENVS, SCENARIOS, SERVER_CONF, SERVER_CPUS, Backends, Nginx,  # noqa: E402
                    client_run, h2load_cmd, oha_cmd, parse_h2load, parse_oha, parse_wrk, port_open, render,
                    reset_prefix, run_load, wait_ports_free, wrk_cmd, POST_LUA)
 
@@ -34,6 +37,12 @@ os.makedirs(OUT, exist_ok=True)
 MCOUNT = f"{B}/bin/libmcount.so"
 MCOUNT_DIR = f"{B}/run/mcount"   # /dev/shm is only 64 MB here
 PERF = (sorted(glob.glob("/usr/lib/linux-tools/*/perf")) or ["perf"])[-1]   # the /usr/bin/perf wrapper wants tools for the running kernel
+
+
+def srv_env(srv, **extra):
+    """The environment of server srv's nginx: its ENVS (RNGINX_EVENTS of the
+    io_uring builds), and `extra`."""
+    return dict(ENVS.get(srv, {}), **extra)
 
 
 # --------------------------------------------------------------------------
@@ -67,7 +76,7 @@ def allocs(scenarios, servers, duration=5):
         for srv in servers:
             prefix = f"{B}/run/{srv}"
             ngx = Nginx(BINS[srv], conf_for(srv, s, prefix), prefix,
-                        SERVER_CPUS, ports=(18080, 18443), env={"LD_PRELOAD": MCOUNT})
+                        SERVER_CPUS, ports=(18080, 18443), env=srv_env(srv, LD_PRELOAD=MCOUNT))
             ngx.start()
             try:
                 workers = ngx.pids[1:3]
@@ -210,7 +219,7 @@ def allocsites(scenarios, servers, duration=5, every=397):
         for srv in servers:
             prefix = f"{B}/run/{srv}"
             ngx = Nginx(BINS[srv], conf_for(srv, s, prefix), prefix, SERVER_CPUS, ports=(18080, 18443),
-                        env={"LD_PRELOAD": MCOUNT, "MCOUNT_SAMPLE": str(every), "MCOUNT_DIR": MCOUNT_DIR})
+                        env=srv_env(srv, LD_PRELOAD=MCOUNT, MCOUNT_SAMPLE=str(every), MCOUNT_DIR=MCOUNT_DIR))
             ngx.start()
             try:
                 workers = ngx.pids[1:3]
@@ -306,7 +315,7 @@ def idle(scenarios, servers, n=5000):
         for srv in servers:
             prefix = f"{B}/run/{srv}"
             ngx = Nginx(BINS[srv], conf_for(srv, s, prefix), prefix, SERVER_CPUS, ports=(18080, 18443),
-                        env={"LD_PRELOAD": MCOUNT})
+                        env=srv_env(srv, LD_PRELOAD=MCOUNT))
             ngx.start()
             try:
                 workers = ngx.pids[1:3]
@@ -364,7 +373,7 @@ def strace_session(srv, s, prefix, load_seconds, rate):
     out = f"{prefix}/logs/strace.txt"
     p = subprocess.Popen(["strace", "-f", "-c", "-o", out, "--", "taskset", "-c", SERVER_CPUS, binary,
                           "-p", prefix + "/", "-c", f"{prefix}/conf/nginx.conf"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, **srv_env(srv)))
     end = time.time() + 20
     while time.time() < end and not (port_open(18080) and port_open(18443)):
         time.sleep(0.1)
@@ -459,7 +468,9 @@ def perfstat_session(srv, s, prefix, seconds, load):
     # (the host name does not resolve)
     p = subprocess.Popen(["sudo", PERF, "stat", "-x", ",", "-o", out] + ev +
                          ["--", "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}", "--init-groups",
-                          "taskset", "-c", SERVER_CPUS, binary, "-p", prefix + "/", "-c", f"{prefix}/conf/nginx.conf"],
+                          # sudo resets the environment: env(1) sets the server's
+                          "env"] + [f"{k}={v}" for k, v in srv_env(srv).items()] +
+                         ["taskset", "-c", SERVER_CPUS, binary, "-p", prefix + "/", "-c", f"{prefix}/conf/nginx.conf"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + 60
     while time.time() < end and not (port_open(18080) and port_open(18443)):
@@ -506,6 +517,97 @@ def sysstat(scenarios, servers, seconds=5):
             res[f"{name}/{srv}"] = {"requests": n, "rps": n / seconds, "total": total, "per_request": per}
             top = ", ".join(f"{k} {v:.2f}" for k, v in list(per.items())[:10])
             print(f"{name:22} {srv:6} rps={n / seconds:9,.0f} syscalls/req {total or 0:6.2f}: {top}", flush=True)
+    return res
+
+
+# --------------------------------------------------------------------------
+# io_uring at full load: ring operations and syscalls per request. The
+# syscalls are counted on the workers, the io_uring tracepoints system-wide:
+# a completion is queued by the softirq of whichever CPU delivered the data
+# (the client's, the backend's), and nothing else here uses io_uring.
+# poll_arm counts the operations that found the socket not ready and waited.
+# --------------------------------------------------------------------------
+
+URING_OPS = {"RECV": 27, "SEND": 26, "SENDMSG": 9, "RECVMSG": 10, "READV": 1, "POLL_ADD": 6, "ASYNC_CANCEL": 14}
+URING_EVENTS = ["submit_req", "complete", "poll_arm", "task_add", "task_work_run", "queue_async_work",
+                "short_write", "req_failed", "cqe_overflow"]
+
+
+def perf_rows(path, names):
+    """The counts of perf stat -x , in the order the events were given (the
+    filters do not show)."""
+    rows = [line.strip().split(",") for line in open(path)]
+    rows = [f for f in rows if len(f) >= 3 and ":" in f[2]]
+    return {n: float(f[0]) if f[0].replace(".", "").isdigit() else 0.0 for n, f in zip(names, rows)}
+
+
+def uringstat(scenarios, servers, seconds=6):
+    sev, snames = ["-e", "raw_syscalls:sys_enter"], ["syscalls"]
+    for sc, nr in dict(SYSCALLS, io_uring_enter=426).items():
+        sev += ["-e", "raw_syscalls:sys_enter", "--filter", f"id == {nr}"]
+        snames.append(sc)
+    for sc in EAGAIN_OF:
+        sev += ["-e", "raw_syscalls:sys_exit", "--filter", f"id == {SYSCALLS[sc]} && ret == -11"]
+        snames.append(sc + " EAGAIN")
+    uev, unames = [], []
+    for ev in URING_EVENTS:
+        uev += ["-e", f"io_uring:io_uring_{ev}"]
+        unames.append(ev)
+    for op, code in URING_OPS.items():
+        for ev in ("submit_req", "poll_arm"):
+            uev += ["-e", f"io_uring:io_uring_{ev}", "--filter", f"opcode == {code}"]
+            unames.append(f"{ev} {op}")
+    res = {}
+    for name in scenarios:
+        s = SCN[name]
+        for srv in servers:
+            prefix = f"{B}/run/{srv}"
+            ngx = Nginx(BINS[srv], conf_for(srv, s, prefix), prefix, SERVER_CPUS, ports=(18080, 18443),
+                        env=ENVS.get(srv))
+            ngx.start()
+            ready, go = f"{prefix}/logs/perf.ready", f"{prefix}/logs/perf.go"
+            sout, uout = f"{prefix}/logs/perf-sys.csv", f"{prefix}/logs/perf-uring.csv"
+            window = str(seconds + 1)
+            q = lambda a: " ".join(shlex.quote(x) for x in a)  # noqa: E731
+            # one root shell, started before the warm-up, which covers sudo's
+            # 10 s here (the host name does not resolve); both counts start
+            # at the go file
+            script = (f"touch {ready}; while [ ! -e {go} ]; do sleep 0.02; done; "
+                      f"{q([PERF, 'stat', '-x', ',', '-o', sout, '-p', ','.join(map(str, ngx.pids[1:]))] + sev + ['--', 'sleep', window])} & "
+                      f"{q([PERF, 'stat', '-x', ',', '-o', uout, '-a'] + uev + ['--', 'sleep', window])} & wait")
+            metrics = None
+            try:
+                p = subprocess.Popen(["sudo", "sh", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                end = time.time() + 40
+                while not os.path.exists(ready) and time.time() < end:
+                    run_load(dict(s), 2, 0)
+                run_load(dict(s), 2, 0)
+                open(go, "w").close()
+                time.sleep(0.5)
+                metrics, _, _ = run_load(s, seconds, 0)
+                p.wait(timeout=60)
+            finally:
+                ngx.stop()
+                wait_ports_free([18080, 18443])
+            n = (metrics or {}).get("requests") or 0
+            if not n:
+                print(f"{name:22} {srv:10} no requests counted", flush=True)
+                continue
+            sc = {k: v / n for k, v in perf_rows(sout, snames).items()}
+            ur = {k: v / n for k, v in perf_rows(uout, unames).items()}
+            sc = {k: round(v, 3) for k, v in sorted(sc.items(), key=lambda kv: -kv[1]) if v >= 0.005}
+            ur = {k: round(v, 3) for k, v in ur.items() if v >= 0.005}
+            total = sc.pop("syscalls", 0)
+            res[f"{name}/{srv}"] = {"requests": n, "rps": n / seconds, "syscalls": total, "per_request": sc,
+                                    "uring": ur}
+            top = ", ".join(f"{k} {v:.2f}" for k, v in list(sc.items())[:9])
+            print(f"{name:22} {srv:10} rps={n / seconds:9,.0f} syscalls/req {total:6.2f}: {top}", flush=True)
+            if ur:
+                ops = ", ".join(f"{op} {ur.get('submit_req ' + op, 0):.2f} (waited {ur.get('poll_arm ' + op, 0):.2f})"
+                                for op in URING_OPS if ur.get("submit_req " + op))
+                rest = ", ".join(f"{k} {ur[k]:.2f}" for k in URING_EVENTS if k in ur)
+                print(f"{'':22} {'':10} ring ops/req: {ops}", flush=True)
+                print(f"{'':22} {'':10} events/req: {rest}", flush=True)
     return res
 
 
@@ -573,8 +675,9 @@ def component(sym, dso):
 # (no frame past the first), so Rust is profiled in frame-pointer builds of
 # the same commits (-C force-frame-pointers=yes)
 PROFILE_BINS = {"rust": f"{B}/bin/nginx-rust-fp", "rust-ad69792": f"{B}/bin/nginx-rust-ad69792-fp",
-                # the io-uring branch: RNGINX_EVENTS from the environment of analyze.py
-                "rust-uring": f"{B}/bin/nginx-rust-uring-fp"}
+                # io_uring builds, run with their ENVS (RNGINX_EVENTS)
+                "rust-uring": f"{B}/bin/nginx-rust-uring-fp", "rust-uring-epoll": f"{B}/bin/nginx-rust-uring-fp",
+                "rust-wip": f"{B}/bin/nginx-rust-wip-fp", "rust-wip-epoll": f"{B}/bin/nginx-rust-wip-fp"}
 
 
 def profile_run(srv, s, label, seconds=6):
@@ -588,7 +691,7 @@ def profile_run(srv, s, label, seconds=6):
     data = f"{OUT}/perf-{s['name']}-{label}.data"
     p = subprocess.Popen([PERF, "record", "-e", "cpu-clock", "-F", os.environ.get("PERF_FREQ", "999"), "--call-graph", callgraph, "-o", data, "--",
                           "taskset", "-c", SERVER_CPUS, binary, "-p", prefix + "/", "-c", f"{prefix}/conf/nginx.conf"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, **ENVS.get(srv, {})))
     end = time.time() + 20
     while time.time() < end and not (port_open(18080) and port_open(18443)):
         time.sleep(0.1)
@@ -683,6 +786,13 @@ def summarize_profile(data):
 
 
 def profile(scenarios, servers, seconds=6):
+    # perf charges its buffers to the user's locked memory, which io_uring
+    # checks against RLIMIT_MEMLOCK (8 MB here): under perf record, the
+    # workers' ring setup failed with ENOMEM, and they fell back to epoll
+    # (a notice, below the bench's error_log level). The limit of this
+    # process goes up, for perf and nginx to inherit
+    if any(ENVS.get(srv, {}).get("RNGINX_EVENTS") == "io_uring" for srv in servers):
+        subprocess.run(["sudo", "prlimit", f"--pid={os.getpid()}", "--memlock=unlimited:unlimited"], check=True)
     # record one after the other (the machine must be otherwise idle), then
     # unwind and summarize in parallel
     runs = []
@@ -726,7 +836,7 @@ def main():
     be.start()
     try:
         r = {"allocs": allocs, "allocsites": allocsites, "idle": idle, "syscalls": syscalls, "sysstat": sysstat,
-             "profile": profile}[what](scen, servers)
+             "uringstat": uringstat, "profile": profile}[what](scen, servers)
     finally:
         be.stop()
     path = f"{OUT}/{what}-{int(time.time())}.json"
