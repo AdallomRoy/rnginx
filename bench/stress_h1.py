@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stress_h1.py <nginx binary> <io_uring|epoll> [uring writes mode]
+"""stress_h1.py <nginx binary> <io_uring|epoll> [uring writes mode] [--tls]
 
 HTTP/1.1 and proxying under stress, after docs/IO_URING_PLAN.md §4: churn
 (keepalive, Connection: close, proxied), clients that close or reset while
@@ -8,23 +8,33 @@ upstream connection closed at once, as ngx_http_upstream_check_broken_connection
 does), the same with a pipelined request received first, clients killed
 mid-response, clients that never read (send_timeout), idle floods, QUIT
 with requests in flight. After each phase the worker's descriptors and
-stub_status must be back to the baseline; the backend's connections too."""
+stub_status must be back to the baseline; the backend's connections too.
+With --tls the clients speak HTTPS (stub_status stays on a plain
+listener)."""
 import asyncio
 import os
 import re
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
 import threading
 import time
 
-BIN, EVENTS = sys.argv[1], sys.argv[2]
-WRITES = sys.argv[3] if len(sys.argv) > 3 else None
-D = f"/tmp/stress-h1-{EVENTS}{'-' + WRITES if WRITES else ''}"
-PORT, BPORT = 18182, 18183
-WWW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "www")   # made by setup.sh: run from the main checkout
+TLS = "--tls" in sys.argv
+ARGS = [a for a in sys.argv if a != "--tls"]
+BIN, EVENTS = ARGS[1], ARGS[2]
+WRITES = ARGS[3] if len(ARGS) > 3 else None
+D = f"/tmp/stress-h1-{EVENTS}{'-' + WRITES if WRITES else ''}{'-tls' if TLS else ''}"
+PORT, BPORT, SPORT = 18182, 18183, 18184
+HERE = os.path.dirname(os.path.abspath(__file__))
+WWW = os.path.join(HERE, "www")   # made by setup.sh, as certs: run from the main checkout
+SCHEME = "https" if TLS else "http"
+CLIENT_TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+CLIENT_TLS.check_hostname = False
+CLIENT_TLS.verify_mode = ssl.CERT_NONE
 
 CONF = f"""
 worker_processes 1;
@@ -42,9 +52,14 @@ http {{
         keepalive_timeout 1s;
     }}
     server {{
-        listen 127.0.0.1:{PORT};
-        root {WWW};
+        listen 127.0.0.1:{SPORT};
         location = /status {{ stub_status; }}
+    }}
+    server {{
+        listen 127.0.0.1:{PORT}{" ssl" if TLS else ""};
+        ssl_certificate {HERE}/certs/ec.crt;
+        ssl_certificate_key {HERE}/certs/ec.key;
+        root {WWW};
         location /proxy/ {{
             proxy_pass http://backend/;
             proxy_http_version 1.1;
@@ -109,8 +124,17 @@ class Backend:
 backend = Backend()
 
 
+def connect(rcvbuf=None):
+    """A client connection, TLS with --tls (the handshake done)."""
+    s = socket.socket()
+    if rcvbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.connect(("127.0.0.1", PORT))
+    return CLIENT_TLS.wrap_socket(s) if TLS else s
+
+
 def status():
-    s = socket.create_connection(("127.0.0.1", PORT))
+    s = socket.create_connection(("127.0.0.1", SPORT))
     s.sendall(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
     data = b""
     while True:
@@ -168,7 +192,7 @@ def wrk(path, seconds=3, conns=100, headers=()):
     cmd = ["wrk", "-t2", f"-c{conns}", f"-d{seconds}s"]
     for h in headers:
         cmd += ["-H", h]
-    r = subprocess.run(cmd + [f"http://127.0.0.1:{PORT}{path}"], capture_output=True, text=True)
+    r = subprocess.run(cmd + [f"{SCHEME}://127.0.0.1:{PORT}{path}"], capture_output=True, text=True)
     n = re.search(r"(\d+) requests in", r.stdout)
     bad = re.search(r"Socket errors:.*|Non-2xx or 3xx responses: \d+", r.stdout)
     return (int(n.group(1)) if n else 0), (bad.group(0) if bad else None)
@@ -181,8 +205,8 @@ def access_statuses():
         return []
 
 
-def request(path, extra=b""):
-    s = socket.create_connection(("127.0.0.1", PORT))
+def request(path, extra=b"", rcvbuf=None):
+    s = connect(rcvbuf)
     s.sendall(b"GET " + path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n" + extra)
     return s
 
@@ -241,7 +265,7 @@ def main():
 def run(ngx):
     for _ in range(100):
         try:
-            socket.create_connection(("127.0.0.1", PORT)).close()
+            socket.create_connection(("127.0.0.1", SPORT)).close()
             break
         except OSError:
             time.sleep(0.05)
@@ -274,7 +298,7 @@ def run(ngx):
 
     # 3. clients killed mid-response (4 MB proxied responses)
     for _ in range(3):
-        p = subprocess.Popen(["wrk", "-t2", "-c64", "-d30s", f"http://127.0.0.1:{PORT}/proxy/big"],
+        p = subprocess.Popen(["wrk", "-t2", "-c64", "-d30s", f"{SCHEME}://127.0.0.1:{PORT}/proxy/big"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.0)
         p.kill()
@@ -283,13 +307,7 @@ def run(ngx):
 
     # 4. clients that never read: send_timeout (2 s) closes them
     t0 = time.time()
-    stalled = []
-    for _ in range(50):
-        s = socket.socket()
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        s.connect(("127.0.0.1", PORT))
-        s.sendall(b"GET /proxy/big HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        stalled.append(s)
+    stalled = [request(b"/proxy/big", rcvbuf=4096) for _ in range(50)]
     time.sleep(0.5)
     st = status()
     check("stalled: all writing", st[2] >= 50, f"(stub_status {st})")
@@ -302,14 +320,15 @@ def run(ngx):
             while s.recv(1 << 16):
                 pass
             closed_at.append(time.time() - t0)
-        except (ConnectionResetError, socket.timeout) as e:
-            closed_at.append(time.time() - t0 if isinstance(e, ConnectionResetError) else 99)
+        except (ConnectionResetError, ssl.SSLError, socket.timeout) as e:
+            closed_at.append(99 if isinstance(e, socket.timeout) else time.time() - t0)
         s.close()
     worst = max(closed_at)
     check("stalled: closed by send_timeout", worst < 5.0, f"(last closed after {worst:.2f} s)")
     settle(master, base, "stalled clients")
 
-    # 5. idle floods: connections with no request, then keepalive ones
+    # 5. idle floods: connections with no request (no TLS handshake either),
+    # then keepalive ones
     idle = [socket.create_connection(("127.0.0.1", PORT)) for _ in range(2000)]
     time.sleep(1.0)
     st = status()
@@ -318,7 +337,7 @@ def run(ngx):
         s.close()
     settle(master, base, "idle flood")
     idle = []
-    for _ in range(2000):
+    for _ in range(1000 if TLS else 2000):
         s = request(b"/1k.bin")
         idle.append(s)
     for s in idle:
@@ -328,7 +347,7 @@ def run(ngx):
             got += s.recv(65536)
     time.sleep(0.5)
     st = status()
-    check("keepalive flood: all waiting", st[3] >= 2000, f"(stub_status {st})")
+    check("keepalive flood: all waiting", st[3] >= len(idle), f"(stub_status {st})")
     for s in idle:
         s.close()
     settle(master, base, "keepalive flood")

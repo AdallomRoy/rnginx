@@ -677,7 +677,8 @@ def component(sym, dso):
 PROFILE_BINS = {"rust": f"{B}/bin/nginx-rust-fp", "rust-ad69792": f"{B}/bin/nginx-rust-ad69792-fp",
                 # io_uring builds, run with their ENVS (RNGINX_EVENTS)
                 "rust-uring": f"{B}/bin/nginx-rust-uring-fp", "rust-uring-epoll": f"{B}/bin/nginx-rust-uring-fp",
-                "rust-wip": f"{B}/bin/nginx-rust-wip-fp", "rust-wip-epoll": f"{B}/bin/nginx-rust-wip-fp"}
+                "rust-wip": f"{B}/bin/nginx-rust-wip-fp", "rust-wip-epoll": f"{B}/bin/nginx-rust-wip-fp",
+                "rust-7e50aba": f"{B}/bin/nginx-rust-7e50aba-fp", "rust-7e50aba-epoll": f"{B}/bin/nginx-rust-7e50aba-fp"}
 
 
 def profile_run(srv, s, label, seconds=6):
