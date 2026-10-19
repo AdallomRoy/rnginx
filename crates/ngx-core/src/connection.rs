@@ -1527,43 +1527,50 @@ impl Connection {
         }
     }
 
-    /// recv(MSG_PEEK) of a byte without waiting, bytes stashed in io_uring
-    /// mode included: 1 if there is data, 0 at the end of the stream,
-    /// WouldBlock if nothing.
-    pub fn peek_byte(&self) -> io::Result<usize> {
-        let fd = {
-            let g = self.uring.borrow();
-            match g.as_ref() {
-                Some(u) if u.stash.is_some() => return Ok(1),
-                Some(u) if u.eof => return Ok(0),
-                Some(u) => u.fd.as_raw_fd(),
-                None => self.fd.get(),
-            }
-        };
-
-        let mut b = [0u8; 1];
-
-        nix::sys::socket::recv(fd, &mut b, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT).map_err(io::Error::from)
-    }
-
     /// ngx_http_test_reading and ngx_http_upstream_check_broken_connection
     /// in io_uring mode: resolves with the socket's pending error (0 if
     /// none) once the client has closed the connection (rev->pending_eof);
     /// data from the client is left for its readers. Never resolves if the
     /// socket cannot be watched.
+    ///
+    /// The wait is the connection's own receive, which its next reader
+    /// wants anyway (the next request of a keepalive connection), not a
+    /// poll that each wait would arm and cancel: a proxied request waits in
+    /// several phases, and a wait given up leaves the receive in flight, as
+    /// a wait for an epoll event consumes nothing.
     pub async fn uring_wait_closed(&self) -> i32 {
         loop {
-            match self.uring_read_event().await {
-                Ok(r) if r.is_read_closed() || r.is_error() => return self.so_error(),
-                Ok(_) => {}
-                Err(_) => return std::future::pending().await,
+            // a read that filled its length (rev->ready) is no sign of data
+            // here: C's handler runs at the next event, and the receive gets
+            // what comes next, or what waits already, into the stash (a
+            // peek would mostly find nothing)
+            if let Some(u) = self.uring.borrow_mut().as_mut() {
+                if u.stash.is_none() {
+                    u.more = false;
+                }
             }
 
-            // a read event without the end of the stream: data, or nothing
-            match self.peek_byte() {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Ok(n) if n > 0 => break,
-                _ => return self.so_error(),
+            if self.uring_readable().await.is_err() {
+                return std::future::pending().await;
+            }
+
+            let mut g = self.uring.borrow_mut();
+            let Some(u) = g.as_mut() else { return std::future::pending().await };
+
+            if u.stash.is_some() {
+                break;
+            }
+
+            if let Some(e) = u.error.take() {
+                // taken, as getsockopt(SO_ERROR) takes it: the readers find
+                // the end of the stream
+                u.eof = true;
+                return e;
+            }
+
+            if u.eof {
+                drop(g);
+                return self.so_error();
             }
         }
 
