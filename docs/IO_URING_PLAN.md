@@ -209,6 +209,15 @@ stay. We take the architecture, not the crate, for these reasons:
   tick longer, and the event pipe, short of free buffers meanwhile, spilled
   proxied responses to temporary files where C does not (measured: −17% on
   `proxy-100k`, plus warnings C does not log).
+- **The HTTP/2 driver writes at once.** The frames it copied into its write
+  buffer go out by `send()` while the socket takes them, as C writes them,
+  and the ring takes the rest as an owned send of the buffer
+  (`Connection::start_send_vec`), with no copy; its `send_timeout` timer is
+  set only if that send waits. After a send that took only a part, the next
+  goes to the ring at once (C waits for the write event). Sent by the ring
+  alone, the output went out one send per run of the tasks, and a receive
+  waited for each window update of the client: `h2c-100k` made 26.4k req/s
+  against 32.6k.
 - **Sends belong to the connection, as receives do.** A future dropped by a
   `select!` after the kernel took the bytes must not lose that fact. The
   in-flight send is the connection's, and a later call with the same pending
@@ -400,9 +409,9 @@ items stay.
   and the epoll fallback. nginx-tests and the benchmarks run on this VM's
   7.0 kernel.
 
-## 7. Status (2026-10-09, branch `io-uring`)
+## 7. Status (2026-10-16)
 
-Done:
+Done (on master; Phase 2's completion on branch `uring-p2`):
 - **Phase 0** (`94d9cfb`): the ring and its driver.
 - **Phase 1** (`141f7ac`): plain HTTP/1 client connections.
 - **Phase 3** (`653c4a2`): plain upstream and stream connections, plus one
@@ -410,9 +419,11 @@ Done:
 - **Phase 2 and fixes** (`ec2fccf`): h2c, with the driver's sends still
   system calls; cancel-safe sends; C's flush of recycled buffers; the
   keepalive close handler on the connection's receive.
+- **Phase 2 completion** (branch `uring-p2`): the HTTP/2 driver's writes
+  (§2.4). Master copied the bytes of every ring send.
 
-nginx-tests pass 455 files with epoll and with `RNGINX_EVENTS=io_uring`;
-`cargo test` passes 639.
+nginx-tests pass 455 files with epoll, with `RNGINX_EVENTS=io_uring`, and
+with `RNGINX_URING_WRITES=sync` too; `cargo test` passes 642.
 
 ### Write modes
 `RNGINX_URING_WRITES` compared three modes (`results/uring-p3-modes-20261009.jsonl`):
@@ -424,7 +435,8 @@ nginx-tests pass 455 files with epoll and with `RNGINX_EVENTS=io_uring`;
 
 Ring writes win on small responses even with the extra wakeup and boxed
 future: the default. The hybrid path (a `writev()` at once, the ring for the
-rest) serves recycled buffers (§2.4).
+rest) serves recycled buffers (§2.4). The HTTP/2 driver writes at once in
+both modes (§2.4); `sync` makes it use system calls only.
 
 ### Results
 C, this build on epoll, and on io_uring, alternating, 3 reps

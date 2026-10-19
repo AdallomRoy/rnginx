@@ -45,6 +45,14 @@ pub struct Driver {
     /// OpenSSL requires after SSL_ERROR_WANT_WRITE).
     wbuf: RefCell<Vec<u8>>,
     wpos: Cell<usize>,
+    /// io_uring mode: the write buffer is the ring's send's until the
+    /// completion (the connection's send: a wait given up loses nothing)
+    sending: Cell<bool>,
+    /// the send in flight is known to wait for room in the socket
+    send_waits: Cell<bool>,
+    /// io_uring mode: the last write took all it was given (wev->ready):
+    /// the next one is tried at once, else it goes to the ring
+    write_ready: Cell<bool>,
     /// The frames fill_wbuf() copied out, whose handlers it runs (kept for
     /// its capacity).
     done: RefCell<Vec<OutFrame>>,
@@ -130,14 +138,39 @@ impl Driver {
             write_timer: Cell::new(None),
             wbuf: RefCell::new(Vec::new()),
             wpos: Cell::new(0),
+            sending: Cell::new(false),
+            send_waits: Cell::new(false),
+            write_ready: Cell::new(true),
             done: RefCell::new(Vec::new()),
             fake_release: Cell::new(None),
         }
     }
 
     fn buffered(&self) -> bool {
-        self.wpos.get() < self.wbuf.borrow().len()
+        self.sending.get() || self.wpos.get() < self.wbuf.borrow().len()
     }
+
+    /// `n` bytes of the write buffer were written: an emptied buffer is
+    /// cleared for the next frames.
+    fn advance(&self, n: usize) {
+        self.wpos.set(self.wpos.get() + n);
+
+        if !self.buffered() {
+            self.wbuf.borrow_mut().clear();
+            self.wpos.set(0);
+        }
+    }
+}
+
+/// How the driver writes in io_uring mode (docs/IO_URING_PLAN.md §2.4): a
+/// send() at once of what the socket takes, as C writes, and the ring
+/// sends the rest, which waits for room in the socket: then a send's
+/// completion, not the socket's readiness, tells what was written. (Sent
+/// by the ring alone, the output went out one send per run of the tasks,
+/// and the receives waited for each window update: h2c-100k -20%.)
+/// RNGINX_URING_WRITES=sync: send() only, a poll waiting for room.
+fn ring_writes(c: &Connection) -> bool {
+    c.is_uring() && !ngx_core::uring::sync_writes()
 }
 
 fn has_output(h2c: &H2Connection, d: &Driver) -> bool {
@@ -269,6 +302,8 @@ enum Ev {
     Close,
     Readable(io::Result<()>),
     Written(io::Result<usize>),
+    /// io_uring mode: the send waits for room in the socket
+    WriteWaits,
     Queued,
     ReadTimeout,
     WriteTimeout,
@@ -307,7 +342,8 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
 
         // frames the streams queued go out below: the send timer of
         // ngx_http_v2_send_output_queue when they do not all go at once
-        if has_output && d.write_timer.get().is_none() {
+        // (sent by the ring, once the send is known to wait: WriteWaits)
+        if has_output && d.write_timer.get().is_none() && !ring_writes(&c) {
             add_write_timer(h2c, d);
         }
 
@@ -330,7 +366,10 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
             _ = c.close_notify.notified() => Ev::Close,
             r = c.readable(), if reading => Ev::Readable(r),
             r = c.writable(), if reading && want_write => Ev::Readable(r),
-            w = write_output(h2c, d), if has_output => Ev::Written(w),
+            w = write_output(h2c, d), if has_output => match w {
+                Some(w) => Ev::Written(w),
+                None => Ev::WriteWaits,
+            },
             _ = h2c.out_notify.notified(), if !has_output => Ev::Queued,
             _ = sleep_opt(read_timer), if read_timer.is_some() => Ev::ReadTimeout,
             _ = sleep_opt(write_timer), if write_timer.is_some() => Ev::WriteTimeout,
@@ -356,6 +395,12 @@ async fn run(h2c: &Rc<H2Connection>, d: &Driver, recv_buffer_size: usize) {
 
             Ev::Written(res) => {
                 write_handler(h2c, d, res);
+            }
+
+            Ev::WriteWaits => {
+                // !wev->ready after c->send_chain(): ngx_add_timer(wev,
+                // send_timeout)
+                add_write_timer(h2c, d);
             }
 
             Ev::Queued => {}
@@ -703,24 +748,173 @@ fn fill_wbuf(h2c: &Rc<H2Connection>, d: &Driver) {
 }
 
 /// Write the write buffer out, waiting for writability. Cancel safe: the
-/// bytes stay in the buffer until a write reports them taken.
-async fn write_output(h2c: &Rc<H2Connection>, d: &Driver) -> io::Result<usize> {
+/// bytes stay in the buffer until a write reports them taken. In io_uring
+/// mode None once the ring's send is known to wait for room in the socket
+/// (C's write that blocks); the next call waits for its completion.
+async fn write_output(h2c: &Rc<H2Connection>, d: &Driver) -> Option<io::Result<usize>> {
+    let c = &h2c.connection;
+
+    if ring_writes(c) {
+        return ring_write(h2c, d).await;
+    }
+
+    if c.is_uring() {
+        return Some(sync_write(h2c, d).await);
+    }
+
     let wbuf = d.wbuf.borrow();
     let pending = &wbuf[d.wpos.get()..];
     if pending.is_empty() {
-        return Ok(0);
+        return Some(Ok(0));
     }
-    h2c.connection.send(pending).await
+    Some(c.send(pending).await)
+}
+
+/// write_output() until a write completes.
+async fn write_output_done(h2c: &Rc<H2Connection>, d: &Driver) -> io::Result<usize> {
+    loop {
+        if let Some(res) = write_output(h2c, d).await {
+            return res;
+        }
+    }
+}
+
+/// write_output() in io_uring mode: what is buffered is sent as
+/// send_output_queue() sends it unless the ring's send is in flight, and
+/// that send's completion collected; the buffer comes back with it. Ok(0)
+/// if what was buffered went at once.
+async fn ring_write(h2c: &Rc<H2Connection>, d: &Driver) -> Option<io::Result<usize>> {
+    let c = &h2c.connection;
+
+    if !d.sending.get() {
+        if let Err(e) = start_output(h2c, d) {
+            return Some(Err(e));
+        }
+        if !d.sending.get() {
+            return Some(Ok(0));
+        }
+    }
+
+    // the timer is set once the send waits: then only its completion
+    let settle = !d.send_waits.get();
+
+    match std::future::poll_fn(|cx| c.poll_send_vec(cx, settle)).await {
+        Some((res, buf)) => {
+            // a send that took a part found the socket full again
+            d.write_ready.set(matches!(res, Ok(n) if d.wpos.get() + n >= buf.len()));
+            sent_back(d, buf);
+            Some(res)
+        }
+        None => {
+            d.send_waits.set(true);
+            None
+        }
+    }
+}
+
+/// The write buffer back from a completed send.
+fn sent_back(d: &Driver, buf: Vec<u8>) {
+    *d.wbuf.borrow_mut() = buf;
+    d.sending.set(false);
+    d.send_waits.set(false);
+}
+
+/// write_output() in io_uring mode with RNGINX_URING_WRITES=sync: send(),
+/// a poll of the socket for room when it takes nothing.
+async fn sync_write(h2c: &Rc<H2Connection>, d: &Driver) -> io::Result<usize> {
+    let c = &h2c.connection;
+
+    loop {
+        let res = {
+            let wbuf = d.wbuf.borrow();
+            c.try_send(&wbuf[d.wpos.get()..])
+        };
+
+        match res {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => c.writable().await?,
+            res => return res,
+        }
+    }
+}
+
+/// The output queue in io_uring mode, no send in flight: frames moved to
+/// the write buffer and sent at once while the socket takes them, the
+/// ring's send started for the rest (at once if the last write found the
+/// socket full: C waits for the write event). The send_timeout timer is
+/// set only if that send waits (ring_write()).
+fn start_output(h2c: &Rc<H2Connection>, d: &Driver) -> io::Result<()> {
+    let c = &h2c.connection;
+
+    loop {
+        fill_wbuf(h2c, d);
+
+        if !d.buffered() {
+            return Ok(());
+        }
+
+        if !d.write_ready.get() {
+            break;
+        }
+
+        let res = {
+            let wbuf = d.wbuf.borrow();
+            c.try_send(&wbuf[d.wpos.get()..])
+        };
+
+        match res {
+            Ok(n) => {
+                d.advance(n);
+                if d.buffered() {
+                    // the socket took a part: the ring waits for room
+                    d.write_ready.set(false);
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                d.write_ready.set(false);
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let buf = std::mem::take(&mut *d.wbuf.borrow_mut());
+
+    match c.start_send_vec(buf, d.wpos.get()) {
+        Ok(()) => {
+            d.sending.set(true);
+            d.send_waits.set(false);
+            Ok(())
+        }
+        Err((e, buf)) => {
+            *d.wbuf.borrow_mut() = buf;
+            Err(e)
+        }
+    }
 }
 
 /// Account `n` bytes of the write buffer as written; arm or clear the send
 /// timer as C does in ngx_http_v2_send_output_queue.
 fn written(h2c: &Rc<H2Connection>, d: &Driver, n: usize) {
-    d.wpos.set(d.wpos.get() + n);
-    if !d.buffered() {
-        d.wbuf.borrow_mut().clear();
-        d.wpos.set(0);
+    d.advance(n);
+
+    let partial = d.buffered();
+
+    if !partial {
         fill_wbuf(h2c, d);
+    }
+
+    if ring_writes(&h2c.connection) {
+        // the write handler's ngx_http_v2_send_output_queue(): the timer
+        // goes once the output all went (wev->ready), and stays while the
+        // socket does not take it all; what is queued since is sent next,
+        // its timer set only if that send waits (ring_write())
+        if partial {
+            add_write_timer(h2c, d);
+        } else {
+            d.write_timer.set(None);
+        }
+        return;
     }
 
     if !has_output(h2c, d) {
@@ -791,6 +985,23 @@ fn send_output_queue(h2c: &Rc<H2Connection>, d: &Driver) -> Result<(), ()> {
 
     if c.error.get() {
         return Err(());
+    }
+
+    if ring_writes(c) {
+        // a send in flight first (!wev->ready); else the output goes to
+        // the ring
+        if !d.sending.get() {
+            if let Err(e) = start_output(h2c, d) {
+                let en = e.raw_os_error().unwrap_or(0);
+                if en != 0 {
+                    ngx_log_error!(NGX_LOG_INFO, c.log, Some(en), "writev() failed");
+                }
+                c.error.set(true);
+                return Err(());
+            }
+        }
+
+        return if c.error.get() { Err(()) } else { Ok(()) };
     }
 
     // !wev->ready: the socket did not take all of the last write, no
@@ -951,7 +1162,7 @@ async fn lingering_close_handler(h2c: &Rc<H2Connection>, d: &Driver) {
     while d.buffered() && !c.error.get() {
         let send_timeout = *clcf(h2c).borrow().send_timeout;
         let res = tokio::select! {
-            w = write_output(h2c, d) => Some(w),
+            w = write_output_done(h2c, d) => Some(w),
             _ = tokio::time::sleep(Duration::from_millis(send_timeout)) => None,
         };
         match res {
@@ -1019,6 +1230,25 @@ async fn finish(h2c: &Rc<H2Connection>, d: &Driver) {
     let c = &h2c.connection;
 
     h2c.finalized.set(true);
+
+    // io_uring mode: the send in flight first, if the socket takes it
+    // without waiting (C's writev() of what is left would not wait); the
+    // close cancels what waits
+    if !c.error.get() && d.sending.get() && !d.send_waits.get() {
+        if let Some((res, buf)) = std::future::poll_fn(|cx| c.poll_send_vec(cx, true)).await {
+            sent_back(d, buf);
+            match res {
+                Ok(n) => d.advance(n),
+                Err(e) => {
+                    let en = e.raw_os_error().unwrap_or(0);
+                    if en != 0 {
+                        ngx_log_error!(NGX_LOG_INFO, c.log, Some(en), "writev() failed");
+                    }
+                    c.error.set(true);
+                }
+            }
+        }
+    }
 
     if !c.error.get() {
         let _ = send_output_queue(h2c, d);

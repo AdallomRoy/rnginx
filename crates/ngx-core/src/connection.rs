@@ -396,6 +396,8 @@ struct UringIo {
     tx: Option<crate::uring::Send<crate::buf::ChainSource>>,
     /// the send of poll_send() in flight (a copy of its bytes)
     txb: Option<crate::uring::Send<Vec<u8>>>,
+    /// the send of start_send_vec() in flight (the caller's buffer)
+    txv: Option<crate::uring::Send<crate::buf::VecSource>>,
     /// the size of a receive
     recv_len: usize,
 }
@@ -474,6 +476,11 @@ impl UringIo {
             }
             Err(e) => self.error = Some(e.raw_os_error().unwrap_or(libc::EIO)),
         }
+    }
+
+    /// A send by the ring is in flight (one at a time).
+    fn sending(&self) -> bool {
+        self.tx.is_some() || self.txb.is_some() || self.txv.is_some()
     }
 
     /// The bytes stashed.
@@ -1085,6 +1092,7 @@ impl Connection {
             rx_waiters: Vec::new(),
             tx: None,
             txb: None,
+            txv: None,
             recv_len: URING_RECV,
         }));
 
@@ -1113,7 +1121,7 @@ impl Connection {
 
         match g.as_ref() {
             None => true,
-            Some(u) if u.rx.is_none() && u.tx.is_none() && u.txb.is_none() && u.stash.is_none() && !u.eof && u.error.is_none() => {
+            Some(u) if u.rx.is_none() && !u.sending() && u.stash.is_none() && !u.eof && u.error.is_none() => {
                 *g = None;
                 true
             }
@@ -1311,7 +1319,7 @@ impl Connection {
         };
 
         if u.txb.is_none() {
-            if u.tx.is_some() {
+            if u.tx.is_some() || u.txv.is_some() {
                 return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
             }
             match crate::uring::send(&u.fd, data.to_vec()) {
@@ -1577,7 +1585,7 @@ impl Connection {
             return Err((io::Error::from_raw_os_error(libc::EINVAL), chain));
         };
 
-        if u.tx.is_some() || u.txb.is_some() {
+        if u.sending() {
             return Err((io::Error::from_raw_os_error(libc::EBUSY), chain));
         }
 
@@ -1598,7 +1606,7 @@ impl Connection {
     /// Any send by the ring is in flight: a system call sending now could
     /// put its bytes ahead of that send's.
     fn any_send_in_flight(&self) -> bool {
-        self.uring.borrow().as_ref().is_some_and(|u| u.tx.is_some() || u.txb.is_some())
+        self.uring.borrow().as_ref().is_some_and(|u| u.sending())
     }
 
     /// The send in flight, completed: its result and the chain (None if no
@@ -1634,6 +1642,77 @@ impl Connection {
             }
         })
         .await
+    }
+
+    /// Starts sending `buf[pos..]` by the ring: the buffer is the
+    /// operation's until poll_send_vec() gives it back. The send is the
+    /// connection's, as its receive is: a wait for it given up loses
+    /// nothing. One send at a time; the buffer comes back with the error
+    /// otherwise.
+    pub fn start_send_vec(&self, buf: Vec<u8>, pos: usize) -> Result<(), (io::Error, Vec<u8>)> {
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else {
+            return Err((io::Error::from_raw_os_error(libc::EINVAL), buf));
+        };
+
+        if u.sending() {
+            return Err((io::Error::from_raw_os_error(libc::EBUSY), buf));
+        }
+
+        match crate::uring::send(&u.fd, crate::buf::VecSource { buf, pos }) {
+            Ok(tx) => {
+                u.txv = Some(tx);
+                Ok(())
+            }
+            Err((e, src)) => Err((e, src.buf)),
+        }
+    }
+
+    /// The send of start_send_vec(), polled where it is: its result (the
+    /// bytes counted in c->sent) and the buffer once complete. With
+    /// `settle`, Ready(None) once it is known to wait for room in the
+    /// socket (not complete after the flush that submitted it: C's write
+    /// that blocks); the caller then polls without. Ready(None) as well if
+    /// no such send is in flight.
+    pub fn poll_send_vec(&self, cx: &mut std::task::Context<'_>, settle: bool) -> std::task::Poll<Option<(io::Result<usize>, Vec<u8>)>> {
+        use std::task::Poll;
+
+        let mut g = self.uring.borrow_mut();
+
+        let Some(tx) = g.as_mut().and_then(|u| u.txv.as_mut()) else {
+            return Poll::Ready(None);
+        };
+
+        let (res, src) = if settle {
+            match tx.poll_settled(cx) {
+                Poll::Ready(Some(done)) => done,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        } else {
+            match std::future::Future::poll(std::pin::Pin::new(tx), cx) {
+                Poll::Ready(done) => done,
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+
+        if let Some(u) = g.as_mut() {
+            u.txv = None;
+        }
+
+        drop(g);
+
+        if let Ok(n) = res {
+            self.sent.set(self.sent.get() + n as u64);
+        }
+
+        Poll::Ready(Some((res, src.buf)))
+    }
+
+    /// A send started by start_send_vec() is in flight.
+    pub fn vec_send_in_flight(&self) -> bool {
+        self.uring.borrow().as_ref().is_some_and(|u| u.txv.is_some())
     }
 
     /// send(2) of a copy of `data` by the ring, in io_uring mode. The send
@@ -1763,7 +1842,7 @@ impl Connection {
     /// from `op` clears the readiness (wev->ready = 0).
     pub fn try_write_io<T>(&self, op: impl FnOnce(BorrowedFd<'_>) -> io::Result<T>) -> io::Result<T> {
         self.fake_io_error()?;
-        let uring_fd = self.uring.borrow().as_ref().map(|u| (u.fd.clone(), u.tx.is_some() || u.txb.is_some()));
+        let uring_fd = self.uring.borrow().as_ref().map(|u| (u.fd.clone(), u.sending()));
         if let Some((fd, in_flight)) = uring_fd {
             // io_uring mode: at once, unless the ring sends (in order); a
             // WouldBlock is waited for with writable()
@@ -3538,6 +3617,142 @@ mod tests {
             assert_eq!(c.sent.get(), data.len() as u64);
 
             c.close();
+        });
+    }
+
+    /// Runs `f` in a LocalSet with the worker's ring, flushed after every
+    /// run of the tasks as event::block_on_events does; skipped where
+    /// io_uring is not available.
+    fn run_uring<F: std::future::Future<Output = ()>>(f: F) {
+        use std::future::Future;
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().on_thread_park(crate::uring::flush).build().unwrap();
+        let local = tokio::task::LocalSet::new();
+
+        if let Err(e) = local.block_on(&rt, async { crate::uring::init() }) {
+            eprintln!("io_uring not available, test skipped: {e}");
+            return;
+        }
+
+        let mut run = std::pin::pin!(local.run_until(f));
+
+        rt.block_on(std::future::poll_fn(move |cx| {
+            let r = run.as_mut().poll(cx);
+            crate::uring::flush();
+            r
+        }));
+
+        crate::uring::shutdown();
+    }
+
+    /// Sends by system calls until the socket takes no more.
+    fn fill(c: &Connection) {
+        let chunk = vec![1u8; 65536];
+
+        loop {
+            match c.try_send(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) => panic!("send: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vec_send_by_the_ring() {
+        run_uring(async {
+            let (c, mut peer) = tcp_pair(None);
+            assert!(c.use_uring());
+
+            c.start_send_vec(b"..hello".to_vec(), 2).unwrap();
+            assert!(c.vec_send_in_flight());
+
+            // one send at a time
+            let (e, back) = c.start_send_vec(b"x".to_vec(), 0).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EBUSY));
+            assert_eq!(back, b"x");
+
+            // completed in the flush that submitted it
+            let (res, buf) = std::future::poll_fn(|cx| c.poll_send_vec(cx, true)).await.expect("a send that did not wait");
+            assert_eq!(res.unwrap(), 5);
+            assert_eq!(buf, b"..hello");
+            assert_eq!(c.sent.get(), 5);
+            assert!(!c.vec_send_in_flight());
+
+            let mut got = [0u8; 5];
+            std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+            assert_eq!(&got, b"hello");
+
+            c.close();
+        });
+    }
+
+    /// A send that waits for room in the socket is known to wait after the
+    /// flush that submitted it; a wait for it given up loses nothing, and
+    /// no system call sends meanwhile.
+    #[test]
+    fn vec_send_waits_and_survives_a_wait_given_up() {
+        run_uring(async {
+            let (c, mut peer) = tcp_pair(Some(4096));
+            assert!(c.use_uring());
+
+            fill(&c);
+            let before = c.sent.get();
+
+            c.start_send_vec(b"..tail".to_vec(), 2).unwrap();
+            assert_eq!(c.try_send(b"x").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+            assert!(std::future::poll_fn(|cx| c.poll_send_vec(cx, true)).await.is_none());
+
+            let wait = std::future::poll_fn(|cx| c.poll_send_vec(cx, false));
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), wait).await.is_err());
+            assert!(c.vec_send_in_flight());
+
+            let reader = std::thread::spawn(move || {
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut peer, &mut v).unwrap();
+                v
+            });
+
+            let (res, buf) = std::future::poll_fn(|cx| c.poll_send_vec(cx, false)).await.expect("the send");
+            assert_eq!(res.unwrap(), 4);
+            assert_eq!(buf, b"..tail");
+            assert_eq!(c.sent.get(), before + 4);
+
+            c.close();
+
+            let got = reader.join().unwrap();
+            assert_eq!(got.len() as u64, before + 4);
+            assert!(got.ends_with(b"tail"));
+        });
+    }
+
+    /// The close cancels a send that waits, and the socket closes once the
+    /// cancelled send has completed: the peer gets what was sent before,
+    /// then the end of the stream.
+    #[test]
+    fn close_cancels_a_waiting_vec_send() {
+        run_uring(async {
+            let (c, mut peer) = tcp_pair(Some(4096));
+            assert!(c.use_uring());
+
+            fill(&c);
+            let before = c.sent.get();
+
+            c.start_send_vec(vec![2u8; 1 << 20], 0).unwrap();
+            assert!(std::future::poll_fn(|cx| c.poll_send_vec(cx, true)).await.is_none());
+
+            c.close();
+
+            // the cancellation completes at the next flush
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut peer, &mut got).unwrap();
+            assert_eq!(got.len() as u64, before);
+            assert!(got.iter().all(|&b| b == 1));
         });
     }
 }

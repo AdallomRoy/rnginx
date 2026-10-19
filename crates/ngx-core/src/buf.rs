@@ -211,6 +211,19 @@ impl ngx_sys::uring::SendSource for ChainSource {
     }
 }
 
+/// A buffer sent by an io_uring operation from `pos` on (the HTTP/2
+/// driver's write buffer), the operation's until the completion.
+pub struct VecSource {
+    pub buf: Vec<u8>,
+    pub pos: usize,
+}
+
+impl ngx_sys::uring::SendSource for VecSource {
+    fn slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
+        out.push(std::io::IoSlice::new(self.buf.get(self.pos..).unwrap_or(&[])));
+    }
+}
+
 pub fn chain_update_sent(chain: &mut Chain, mut sent: i64) {
     while !chain.is_empty() {
         let buf = &mut chain[0];
