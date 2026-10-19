@@ -77,6 +77,10 @@ what it could not wait for.
 - SSL I/O on the socket (SSL_set_fd, SSL_read/write/peek/shutdown,
   SSL_do_handshake, early data, SSL_sendfile/kTLS), so that errno, the
   error queue and record boundaries are OpenSSL's own;
+- a BIO whose reads and writes are the caller's (`BioIo`, `set_io_bio`:
+  connections in io_uring mode), answering OpenSSL as a socket BIO does
+  (retry flags, BIO_eof(), errno); its data is a Box from Box::into_raw(),
+  freed by the BIO's destroy callback;
 - the error queue (peeking at errors without draining them, nginx's own
   formatting), OPENSSL_init_ssl;
 - BIOs and PEM/DER reading as nginx does it (file BIOs, the chain read one

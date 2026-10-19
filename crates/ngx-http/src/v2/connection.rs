@@ -168,9 +168,11 @@ impl Driver {
 /// completion, not the socket's readiness, tells what was written. (Sent
 /// by the ring alone, the output went out one send per run of the tasks,
 /// and the receives waited for each window update: h2c-100k -20%.)
-/// RNGINX_URING_WRITES=sync: send() only, a poll waiting for room.
+/// RNGINX_URING_WRITES=sync: send() only, a poll waiting for room. Over
+/// TLS the frames go through SSL_write() (try_send()), which writes by the
+/// ring BIO's sends.
 fn ring_writes(c: &Connection) -> bool {
-    c.is_uring() && !ngx_core::uring::sync_writes()
+    c.is_uring() && c.ssl.borrow().is_none() && !ngx_core::uring::sync_writes()
 }
 
 fn has_output(h2c: &H2Connection, d: &Driver) -> bool {
@@ -202,6 +204,10 @@ pub async fn init(c: Rc<Connection>, hc: Rc<HttpConnection>, preread: Vec<u8>) {
     ngx_log_debug!(NGX_LOG_DEBUG_HTTP, c.log, "init http2 connection");
 
     c.log.set_action(Some("processing HTTP/2 connection"));
+
+    // over TLS in io_uring mode the frames go out by send() at once, the
+    // ring taking what the socket refuses, as plain ones do (ring_writes())
+    c.send_at_once.set(true);
 
     let conf_ctx = hc.conf_ctx.borrow().clone();
     let recv_buffer_size = {

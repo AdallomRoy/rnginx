@@ -1073,6 +1073,22 @@ pub async fn ngx_http_ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>)
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
 
+    // io_uring mode: kernel TLS needs OpenSSL on the socket (a socket BIO):
+    // a connection to a server enabling it leaves the mode before anything
+    // is received; the others stay, OpenSSL reading what the ring receives
+    // (the ring BIO), and the peeks leave what they see stashed for it
+    if c.is_uring() {
+        let ktls = {
+            let sscf = sscf_of_ctx(&hc.conf_ctx.borrow());
+            let ktls = ngx_core::event_openssl::ngx_ssl_ktls(&sscf.borrow().ssl);
+            ktls
+        };
+
+        if ktls {
+            c.try_leave_uring();
+        }
+    }
+
     c.set_reusable(true);
 
     loop {
@@ -1081,8 +1097,16 @@ pub async fn ngx_http_ssl_handshake(c: &Rc<Connection>, hc: &Rc<HttpConnection>)
         let size = if hc.proxy_protocol.get() { ngx_core::proxy_protocol::NGX_PROXY_PROTOCOL_MAX_HEADER + 1 } else { 1 };
         let mut buf = vec![0u8; size];
 
+        let peek = async {
+            if c.is_uring() {
+                c.uring_peek(&mut buf).await
+            } else {
+                c.peek(&mut buf).await
+            }
+        };
+
         let res = tokio::select! {
-            r = tokio::time::timeout_at(deadline, c.peek(&mut buf)) => r,
+            r = tokio::time::timeout_at(deadline, peek) => r,
             // c->close
             _ = c.close_notify.notified() => return SslHandshakeNext::Close,
         };

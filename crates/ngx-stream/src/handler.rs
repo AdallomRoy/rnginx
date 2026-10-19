@@ -61,15 +61,18 @@ pub fn init_connection(c: Rc<Connection>) {
 
     s.ssl.set(addr_conf.ssl);
 
-    // a plain TCP session reads and writes through the worker's ring where
-    // there is one (docs/IO_URING_PLAN.md); one passed to a TLS listener
-    // leaves it, as OpenSSL reads the socket itself
-    if !addr_conf.ssl {
+    // a TCP session reads and writes through the worker's ring where there
+    // is one (docs/IO_URING_PLAN.md); on a TLS listener OpenSSL does its I/O
+    // through the ring too (the ring BIO), unless the server enables kernel
+    // TLS, which needs the socket: a session passed to it leaves the mode
+    if addr_conf.ssl && crate::ssl::ktls(&s) {
+        if !c.try_leave_uring() {
+            ngx_log_error!(NGX_LOG_ALERT, c.log, None, "io_uring connection passed with data received");
+            c.close();
+            return;
+        }
+    } else {
         c.use_uring();
-    } else if !c.try_leave_uring() {
-        ngx_log_error!(NGX_LOG_ALERT, c.log, None, "io_uring connection passed with data received");
-        c.close();
-        return;
     }
 
     let buffered = c.buffer.borrow().len();
@@ -134,8 +137,18 @@ async fn proxy_protocol_handler(s: &S, timeout: u64) -> bool {
 
     let mut buf = vec![0u8; NGX_PROXY_PROTOCOL_MAX_HEADER];
 
+    // on a TLS listener in io_uring mode the peek stays in the mode: OpenSSL
+    // reads what the ring receives (the ring BIO)
+    let peek = async {
+        if s.ssl.get() && c.is_uring() {
+            c.uring_peek(&mut buf).await
+        } else {
+            c.peek(&mut buf).await
+        }
+    };
+
     let res = tokio::select! {
-        r = tokio::time::timeout(Duration::from_millis(timeout), c.peek(&mut buf)) => r,
+        r = tokio::time::timeout(Duration::from_millis(timeout), peek) => r,
         _ = c.close_notify.notified() => {
             finalize_session(s, NGX_STREAM_OK).await;
             return false;

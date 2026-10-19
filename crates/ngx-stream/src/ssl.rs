@@ -228,6 +228,15 @@ fn remove_cached_session(c: &Connection) {
     ngx_ssl_remove_cached_session(c);
 }
 
+/// The server of the session enables kernel TLS (ssl_conf_command Options
+/// KTLS): its connections need OpenSSL on the socket, not the ring BIO of
+/// io_uring mode.
+pub fn ktls(s: &S) -> bool {
+    let sscf = s.srv_conf::<SslSrvConf>(ctx_index());
+    let ktls = ngx_ssl_ktls(&sscf.borrow().ssl);
+    ktls
+}
+
 /// ngx_stream_ssl_init_connection: the handshake; (rc, whether it did not
 /// complete at once)
 async fn ngx_stream_ssl_init_connection(s: &S, c: &Rc<Connection>) -> (i64, bool) {

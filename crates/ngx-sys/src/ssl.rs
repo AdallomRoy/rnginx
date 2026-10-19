@@ -74,6 +74,7 @@ extern "C" {
     fn CRYPTO_free(ptr: *mut c_void, file: *const c_char, line: c_int);
 
     fn BIO_new(ty: *const ffi::BIO_METHOD) -> *mut ffi::BIO;
+    fn BIO_get_new_index() -> c_int;
     fn BIO_s_mem() -> *const ffi::BIO_METHOD;
     fn BIO_s_null() -> *const ffi::BIO_METHOD;
     fn BIO_new_file(filename: *const c_char, mode: *const c_char) -> *mut ffi::BIO;
@@ -208,6 +209,7 @@ pub const SSL_WRITING: i32 = 2;
 pub const SSL_SENT_SHUTDOWN: i32 = 1;
 pub const SSL_RECEIVED_SHUTDOWN: i32 = 2;
 
+pub const SSL_OP_ENABLE_KTLS: u64 = 1 << 3;
 pub const SSL_OP_IGNORE_UNEXPECTED_EOF: u64 = 1 << 7;
 pub const SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS: u64 = 1 << 11;
 pub const SSL_OP_NO_TICKET: u64 = 1 << 14;
@@ -1269,6 +1271,239 @@ pub fn shutdown(ssl: &mut SslRef) -> SslIo {
     io_result(ssl, rc, 0, rc != 1)
 }
 
+// --- SSL: I/O done by the caller, through a BIO of its own (io_uring) ---
+
+const BIO_TYPE_SOURCE_SINK: c_int = 0x0400;
+const BIO_C_GET_FD: c_int = 105;
+const BIO_CTRL_DUP: c_int = 12;
+
+/// What a read of a [`BioIo`] came to, as recv() on a non-blocking socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BioRead {
+    /// bytes read (at least one)
+    Data(usize),
+    /// the end of the stream
+    Eof,
+    /// nothing now (EAGAIN): SSL_ERROR_WANT_READ
+    Retry,
+    /// an error, with its errno: SSL_ERROR_SYSCALL
+    Error(i32),
+}
+
+/// What a write of a [`BioIo`] came to, as send() on a non-blocking socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BioWrite {
+    /// bytes taken (at least one)
+    Done(usize),
+    /// nothing now (EAGAIN): SSL_ERROR_WANT_WRITE; OpenSSL writes the same
+    /// bytes again
+    Retry,
+    /// an error, with its errno: SSL_ERROR_SYSCALL
+    Error(i32),
+}
+
+/// The I/O of an SSL object done by the caller: its BIO calls these where a
+/// socket BIO calls recv() and send(), and tells OpenSSL their outcomes as a
+/// socket BIO tells those of the system calls (the retry flags, BIO_eof(),
+/// errno), so that SSL_get_error(), errno and the error queue are what nginx
+/// sees with a socket.
+pub trait BioIo: 'static {
+    fn read(&mut self, buf: &mut [u8]) -> BioRead;
+    fn write(&mut self, data: &[u8]) -> BioWrite;
+}
+
+/// The data of a BIO of the caller's I/O (Box::into_raw(), freed by the
+/// destroy callback).
+struct IoBio {
+    io: Box<dyn BioIo>,
+    /// a read found the end of the stream: BIO_eof(), as the
+    /// BIO_FLAGS_IN_EOF of a socket BIO (OpenSSL 3 tells an end of the
+    /// stream without close_notify by it)
+    eof: bool,
+}
+
+/// The method of the BIOs of the caller's I/O, made once (OpenSSL's,
+/// never freed).
+fn io_bio_method() -> *const ffi::BIO_METHOD {
+    static METHOD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    *METHOD.get_or_init(|| {
+        // SAFETY: BIO_meth_new() makes a method of the type and name given
+        // (a static string); the callbacks set are functions of this module
+        // with the signatures OpenSSL calls them with.
+        unsafe {
+            let m = ffi::BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, c"rnginx io_uring".as_ptr());
+
+            if m.is_null() {
+                return 0;
+            }
+
+            ffi::BIO_meth_set_write__fixed_rust(m, Some(raw_io_bio_write));
+            ffi::BIO_meth_set_read__fixed_rust(m, Some(raw_io_bio_read));
+            ffi::BIO_meth_set_ctrl__fixed_rust(m, Some(raw_io_bio_ctrl));
+            ffi::BIO_meth_set_create__fixed_rust(m, Some(raw_io_bio_create));
+            ffi::BIO_meth_set_destroy__fixed_rust(m, Some(raw_io_bio_destroy));
+
+            m as usize
+        }
+    }) as *const ffi::BIO_METHOD
+}
+
+/// The IoBio of a BIO of io_bio_method(), for its callback.
+///
+/// # Safety
+/// `b` is a BIO of io_bio_method(), passed by OpenSSL to one of its
+/// callbacks; the reference does not outlive the callback.
+unsafe fn io_bio<'a>(b: *mut ffi::BIO) -> Option<&'a mut IoBio> {
+    // SAFETY: the BIO's data is null or the IoBio set by set_io_bio(), from
+    // Box::into_raw(), freed only by the destroy callback; OpenSSL calls
+    // the callbacks of a BIO one at a time, from the calls on its SSL (one
+    // thread), so nothing else refers to the IoBio meanwhile.
+    unsafe { (ffi::BIO_get_data(b) as *mut IoBio).as_mut() }
+}
+
+unsafe extern "C" fn raw_io_bio_write(b: *mut ffi::BIO, data: *const c_char, len: c_int) -> c_int {
+    // SAFETY: OpenSSL calls the callback with a BIO of the method
+    unsafe { ffi::BIO_clear_retry_flags(b) };
+
+    // SAFETY: as above
+    let Some(bio) = (unsafe { io_bio(b) }) else { return -1 };
+
+    if data.is_null() || len <= 0 {
+        return 0;
+    }
+
+    // SAFETY: OpenSSL passes len bytes at data, readable for the call
+    let data = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+
+    match bio.io.write(data) {
+        BioWrite::Done(n) => n.min(len as usize) as c_int,
+        BioWrite::Retry => {
+            // SAFETY: as above
+            unsafe { ffi::BIO_set_retry_write(b) };
+            -1
+        }
+        BioWrite::Error(e) => {
+            set_errno(e);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn raw_io_bio_read(b: *mut ffi::BIO, buf: *mut c_char, len: c_int) -> c_int {
+    // SAFETY: OpenSSL calls the callback with a BIO of the method
+    unsafe { ffi::BIO_clear_retry_flags(b) };
+
+    // SAFETY: as above
+    let Some(bio) = (unsafe { io_bio(b) }) else { return -1 };
+
+    if buf.is_null() || len <= 0 {
+        return 0;
+    }
+
+    // SAFETY: OpenSSL passes len bytes at buf, writable for the call and
+    // not otherwise used meanwhile
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+
+    match bio.io.read(buf) {
+        BioRead::Data(n) => n.min(len as usize) as c_int,
+        BioRead::Eof => {
+            bio.eof = true;
+            0
+        }
+        BioRead::Retry => {
+            // SAFETY: as above
+            unsafe { ffi::BIO_set_retry_read(b) };
+            -1
+        }
+        BioRead::Error(e) => {
+            set_errno(e);
+            -1
+        }
+    }
+}
+
+/// The controls OpenSSL sends to its BIOs, answered as a socket BIO does:
+/// flushing is done (writes are sends), BIO_eof() after a read found the
+/// end, no descriptor, no kernel TLS; the rest is not supported (0).
+unsafe extern "C" fn raw_io_bio_ctrl(b: *mut ffi::BIO, cmd: c_int, _larg: c_long, _parg: *mut c_void) -> c_long {
+    match cmd {
+        ffi::BIO_CTRL_FLUSH | BIO_CTRL_DUP => 1,
+        // SAFETY: OpenSSL calls the callback with a BIO of the method
+        ffi::BIO_CTRL_EOF => unsafe { io_bio(b) }.is_some_and(|bio| bio.eof) as c_long,
+        BIO_C_GET_FD => -1,
+        _ => 0,
+    }
+}
+
+unsafe extern "C" fn raw_io_bio_create(b: *mut ffi::BIO) -> c_int {
+    // SAFETY: OpenSSL calls the callback with the BIO it makes: no data,
+    // not initialized until set_io_bio() gives it its IoBio
+    unsafe {
+        ffi::BIO_set_data(b, std::ptr::null_mut());
+        ffi::BIO_set_init(b, 0);
+    }
+    1
+}
+
+unsafe extern "C" fn raw_io_bio_destroy(b: *mut ffi::BIO) -> c_int {
+    if b.is_null() {
+        return 0;
+    }
+
+    // SAFETY: OpenSSL calls the callback with a BIO of the method when it
+    // frees it: its data, if any, is the IoBio from Box::into_raw() of
+    // set_io_bio(), used by nothing after this
+    unsafe {
+        let p = ffi::BIO_get_data(b) as *mut IoBio;
+        if !p.is_null() {
+            ffi::BIO_set_data(b, std::ptr::null_mut());
+            drop(Box::from_raw(p));
+        }
+        ffi::BIO_set_init(b, 0);
+    }
+
+    1
+}
+
+/// SSL_set_bio(ssl, bio, bio) with a BIO whose reads and writes are those
+/// of `io` (false if OpenSSL could not make it): the SSL owns the BIO, and
+/// `io` is dropped with it.
+pub fn set_io_bio(ssl: &mut SslRef, io: Box<dyn BioIo>) -> bool {
+    let m = io_bio_method();
+
+    if m.is_null() {
+        return false;
+    }
+
+    // SAFETY: a BIO of the method is made and given its IoBio (from
+    // Box::into_raw(), freed by the destroy callback); SSL_set_bio() with
+    // the same BIO for reading and writing takes the one reference
+    // BIO_new() returned. The SSL is valid, borrowed mutably.
+    unsafe {
+        let b = BIO_new(m);
+
+        if b.is_null() {
+            return false;
+        }
+
+        let p = Box::into_raw(Box::new(IoBio { io, eof: false }));
+
+        ffi::BIO_set_data(b, p as *mut c_void);
+        ffi::BIO_set_init(b, 1);
+
+        SSL_set_bio(ssl.as_ptr(), b, b);
+    }
+
+    true
+}
+
+/// errno of the thread set to `e`, as a failed system call leaves it
+fn set_errno(e: i32) {
+    // SAFETY: the thread's errno
+    unsafe { *libc::__errno_location() = e };
+}
+
 // --- SSL: state ---
 
 /// SSL_want(ssl)
@@ -1960,5 +2195,198 @@ mod tests {
         assert!(r.is_err());
 
         assert!(current(|s| s.is_none()));
+    }
+
+    /// One end of an in-memory connection for set_io_bio(): reads `rx`,
+    /// writes `tx`; the end of the stream once `rx` is drained and closed,
+    /// an error `fail` instead if set; writes refused while `hold` is set.
+    struct End {
+        rx: std::rc::Rc<RefCell<std::collections::VecDeque<u8>>>,
+        tx: std::rc::Rc<RefCell<std::collections::VecDeque<u8>>>,
+        closed: std::rc::Rc<std::cell::Cell<bool>>,
+        fail: std::rc::Rc<std::cell::Cell<i32>>,
+        hold: std::rc::Rc<std::cell::Cell<bool>>,
+        writes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl BioIo for End {
+        fn read(&mut self, buf: &mut [u8]) -> BioRead {
+            let mut rx = self.rx.borrow_mut();
+            if rx.is_empty() {
+                return match (self.fail.get(), self.closed.get()) {
+                    (0, false) => BioRead::Retry,
+                    (0, true) => BioRead::Eof,
+                    (e, _) => BioRead::Error(e),
+                };
+            }
+            let n = buf.len().min(rx.len());
+            for (d, b) in buf.iter_mut().zip(rx.drain(..n)) {
+                *d = b;
+            }
+            BioRead::Data(n)
+        }
+
+        fn write(&mut self, data: &[u8]) -> BioWrite {
+            self.writes.set(self.writes.get() + 1);
+            if self.hold.get() {
+                return BioWrite::Retry;
+            }
+            self.tx.borrow_mut().extend(data);
+            BioWrite::Done(data.len())
+        }
+    }
+
+    /// A server and a client SSL object, their BIOs connected in memory,
+    /// with the controls of the server's end.
+    struct Pair {
+        server: openssl::ssl::Ssl,
+        client: openssl::ssl::Ssl,
+        to_server_closed: std::rc::Rc<std::cell::Cell<bool>>,
+        server_fail: std::rc::Rc<std::cell::Cell<i32>>,
+        server_hold: std::rc::Rc<std::cell::Cell<bool>>,
+        server_writes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    fn pair() -> Pair {
+        use openssl::asn1::Asn1Time;
+        use openssl::bn::BigNum;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use openssl::ssl::{Ssl, SslVerifyMode};
+        use openssl::x509::{X509Builder, X509NameBuilder};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let key = PKey::from_ec_key(EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "localhost").unwrap();
+        let name = name.build();
+        let mut cert = X509Builder::new().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = cert.build();
+
+        let mut sctx = SslContext::builder(SslMethod::tls_server()).unwrap();
+        sctx.set_private_key(&key).unwrap();
+        sctx.set_certificate(&cert).unwrap();
+        let mut cctx = SslContext::builder(SslMethod::tls_client()).unwrap();
+        cctx.set_verify(SslVerifyMode::NONE);
+
+        let s2c = Rc::new(RefCell::new(std::collections::VecDeque::new()));
+        let c2s = Rc::new(RefCell::new(std::collections::VecDeque::new()));
+        let to_server_closed = Rc::new(Cell::new(false));
+        let server_fail = Rc::new(Cell::new(0));
+        let server_hold = Rc::new(Cell::new(false));
+        let server_writes = Rc::new(Cell::new(0));
+
+        let mut server = Ssl::new(&sctx.build()).unwrap();
+        server.set_accept_state();
+        let end = End { rx: c2s.clone(), tx: s2c.clone(), closed: to_server_closed.clone(), fail: server_fail.clone(), hold: server_hold.clone(), writes: server_writes.clone() };
+        assert!(set_io_bio(&mut server, Box::new(end)));
+
+        let mut client = Ssl::new(&cctx.build()).unwrap();
+        client.set_connect_state();
+        let end = End { rx: s2c, tx: c2s, closed: Rc::new(Cell::new(false)), fail: Rc::new(Cell::new(0)), hold: Rc::new(Cell::new(false)), writes: Rc::new(Cell::new(0)) };
+        assert!(set_io_bio(&mut client, Box::new(end)));
+
+        let mut p = Pair { server, client, to_server_closed, server_fail, server_hold, server_writes };
+
+        // the handshake, each side until it waits for the other
+        let (mut s_done, mut c_done) = (false, false);
+        for _ in 0..20 {
+            if !c_done {
+                let io = do_handshake(&mut p.client);
+                c_done = io.rc == 1;
+                assert!(c_done || io.error == SSL_ERROR_WANT_READ, "client handshake: {:?}", io);
+            }
+            if !s_done {
+                let io = do_handshake(&mut p.server);
+                s_done = io.rc == 1;
+                assert!(s_done || io.error == SSL_ERROR_WANT_READ, "server handshake: {:?}", io);
+            }
+            if s_done && c_done {
+                return p;
+            }
+        }
+
+        panic!("no handshake");
+    }
+
+    /// TLS through set_io_bio(): the handshake and data both ways; a write
+    /// refused (EAGAIN) is SSL_ERROR_WANT_WRITE, and OpenSSL writes the same
+    /// record again; a read with nothing is SSL_ERROR_WANT_READ.
+    #[test]
+    fn io_bio_data_and_retries() {
+        init_ssl();
+        let mut p = pair();
+
+        assert_eq!(write(&mut p.client, b"hello").rc, 5);
+        let mut buf = [0u8; 64];
+        assert_eq!(read(&mut p.server, &mut buf).rc, 5);
+        assert_eq!(&buf[..5], b"hello");
+
+        let io = read(&mut p.server, &mut buf);
+        assert_eq!(io.error, SSL_ERROR_WANT_READ);
+
+        // the write refused: tried again with the same bytes, it goes
+        p.server_hold.set(true);
+        let before = p.server_writes.get();
+        let io = write(&mut p.server, b"world");
+        assert_eq!((io.rc, io.error), (-1, SSL_ERROR_WANT_WRITE));
+        assert_eq!(p.server_writes.get(), before + 1);
+        p.server_hold.set(false);
+        assert_eq!(write(&mut p.server, b"world").rc, 5);
+
+        // (the client may first take the server's session tickets)
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let io = read(&mut p.client, &mut buf);
+            if io.rc > 0 {
+                got.extend_from_slice(&buf[..io.rc as usize]);
+                break;
+            }
+            assert_eq!(io.error, SSL_ERROR_WANT_READ);
+        }
+        assert_eq!(got, b"world");
+    }
+
+    /// The end of the stream without close_notify is OpenSSL 3's
+    /// "unexpected eof while reading" (SSL_ERROR_SSL), as with a socket: the
+    /// BIO tells BIO_eof() after a read found the end.
+    #[test]
+    fn io_bio_end_of_stream() {
+        init_ssl();
+        let mut p = pair();
+
+        p.to_server_closed.set(true);
+        err_clear_error();
+        let mut buf = [0u8; 16];
+        let io = read(&mut p.server, &mut buf);
+        assert_eq!((io.rc, io.error), (0, SSL_ERROR_SSL));
+        let reason = err_get_reason(err_peek_error());
+        err_clear_error();
+        // SSL_R_UNEXPECTED_EOF_WHILE_READING
+        assert_eq!(reason, 294);
+    }
+
+    /// A read error is SSL_ERROR_SYSCALL with its errno, the error queue
+    /// empty, as nginx reports a socket's.
+    #[test]
+    fn io_bio_read_error() {
+        init_ssl();
+        let mut p = pair();
+
+        p.server_fail.set(libc::ECONNRESET);
+        err_clear_error();
+        let mut buf = [0u8; 16];
+        let io = read(&mut p.server, &mut buf);
+        assert_eq!((io.rc, io.error, io.errno), (-1, SSL_ERROR_SYSCALL, libc::ECONNRESET));
+        assert_eq!(err_peek_error(), 0);
     }
 }

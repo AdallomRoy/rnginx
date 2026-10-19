@@ -398,8 +398,46 @@ struct UringIo {
     txb: Option<crate::uring::Send<Vec<u8>>>,
     /// the send of start_send_vec() in flight (the caller's buffer)
     txv: Option<crate::uring::Send<crate::buf::VecSource>>,
+    /// the send of the TLS records the ring BIO was given (a copy), and how
+    /// many bytes: OpenSSL writes the same bytes again (BIO_should_retry)
+    /// and gets the send's result
+    txt: Option<crate::uring::Send<Vec<u8>>>,
+    txt_len: usize,
+    /// the error of a send of TLS records, returned by the writes after it,
+    /// as send() fails again on a socket that failed (OpenSSL writes a
+    /// close_notify again on each SSL_shutdown(): a new send for each
+    /// would never end)
+    txt_error: Option<i32>,
+    /// a send of TLS records by the ring completed since the connection
+    /// last read: the records that follow in the burst (bulk output, the
+    /// rest of a response) are sent by send() at once, the ring taking them
+    /// only when the socket is full (a send of the ring for each record
+    /// would wait a tick for each)
+    txt_burst: bool,
     /// the size of a receive
     recv_len: usize,
+}
+
+/// The BIO of a TLS connection in io_uring mode (Connection::uring_bio()):
+/// OpenSSL's reads and writes, as those of a socket, by the connection's.
+struct UringBio {
+    c: Weak<Connection>,
+}
+
+impl ngx_sys::ssl::BioIo for UringBio {
+    fn read(&mut self, buf: &mut [u8]) -> ngx_sys::ssl::BioRead {
+        match self.c.upgrade() {
+            Some(c) => c.bio_read(buf),
+            None => ngx_sys::ssl::BioRead::Error(libc::EBADF),
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) -> ngx_sys::ssl::BioWrite {
+        match self.c.upgrade() {
+            Some(c) => c.bio_write(data),
+            None => ngx_sys::ssl::BioWrite::Error(libc::EBADF),
+        }
+    }
 }
 
 /// Bytes received and not read yet.
@@ -432,6 +470,27 @@ impl UringIo {
         };
 
         self.stash = rest;
+
+        Some(n)
+    }
+
+    /// read_stash() keeping a provided buffer read partly, its rest read
+    /// from it next (the ring BIO: OpenSSL reads a record's header, then
+    /// its body, in the same call): no copy of the rest. The buffer is
+    /// given back once read whole.
+    fn read_stash_keep(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if matches!(self.stash, Some(Stash::Heap(..))) {
+            return self.read_stash(buf);
+        }
+
+        let Some(Stash::Ring(r, pos)) = self.stash.as_mut() else { return None };
+
+        let n = r.copy_to(*pos, buf);
+        *pos += n;
+
+        if *pos >= r.len() {
+            self.stash = None;
+        }
 
         Some(n)
     }
@@ -480,7 +539,7 @@ impl UringIo {
 
     /// A send by the ring is in flight (one at a time).
     fn sending(&self) -> bool {
-        self.tx.is_some() || self.txb.is_some() || self.txv.is_some()
+        self.tx.is_some() || self.txb.is_some() || self.txv.is_some() || self.txt.is_some()
     }
 
     /// The bytes stashed.
@@ -537,6 +596,12 @@ pub struct Connection {
     /// the close, and the client, done reading, closed first (its TIME_WAIT,
     /// not the server's).
     pub close_after_write: Cell<bool>,
+    /// the output in progress is sent at once by send() while the socket
+    /// takes it, the ring taking what it refuses (TLS in io_uring mode, the
+    /// ring BIO): the HTTP/2 driver's frames, as it writes plain ones
+    /// (docs/IO_URING_PLAN.md §2.4), and buffers the producer wants back
+    /// (b->recycled, as written at once on plain connections)
+    pub send_at_once: Cell<bool>,
     pub sendfile: Cell<bool>,
     pub udp: Cell<bool>,
     /// Signalled to wake an idle (keepalive) connection so it closes itself.
@@ -663,6 +728,7 @@ impl Connection {
             need_last_buf: Cell::new(false),
             need_flush_buf: Cell::new(false),
             close_after_write: Cell::new(false),
+            send_at_once: Cell::new(false),
             sendfile: Cell::new(false),
             udp: Cell::new(false),
             close_notify: tokio::sync::Notify::new(),
@@ -768,6 +834,7 @@ impl Connection {
             need_last_buf: Cell::new(false),
             need_flush_buf: Cell::new(false),
             close_after_write: Cell::new(false),
+            send_at_once: Cell::new(false),
             sendfile: Cell::new(c.sendfile.get()),
             udp: Cell::new(false),
             close_notify: tokio::sync::Notify::new(),
@@ -837,6 +904,7 @@ impl Connection {
             need_last_buf,
             need_flush_buf,
             close_after_write,
+            send_at_once,
             sendfile,
             udp,
             close_notify,
@@ -909,6 +977,7 @@ impl Connection {
         need_last_buf.set(false);
         need_flush_buf.set(false);
         close_after_write.set(false);
+        send_at_once.set(false);
         sendfile.set(c.sendfile.get());
         udp.set(false);
 
@@ -1104,6 +1173,10 @@ impl Connection {
             tx: None,
             txb: None,
             txv: None,
+            txt: None,
+            txt_len: 0,
+            txt_error: None,
+            txt_burst: false,
             recv_len: URING_RECV,
         }));
 
@@ -1350,6 +1423,182 @@ impl Connection {
                 Poll::Ready(res)
             }
         }
+    }
+
+    /// The BIO of an SSL object of this connection in io_uring mode
+    /// (ngx_ssl_create_connection): OpenSSL reads what the ring received and
+    /// writes by sends of the ring, as it would with the socket (see
+    /// bio_read(), bio_write()). None out of the mode.
+    pub fn uring_bio(&self) -> Option<Box<dyn ngx_sys::ssl::BioIo>> {
+        if !self.is_uring() {
+            return None;
+        }
+
+        Some(Box::new(UringBio { c: self.this.clone() }))
+    }
+
+    /// A read of the ring BIO, as recv() of uring_try_recv(): what is
+    /// stashed, the end of the stream or the error a receive found, a
+    /// recv() at once while more may wait (rev->ready), else a retry, the
+    /// caller waiting with readable() (SSL_ERROR_WANT_READ). The end of the
+    /// stream is OpenSSL's to report (c->read->eof is not set here).
+    fn bio_read(&self, buf: &mut [u8]) -> ngx_sys::ssl::BioRead {
+        use ngx_sys::ssl::BioRead;
+
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else { return BioRead::Error(libc::EBADF) };
+
+        if let Some(n) = u.read_stash_keep(buf) {
+            u.txt_burst = false;
+            return BioRead::Data(n);
+        }
+
+        if let Some(e) = u.error.take() {
+            // the error once, the end of the stream next
+            u.eof = true;
+            return BioRead::Error(e);
+        }
+
+        if u.eof {
+            return BioRead::Eof;
+        }
+
+        // a receive in flight gets the next bytes: a recv() now could
+        // return later ones first
+        if u.rx.is_some() || !u.more {
+            return BioRead::Retry;
+        }
+
+        match nix::sys::socket::recv(u.fd.as_raw_fd(), buf, MsgFlags::MSG_DONTWAIT) {
+            Ok(0) => {
+                u.more = false;
+                u.eof = true;
+                BioRead::Eof
+            }
+            Ok(n) => {
+                if n < buf.len() {
+                    u.more = false;
+                }
+                u.txt_burst = false;
+                BioRead::Data(n)
+            }
+            Err(Errno::EAGAIN) => {
+                u.more = false;
+                BioRead::Retry
+            }
+            Err(e) => BioRead::Error(e as i32),
+        }
+    }
+
+    /// A write of the ring BIO: the TLS records go in a send of the ring (a
+    /// copy), and the write is refused (BIO_should_retry) until it
+    /// completes; OpenSSL writes the same bytes again and gets the send's
+    /// result, the bytes the kernel took, as from send() (writable() waits
+    /// for the completion). Sent so, a response's records complete a tick
+    /// later, and the next request's receive is armed once it has come, as
+    /// with the sends of plain responses. The records that follow in a burst
+    /// (see UringIo::txt_burst), the output sent at once (send_at_once), and
+    /// with RNGINX_URING_WRITES=hybrid, are sent by send() at once, by the
+    /// ring if the socket is full; with RNGINX_URING_WRITES=sync, and the
+    /// last output before a close, by send() only.
+    fn bio_write(&self, data: &[u8]) -> ngx_sys::ssl::BioWrite {
+        use ngx_sys::ssl::BioWrite;
+
+        let mut g = self.uring.borrow_mut();
+
+        let Some(u) = g.as_mut() else { return BioWrite::Error(libc::EBADF) };
+
+        if let Some(tx) = u.txt.as_mut() {
+            if data.len() != u.txt_len {
+                // OpenSSL writes again what was refused: other bytes would
+                // be lost, or sent twice
+                ngx_log_error!(NGX_LOG_ALERT, self.log, None, "SSL write of {} bytes while a send of {} is in flight", data.len(), u.txt_len);
+                return BioWrite::Error(libc::EIO);
+            }
+
+            let Some((res, _)) = tx.try_take() else { return BioWrite::Retry };
+
+            u.txt = None;
+
+            return match res {
+                Ok(n) => {
+                    u.txt_burst = true;
+                    BioWrite::Done(n)
+                }
+                Err(e) => {
+                    let e = e.raw_os_error().unwrap_or(libc::EIO);
+                    u.txt_error = Some(e);
+                    BioWrite::Error(e)
+                }
+            };
+        }
+
+        if let Some(e) = u.txt_error {
+            return BioWrite::Error(e);
+        }
+
+        if u.sending() {
+            // another send of the ring first (in order)
+            return BioWrite::Retry;
+        }
+
+        let only_send = crate::uring::sync_writes() || self.close_after_write.get();
+
+        if only_send || u.txt_burst || self.send_at_once.get() || crate::uring::hybrid_writes() {
+            match nix::sys::socket::send(u.fd.as_raw_fd(), data, MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT) {
+                Ok(n) => return BioWrite::Done(n),
+                // the socket is full: the ring's send waits for room
+                Err(Errno::EAGAIN) if !only_send => {}
+                Err(Errno::EAGAIN) => return BioWrite::Retry,
+                Err(e) => return BioWrite::Error(e as i32),
+            }
+        }
+
+        match crate::uring::send(&u.fd, data.to_vec()) {
+            Ok(tx) => {
+                u.txt = Some(tx);
+                u.txt_len = data.len();
+                BioWrite::Retry
+            }
+            Err((e, _)) => BioWrite::Error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    /// writable() in io_uring mode: the send of TLS records in flight first
+    /// (the write the ring BIO refused goes on once it completes; its
+    /// result stays for that write), else a poll for room in the socket.
+    async fn uring_writable(&self) -> io::Result<()> {
+        if self.uring.borrow().as_ref().is_some_and(|u| u.txt.is_some()) {
+            std::future::poll_fn(|cx| match self.uring.borrow_mut().as_mut().and_then(|u| u.txt.as_mut()) {
+                Some(tx) => tx.poll_ready(cx),
+                None => std::task::Poll::Ready(()),
+            })
+            .await;
+
+            return Ok(());
+        }
+
+        self.uring_poll(libc::POLLOUT).await.map(drop)
+    }
+
+    /// A send of TLS records by the ring is in flight (the ring BIO).
+    pub fn tls_send_in_flight(&self) -> bool {
+        self.uring.borrow().as_ref().is_some_and(|u| u.txt.is_some())
+    }
+
+    /// The send of TLS records in flight, settled: true once it has
+    /// completed in the flush that submitted it (the write it refused never
+    /// blocked, as a write that does not block in C: no send_timeout timer,
+    /// no ngx_http_test_reading; its result stays for that write), false
+    /// once it is known to wait for room in the socket, or if none is in
+    /// flight.
+    pub async fn settle_tls_send(&self) -> bool {
+        std::future::poll_fn(|cx| match self.uring.borrow_mut().as_mut().and_then(|u| u.txt.as_mut()) {
+            Some(tx) => tx.poll_settled_ready(cx),
+            None => std::task::Poll::Ready(false),
+        })
+        .await
     }
 
     /// The close handler of an idle connection in io_uring mode
@@ -1816,7 +2065,7 @@ impl Connection {
     /// Wait until the socket is writable.
     pub async fn writable(&self) -> io::Result<()> {
         if self.is_uring() {
-            return self.uring_poll(libc::POLLOUT).await.map(drop);
+            return self.uring_writable().await;
         }
         if self.is_quic_stream() {
             return crate::quic::streams::writable(self).await;
@@ -1883,23 +2132,11 @@ impl Connection {
     /// retained readiness is cleared and the next wait blocks for a new
     /// event, as epoll ET re-arming does after NGX_AGAIN in C. Waiting with
     /// readable() / writable() alone keeps the stale readiness and spins.
-    pub async fn drive_io<T>(&self, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+    pub async fn drive_io<T>(&self, op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
         if self.is_uring() {
-            let mut step = op();
-            loop {
-                match step {
-                    IoStep::Done(v) => return Ok(v),
-                    IoStep::WantRead => {
-                        self.read_drained();
-                        self.uring_poll(libc::POLLIN | libc::POLLRDHUP).await?;
-                    }
-                    IoStep::WantWrite => {
-                        self.uring_poll(libc::POLLOUT).await?;
-                    }
-                }
-                step = op();
-            }
+            return self.uring_drive_io(None, op).await;
         }
+        let mut op = op;
         let mut step = op();
         loop {
             match step {
@@ -1930,6 +2167,10 @@ impl Connection {
     /// found the socket drained, so the retained readiness is cleared
     /// (c->read->ready = 0).
     pub async fn drive_io_from<T>(&self, mut step: IoStep<T>, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+        if self.is_uring() {
+            return self.uring_drive_io(Some(step), op).await;
+        }
+
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
         // (the read side is cleared in the loop)
@@ -1957,6 +2198,32 @@ impl Connection {
                     }
                 }
             }
+        }
+    }
+
+    /// drive_io() and drive_io_from() in io_uring mode: an operation that
+    /// wants reading found nothing stashed (the ring BIO's retry, or EAGAIN
+    /// of a recv() made while more might wait), so the readiness is cleared
+    /// and the connection's receive waited for; one that wants writing
+    /// waits for the send of TLS records in flight, or for room in the
+    /// socket.
+    async fn uring_drive_io<T>(&self, step: Option<IoStep<T>>, mut op: impl FnMut() -> IoStep<T>) -> io::Result<T> {
+        let mut step = match step {
+            Some(s) => s,
+            None => op(),
+        };
+
+        loop {
+            match step {
+                IoStep::Done(v) => return Ok(v),
+                IoStep::WantRead => {
+                    self.read_drained();
+                    self.uring_readable().await?;
+                }
+                IoStep::WantWrite => self.uring_writable().await?,
+            }
+
+            step = op();
         }
     }
 
@@ -2043,6 +2310,13 @@ impl Connection {
     /// readable() is not budgeted, so a caller alternating readable() and
     /// try_recv() would then loop forever without yielding to the runtime.
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.is_uring() {
+            if let Some(ssl) = self.ssl.borrow().clone() {
+                // io_uring mode, TLS: one SSL_read(), OpenSSL reading what
+                // the ring received (the ring BIO)
+                return ssl.try_recv(self, buf);
+            }
+        }
         if let Some(r) = self.uring_try_recv(buf, false) {
             return r;
         }
@@ -2128,6 +2402,9 @@ impl Connection {
     /// ngx_unix_recv equivalent: read some bytes, awaiting readiness. Ok(0) is EOF.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         if self.is_uring() {
+            if let Some(ssl) = self.ssl.borrow().clone() {
+                return ssl.recv(self, buf).await;
+            }
             loop {
                 match self.try_recv(buf) {
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.uring_readable().await?,
@@ -2215,27 +2492,10 @@ impl Connection {
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.fake_io_error()?;
         // a peek leaves the data in the socket (MSG_PEEK) for whoever reads
-        // next, OpenSSL included: on the reactor, unless something received
-        // is stashed already
+        // next, OpenSSL with a socket BIO included: on the reactor, unless
+        // something received is stashed already
         if self.is_uring() && !self.try_leave_uring() {
-            loop {
-                {
-                    let mut g = self.uring.borrow_mut();
-                    let u = g.as_mut().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-                    if let Some(n) = u.peek_stash(buf) {
-                        return Ok(n);
-                    }
-                    if u.eof {
-                        return Ok(0);
-                    }
-                    if let Some(e) = u.error {
-                        return Err(io::Error::from_raw_os_error(e));
-                    }
-                    // more may wait: a receive gets it into the stash
-                    u.more = false;
-                }
-                self.uring_readable().await?;
-            }
+            return self.uring_peek(buf).await;
         }
         if let Some(udp) = self.udp_conn() {
             return udp.peek(self, buf).await;
@@ -2247,6 +2507,30 @@ impl Connection {
                 Ok(r) => return r,
                 Err(_) => continue,
             }
+        }
+    }
+
+    /// A peek in io_uring mode, staying in it: what a receive got, left
+    /// stashed for the next reader (which may be OpenSSL with the ring
+    /// BIO, see uring_bio()), the end of the stream, or the error.
+    pub async fn uring_peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            {
+                let mut g = self.uring.borrow_mut();
+                let u = g.as_mut().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+                if let Some(n) = u.peek_stash(buf) {
+                    return Ok(n);
+                }
+                if u.eof {
+                    return Ok(0);
+                }
+                if let Some(e) = u.error {
+                    return Err(io::Error::from_raw_os_error(e));
+                }
+                // more may wait: a receive gets it into the stash
+                u.more = false;
+            }
+            self.uring_readable().await?;
         }
     }
 
@@ -2327,6 +2611,9 @@ impl Connection {
     /// ngx_unix_send equivalent: write some bytes, awaiting writability.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         if self.is_uring() {
+            if let Some(ssl) = self.ssl.borrow().clone() {
+                return ssl.send(self, buf).await;
+            }
             return self.uring_send(buf).await;
         }
         if self.is_quic_stream() {
@@ -2355,7 +2642,7 @@ impl Connection {
 
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
-        if self.is_uring() {
+        if self.is_uring() && self.ssl.borrow().is_none() {
             return self.uring_send(&iov.concat()).await;
         }
         if self.is_quic_stream() {

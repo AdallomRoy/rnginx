@@ -205,6 +205,58 @@ impl Driver {
         Poll::Ready(Some(self.take_done(i)))
     }
 
+    /// The completion if the operation has completed, taken; no waker is
+    /// registered (the caller waits with poll_ready()).
+    fn try_take(&mut self, tag: u64) -> Option<Completion> {
+        let slot = self.slot(tag)?;
+
+        let State::Done(i) = slot.state else { return None };
+
+        slot.state = State::Free;
+        self.free.push(tag as u32);
+
+        Some(self.take_done(i))
+    }
+
+    /// Ready once the operation has completed, its completion left for
+    /// the next poll or try_take().
+    fn poll_ready(&mut self, tag: u64, cx: &mut Context<'_>) -> Poll<()> {
+        let slot = self.slot(tag).expect("the slot of an operation");
+
+        match &mut slot.state {
+            State::Done(_) => Poll::Ready(()),
+            State::Waiting { waker, .. } => {
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                Poll::Pending
+            }
+            _ => unreachable!("an operation polled after its end"),
+        }
+    }
+
+    /// Ready(true) once the operation has completed (its completion left
+    /// for the next poll or try_take()), Ready(false) once it is known to
+    /// wait in the kernel (not complete after the flush that submitted it).
+    fn poll_settled_ready(&mut self, tag: u64, cx: &mut Context<'_>) -> Poll<bool> {
+        let slot = self.slot(tag).expect("the slot of an operation");
+
+        match &mut slot.state {
+            State::Done(_) => Poll::Ready(true),
+            State::Waiting { flushed: true, .. } => Poll::Ready(false),
+            State::Waiting { waker, settle, .. } => {
+                *settle = true;
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                Poll::Pending
+            }
+            _ => unreachable!("an operation polled after its end"),
+        }
+    }
+
     /// The future of an operation went away: the operation is cancelled,
     /// or its completion (what it lent) returned to be dropped.
     fn abandon(&mut self, tag: u64) -> Option<Completion> {
@@ -341,6 +393,17 @@ pub fn hybrid_writes() -> bool {
 /// What the driver did so far.
 pub fn stats() -> Stats {
     DRIVER.try_with(|d| d.borrow().as_ref().map(|d| d.stats).unwrap_or_default()).unwrap_or_default()
+}
+
+/// Whether the kernel lets this process do its sockets' I/O through
+/// io_uring: a small ring with what the driver uses (the opcodes, a group
+/// of provided buffers) is made and dropped. io_uring is then the default
+/// event method, as ngx_event_init_conf takes the best method available.
+pub fn available() -> bool {
+    match Ring::new(8) {
+        Ok(mut ring) => ring.add_buffer_group(1, 64, 1).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Creates the process's ring and starts its driver task (in the event
@@ -596,6 +659,39 @@ pub fn send<S: SendSource>(fd: &Fd, src: S) -> Result<Send<S>, (io::Error, S)> {
 }
 
 impl<S: SendSource> Send<S> {
+    /// The send's output if it has completed, without waiting or
+    /// registering a waker (poll_ready() waits).
+    pub fn try_take(&mut self) -> Option<(io::Result<usize>, S)> {
+        let mut c = DRIVER.with(|d| d.borrow_mut().as_mut().and_then(|d| d.try_take(self.op.tag)))?;
+
+        self.op.done = true;
+
+        let src = c.take_payload::<S>().expect("the source of a send");
+
+        Some((c.res(), src))
+    }
+
+    /// Ready(true) once the send has completed (its output stays for
+    /// try_take() or the future), Ready(false) once it is known to wait in
+    /// the kernel for room in the socket (as C's NGX_AGAIN).
+    pub fn poll_settled_ready(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        if self.op.done {
+            return Poll::Ready(true);
+        }
+
+        DRIVER.with(|d| d.borrow_mut().as_mut().expect("the io_uring driver").poll_settled_ready(self.op.tag, cx))
+    }
+
+    /// Ready once the send has completed; its output stays for try_take()
+    /// or the future.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.op.done {
+            return Poll::Ready(());
+        }
+
+        DRIVER.with(|d| d.borrow_mut().as_mut().expect("the io_uring driver").poll_ready(self.op.tag, cx))
+    }
+
     /// The send's output if it completed in the flush that submitted it,
     /// or None once it is known to wait in the kernel for room in the
     /// socket (as C's NGX_AGAIN): the caller then awaits the future.

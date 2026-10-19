@@ -538,6 +538,10 @@ async fn ssl_send_chain(c: &Connection, chain: &mut Chain, limit: i64) -> io::Re
 fn ssl_send_chain_pass(c: &Connection, chain: &mut Chain, limit: i64, total: &mut i64) -> io::Result<Pass> {
     let mut pos = SslChainPos::default();
 
+    // io_uring mode: buffers the producer wants back (b->recycled) are
+    // written at once, as on plain connections (the ring BIO)
+    c.send_at_once.set(chain.iter().any(|b| b.recycled));
+
     match ngx_ssl_send_chain_wait_step(c, &*chain, &mut pos, limit) {
         IoStep::Done(Ok(())) => {
             let n = ngx_ssl_chain_taken(&*chain, pos);
@@ -575,6 +579,22 @@ pub async fn ssl_send_chain_from(c: &Connection, chain: &mut Chain, limit: i64, 
             Ok(n)
         }
         Err(()) => Err(ssl_error_logged()),
+    }
+}
+
+/// One attempt of ssl_send_chain_from() without waiting, from `pos`: Done
+/// with the bytes taken off the chain (updated), or the readiness the pass
+/// waits for, `pos` where it goes on.
+pub fn ssl_send_chain_step(c: &Connection, chain: &mut Chain, limit: i64, pos: &mut SslChainPos) -> IoStep<io::Result<i64>> {
+    match ngx_ssl_send_chain_wait_step(c, &*chain, pos, limit) {
+        IoStep::Done(Ok(())) => {
+            let n = ngx_ssl_chain_taken(&*chain, *pos);
+            update_sent(chain, n);
+            IoStep::Done(Ok(n))
+        }
+        IoStep::Done(Err(())) => IoStep::Done(Err(ssl_error_logged())),
+        IoStep::WantRead => IoStep::WantRead,
+        IoStep::WantWrite => IoStep::WantWrite,
     }
 }
 

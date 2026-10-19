@@ -1775,10 +1775,25 @@ pub fn ngx_ssl_create_connection(ssl: &NgxSsl, c: &Connection, flags: u32) -> i6
         }
     };
 
+    let ktls = sys::ctx_options(&ctx) & sys::SSL_OP_ENABLE_KTLS != 0;
+
     *sc.state.session_ctx.borrow_mut() = Some(ctx);
     *sc.state.session_data.borrow_mut() = Some(ssl.data.clone());
 
-    if !sys::set_fd(&mut conn, c.fd.get()) {
+    // io_uring mode: OpenSSL reads what the ring received and writes by
+    // sends of the ring (the ring BIO), unless the context enables kernel
+    // TLS, which needs the socket (the connection leaves the mode); with
+    // the socket bound otherwise, as in C
+    if ktls {
+        c.try_leave_uring();
+    }
+
+    let bound = match c.uring_bio() {
+        Some(bio) => sys::set_io_bio(&mut conn, bio),
+        None => sys::set_fd(&mut conn, c.fd.get()),
+    };
+
+    if !bound {
         ngx_ssl_error(NGX_LOG_ALERT, &c.log, 0, format_args!("SSL_set_fd() failed"));
         return NGX_ERROR;
     }
@@ -1810,6 +1825,13 @@ pub fn ngx_ssl_create_connection(ssl: &NgxSsl, c: &Connection, flags: u32) -> i6
     *c.ssl.borrow_mut() = Some(Rc::new(sc));
 
     NGX_OK
+}
+
+/// The context enables kernel TLS (ssl_conf_command Options KTLS): its
+/// connections need OpenSSL on the socket (a socket BIO), not the ring BIO
+/// of io_uring mode.
+pub fn ngx_ssl_ktls(ssl: &NgxSsl) -> bool {
+    ssl.ctx.get().is_some_and(|ctx| sys::ctx_options(&ctx) & sys::SSL_OP_ENABLE_KTLS != 0)
 }
 
 /// ngx_ssl_get_session: a reference to the session to be saved

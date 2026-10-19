@@ -464,6 +464,26 @@ async fn send_out(r: &R, out: &mut Chain, mut limit: i64, send_timeout: u64, ssl
         }
     }
 
+    // io_uring mode, TLS: the write the ring BIO refused waits for its send
+    // of the records. Completed in the flush that submitted it, the write
+    // never blocked: no send_timeout timer and no ngx_http_test_reading,
+    // and the pass goes on at once (it may start another send)
+    let mut ssl = ssl;
+
+    while let Some((false, pos)) = ssl {
+        if h2 || !r.connection.tls_send_in_flight() || !r.connection.settle_tls_send().await {
+            break;
+        }
+
+        let mut pos = pos;
+
+        match crate::output::ssl_send_chain_step(&r.connection, out, limit, &mut pos) {
+            ngx_core::connection::IoStep::Done(res) => return Sent::Done(Ok(res)),
+            ngx_core::connection::IoStep::WantWrite => ssl = Some((false, pos)),
+            ngx_core::connection::IoStep::WantRead => ssl = Some((true, pos)),
+        }
+    }
+
     let chain = async {
         if h2 {
             // fc->send_chain = ngx_http_v2_send_chain
