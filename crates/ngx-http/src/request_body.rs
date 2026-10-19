@@ -788,7 +788,10 @@ async fn read_discarded_request_body(r: &R, wait: bool) -> i64 {
                 Ok(Ok(n)) => n,
             }
         } else {
-            match c.try_recv_raw(&mut buffer[..size]) {
+            // c->recv: an SSL_read() on a TLS connection (a recv() of the
+            // socket would take its records as body bytes)
+            let res = if c.ssl.borrow().is_some() { c.try_recv(&mut buffer[..size]) } else { c.try_recv_raw(&mut buffer[..size]) };
+            match res {
                 Ok(0) => return NGX_OK,
                 Ok(n) => n,
                 Err(e) => {
