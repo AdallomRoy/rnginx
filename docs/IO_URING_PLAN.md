@@ -165,6 +165,11 @@ stay. We take the architecture, not the crate, for these reasons:
   request heads and frames, 16 KB for bodies; sizes to be measured. An idle
   connection holds no buffer, as in C. The `len` of the operation caps the
   read.
+- **A window of the buffers** is in the kernel's ring, the one given back
+  last first: the kernel takes the ring's entries in order, so with all the
+  buffers there each is used in turn and made resident. A receive that finds
+  the ring empty (ENOBUFS) is retried at the next flush, and widens the
+  window by one entry.
 - **Armed late, never multishot.** A RECV is submitted only when the code
   waits for data and nothing is stashed. That is the arming measured in
   §1.2, and it is what nginx's structure already does: try the read, then
@@ -409,21 +414,28 @@ items stay.
   and the epoll fallback. nginx-tests and the benchmarks run on this VM's
   7.0 kernel.
 
-## 7. Status (2026-10-16)
+## 7. Status (2026-10-19)
 
-Done (on master; Phase 2's completion on branch `uring-p2`):
+Done, on master:
 - **Phase 0** (`94d9cfb`): the ring and its driver.
 - **Phase 1** (`141f7ac`): plain HTTP/1 client connections.
 - **Phase 3** (`653c4a2`): plain upstream and stream connections, plus one
   allocation per send (Phase 1b).
-- **Phase 2 and fixes** (`ec2fccf`): h2c, with the driver's sends still
-  system calls; cancel-safe sends; C's flush of recycled buffers; the
-  keepalive close handler on the connection's receive.
-- **Phase 2 completion** (branch `uring-p2`): the HTTP/2 driver's writes
-  (§2.4). Master copied the bytes of every ring send.
+- **Phase 2 and fixes** (`ec2fccf`): h2c; cancel-safe sends; C's flush of
+  recycled buffers; the keepalive close handler on the connection's receive.
+- **Phase 2 completion** (`1c36048`): the HTTP/2 driver's writes (§2.4).
+- **The client watch** (`2dac457`): ngx_http_test_reading and
+  ngx_http_upstream_check_broken_connection wait on the connection's own
+  receive, as the keepalive close handler does, instead of a poll armed and
+  cancelled in each phase of a proxied request.
+- **Idle memory** (`169ba25`): the provided buffers are used from a window,
+  the one given back last first (§2.3), and a driver slot keeps the index of
+  its completion, not the completion.
 
 nginx-tests pass 455 files with epoll, with `RNGINX_EVENTS=io_uring`, and
-with `RNGINX_URING_WRITES=sync` too; `cargo test` passes 642.
+with `RNGINX_URING_WRITES=sync` and `hybrid`; `cargo test` passes 643. The
+stress tests of §4, `bench/stress_h1.py` (HTTP/1 and proxying; C passes it
+too) and `bench/stress_h2.py`, pass in every mode.
 
 ### Write modes
 `RNGINX_URING_WRITES` compared three modes (`results/uring-p3-modes-20261009.jsonl`):
@@ -465,23 +477,45 @@ C, this build on epoll, and on io_uring, alternating, 3 reps
 | `stream-tcp-proxy` | 0.88× | 0.96× | 1.09 |
 | TLS fronts, `grpc-pass`, `fastcgi-1k` | | unchanged | 0.99–1.06 |
 
+Since then (req/s ratios to C, medians of per-rep ratios):
+- **Phase 2 completion** (`results/uring-p2-final-20261016.jsonl`):
+  `h2c-100k` 0.62× → **0.89×**, `h2c-return` 1.69× → 1.73×, `h2c-1k`
+  1.42× → 1.44×; HTTP/1 unchanged. Sent by the ring alone, the HTTP/2 output
+  lost 20% on `h2c-100k`, hence the writes at once of §2.4.
+- **The client watch and idle memory** (`results/uring-wip-20261019.jsonl`):
+  `h1-return` 0.90× → 0.93×, `h1-static-1k` 0.92× → 0.95×,
+  `proxy-1k-keepalive` 0.67× → 0.69× (6 → 3 ring operations per request:
+  no POLL_ADD and ASYNC_CANCEL any more), `proxy-100k` 0.80× → 0.81× (epoll
+  0.84×), `h1-2k-conns` 0.86× in both.
+
 Fixed rate and idle memory:
 - **`rate-h1-static-1k`**: server CPU per request goes from 26.8 µs (epoll)
   to 22.6 µs (C 19.4). p99 is 0.36 ms against epoll's 0.32 (the completion
   tick).
 - **`rate-proxy-1k`**: 34.2 against 33.2 µs, so slightly more.
-- **`idle-10k-h1`**: 2.86 KB per connection against 2.33 (C 0.55). An idle
-  connection holds a receive in flight: driver and ring slots, plus the
-  connection's io_uring state.
+- **`idle-10k-h1`**: 2.48 KB per connection against 2.34 on epoll (C 0.55),
+  down from 2.86 (`results/uring-wip2-mem-20261019.jsonl`); the heap held per
+  idle connection is 2.43 KB against 2.32. With all its buffers in the
+  kernel's ring, a worker used each in turn and made all 6 MB of them
+  resident; from the window, about as many as are in use at a time.
+- **Under load, io_uring holds more**: at `h1-2k-conns` the peak PSS is
+  37–38 MB against 20 MB on epoll (C 28). The live heap during the load is
+  8.5 MB more, about 4.3 KB and 18 blocks per connection, and is freed when
+  the load stops: a request lives until its send completes, a tick later, so
+  at saturation more requests are alive at once, each a request object.
+  Rule 4 of §2.8 (`c->sent` and `$bytes_sent` counted at completion) keeps
+  the request until then; smaller or reused request objects are `bench/PLAN.md` Phase 2
+  (2a, 2c). Each worker also allocates 6 MB of provided buffers (heap, not
+  resident until used).
 
 ### Open
-- **Proxying gains less than serving.** `proxy-1k-keepalive` gains 5% while
-  `h1-return` gains 31%, and `rate-proxy-1k` costs slightly more CPU. To be
-  profiled: the upstream request send and response receive (16 KB receives),
-  and the hybrid writes of event-pipe output (`proxy-100k` −5%).
-- **Phase 2 completion:** the HTTP/2 driver's frames as ring sends of its
-  write buffer.
-- **Phase 4:** TLS. **Phase 5:** accept, close, small files, and io_uring as
-  the default.
-- **Idle memory:** smaller driver slots (a completion stored only while it
-  waits to be polled) and a slimmer per-connection state.
+- **Proxying gains less than serving.** `proxy-1k-keepalive` is at 0.69×.
+  Its kernel time per request is close to C's (16.6 against 15.5 µs in the
+  profiles of 2026-10-16, `results/analysis/profile-1792157*.json`); the gap
+  is user time (13.5 against 5.3 µs), `bench/PLAN.md` Phase 2/3. To be
+  profiled: `proxy-100k`, still below epoll (the 16 KB receives copied out of
+  provided buffers, the writes of event-pipe output).
+- **Phase 4:** TLS. **Phase 5:** accept, close, small files, DEFER_TASKRUN,
+  and io_uring as the default.
+- **Per-connection state:** an idle connection still holds about 110 bytes
+  more heap than with epoll.
