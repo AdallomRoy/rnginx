@@ -223,6 +223,11 @@ impl std::fmt::Debug for BufToken {
 
 /// A group of provided buffers: a buffer ring registered with the kernel
 /// (entries the kernel reads up to the tail we publish) and the buffers.
+///
+/// Only a window of the buffers is in the ring; the others wait on a stack,
+/// the last given back on top. The kernel takes the ring's entries in
+/// order, so with every buffer in the ring each would be used in turn, and
+/// made resident, however few are in use at a time.
 struct Group {
     bgid: u16,
     /// the ring's entries (page aligned, zeroed), `entries` of them
@@ -234,6 +239,14 @@ struct Group {
     mem: *mut u8,
     mem_layout: Layout,
     size: usize,
+    /// the buffers neither in the ring nor lent, the last given back on top
+    free: Vec<u16>,
+    /// the entries published that no completion has taken yet
+    in_ring: u16,
+    /// the entries the ring is kept at: one more for each receive that
+    /// found none (ENOBUFS), up to `entries`, so that a burst of receives
+    /// widens it by what it lacked
+    window: u16,
 }
 
 impl Group {
@@ -334,8 +347,9 @@ impl<K: AsFd + 'static> Ring<K> {
     }
 
     /// Registers `count` provided buffers of `size` bytes (count a power of
-    /// two, at most 32768) for buffer-select receives (5.19).
-    pub fn add_buffer_group(&mut self, count: u16, size: usize) -> io::Result<BufGroup> {
+    /// two, at most 32768) for buffer-select receives (5.19), `window` of
+    /// them in the kernel's ring at first (more once receives find none).
+    pub fn add_buffer_group(&mut self, count: u16, size: usize, window: u16) -> io::Result<BufGroup> {
         if !count.is_power_of_two() || count > 32768 || size == 0 || size > u32::MAX as usize {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -372,9 +386,10 @@ impl<K: AsFd + 'static> Ring<K> {
             return Err(e);
         }
 
-        let mut g = Group { bgid, ring, ring_layout, entries: count, tail: 0, mem, mem_layout, size };
+        let window = window.clamp(1, count);
+        let mut g = Group { bgid, ring, ring_layout, entries: count, tail: 0, mem, mem_layout, size, free: (window..count).rev().collect(), in_ring: window, window };
 
-        for bid in 0..count {
+        for bid in 0..window {
             g.add(bid);
         }
 
@@ -619,7 +634,7 @@ impl<K: AsFd + 'static> Ring<K> {
     /// posts the completions of what became ready); the provided buffers
     /// given back go to the kernel first.
     pub fn submit(&mut self) -> io::Result<usize> {
-        self.publish_returned();
+        self.refill();
 
         loop {
             match self.ring.submitter().submit() {
@@ -631,7 +646,7 @@ impl<K: AsFd + 'static> Ring<K> {
 
     /// Submits, then waits up to `timeout` for a completion.
     fn submit_and_wait(&mut self, timeout: Duration) -> io::Result<usize> {
-        self.publish_returned();
+        self.refill();
 
         let ts = types::Timespec::from(timeout);
         let args = types::SubmitArgs::new().timespec(&ts);
@@ -639,25 +654,26 @@ impl<K: AsFd + 'static> Ring<K> {
         self.ring.submitter().submit_with_args(1, &args)
     }
 
-    /// The provided buffers given back, the kernel's again.
-    fn publish_returned(&mut self) {
-        let mut returned = self.returned.borrow_mut();
-
-        if returned.is_empty() {
-            return;
+    /// The provided buffers given back go on their groups' stacks, and the
+    /// rings are filled up to their windows from the tops (the buffers used
+    /// last, resident already).
+    fn refill(&mut self) {
+        for (group, bid) in self.returned.borrow_mut().drain(..) {
+            self.groups[group as usize].free.push(bid);
         }
 
-        let mut touched = 0u64;
-
-        for (group, bid) in returned.drain(..) {
-            self.groups[group as usize].add(bid);
-            touched |= 1 << (group % 64);
-        }
-
-        for (i, g) in self.groups.iter().enumerate() {
-            if touched & (1 << (i % 64)) != 0 {
-                g.publish();
+        for g in self.groups.iter_mut() {
+            if g.in_ring >= g.window || g.free.is_empty() {
+                continue;
             }
+
+            while g.in_ring < g.window {
+                let Some(bid) = g.free.pop() else { break };
+                g.add(bid);
+                g.in_ring += 1;
+            }
+
+            g.publish();
         }
     }
 
@@ -691,7 +707,19 @@ impl<K: AsFd + 'static> Ring<K> {
             let group = slot.op.as_ref().and_then(|f| f.group);
 
             let buffer = match (group, cqueue::buffer_select(flags)) {
-                (Some(group), Some(bid)) => Some(BufToken { ring: id, group, bid, len: result.max(0) as u32, returned: returned.clone() }),
+                (Some(group), Some(bid)) => {
+                    let g = &mut self.groups[group as usize];
+                    g.in_ring = g.in_ring.saturating_sub(1);
+                    Some(BufToken { ring: id, group, bid, len: result.max(0) as u32, returned: returned.clone() })
+                }
+                (Some(group), None) if result == -libc::ENOBUFS => {
+                    // the ring was empty: an entry more from now on (each
+                    // receive of a burst that found none adds one; doubling
+                    // for each took the window to all the buffers at once)
+                    let g = &mut self.groups[group as usize];
+                    g.window = g.window.saturating_add(1).min(g.entries);
+                    None
+                }
                 _ => None,
             };
 
@@ -715,7 +743,7 @@ impl<K: AsFd + 'static> Ring<K> {
 
         drop(cq);
 
-        self.publish_returned();
+        self.refill();
 
         n
     }
@@ -814,7 +842,7 @@ mod tests {
     #[test]
     fn recv_into_provided_buffer() {
         let Some(mut r) = ring() else { return };
-        let g = r.add_buffer_group(4, 64).unwrap();
+        let g = r.add_buffer_group(4, 64, 4).unwrap();
         let (mut a, b) = pair();
 
         a.write_all(b"hello").unwrap();
@@ -832,7 +860,7 @@ mod tests {
     #[test]
     fn recv_waits_and_capped_length() {
         let Some(mut r) = ring() else { return };
-        let g = r.add_buffer_group(2, 8).unwrap();
+        let g = r.add_buffer_group(2, 8, 2).unwrap();
         let (mut a, b) = pair();
 
         r.push_recv(owned(&b), 4, g, 1).unwrap();
@@ -848,7 +876,7 @@ mod tests {
     #[test]
     fn buffers_come_back_once_dropped() {
         let Some(mut r) = ring() else { return };
-        let g = r.add_buffer_group(1, 16).unwrap();
+        let g = r.add_buffer_group(1, 16, 1).unwrap();
         let (mut a, b) = pair();
 
         a.write_all(b"one").unwrap();
@@ -868,6 +896,80 @@ mod tests {
         let mut c3 = wait(&mut r, 1).remove(0);
         let t3 = c3.take_buffer().unwrap();
         assert_eq!(r.buffer(&t3), b"two");
+    }
+
+    /// Only a window of the buffers is in the kernel's ring, the one given
+    /// back last on top of the others: one receive at a time uses two
+    /// buffers of the eight (the one it takes is replaced at once, and is
+    /// next once given back); a receive that finds the ring empty widens
+    /// the window.
+    #[test]
+    fn buffers_are_reused_from_a_window() {
+        let Some(mut r) = ring() else { return };
+        let g = r.add_buffer_group(8, 16, 1).unwrap();
+        let (mut a, b) = pair();
+
+        let mut used = std::collections::HashSet::new();
+        for _ in 0..6 {
+            a.write_all(b"x").unwrap();
+            r.push_recv(owned(&b), 16, g, 1).unwrap();
+            let mut c = wait(&mut r, 1).remove(0);
+            used.insert(c.take_buffer().unwrap().bid);
+        }
+        assert_eq!(used.len(), 2);
+
+        // two receives in one submission, one buffer in the ring: the
+        // second finds none
+        let (mut a2, b2) = pair();
+        a.write_all(b"y").unwrap();
+        a2.write_all(b"z").unwrap();
+        r.push_recv(owned(&b), 16, g, 2).unwrap();
+        r.push_recv(owned(&b2), 16, g, 3).unwrap();
+        let mut done = wait(&mut r, 2);
+        done.sort_by_key(|c| c.tag);
+        assert_eq!(done[0].res().unwrap(), 1);
+        assert_eq!(done[1].result, -libc::ENOBUFS);
+        assert_eq!(r.groups[0].window, 2);
+
+        r.push_recv(owned(&b2), 16, g, 4).unwrap();
+        let mut c = wait(&mut r, 1).remove(0);
+        let t = c.take_buffer().unwrap();
+        assert_eq!(r.buffer(&t), b"z");
+    }
+
+    /// A burst of receives that finds too few buffers in the ring widens
+    /// the window by what it lacked, not to all the buffers; the same
+    /// burst then finds enough.
+    #[test]
+    fn a_burst_widens_the_window_by_what_it_lacked() {
+        let Some(mut r) = ring() else { return };
+        let g = r.add_buffer_group(16, 16, 2).unwrap();
+        let mut pairs: Vec<_> = (0..5).map(|_| pair()).collect();
+
+        let mut burst = |r: &mut Ring, tag: u64| {
+            for (i, (a, b)) in pairs.iter_mut().enumerate() {
+                a.write_all(b"x").unwrap();
+                r.push_recv(owned(b), 16, g, tag + i as u64).unwrap();
+            }
+            let done = wait(r, 5);
+            let failed = done.iter().filter(|c| c.result == -libc::ENOBUFS).count();
+            // the data not received by a failed receive, read: the next
+            // burst starts from empty sockets
+            for (_, b) in pairs.iter_mut() {
+                let mut sink = [0u8; 16];
+                let _ = std::io::Read::read(b, &mut sink);
+            }
+            failed
+        };
+
+        // two buffers in the ring, five receives: three find none
+        assert_eq!(burst(&mut r, 10), 3);
+        assert_eq!(r.groups[0].window, 5);
+
+        // (the buffers of the first burst came back when their
+        // completions were dropped)
+        assert_eq!(burst(&mut r, 20), 0);
+        assert_eq!(r.groups[0].window, 5);
     }
 
     #[test]
@@ -924,7 +1026,7 @@ mod tests {
     #[test]
     fn cancel_completes_the_operation() {
         let Some(mut r) = ring() else { return };
-        let g = r.add_buffer_group(2, 16).unwrap();
+        let g = r.add_buffer_group(2, 16, 2).unwrap();
         let (_a, b) = pair();
 
         let op = r.push_recv(owned(&b), 16, g, 1).unwrap();
@@ -963,7 +1065,7 @@ mod tests {
     #[test]
     fn drop_with_operations_in_flight() {
         let Some(mut r) = ring() else { return };
-        let g = r.add_buffer_group(2, 16).unwrap();
+        let g = r.add_buffer_group(2, 16, 2).unwrap();
         let (_a, b) = pair();
 
         r.push_recv(owned(&b), 16, g, 1).unwrap();

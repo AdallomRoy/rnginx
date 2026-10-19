@@ -38,9 +38,12 @@ type Completion = ngx_sys::uring::Completion<Fd>;
 const RING_ENTRIES: u32 = 4096;
 
 /// The provided buffers of receives of at most SMALL.1 bytes (request heads,
-/// frames), and of the larger ones (bodies): count and size.
-const SMALL: (u16, usize) = (1024, 2048);
-const LARGE: (u16, usize) = (256, 16384);
+/// frames), and of the larger ones (bodies): count, size, and how many are
+/// in the kernel's ring at first (more once receives find it empty). The
+/// buffers used are those given back last: as many are touched (resident)
+/// as are in use at a time, not all of them.
+const SMALL: (u16, usize, u16) = (1024, 2048, 64);
+const LARGE: (u16, usize, u16) = (256, 16384, 16);
 
 thread_local! {
     static DRIVER: RefCell<Option<Driver>> = const { RefCell::new(None) };
@@ -63,7 +66,9 @@ enum State {
     /// that submitted it (it waits in the kernel); `settle`: its future
     /// wants to know that (poll_settled)
     Waiting { op: OpId, waker: Option<Waker>, flushed: bool, settle: bool },
-    Done(Completion),
+    /// complete: the completion is `done[i]`, a slot being as small as an
+    /// operation in flight (one for each idle connection)
+    Done(u32),
     /// the future went away before the completion
     Ignored,
 }
@@ -79,6 +84,9 @@ struct Driver {
     large: BufGroup,
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// the completions their futures have not taken yet (few at a time)
+    done: Vec<Option<Completion>>,
+    done_free: Vec<u32>,
     stats: Stats,
     /// the wakers of a flush, woken once the driver is not borrowed (kept
     /// for their capacity)
@@ -126,6 +134,26 @@ impl Driver {
         }
     }
 
+    /// Keeps a completion until its future takes it: its index in `done`.
+    fn keep(&mut self, c: Completion) -> u32 {
+        match self.done_free.pop() {
+            Some(i) => {
+                self.done[i as usize] = Some(c);
+                i
+            }
+            None => {
+                self.done.push(Some(c));
+                (self.done.len() - 1) as u32
+            }
+        }
+    }
+
+    /// The completion kept at `i`, taken.
+    fn take_done(&mut self, i: u32) -> Completion {
+        self.done_free.push(i);
+        self.done[i as usize].take().expect("a completion kept")
+    }
+
     /// Starts an operation: `push` queues it with the tag given.
     fn start<E>(&mut self, push: impl FnOnce(&mut Ring, u64) -> Result<OpId, E>) -> Result<u64, E> {
         let (index, gen) = self.alloc();
@@ -157,23 +185,24 @@ impl Driver {
     fn poll_settled(&mut self, tag: u64, cx: &mut Context<'_>, settle: bool) -> Poll<Option<Completion>> {
         let slot = self.slot(tag).expect("the slot of an operation");
 
-        match &mut slot.state {
-            State::Waiting { flushed: true, .. } if settle => Poll::Ready(None),
+        let i = match &mut slot.state {
+            State::Waiting { flushed: true, .. } if settle => return Poll::Ready(None),
             State::Waiting { waker, settle: s, .. } => {
                 *s |= settle;
                 match waker {
                     Some(w) if w.will_wake(cx.waker()) => {}
                     _ => *waker = Some(cx.waker().clone()),
                 }
-                Poll::Pending
+                return Poll::Pending;
             }
-            State::Done(_) => {
-                let State::Done(c) = std::mem::replace(&mut slot.state, State::Free) else { unreachable!() };
-                self.free.push(tag as u32);
-                Poll::Ready(Some(c))
-            }
+            State::Done(i) => *i,
             _ => unreachable!("an operation polled after its end"),
-        }
+        };
+
+        slot.state = State::Free;
+        self.free.push(tag as u32);
+
+        Poll::Ready(Some(self.take_done(i)))
     }
 
     /// The future of an operation went away: the operation is cancelled,
@@ -186,9 +215,9 @@ impl Driver {
                 let _ = self.ring.push_cancel(op);
                 None
             }
-            State::Done(c) => {
+            State::Done(i) => {
                 self.release(tag);
-                Some(c)
+                Some(self.take_done(i))
             }
             s => {
                 slot.state = s;
@@ -248,8 +277,9 @@ impl Driver {
 
             match self.slot(tag).map(|s| std::mem::replace(&mut s.state, State::Free)) {
                 Some(State::Waiting { waker, .. }) => {
+                    let i = self.keep(c);
                     if let Some(s) = self.slot(tag) {
-                        s.state = State::Done(c);
+                        s.state = State::Done(i);
                     }
                     if let Some(w) = waker {
                         self.wake.push(w);
@@ -318,8 +348,8 @@ pub fn stats() -> Stats {
 /// kernel.io_uring_disabled sysctl, an older kernel, RLIMIT_MEMLOCK).
 pub fn init() -> io::Result<()> {
     let mut ring = Ring::new(RING_ENTRIES)?;
-    let small = ring.add_buffer_group(SMALL.0, SMALL.1)?;
-    let large = ring.add_buffer_group(LARGE.0, LARGE.1)?;
+    let small = ring.add_buffer_group(SMALL.0, SMALL.1, SMALL.2)?;
+    let large = ring.add_buffer_group(LARGE.0, LARGE.1, LARGE.2)?;
 
     let dup = rustix::io::fcntl_dupfd_cloexec(ring.as_fd(), 0)?;
     let afd = tokio::io::unix::AsyncFd::with_interest(fd::get(fd::register(dup))?, tokio::io::Interest::READABLE)?;
@@ -331,6 +361,8 @@ pub fn init() -> io::Result<()> {
             large,
             slots: Vec::new(),
             free: Vec::new(),
+            done: Vec::new(),
+            done_free: Vec::new(),
             stats: Stats::default(),
             wake: Vec::new(),
             graveyard: Vec::new(),
