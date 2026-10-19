@@ -241,8 +241,20 @@ stay. We take the architecture, not the crate, for these reasons:
   Synchronous syscalls on the socket, namely `sendfile`, TCP_CORK and
   TCP_NODELAY, and `shutdown`, run only when no send is queued or in flight
   on it (checked by debug assertions). File buffers keep a synchronous
-  sendfile after the memory part's send completed. Phase 5 replaces it by a
-  linked READ→SENDMSG for small files.
+  sendfile after the memory part's send completed.
+- **Small files go in the header's send.** A file part of at most 16 KB
+  after memory buffers (the static file after its response header) is read
+  into a copy buffer (pread) and goes in one send with the header: a send
+  for the header made sendfile() wait a tick for its completion, and
+  TCP_CORK went on and off for each response. A file part that cannot be
+  read whole stays for sendfile(), which reports what it finds as in C. A
+  linked READ→SENDMSG would send what a short read did not fill.
+- **The last output before a close is written at once**, by system calls
+  (`close_after_write`, set for the last buffer of a response without
+  keepalive): the end of the stream must follow the data at once, as in C.
+  Sent by the ring, the data went out a tick before the close; the client,
+  done reading, closed first and got the TIME_WAIT (`h1-conn-close` lost half
+  its throughput once the file went in the ring's send).
 - **Write filter** (`write_filter.rs`): `iteration()` submits, and a new
   `Pass` result maps to `Resume::Send`. Timers and watches follow C's
   NGX_AGAIN rule:
@@ -278,25 +290,28 @@ called for them. The few waits that do not read become POLL_ADD operations:
   OpenSSL's retries (`drive_io`).
 
 ### 2.6 What stays on epoll
-These stay on epoll, each until its phase:
-- listening sockets (Phase 5);
-- TLS connections (Phase 4);
+These stay on epoll:
+- listening sockets (accept, see §7);
+- upstream TLS connections (proxy_ssl, grpc_ssl, ...);
+- the connections of a server enabling kernel TLS (§2.9);
 - UDP and QUIC;
 - pipes, eventfds and signals;
 - the resolver;
 - the control socket;
 - mail.
 
-Each connection gets its mode when accepted or connected. A plain HTTP/1
-connection that becomes HTTP/2 or a WebSocket tunnel switches to epoll, with
-nothing in flight and the stash handed over as preread, until its phase
-converts that path.
+Each connection gets its mode when accepted or connected, and keeps it:
+HTTP/2, TLS and WebSocket tunnels stay in the ring. A peek whose data may go
+to another reader (the stream preread, a session passed to another
+listener) leaves the mode first when nothing was received.
 
 ### 2.7 Selection and fallback
-- **Selection.** `use io_uring;` in `events {}`, nginx's event-method
-  directive (today `set_use` accepts `epoll` only).
-  `RNGINX_EVENTS=io_uring|epoll` overrides it, for nginx-tests and for
-  bench.py, whose configuration C shares.
+- **Selection.** io_uring is the default where the kernel allows it: the
+  master makes and drops a small ring at configuration time, as
+  ngx_event_init_conf takes the best method available. `use io_uring;` and
+  `use epoll;` in `events {}` select. `RNGINX_EVENTS=io_uring|epoll`
+  overrides both, for nginx-tests and for bench.py, whose configuration C
+  shares.
 - **Probe** at worker start:
   - `io_uring_setup` succeeds;
   - IORING_REGISTER_PROBE reports RECV, SEND, SENDMSG, READV, POLL_ADD and
@@ -335,6 +350,39 @@ Each of these is a test gate in its phase:
 8. Graceful shutdown (QUIT, `worker_shutdown_timeout`) closes idle
    connections and cancels their reads, and the worker exits once the ring
    is drained.
+
+### 2.9 TLS
+- **OpenSSL does its I/O through a BIO of the connection's**
+  (`ngx_sys::ssl::set_io_bio`, `Connection::uring_bio()`), not on the
+  socket. The BIO's read takes what the ring received (the stash), or a
+  recv() while more may wait; its write sends the records by the ring. It
+  answers OpenSSL as a socket BIO answers the system calls: the retry flags,
+  BIO_eof() (OpenSSL 3 tells an end of the stream without close_notify by
+  it), errno. SSL_get_error(), errno and the error queue are then what
+  nginx sees with a socket, and C's log lines stay.
+- **Writes are awaited, as plain ones (§2.4).** The first write of a burst
+  starts a send of the records (a copy) and is refused
+  (SSL_ERROR_WANT_WRITE); OpenSSL writes the same bytes again and gets the
+  bytes the kernel took. The write filter settles that send: completed in
+  the flush that submitted it, the write never blocked (no `send_timeout`
+  timer, no ngx_http_test_reading, which armed the next request's receive
+  early and cost a poll and its cancellation per request). A response's
+  records so complete a tick later, and the next request's receive is
+  armed once it has come (§1.2).
+- **The records that follow in the burst go by send() at once**, the ring
+  taking what the socket refuses: a ring send per record waited a tick for
+  each (`tls-h1-1m` −20%, `h2-tls-100k` −18%). So do the HTTP/2 driver's
+  frames and recycled buffers (`send_at_once`), as on plain connections,
+  and the last output before a close (`close_after_write`, send() only).
+- **A failed send's error is returned by the writes after it**, as send()
+  fails again on a broken socket: OpenSSL writes its close_notify again on
+  each SSL_shutdown(), and a new send for each never ended (`grpc_ssl.t`
+  took 98 s).
+- **The TLS/plain detection's peek stays in the mode**
+  (`Connection::uring_peek()`): OpenSSL reads what it leaves stashed.
+- **Kernel TLS needs the socket:** a server enabling it
+  (`ssl_conf_command Options KTLS`) keeps its connections on epoll, with
+  OpenSSL on the socket.
 
 ## 3. Phases
 Each phase is on a branch, gated by nginx-tests with `RNGINX_EVENTS=io_uring`
@@ -431,11 +479,37 @@ Done, on master:
 - **Idle memory** (`169ba25`): the provided buffers are used from a window,
   the one given back last first (§2.3), and a driver slot keeps the index of
   its completion, not the completion.
+- **Phase 5, small files** (`003d9eb`): a small file after the header goes
+  in the header's send, and the last output before a close is written at
+  once (§2.4).
+- **Phase 4** (`9a45415`): TLS through the ring, OpenSSL's I/O by a BIO of
+  the connection's (§2.9).
+- **io_uring as the default** (`a1c981a`) where the kernel allows it
+  (§2.7).
 
-nginx-tests pass 455 files with epoll, with `RNGINX_EVENTS=io_uring`, and
-with `RNGINX_URING_WRITES=sync` and `hybrid`; `cargo test` passes 643. The
-stress tests of §4, `bench/stress_h1.py` (HTTP/1 and proxying; C passes it
-too) and `bench/stress_h2.py`, pass in every mode.
+nginx-tests pass 455 files with the default (io_uring), with
+`RNGINX_EVENTS=epoll`, and with `RNGINX_URING_WRITES=sync` and `hybrid`;
+`cargo test` passes 647. The stress tests of §4, `bench/stress_h1.py`
+(HTTP/1 and proxying, plain and `--tls`) and `bench/stress_h2.py`, pass in
+every mode; C passes them too.
+
+### Not done, and why
+- **Multishot ACCEPT.** An io_uring accept waits on the listening socket
+  with an exclusive wakeup that goes to the first worker whose accept was
+  armed, busy or not. EPOLLEXCLUSIVE goes on to the next epoll instance
+  when no thread waits on one, so the connections of a busy worker go to an
+  idle one (ngx_reorder_accept_events only rotates the order). A ring accept
+  would save `accept4()` and part of an `epoll_wait()` per connection, 1-2%
+  of `h1-conn-close`, and lose that.
+- **Close through the ring.** IORING_OP_CLOSE runs at the next flush: the
+  end of the stream would follow the data a part of a tick late, as the
+  sends of §2.4 did before `close_after_write`. Closes of files could go
+  there (one syscall of a static response), not done.
+- **DEFER_TASKRUN.** The prototype measured it the same as COOP_TASKRUN,
+  and it changes how a parked thread is woken (§6).
+- **A READV into the event pipe's own buffers** (§2.3, upstream reads): the
+  copy out of the provided buffer is about 0.9 µs of `proxy-100k`'s 133 µs
+  per request; the pipe lends its buffers for one poll only.
 
 ### Write modes
 `RNGINX_URING_WRITES` compared three modes (`results/uring-p3-modes-20261009.jsonl`):
@@ -451,8 +525,38 @@ rest) serves recycled buffers (§2.4). The HTTP/2 driver writes at once in
 both modes (§2.4); `sync` makes it use system calls only.
 
 ### Results
-C, this build on epoll, and on io_uring, alternating, 3 reps
-(`results/uring-final-20261009.jsonl`); req/s ratios to C:
+C, master before Phases 4 and 5 (`7e50aba`, io_uring) and now (io_uring,
+the default), alternating, 3 reps (`results/uring-final2-20261019.jsonl`);
+req/s ratios to C, medians of per-rep ratios. Geometric mean of the 27:
+0.873× → **0.906×**.
+
+| Scenario | `7e50aba` | now | change |
+|---|--:|--:|--:|
+| `h1-static-1k` | 0.94× | **1.11×** | +19% |
+| `h1-access-log` | 0.93× | **1.13×** | +19% |
+| `h1-limit-req` | 0.94× | **1.10×** | +18% |
+| `h1-2k-conns` | 0.86× | 0.93× | +12% |
+| `h1-conn-close` | 0.74× | 0.80× | +9% |
+| `h1-return`, `h1-regex-rewrite` | 0.93×, 0.87× | 0.92×, 0.84× | −1 to −1.5% (5 reps), allocations the same |
+| `h1-static-100k`, `h1-static-1m` | 0.90×, 1.02× | the same | 0% |
+| `tls-h1-1k` | 0.74× | **0.94×** | +26% |
+| `h2-tls-1k`, `h2-tls-100k` | 1.06×, 0.90× | 1.05×, 0.90× | 0% |
+| `h2c-1k`, `h2c-100k` | 1.43×, 0.90× | 1.45×, 0.90× | +2%, 0% |
+| `proxy-cache-hit` (a small file) | 0.82× | 0.94× | +15% |
+| `proxy-tls-terminate` | 0.71× | 0.68× | −3 to −6% (four runs) |
+| `proxy-1k-keepalive`, `-no-keepalive`, `proxy-100k`, `proxy-1m`, `proxy-post-10k` | 0.69×, 0.88×, 0.81×, 0.89×, 0.66× | the same | ±1% |
+| `proxy-to-tls-upstream`, `proxy-h2-upstream`, `grpc-pass`, `fastcgi-1k` | 0.78×, 0.77×, 0.78×, 1.03× | the same | ±1.5% |
+| `stream-tcp-proxy`, `stream-tls-terminate` | 0.97×, 0.96× | 0.98×, 0.97× | +0 to 2% |
+
+On TLS the ring BIO's write rules were measured one by one
+(`results/uring-tls-20261019.jsonl` to `uring-tls4-20261019.jsonl`): ring
+sends alone made `tls-h1-1k` +27% but `tls-h1-1m` −20% and `h2-tls-100k`
+−18%; system calls alone gave +4%; the rules of §2.9 keep the first and
+lose neither.
+
+Before that, 2026-10-09: C, this build on epoll, and on io_uring,
+alternating, 3 reps (`results/uring-final-20261009.jsonl`); req/s ratios to
+C:
 
 | Scenario | epoll | io_uring | io_uring ÷ epoll |
 |---|--:|--:|--:|
@@ -504,18 +608,22 @@ Fixed rate and idle memory:
   the load stops: a request lives until its send completes, a tick later, so
   at saturation more requests are alive at once, each a request object.
   Rule 4 of §2.8 (`c->sent` and `$bytes_sent` counted at completion) keeps
-  the request until then; smaller or reused request objects are `bench/PLAN.md` Phase 2
-  (2a, 2c). Each worker also allocates 6 MB of provided buffers (heap, not
-  resident until used).
+  the request until then; smaller or reused request objects are
+  `bench/PLAN.md` Phase 2 (2a, 2c). Each worker also allocates 6 MB of
+  provided buffers (heap, not resident until used).
 
 ### Open
+- **`proxy-tls-terminate`** is 3-6% below the epoll path: the client watch
+  arms the TLS client's receive while the upstream answers (it waits 0.36
+  times per request), where epoll had a standing registration.
 - **Proxying gains less than serving.** `proxy-1k-keepalive` is at 0.69×.
   Its kernel time per request is close to C's (16.6 against 15.5 µs in the
   profiles of 2026-10-16, `results/analysis/profile-1792157*.json`); the gap
-  is user time (13.5 against 5.3 µs), `bench/PLAN.md` Phase 2/3. To be
-  profiled: `proxy-100k`, still below epoll (the 16 KB receives copied out of
-  provided buffers, the writes of event-pipe output).
-- **Phase 4:** TLS. **Phase 5:** accept, close, small files, DEFER_TASKRUN,
-  and io_uring as the default.
+  is user time (13.5 against 5.3 µs), `bench/PLAN.md` Phase 2/3.
+  `proxy-100k` spends about 4 µs per request more than epoll (3.7%), 0.9 µs
+  of it the copy out of the provided buffers (see Not done).
+- **Memory under load** (above): smaller or reused request objects,
+  `bench/PLAN.md` Phase 2.
 - **Per-connection state:** an idle connection still holds about 110 bytes
   more heap than with epoll.
+- Still on epoll: upstream TLS, accept, UDP and QUIC (§2.6).
