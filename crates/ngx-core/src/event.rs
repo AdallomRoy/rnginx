@@ -178,7 +178,13 @@ fn init_event_conf(cf: &mut Conf, conf: &Rc<dyn Any>) -> ConfResult {
     let cell = conf_cell::<EventConf>(conf);
     let mut ecf = cell.borrow_mut();
     ecf.connections.init(DEFAULT_CONNECTIONS);
-    ecf.use_.init(b"epoll".to_vec());
+    // the event method: io_uring where the kernel lets the process use it
+    // (docs/IO_URING_PLAN.md), epoll otherwise, as ngx_event_init_conf takes
+    // the best method available
+    if !ecf.use_.is_set() {
+        let m: &[u8] = if crate::uring::available() { b"io_uring" } else { b"epoll" };
+        ecf.use_.init(m.to_vec());
+    }
     // RNGINX_EVENTS=io_uring|epoll overrides "use" (nginx-tests, bench.py)
     crate::uring::read_env();
     if let Some(m) = std::env::var_os("RNGINX_EVENTS") {

@@ -28,7 +28,7 @@ What is not ported:
 | the `perl`, `xslt` and `image_filter` HTTP modules | Their directives are accepted and do nothing. |
 | the `google_perftools` module | Its directive is unknown. |
 | dynamic modules | `load_module` fails, so third-party C modules (njs, Lua, Brotli, ...) cannot be loaded. |
-| platforms other than Linux | The event loop uses epoll. nginx's Windows port and its other event methods (kqueue, eventport, /dev/poll, select, poll) are not ported. |
+| platforms other than Linux | The event loop uses io_uring where the kernel allows it (Linux 6.0 and later; containers often block it), epoll otherwise; `use epoll;` selects epoll. nginx's Windows port and its other event methods (kqueue, eventport, /dev/poll, select, poll) are not ported. |
 
 Some directives are accepted but have no effect:
 - `thread_pool`, `aio on` and `aio threads`: files are read synchronously.
