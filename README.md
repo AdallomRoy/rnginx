@@ -3,7 +3,7 @@
 rnginx is a drop-in replacement for [nginx](https://nginx.org), written in Rust. It is a function-by-function port of nginx 1.31.7. It reads the same configuration files, takes the same command-line options and signals, and produces the same responses and log messages. nginx's [documentation](https://nginx.org/en/docs/) applies to it.
 
 - **Coverage:** every nginx module is ported except mail and three HTTP modules that wrap external libraries: embedded Perl, XSLT and the image filter. rnginx runs on Linux only.
-- **Performance:** rnginx has 80–90% of C nginx's throughput overall. Small proxied requests run at 0.63× C's speed, and HTTP/2 at up to 1.46×.
+- **Performance:** rnginx has 95% of C nginx's throughput overall. Small static files and HTTP/2 run faster than C (1.12× and up to 1.44×), small proxied requests at 0.66–0.69× of C's speed.
 - **Memory safety:** all of the code compiles under `#![forbid(unsafe_code)]`, except one small crate of system and OpenSSL calls. That rules out buffer overflows, use-after-free and memory disclosure in the server's own code. Bugs of that kind are behind more than half of nginx's security advisories.
 
 ## Status
@@ -38,39 +38,41 @@ Some directives are accepted but have no effect:
 
 ## Performance
 
-The benchmark ran on 2026-10-05, against C nginx 1.31.7 built at `-O2` with the same modules. The machine had 8 CPUs: the server under test was pinned to two of them, and the load generators (wrk, h2load, oha) to four others. rnginx and C took turns, three runs of each scenario, and the ratios compare the medians. The harness is in [bench/](bench/README.md), and [bench/PLAN.md §1.6](bench/PLAN.md#16-after-phase-0-the-full-run-master-aabbd30) has the full results.
+The benchmark ran on 2026-10-19, against C nginx 1.31.7 built at `-O2` with the same modules. rnginx used io_uring, its default event method; C nginx uses epoll. The machine had 8 CPUs: the server under test was pinned to two of them, and the load generators (wrk, h2load, oha) to four others. rnginx and C took turns, three runs of each scenario, and the ratios compare the medians. The harness is in [bench/](bench/README.md), and [bench/PLAN.md §1.7](bench/PLAN.md#17-after-io_uring-the-full-run-master-6a3128d) has the full results.
 
 | | rnginx ÷ C |
 |---|--:|
-| requests per second, geometric mean of 35 scenarios | **0.87×** |
-| the same without `h1-sub-filter-sendfile`, where C is unusually slow | 0.83× |
-| CPU time per request | 1.17× |
+| requests per second, geometric mean of 35 scenarios | **0.95×** |
+| the same without `h1-sub-filter-sendfile`, where C is unusually slow | 0.92× |
+| CPU time per request | 1.06× |
 
 | Workload | Scenario | rnginx ÷ C |
 |---|---|--:|
-| static file, 1 MB | `h1-static-1m` | 1.00× |
-| static file, 1 KB | `h1-static-1k` | 0.74× |
-| `return 200` | `h1-return` | 0.72× |
-| HTTPS, 1 KB | `tls-h1-1k` | 0.75× |
-| TLS handshakes, RSA | `tls-handshake-rsa` | 0.97× |
+| static file, 1 MB | `h1-static-1m` | 1.01× |
+| static file, 1 KB | `h1-static-1k` | 1.12× |
+| `return 200` | `h1-return` | 0.94× |
+| HTTPS, 1 KB | `tls-h1-1k` | 0.94× |
+| TLS handshakes, RSA | `tls-handshake-rsa` | 0.96× |
 | gzip | `h1-gzip` | 0.98× |
-| HTTP/2 over TLS, 1 KB | `h2-tls-1k` | 1.06× |
-| HTTP/2 cleartext, 1 KB | `h2c-1k` | 1.46× |
-| HTTP/3, 1 KB | `h3-1k` | 0.65× |
-| reverse proxy, 1 KB, keepalive to the upstream | `proxy-1k-keepalive` | 0.63× |
-| reverse proxy, 100 KB | `proxy-100k` | 0.84× |
-| proxy cache hit | `proxy-cache-hit` | 0.69× |
-| gRPC | `grpc-pass` | 0.75× |
-| TCP proxy (stream) | `stream-tcp-proxy` | 0.88× |
+| HTTP/2 over TLS, 1 KB | `h2-tls-1k` | 1.04× |
+| HTTP/2 cleartext, 1 KB | `h2c-1k` | 1.44× |
+| HTTP/3, 1 KB | `h3-1k` | 0.63× |
+| reverse proxy, 1 KB, keepalive to the upstream | `proxy-1k-keepalive` | 0.69× |
+| reverse proxy, 100 KB | `proxy-100k` | 0.82× |
+| proxy cache hit | `proxy-cache-hit` | 0.96× |
+| gRPC | `grpc-pass` | 0.76× |
+| TCP proxy (stream) | `stream-tcp-proxy` | 0.94× |
+| TCP proxy (stream), bulk transfer | `stream-bulk-iperf` | 0.72× |
 
 - **At parity:** large transfers, TLS handshakes and gzip, where most of the time goes to the kernel, OpenSSL or zlib.
-- **Ahead of C:** HTTP/2 with small responses. rnginx batches frames into fewer writes, so it spends less time in the kernel.
-- **Behind C:** small HTTP/1.1 and proxied requests, at 0.63–0.78×. rnginx makes the same system calls as C, but spends more user-space CPU per request, on allocations and async layers.
-- **Memory per idle connection:** 2.3 KB for HTTP/1.1, against C's 0.55 KB. For TLS it is 1.1× C's, and for HTTP/2 1.5×.
+- **Ahead of C:** small static files and HTTP/2. With io_uring, one system call submits the reads and writes of many connections. With `sendfile on`, a static file of up to 16 KB goes out in one send with its header, where C makes a `writev()` and a `sendfile()` (and, with `tcp_nopush on`, two `setsockopt()` calls). The HTTP/2 code batches frames into fewer writes.
+- **Behind C:** proxied requests (0.66–0.87×), HTTP/3 (0.63×; its UDP sockets do not use io_uring) and `sub_filter` (0.77×). There rnginx spends more user-space CPU per request than C, on allocations and async layers. Bulk TCP proxying through the stream module is at 0.72× with io_uring, and near C's speed with epoll.
+- **With epoll** (`use epoll;`, or where the kernel does not allow io_uring, as in many containers), rnginx is at about 0.87× of C overall (the run of 2026-10-05, [bench/PLAN.md §1.6](bench/PLAN.md#16-after-phase-0-the-full-run-master-aabbd30)).
+- **Memory per idle connection:** 2.5 KB for HTTP/1.1, against C's 0.56 KB. For TLS it is 1.1× C's, and for HTTP/2 1.5×.
 
 ## Memory safety
 
-rnginx is about 190,000 lines of Rust in six crates. Five of them are `#![forbid(unsafe_code)]`: `ngx-core`, `ngx-http`, `ngx-stream`, `ngx-mail` and the `nginx` binary. The compiler rejects any `unsafe` code in them. This code cannot have buffer overflows or over-reads, use-after-free, double frees, or reads of uninitialized memory. An index past the end of a buffer stops the worker instead of reading or writing outside the buffer, and a use-after-free does not compile.
+rnginx is about 195,000 lines of Rust in six crates. Five of them are `#![forbid(unsafe_code)]`: `ngx-core`, `ngx-http`, `ngx-stream`, `ngx-mail` and the `nginx` binary. The compiler rejects any `unsafe` code in them. This code cannot have buffer overflows or over-reads, use-after-free, double frees, or reads of uninitialized memory. An index past the end of a buffer stops the worker instead of reading or writing outside the buffer, and a use-after-free does not compile.
 
 This class of bug is behind more than half of nginx's [security advisories](https://nginx.org/en/security_advisories.html). As of October 2026, 35 of the 63 are buffer overflows, over-reads, use-after-free, memory corruption or memory disclosure. Examples:
 - "Stack-based buffer overflow with specially crafted request" (CVE-2013-2028);
@@ -78,7 +80,7 @@ This class of bug is behind more than half of nginx's [security advisories](http
 - "Use-after-free in HTTP/3" (CVE-2024-24990).
 
 The guarantee does not cover:
-- **`crates/ngx-sys`:** 2,500 lines with 127 `unsafe` blocks, each with a `// SAFETY:` comment. It holds the OpenSSL calls that the `openssl` crate has no safe API for, and a few system calls such as `fork` and `setproctitle`. No raw pointer crosses its API.
+- **`crates/ngx-sys`:** 4,000 lines with 157 `unsafe` blocks, each with a `// SAFETY:` comment. It holds the OpenSSL calls that the `openssl` crate has no safe API for, the io_uring ring, which owns every buffer the kernel may use until the operation completes, and a few system calls such as `fork` and `setproctitle`. No raw pointer crosses its API.
 - **C libraries:** OpenSSL, PCRE2 and zlib, the same ones C nginx uses.
 - **Dependencies:** the `unsafe` code inside std, tokio, the `openssl` crate, nix, rustix and rnginx's other dependencies.
 - **Other kinds of bugs:** logic bugs, request smuggling and resource exhaustion. A panic, such as an out-of-bounds index, aborts the worker process and its connections, and the master starts a new worker, as it does when a C worker crashes.
@@ -141,14 +143,15 @@ To run the unit tests, use `cargo test --workspace`.
 
 | | |
 |---|---|
-| `crates/ngx-core` | the core: configuration, processes, the event loop and connections (on tokio), shared memory, the resolver, TLS, QUIC, regular expressions, logging |
+| `crates/ngx-core` | the core: configuration, processes, the event loop and connections (on tokio, with io_uring or epoll), shared memory, the resolver, TLS, QUIC, regular expressions, logging |
 | `crates/ngx-http` | HTTP/1.1, HTTP/2, HTTP/3 and the HTTP modules |
 | `crates/ngx-stream` | the stream (TCP and UDP) modules |
 | `crates/ngx-mail` | parsing of the `mail` block only |
 | `crates/nginx` | the binary |
-| `crates/ngx-sys` | the only crate with `unsafe` code: the system and OpenSSL calls that no safe crate provides |
+| `crates/ngx-sys` | the only crate with `unsafe` code: the system and OpenSSL calls that no safe crate provides, and the io_uring ring |
 | `bench/` | the benchmark harness against C nginx, its reports, and the plan to reach parity |
 | `docs/SAFETY.md` | how the port avoids `unsafe` code, and the differences from C that this causes |
+| `docs/IO_URING_PLAN.md` | the design of the io_uring event method, what it measured, and its status |
 | `CONVENTIONS.md` | rules for contributors |
 
 ## License

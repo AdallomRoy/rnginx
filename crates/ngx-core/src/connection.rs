@@ -597,10 +597,11 @@ pub struct Connection {
     /// not the server's).
     pub close_after_write: Cell<bool>,
     /// the output in progress is sent at once by send() while the socket
-    /// takes it, the ring taking what it refuses (TLS in io_uring mode, the
-    /// ring BIO): the HTTP/2 driver's frames, as it writes plain ones
+    /// takes it, the ring taking what it refuses (io_uring mode). Over TLS
+    /// (the ring BIO): the HTTP/2 driver's frames, as it writes plain ones
     /// (docs/IO_URING_PLAN.md §2.4), and buffers the producer wants back
-    /// (b->recycled, as written at once on plain connections)
+    /// (b->recycled, as written at once on plain connections); and the
+    /// send() and writev() of a stream relay's bulk data
     pub send_at_once: Cell<bool>,
     pub sendfile: Cell<bool>,
     pub udp: Cell<bool>,
@@ -1394,6 +1395,11 @@ impl Connection {
     /// AsyncWrite) in io_uring mode: a copy of `data` is sent by the ring;
     /// the caller polls again with the same bytes until the result.
     pub fn poll_send(&self, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        self.poll_send_slices(cx, &[data])
+    }
+
+    /// poll_send() of the slices, in one copy.
+    fn poll_send_slices(&self, cx: &mut std::task::Context<'_>, iov: &[&[u8]]) -> std::task::Poll<io::Result<usize>> {
         use std::task::Poll;
 
         let mut g = self.uring.borrow_mut();
@@ -1406,7 +1412,7 @@ impl Connection {
             if u.tx.is_some() || u.txv.is_some() {
                 return Poll::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY)));
             }
-            match crate::uring::send(&u.fd, data.to_vec()) {
+            match crate::uring::send(&u.fd, iov.concat()) {
                 Ok(tx) => u.txb = Some(tx),
                 Err((e, _)) => return Poll::Ready(Err(e)),
             }
@@ -1982,13 +1988,48 @@ impl Connection {
         self.uring.borrow().as_ref().is_some_and(|u| u.txv.is_some())
     }
 
-    /// send(2) of a copy of `data` by the ring, in io_uring mode. The send
-    /// in flight is the connection's (poll_send()): a future given up
-    /// leaves it, and the next call, with the same bytes still pending (a
-    /// caller that drops a send waits to learn what was written, as the
-    /// HTTP/2 driver), gets its result instead of sending them twice.
-    async fn uring_send(&self, data: &[u8]) -> io::Result<usize> {
-        std::future::poll_fn(|cx| self.poll_send(cx, data)).await
+    /// send() and writev() on a plain socket in io_uring mode: a send of a
+    /// copy of the bytes by the ring. The send in flight is the
+    /// connection's (poll_send()): a future given up leaves it, and the
+    /// next call, with the same bytes still pending (a caller that drops a
+    /// send waits to learn what was written, as the HTTP/2 driver), gets
+    /// its result instead of sending them twice.
+    ///
+    /// The output sent at once (send_at_once: the bulk data of a stream
+    /// relay, which C writes as soon as it has read it), and all with
+    /// RNGINX_URING_WRITES=hybrid, goes by writev() while the socket takes
+    /// it, and the ring sends what it refuses, waiting for room. Sent by
+    /// the ring alone, each read of a relay waited a tick for the send of
+    /// the one before (stream-bulk-iperf: 0.69× C). With
+    /// RNGINX_URING_WRITES=sync, and the last output before a close
+    /// (close_after_write), by writev() only, a poll waiting for room.
+    async fn uring_writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
+        let only_send = crate::uring::sync_writes() || self.close_after_write.get();
+
+        if only_send || self.send_at_once.get() || crate::uring::hybrid_writes() {
+            let mut stack = [IoSlice::new(&[]); 16];
+            let mut more = Vec::new();
+            let iovs = iovecs(iov, &mut stack, &mut more);
+
+            if iovs.is_empty() {
+                return Ok(0);
+            }
+
+            // (a send of the ring in flight first, in order)
+            while !self.any_send_in_flight() {
+                match self.try_write_io(|s| nix::sys::uio::writev(s, iovs).map_err(io::Error::from)) {
+                    Ok(n) => {
+                        self.sent.set(self.sent.get() + n as u64);
+                        return Ok(n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && only_send => self.uring_writable().await?,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        std::future::poll_fn(|cx| self.poll_send_slices(cx, iov)).await
     }
 
     /// Wait until the socket is readable.
@@ -2614,7 +2655,7 @@ impl Connection {
             if let Some(ssl) = self.ssl.borrow().clone() {
                 return ssl.send(self, buf).await;
             }
-            return self.uring_send(buf).await;
+            return self.uring_writev(&[buf]).await;
         }
         if self.is_quic_stream() {
             return crate::quic::streams::send(self, &[buf]).await;
@@ -2643,7 +2684,7 @@ impl Connection {
     /// writev over the given slices.
     pub async fn writev(&self, iov: &[&[u8]]) -> io::Result<usize> {
         if self.is_uring() && self.ssl.borrow().is_none() {
-            return self.uring_send(&iov.concat()).await;
+            return self.uring_writev(iov).await;
         }
         if self.is_quic_stream() {
             return crate::quic::streams::send(self, iov).await;
@@ -2662,23 +2703,9 @@ impl Connection {
             return Ok(0);
         }
         let afd = self.afd()?;
-        // the iovecs on the stack, as ngx_writev_chain has them; a Vec
-        // only for more than fit there (at most IOV_MAX of them)
         let mut stack = [IoSlice::new(&[]); 16];
-        let mut n = 0;
-        let mut more: Vec<IoSlice<'_>> = Vec::new();
-        for s in iov.iter().filter(|s| !s.is_empty()) {
-            if n < stack.len() {
-                stack[n] = IoSlice::new(s);
-                n += 1;
-                continue;
-            }
-            if more.is_empty() {
-                more.extend_from_slice(&stack);
-            }
-            more.push(IoSlice::new(s));
-        }
-        let iovs: &[IoSlice<'_>] = if more.is_empty() { &stack[..n] } else { &more[..more.len().min(1024)] };
+        let mut more = Vec::new();
+        let iovs = iovecs(iov, &mut stack, &mut more);
         if iovs.is_empty() {
             return Ok(0);
         }
@@ -3001,6 +3028,29 @@ impl Drop for Connection {
 pub(crate) fn wake_exiting_cycle() {
     if crate::event::is_exiting() {
         CLOSE_NOTIFY.with(|n| n.notify_waiters());
+    }
+}
+
+/// The iovecs of a writev() of the slices, the empty ones left out: on the
+/// stack, as ngx_writev_chain has them; in `more` only for more than fit
+/// there (at most IOV_MAX of them).
+fn iovecs<'s, 'a>(iov: &[&'a [u8]], stack: &'s mut [IoSlice<'a>; 16], more: &'s mut Vec<IoSlice<'a>>) -> &'s [IoSlice<'a>] {
+    let mut n = 0;
+    for s in iov.iter().filter(|s| !s.is_empty()) {
+        if n < stack.len() {
+            stack[n] = IoSlice::new(s);
+            n += 1;
+            continue;
+        }
+        if more.is_empty() {
+            more.extend_from_slice(&stack[..]);
+        }
+        more.push(IoSlice::new(s));
+    }
+    if more.is_empty() {
+        &stack[..n]
+    } else {
+        &more[..more.len().min(1024)]
     }
 }
 
@@ -4028,6 +4078,95 @@ mod tests {
 
             let got = reader.join().unwrap();
             assert_eq!(got.len() as u64, before + 4);
+            assert!(got.ends_with(b"tail"));
+        });
+    }
+
+    /// Output sent at once (send_at_once) goes by writev() while the socket
+    /// takes it, with no operation of the ring; what a full socket refuses
+    /// is sent by the ring, which waits for room, in order.
+    #[test]
+    fn writev_at_once_then_by_the_ring() {
+        run_uring(async {
+            let (c, mut peer) = tcp_pair(Some(4096));
+            assert!(c.use_uring());
+            c.send_at_once.set(true);
+
+            let ops = crate::uring::stats().completions;
+            assert_eq!(c.writev(&[b"ab", b"", b"cde"]).await.unwrap(), 5);
+            assert_eq!(c.send(b"f").await.unwrap(), 1);
+            assert_eq!(crate::uring::stats().completions, ops);
+            assert_eq!(c.sent.get(), 6);
+
+            let mut got = [0u8; 6];
+            std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+            assert_eq!(&got, b"abcdef");
+
+            fill(&c);
+            let before = c.sent.get();
+
+            let reader = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut peer, &mut v).unwrap();
+                v
+            });
+
+            // refused at once: by the ring, a copy
+            assert_eq!(c.writev(&[b"x", b"yz"]).await.unwrap(), 3);
+            assert!(crate::uring::stats().completions > ops);
+            assert_eq!(c.sent.get(), before + 3);
+
+            c.close();
+
+            let got = reader.join().unwrap();
+            assert_eq!(got.len() as u64, before + 3 - 6);
+            assert!(got.ends_with(b"xyz"));
+        });
+    }
+
+    /// Without send_at_once, a send of the ring; a wait for it given up
+    /// leaves it in flight, and the next call with the same bytes gets its
+    /// result (no write at once goes ahead of it, none sends them twice).
+    #[test]
+    fn writev_by_the_ring_survives_a_wait_given_up() {
+        run_uring(async {
+            let (c, mut peer) = tcp_pair(Some(4096));
+            assert!(c.use_uring());
+
+            let ops = crate::uring::stats().completions;
+            assert_eq!(c.writev(&[b"ab", b"c"]).await.unwrap(), 3);
+            assert!(crate::uring::stats().completions > ops);
+
+            let mut got = [0u8; 3];
+            std::io::Read::read_exact(&mut peer, &mut got).unwrap();
+            assert_eq!(&got, b"abc");
+
+            fill(&c);
+            let before = c.sent.get();
+
+            let wait = c.writev(&[b"tail"]);
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), wait).await.is_err());
+            assert!(c.any_send_in_flight());
+
+            // the same bytes again, sent at once if they can: the send in
+            // flight first
+            c.send_at_once.set(true);
+
+            let reader = std::thread::spawn(move || {
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut peer, &mut v).unwrap();
+                v
+            });
+
+            assert_eq!(c.writev(&[b"tail"]).await.unwrap(), 4);
+            assert!(!c.any_send_in_flight());
+            assert_eq!(c.sent.get(), before + 4);
+
+            c.close();
+
+            let got = reader.join().unwrap();
+            assert_eq!(got.len() as u64, before + 4 - 3);
             assert!(got.ends_with(b"tail"));
         });
     }

@@ -1445,6 +1445,11 @@ async fn proxy_process(s: &S, pc: &Rc<Connection>) {
 
     u.connected.set(true);
 
+    // io_uring mode: the client's receives are of the upstream's size, as
+    // C reads into the whole buffer: one of a request head's size brought
+    // 2 KB after each wait for bulk data, and a write of them
+    c.set_uring_recv_len(16384);
+
     let r = Relay {
         s: s.clone(),
         u: u.clone(),
@@ -1591,6 +1596,18 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
                 c.log.set_action(Some(send_action));
 
                 let bufs: Vec<&[u8]> = out.iter().map(|b| b.as_slice()).collect();
+
+                // io_uring mode: while the source has more to read (bulk
+                // data, or its end), what was read is written at once, as C
+                // writes it, the ring sending what the socket refuses
+                // (Connection::send_at_once): sent by the ring, each read
+                // waited a tick for the send of the one before. Else by the
+                // ring, as the relay waits for the source next anyway: the
+                // send goes in the ring's flush (written at once,
+                // stream-tcp-proxy lost 15%)
+                if dst.is_uring() {
+                    dst.send_at_once.set(src.read_ready());
+                }
 
                 r.buffered(from_upstream).set(true);
 

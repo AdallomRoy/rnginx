@@ -244,6 +244,82 @@ Every scenario of `bench.py` with C, the Phase 1 build and master `aabbd30` (the
 - Memory per idle connection: TLS, at 1.1× C, meets §2's 1.2×; HTTP/1.1 (4.2×, target 2×) and h2 (1.5×, target 1.2×) do not.
 - Run health: req/s spread above 10% between reps in 6 of the 135 server-scenario pairs, C's included; iperf3's connection resets at the end of `stream-bulk-iperf` are in all three servers' error logs.
 
+### 1.7 After io_uring: the full run (master `6a3128d`)
+Every scenario of `bench.py` with C and master `6a3128d` alternating in each rep, 3 reps, on 2026-10-19 (`results/full-6a3128d-20261019.jsonl`); no invalid runs. rnginx runs with its default event method, io_uring (`docs/IO_URING_PLAN.md`); C with epoll. The 2026-10-05 column is the Phase 0 build of §1.6, on epoll. Ratios to C of the medians:
+
+| Geomean | 2026-10-05 (epoll) | now (io_uring) |
+|---|--:|--:|
+| 35 saturation scenarios | 0.87× | **0.95×** |
+| the same without `h1-sub-filter-sendfile` | 0.83× | **0.92×** |
+| CPU per request, 35 saturation scenarios | 1.17× | **1.06×** |
+
+| Scenario | C req/s | 2026-10-05 | **now** | CPU µs/req, C / now |
+|---|--:|--:|--:|--:|
+| `h1-return` | 242k | 0.72× | **0.94×** | 8.2 / 8.8 |
+| `h1-static-1k` | 125k | 0.74× | **1.12×** | 15.9 / 14.2 |
+| `h1-static-100k` | 85.6k | 0.82× | **0.89×** | 23.2 / 26.2 |
+| `h1-static-1m` | 16.4k | 1.00× | **1.01×** | 56.5 / 63.3 |
+| `h1-conn-close` | 72.6k | 0.74× | **0.81×** | 27.4 / 34.0 |
+| `h1-2k-conns` | 119k | 0.74× | **1.00×** | 16.7 / 16.7 |
+| `h1-regex-rewrite` | 208k | 0.67× | **0.85×** | 9.6 / 11.2 |
+| `h1-access-log` | 119k | 0.74× | **1.10×** | 16.8 / 15.2 |
+| `h1-gzip` | 2.27k | 0.98× | **0.98×** | 883.2 / 899.6 |
+| `h1-sub-filter` | 7.44k | 0.80× | **0.77×** | 269.0 / 348.2 |
+| `h1-sub-filter-sendfile` | 1.50k | 3.91× | **3.83×** | 1272.8 / 348.9 |
+| `h1-limit-req` | 120k | 0.75× | **1.03×** | 16.6 / 16.1 |
+| `tls-h1-1k` | 102k | 0.75× | **0.94×** | 19.5 / 20.7 |
+| `tls-h1-1m` | 2.28k | 0.95× | **0.93×** | 876.0 / 944.3 |
+| `tls-resume-ecdsa` | 6.62k | 0.92× | **0.93×** | 301.7 / 324.5 |
+| `tls-handshake-ecdsa` | 4.15k | 0.98× | **1.00×** | 330.7 / 347.8 |
+| `tls-handshake-rsa` | 3.27k | 0.97× | **0.96×** | 611.4 / 637.0 |
+| `h2-tls-1k` | 132k | 1.06× | **1.04×** | 15.2 / 14.7 |
+| `h2-tls-100k` | 17.6k | 0.90× | **0.89×** | 113.4 / 127.1 |
+| `h2c-1k` | 109k | 1.46× | **1.44×** | 18.4 / 12.6 |
+| `h2c-return` ³ | 197k | - | **1.75×** | 10.2 / 5.8 |
+| `h2c-100k` ³ | 37.4k | - | **0.90×** | 53.5 / 59.2 |
+| `h2-tls-return` | 268k | 1.22× | **1.21×** | 7.5 / 6.2 |
+| `h3-1k` ² | 87.8k | 0.65× | **0.63×** | 22.7 / 36.1 |
+| `h3-100k` ² | 5.02k | 0.81× | **0.81×** | 397.1 / 489.2 |
+| `proxy-1k-keepalive` | 102k | 0.63× | **0.69×** | 19.5 / 28.5 |
+| `proxy-1k-no-keepalive` | 34.3k | 0.75× | **0.87×** | 58.2 / 66.6 |
+| `proxy-100k` | 18.6k | 0.84× | **0.82×** | 107.3 / 131.1 |
+| `proxy-1m` | 1.78k | 0.90× | **0.87×** | 1124.7 / 1289.3 |
+| `proxy-post-10k` | 84.2k | 0.67× | **0.66×** | 23.7 / 36.2 |
+| `proxy-tls-terminate` | 77.6k | 0.66× | **0.68×** | 25.7 / 37.5 |
+| `proxy-to-tls-upstream` | 83.9k | 0.66× | **0.75×** | 23.8 / 31.9 |
+| `proxy-h2-frontend` | 65.0k | 0.78× | **0.99×** | 30.8 / 31.3 |
+| `proxy-cache-hit` | 102k | 0.69× | **0.96×** | 19.6 / 20.4 |
+| `proxy-h2-upstream` | 77.6k | 0.65× | **0.77×** | 25.7 / 33.3 |
+| `grpc-pass` | 65.6k | 0.75× | **0.76×** | 30.5 / 40.0 |
+| `fastcgi-1k` | 39.9k | 1.03× | **1.03×** | 31.2 / 41.0 |
+| `stream-tcp-proxy` | 149k | 0.88× | **0.94×** | 13.3 / 14.2 |
+| `stream-tls-terminate` | 115k | 0.86× | **0.94×** | 17.3 / 18.4 |
+| `stream-bulk-iperf` ² | 12.1 Gbit/s | 0.95× | **0.72×** | - |
+
+| Fixed rate, 10k req/s | C CPU % | 2026-10-05 CPU ÷ C | **now** | p99 ms, C / now |
+|---|--:|--:|--:|--:|
+| `rate-h1-static-1k` | 18 | 1.36× | **1.10×** | 0.26 / 0.27 |
+| `rate-tls-1k` | 23 | 1.33× | **1.23×** | 0.32 / 0.40 |
+| `rate-h2-1k` | 21 | 1.22× | **1.43×** | 0.37 / 0.57 |
+| `rate-proxy-1k` | 21 | 1.55× | **1.60×** | 0.39 / 0.60 |
+
+| KB per idle connection | C | 2026-10-05 | **now** | now ÷ C |
+|---|--:|--:|--:|--:|
+| `idle-10k-h1` | 0.56 | 2.33 | **2.52** | 4.5× |
+| `idle-10k-tls` | 14.98 | 16.62 | **16.79** | 1.1× |
+| `idle-10k-h2` | 15.46 | 23.19 | **23.50** | 1.5× |
+
+² Not in the saturation geomean (oha, iperf3). ³ Added after 2026-10-05, not in the 35; the geomean of all 37 is 0.97×.
+
+- The geomean of the 35 goes from 0.87× to **0.95×**, CPU per request from 1.17× to **1.06×** C. 10 of the 35 are above C: static files of up to 16 KB (`h1-static-1k` 1.12×, `h1-access-log` 1.10×, `h1-limit-req` 1.03×), HTTP/2 (`h2-tls-1k`, `h2-tls-return`, `h2c-1k`), the 1 MB file, ECDSA handshakes, `fastcgi-1k` and `h1-sub-filter-sendfile`; `h1-2k-conns` is even.
+- What io_uring changed is in `docs/IO_URING_PLAN.md` §7. The scenarios still below 0.8× are proxying (`proxy-1k-keepalive` 0.69×, `proxy-post-10k` 0.66×, `proxy-tls-terminate` 0.68×, `grpc-pass` 0.76×), `h1-sub-filter` and HTTP/3 (UDP is not on io_uring): there rnginx spends more user time per request than C (Phases 2/3).
+- **Worse than on epoll, both in io_uring mode** (the same binary with `RNGINX_EVENTS=epoll`, `results/full-check-20261019.jsonl`):
+  - `stream-bulk-iperf`: 8.2–8.6 Gbit/s on io_uring, 11.3–13.0 on epoll (C 11.9–14.0). The stream relay's sends by the ring copy each chunk and complete a tick later, where epoll sends at once; to be done as the HTTP/2 driver's and the TLS bursts' writes (send() at once, the ring for what the socket refuses).
+  - `rate-h2-1k`: 29–30% CPU on io_uring, 25–26% on epoll (C 21–22%), HTTP/2 over TLS at a fixed rate.
+- At a fixed 10k req/s rnginx uses 1.10–1.60× C's CPU, with p99 0.01–0.23 ms above C's.
+- Memory per idle connection: HTTP/1.1 2.52 KB (4.5× C; 2.33 on epoll), TLS 1.1×, h2 1.5×.
+- Run health: req/s spread above 10% between reps in 3 of the 94 server-scenario pairs, two of them C's; iperf3's connection resets at the end of `stream-bulk-iperf` are in both servers' error logs.
+
 ## 2. Target and how progress is measured
 
 **Target:**

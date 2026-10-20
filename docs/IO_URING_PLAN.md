@@ -223,6 +223,17 @@ stay. We take the architecture, not the crate, for these reasons:
   alone, the output went out one send per run of the tasks, and a receive
   waited for each window update of the client: `h2c-100k` made 26.4k req/s
   against 32.6k.
+- **A stream relay writes bulk data at once.** While its source has more to
+  read (the last read filled its length, or found the end), a direction of
+  the relay writes what it read by `writev()` while the socket takes it, as
+  C writes, and the ring sends a copy of what it refuses
+  (`Connection::send_at_once`, for `send()` and `writev()`). Sent by the
+  ring alone, each read waited a tick for the send of the one before:
+  `stream-bulk-iperf` made 0.69× C against 0.96× on epoll. The other writes
+  stay on the ring: the relay waits for its source next anyway, and the
+  send goes in that flush (written at once, `stream-tcp-proxy` lost 15%).
+  The client connection's receives are of the upstream's size, 16 KB: one
+  of 2 KB after each wait for the source brought a write of 2 KB.
 - **Sends belong to the connection, as receives do.** A future dropped by a
   `select!` after the kernel took the bytes must not lose that fact. The
   in-flight send is the connection's, and a later call with the same pending
@@ -489,7 +500,7 @@ Done, on master:
 
 nginx-tests pass 455 files with the default (io_uring), with
 `RNGINX_EVENTS=epoll`, and with `RNGINX_URING_WRITES=sync` and `hybrid`;
-`cargo test` passes 647. The stress tests of §4, `bench/stress_h1.py`
+`cargo test` passes 649. The stress tests of §4, `bench/stress_h1.py`
 (HTTP/1 and proxying, plain and `--tls`) and `bench/stress_h2.py`, pass in
 every mode; C passes them too.
 
@@ -523,6 +534,10 @@ Ring writes win on small responses even with the extra wakeup and boxed
 future: the default. The hybrid path (a `writev()` at once, the ring for the
 rest) serves recycled buffers (§2.4). The HTTP/2 driver writes at once in
 both modes (§2.4); `sync` makes it use system calls only.
+`Connection::send()` and `writev()` (the stream relay, the client side of
+upgraded connections) follow the modes too, where they sent by the ring in
+all three: by the ring unless the output is sent at once (§2.4), at once
+with `hybrid`, by system calls only with `sync`.
 
 ### Results
 C, master before Phases 4 and 5 (`7e50aba`, io_uring) and now (io_uring,

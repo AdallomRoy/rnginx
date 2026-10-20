@@ -102,6 +102,11 @@ BINS["rust-7e50aba"] = f"{B}/bin/nginx-rust-7e50aba"
 BINS["rust-7e50aba-epoll"] = BINS["rust-7e50aba"]
 ENVS["rust-7e50aba"] = {"RNGINX_EVENTS": "io_uring"}
 ENVS["rust-7e50aba-epoll"] = {"RNGINX_EVENTS": "epoll"}
+# master 6a3128d: io_uring the default (Phases 4 and 5), as installed (no
+# RNGINX_EVENTS)
+BINS["rust-6a3128d"] = f"{B}/bin/nginx-rust-6a3128d"
+BINS["rust-6a3128d-epoll"] = BINS["rust-6a3128d"]
+ENVS["rust-6a3128d-epoll"] = {"RNGINX_EVENTS": "epoll"}
 # work in progress on io_uring (docs/IO_URING_PLAN.md §7 Open), against
 # the last merged build: on io_uring and on epoll
 BINS["rust-wip"] = f"{B}/bin/nginx-rust-wip"

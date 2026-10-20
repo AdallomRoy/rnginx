@@ -590,6 +590,9 @@ def uringstat(scenarios, servers, seconds=6):
                 ngx.stop()
                 wait_ports_free([18080, 18443])
             n = (metrics or {}).get("requests") or 0
+            if not n and (metrics or {}).get("bytes"):
+                # a bulk transfer (iperf3): per 16 KB relayed, a "request"
+                n = metrics["bytes"] / 16384
             if not n:
                 print(f"{name:22} {srv:10} no requests counted", flush=True)
                 continue
