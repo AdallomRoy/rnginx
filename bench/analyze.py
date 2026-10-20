@@ -173,15 +173,39 @@ def elf_vaddr(path, off):
     return off
 
 
+# binutils' addr2line indexes all of a Rust binary's line tables before the
+# first answer: more than 8 minutes on the 40 MB nginx (2026-10-20), where
+# LLVM's answers at once (apt: llvm-14)
+ADDR2LINE = next((p for p in ("/usr/bin/llvm-addr2line-14", "/usr/bin/llvm-addr2line") if os.path.exists(p)), "addr2line")
+LEGACY = [("$LT$", "<"), ("$GT$", ">"), ("$LP$", "("), ("$RP$", ")"), ("$C$", ","), ("$RF$", "&"),
+          ("$BP$", "*"), ("$SP$", "@"), ("$u20$", " "), ("$u27$", "'"), ("$u5b$", "["), ("$u5d$", "]"),
+          ("$u7b$", "{"), ("$u7d$", "}"), ("$u7e$", "~"), ("..", "::")]
+
+
+def demangle_legacy(fn):
+    """What LLVM's demangler leaves of Rust's legacy mangling: the escapes,
+    '..' for '::' and the hash."""
+    if "$" not in fn and ".." not in fn:
+        return fn
+    fn = re.sub(r"::h[0-9a-f]{16}$", "", fn)
+    if fn.startswith("_$"):
+        # a leading '<' is "_$LT$"
+        fn = fn[1:]
+    for a, b in LEGACY:
+        fn = fn.replace(a, b)
+    return fn
+
+
 def symbolize(path, addrs):
     """{vaddr: [(function, file:line) innermost inline first]} via addr2line -i;
     -a prints each address before its chain."""
     addrs = sorted(set(addrs))
     if not addrs:
         return {}
-    out = subprocess.run(["addr2line", "-a", "-f", "-C", "-i", "-e", path],
+    out = subprocess.run([ADDR2LINE, "-a", "-f", "-C", "-i", "-e", path],
                          input="\n".join(f"{a:x}" for a in addrs) + "\n",
                          capture_output=True, text=True).stdout.splitlines()
+    out = [demangle_legacy(line) if not line.startswith("0x") else line for line in out]
     res, cur, j = {}, None, 0
     while j < len(out):
         line = out[j]
@@ -681,7 +705,8 @@ PROFILE_BINS = {"rust": f"{B}/bin/nginx-rust-fp", "rust-ad69792": f"{B}/bin/ngin
                 # io_uring builds, run with their ENVS (RNGINX_EVENTS)
                 "rust-uring": f"{B}/bin/nginx-rust-uring-fp", "rust-uring-epoll": f"{B}/bin/nginx-rust-uring-fp",
                 "rust-wip": f"{B}/bin/nginx-rust-wip-fp", "rust-wip-epoll": f"{B}/bin/nginx-rust-wip-fp",
-                "rust-7e50aba": f"{B}/bin/nginx-rust-7e50aba-fp", "rust-7e50aba-epoll": f"{B}/bin/nginx-rust-7e50aba-fp"}
+                "rust-7e50aba": f"{B}/bin/nginx-rust-7e50aba-fp", "rust-7e50aba-epoll": f"{B}/bin/nginx-rust-7e50aba-fp",
+                "rust-bee4068": f"{B}/bin/nginx-rust-bee4068-fp", "rust-bee4068-epoll": f"{B}/bin/nginx-rust-bee4068-fp"}
 
 
 def profile_run(srv, s, label, seconds=6):

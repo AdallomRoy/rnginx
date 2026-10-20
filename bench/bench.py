@@ -115,6 +115,19 @@ ENVS["rust-wip"] = {"RNGINX_EVENTS": "io_uring"}
 ENVS["rust-wip-epoll"] = {"RNGINX_EVENTS": "epoll"}
 BINS["rust-wip-sync"] = BINS["rust-wip"]
 ENVS["rust-wip-sync"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "sync"}
+# master bee4068 (the stream relay's writes at once), as installed; on
+# epoll; and its glibc-malloc build for analyze.py allocs
+BINS["rust-bee4068"] = f"{B}/bin/nginx-rust-bee4068"
+BINS["rust-bee4068-epoll"] = BINS["rust-bee4068"]
+ENVS["rust-bee4068"] = {"RNGINX_EVENTS": "io_uring"}
+ENVS["rust-bee4068-epoll"] = {"RNGINX_EVENTS": "epoll"}
+BINS["g-bee4068"] = f"{B}/bin/nginx-rust-bee4068-glibc"
+# the same code built with a profile (PGO) of a broad mix of the scenarios
+# (bench/local/pgo.sh)
+BINS["rust-bee4068-pgo"] = f"{B}/bin/nginx-rust-bee4068-pgo"
+# writes by system calls only (the stream relay writes and waits for room, as C)
+BINS["rust-bee4068-sync"] = BINS["rust-bee4068"]
+ENVS["rust-bee4068-sync"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "sync"}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")
