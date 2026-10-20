@@ -33,6 +33,7 @@ The harness expects a machine with 8 dedicated CPUs (0–7). The nginx under tes
 
 Packages (Ubuntu 22.04):
 - `wrk nghttp2-client iperf3 strace linux-tools-generic libjemalloc2 libmimalloc2.0`;
+- `llvm-14`, whose `llvm-addr2line` `analyze.py allocsites` uses (binutils' `addr2line` takes minutes on the Rust binary);
 - Go, on the PATH or in `/usr/local/go`;
 - what C nginx needs to build: `build-essential libpcre2-dev libssl-dev zlib1g-dev libxslt1-dev libgd-dev libgeoip-dev libperl-dev`.
 
@@ -41,7 +42,8 @@ Then run `./setup.sh`. It makes, skipping each step whose output exists:
 - the tools;
 - oha 1.16, in two builds, one with HTTP/3;
 - `bin/nginx-rust`, from `cargo build --release`;
-- `bin/nginx-c-O2`, with `build-c.sh`.
+- `bin/nginx-c-O2`, with `build-c.sh`;
+- `bin/nginx-rust-pgo`, the build with profile-guided optimization (`../scripts/pgo-build.sh`, which trains it on 27 of the scenarios; it adds the rustup component `llvm-tools`). Released builds are made this way, so compare C with `rust-pgo`.
 
 ## Running
 

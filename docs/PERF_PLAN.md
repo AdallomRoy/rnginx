@@ -12,7 +12,12 @@ scenarios at equal CPU; idle memory per connection within 2× C (HTTP/1) and
 Data: `bench/results/plan2/` (benchmarks) and `bench/results/analysis/`
 (`profile-1792504702.json`, `allocs-1792505668.json`,
 `allocsites-1792509600.json`); the scripts are in `bench/local/` (`plan2.sh`,
-`pgo.sh`, `ab.sh`).
+`pgo.sh`, `ab.sh`, `stall_capture.py`).
+
+**Status (2026-10-20):** Phase 0 is done, PGO adopted
+(`scripts/pgo-build.sh`): 1.08× C on the 35 saturation scenarios, at 0.94×
+its CPU per request (§4). A5 is done: the stream relay's stalls had their
+cause in the ring's flushes (§2.3). Next: the rest of Phase A.
 
 ## 1. Where we are
 
@@ -174,14 +179,44 @@ with the worker's CPU use:
 | master, `RNGINX_URING_WRITES=sync` | 12.1, 12.7, 11.0, 11.0, 10.8 | 11.0 |
 | master on epoll | 11.4, 11.4, 11.3, 13.3, 11.4 | 11.4 |
 
-**What happens.** Once a write at once finds the socket full, the rest goes
-to the ring as a copy. The writes after it then queue behind that send:
-`uring_writev` makes no write at once while a send is in flight. From then
-on, every write waits for a ring send and a run of the tasks, and the worker
-idles at 50%.
+**Not a slow relay.** A slow run relays the same bytes with the same CPU
+time as a fast one (about 10 CPU-seconds), then lasts 20 s instead of 10:
+the iperf3 client spins for 10 more seconds and nginx idles. iperf3 reports
+the bytes over 20 s, hence the half rate. The first guess, that a full
+socket handing a copy to the ring made the writes queue behind ring sends,
+was wrong: writing at once and waiting for room instead left 1 slow run in
+10 (master: 2).
 
-**Fix.** With `sync` (`writev()`, then a wait for room and another
-`writev()`, as C does) the runs are stable.
+**What happens** (sockets and system calls caught during the stalls,
+`bench/local/stall_capture.py`):
+- All the data has been delivered: the client, nginx and the iperf3 server
+  have each sent and received every byte, and every queue is empty.
+- The client's end-of-test message, one byte on the control connection
+  (another session of the stream server), is in the server's socket, not
+  read (`Recv-Q 1`).
+- The server sleeps in `select()` on its data socket alone, with a 10 s
+  timeout: iperf 3.9's `Nread()` read part of a 128 KB block and waits up to
+  `nread_read_timeout` (10 s) for the rest, which never comes. The client
+  wrote non-blocking, so its stream does not end on a block.
+- Normally the end-of-test message comes while the server still reads the
+  data in the sockets' buffers; it handles the message first and closes the
+  data socket (nginx then logs EPIPE or ECONNRESET). Here it came after: in
+  every stall both sessions were on one worker, and the control session's
+  byte had waited behind the bulk relay.
+
+**Why it waited.** The relay yields when its coop budget is spent (every 128
+reads), but tokio's `LocalSet` runs a yielding task again in the same turn,
+up to 61 times, and the ring is flushed only between turns. The other
+sessions' completions and sends waited behind up to ~7,800 reads of bulk
+data, tens of milliseconds.
+
+**Fix** (branch `perf-plan`): the relay flushes the ring before it yields its
+spent budget (`ngx-stream/src/proxy.rs`). Stalls: 0 in 24 runs of 10 s (23
+of them with both sessions on one worker), against 3 in 16 before. In the
+benchmark (`results/plan2/flush-bulk.jsonl`, `flush-small.jsonl`, 5 and 3
+reps): `stream-bulk-iperf` 13.0, 12.6, 12.5, 12.9 and 11.0 Gbit/s, **1.05×**
+C (master the same run: 0.94×, one stall at 5.7); `stream-tcp-proxy` and
+`stream-tls-terminate` unchanged (0.999 and 1.007 of master).
 
 ## 3. Approach
 Three kinds of work, in order of cost:
@@ -239,24 +274,32 @@ CPU per request, user / kernel µs:
 - **After PGO, user time is still 1.2–2.1× C's.** The rest of this plan is
   still needed, but it starts from a smaller base.
 
-**The build.**
+**The build** (`scripts/pgo-build.sh`, about 6 minutes once the
+instrumented build is cached):
 - Four steps: a `-Cprofile-generate` build, a training run, `llvm-profdata
   merge` (from the rustup component `llvm-tools`), and a `-Cprofile-use`
   build.
 - The training load is a broad mix of `bench.py` scenarios, so that no
-  protocol is left cold: 27 of them here, 3 s each (`bench/local/pgo.sh`).
-- To do:
-  - a script in `scripts/` that does all four steps;
-  - the benchmark and released binaries built with it;
-  - CI building the profile once per release.
-- Day-to-day builds stay as they are.
+  protocol is left cold: 27 of them, 3 s each.
+- The build scripts and proc macros are instrumented too, and leave their
+  own profiles while the build runs: the script deletes them before the
+  training, so that crates built for both the host and the target do not
+  merge their counts.
+- `bench/setup.sh` makes `bin/nginx-rust-pgo` with it, the benchmark's
+  `rust-pgo`; the README documents it as the build to use. CI keeps the
+  plain build: the training needs the benchmark harness.
 
-**Before adopting:**
-- nginx-tests on the PGO binary, in both event modes;
-- a full `bench.py` run, to check the scenarios outside the training mix:
-  `h1-2k-conns`, `h1-static-1m`, `tls-h1-1m`, the handshakes,
-  `h2-tls-100k`, `h3-100k`, `proxy-1m`, `proxy-h2-frontend`, the fixed-rate
-  and memory scenarios.
+**Status: adopted** (branch `perf-plan`).
+- nginx-tests: the PGO binary passes the same 455 files with io_uring and
+  with epoll.
+- The full run of every scenario (`bench/PLAN.md` §1.8,
+  `results/plan2/full-pgo.jsonl`): the 35 go from 0.96× to **1.08×** C (1.03×
+  without `h1-sub-filter-sendfile`), CPU per request from 1.06× to **0.94×**;
+  +12.2% per rep on the 37 saturation scenarios.
+- Outside the training mix, nothing loses: `h1-2k-conns` +13%,
+  `h2c-return` +18%, `h2-tls-return` +17%, `proxy-h2-frontend` +22%,
+  `proxy-1m` +4%, `h3-100k` +7%, the 1 MB file and the handshakes ±0–2%;
+  the fixed-rate CPU drops 10–19%; idle memory does not change.
 
 **Then BOLT.** Post-link layout attacks the same misses; it is not measured
 yet.
@@ -269,7 +312,7 @@ yet.
 | A2 | Send HTTP/2 frames from their own buffers, with no `wbuf` copy on plain connections. The ring's send takes the queued frames as an owned list, with iovecs over each `OutFrame`, which returns to `FRAME_BUFS` at completion; the write at once is a `writev()` of the same. | `v2/connection.rs`, `ngx-core/connection.rs` | `h2c-100k` −3.7 |
 | A3 | Take the event pipe's raw buffers and `u.resp.buf` from a per-worker free list of initialized buffers (as `FRAME_BUFS` and the copy filter do), returned when the pipe is dropped | `event_pipe.rs`, `upstream_rt.rs` | `proxy-100k` −1.0; `proxy-1k` −0.07 |
 | A4 | Read upstream responses without the copy. While the last read filled its length, `recv()` straight into the pipe's buffer, as C reads while `rev->ready` (the "bulk exception" of `IO_URING_PLAN.md` §2.3); use the ring only when the read would block. | `upstream_rt.rs`, `ngx-core/connection.rs` | `proxy-100k` −1.2; `proxy-1k` −0.17 |
-| A5 | Write the stream relay's bulk data as C does (§2.3): `writev()`, and when the socket is full, wait for room and write again, not a ring send of a copy | `ngx-core/connection.rs` | `stream-bulk-iperf` stable, 0.88–0.91× → then the relay's copies |
+| A5 | **Done** (§2.3): the stream relay flushes the ring before it yields its spent coop budget, so that the other sessions' operations do not wait behind bulk data | `ngx-stream/proxy.rs` | `stream-bulk-iperf`: no stalls (0 in 24 runs, from 3 in 16) |
 | A6 | Add a single-threaded `Notify` to ngx-core with the subset of tokio's API in use (`notified()`, `notify_one()` with its stored permit, `notify_waiters()`), built on `Cell`s and a slab of wakers. The ~70 uses switch by import. | `ngx-core/sync.rs` (new), users | `proxy-1k` −0.25; `grpc-pass` −0.67; `h3-1k` −0.48 |
 | A7 | Cut the per-buffer costs of the send path (for `sub_filter`): read the location conf once per call, not once per buffer; run `update_sent` and the chunk framing over runs of small buffers | `output.rs`, `chunked_filter.rs`, `write_filter.rs` | `h1-sub-filter` −20 to −30 |
 | A8 | Make `analyze.py` count jemalloc's symbols (`_rjem_*`) as allocation, not as "other (binary)" | `bench/analyze.py` | tooling |
@@ -307,24 +350,23 @@ on one scenario and a measurement, before the migration.
 
 ## 8. Projection
 The table adds the savings estimated above to the PGO build's CPU per
-request (`results/plan2/pgo-ab.jsonl`), scaled by 0.75: PGO makes all code
-cheaper, so a saving measured before PGO counts for less after it. Ratios
-are req/s ÷ C.
+request in the full run (`bench/PLAN.md` §1.8), scaled by 0.75: PGO makes
+all code cheaper, so a saving measured before PGO counts for less after it.
+Ratios are req/s ÷ C; "plain" is master built without the profile.
 
-| Scenario | now | + PGO | + Phase A | + Phase B |
+| Scenario | plain | **PGO** (measured) | + Phase A | + Phase B |
 |---|--:|--:|--:|--:|
-| `h1-return` | 0.93× | 1.01× | 1.02× | ~1.08× |
-| `h1-conn-close` | 0.78× | 0.98× | 0.98× | ~1.02× |
-| `h1-regex-rewrite` | 0.89× | 1.00× | 1.00× | ~1.07× |
-| `tls-h1-1k` | 0.95× | 1.10× | 1.10× | ~1.15× |
-| `h3-1k` | 0.67× | 0.89× | 0.90× | 0.95–1.0× |
-| `proxy-1k-keepalive` | 0.69× | 0.86× | 0.87× | 0.92–0.97× |
-| `proxy-post-10k` | 0.68× | 0.81× | 0.82× | 0.87–0.92× |
-| `grpc-pass` | 0.78× | 0.91× | 0.93× | 0.97–1.0× |
-| `proxy-100k` | 0.82× | 0.88× | 0.89× | 0.90–0.93× |
-| `h2c-100k` | 0.90× | not measured | +9% | |
-| `h1-sub-filter` | 0.77× | not measured | +8% | ~0.9× before PGO |
-| `stream-bulk-iperf` | unstable | | 0.88–0.91× | |
+| `h1-return` | 0.94× | **1.05×** | 1.06× | ~1.13× |
+| `h1-conn-close` | 0.78× | **0.97×** | 0.97× | ~1.01× |
+| `h1-regex-rewrite` | 0.90× | **1.02×** | 1.02× | ~1.09× |
+| `tls-h1-1k` | 0.91× | **1.08×** | 1.08× | ~1.12× |
+| `h3-1k` | 0.64× | **0.88×** | 0.89× | 0.94–0.99× |
+| `proxy-1k-keepalive` | 0.68× | **0.84×** | 0.85× | 0.90–0.95× |
+| `proxy-post-10k` | 0.65× | **0.80×** | 0.81× | 0.86–0.91× |
+| `grpc-pass` | 0.78× | **0.92×** | 0.93× | 0.97–1.0× |
+| `proxy-100k` | 0.83× | **0.90×** | 0.92× | 0.93–0.96× |
+| `h2c-100k` | 0.90× | **0.95×** | ~1.03× | |
+| `h1-sub-filter` | 0.78× | **0.89×** | ~0.96× | ~1.0× |
 
 These are additive estimates; each step is measured before the next. Phase
 C is what takes proxying and HTTP/3 past C.

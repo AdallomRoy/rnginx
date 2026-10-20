@@ -27,6 +27,9 @@ import time
 
 B = os.path.dirname(os.path.abspath(__file__))
 BINS = {"c": f"{B}/bin/nginx-c-O2", "rust": f"{B}/bin/nginx-rust"}
+# the Rust build with profile-guided optimization, as released builds are
+# made (scripts/pgo-build.sh; setup.sh)
+BINS["rust-pgo"] = f"{B}/bin/nginx-rust-pgo"
 # the Rust port before the fixes of the bench-fixes branch (master 1196fa6)
 BINS["rust-old"] = f"{B}/bin/nginx-rust-master-1196fa6"
 # the previous master (bench fixes on 1196fa6, before the fixes branch was merged)
@@ -128,6 +131,10 @@ BINS["rust-bee4068-pgo"] = f"{B}/bin/nginx-rust-bee4068-pgo"
 # writes by system calls only (the stream relay writes and waits for room, as C)
 BINS["rust-bee4068-sync"] = BINS["rust-bee4068"]
 ENVS["rust-bee4068-sync"] = {"RNGINX_EVENTS": "io_uring", "RNGINX_URING_WRITES": "sync"}
+# branch perf-plan: the stream relay flushes the ring before it yields its
+# spent coop budget (docs/PERF_PLAN.md §2.3)
+BINS["rust-flush"] = f"{B}/bin/nginx-rust-flush"
+ENVS["rust-flush"] = {"RNGINX_EVENTS": "io_uring"}
 BACKEND_BIN = f"{B}/bin/nginx-c-O2"
 SERVER_CPUS, BACKEND_CPUS, CLIENT_CPUS = "0,1", "2,3", "4-7"
 CLK_TCK = os.sysconf("SC_CLK_TCK")

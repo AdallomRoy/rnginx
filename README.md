@@ -3,7 +3,7 @@
 rnginx is a drop-in replacement for [nginx](https://nginx.org), written in Rust. It is a function-by-function port of nginx 1.31.7. It reads the same configuration files, takes the same command-line options and signals, and produces the same responses and log messages. nginx's [documentation](https://nginx.org/en/docs/) applies to it.
 
 - **Coverage:** every nginx module is ported except mail and three HTTP modules that wrap external libraries: embedded Perl, XSLT and the image filter. rnginx runs on Linux only.
-- **Performance:** rnginx has 95% of C nginx's throughput overall. Small static files and HTTP/2 run faster than C (1.12× and up to 1.44×), small proxied requests at 0.66–0.69× of C's speed.
+- **Performance:** built with profile-guided optimization (`scripts/pgo-build.sh`), rnginx has 108% of C nginx's throughput overall, at 94% of its CPU time per request. Small static files and HTTP/2 run faster than C (1.28× and up to 2.17×), small proxied requests at 0.80–0.87× of C's speed. A plain `cargo build --release` has 96% of C's throughput.
 - **Memory safety:** all of the code compiles under `#![forbid(unsafe_code)]`, except one small crate of system and OpenSSL calls. That rules out buffer overflows, use-after-free and memory disclosure in the server's own code. Bugs of that kind are behind more than half of nginx's security advisories.
 
 ## Status
@@ -38,36 +38,37 @@ Some directives are accepted but have no effect:
 
 ## Performance
 
-The benchmark ran on 2026-10-19, against C nginx 1.31.7 built at `-O2` with the same modules. rnginx used io_uring, its default event method; C nginx uses epoll. The machine had 8 CPUs: the server under test was pinned to two of them, and the load generators (wrk, h2load, oha) to four others. rnginx and C took turns, three runs of each scenario, and the ratios compare the medians. The harness is in [bench/](bench/README.md), and [bench/PLAN.md §1.7](bench/PLAN.md#17-after-io_uring-the-full-run-master-6a3128d) has the full results.
+The benchmark ran on 2026-10-20, against C nginx 1.31.7 built at `-O2` with the same modules. rnginx used io_uring, its default event method; C nginx uses epoll. The machine had 8 CPUs: the server under test was pinned to two of them, and the load generators (wrk, h2load, oha) to four others. C and two rnginx builds of the same code took turns, three runs of each scenario, and the ratios compare the medians: the build with profile-guided optimization (`scripts/pgo-build.sh`), and a plain `cargo build --release`. The harness is in [bench/](bench/README.md), and [bench/PLAN.md §1.8](bench/PLAN.md#18-with-profile-guided-optimization-the-full-run-master-bee4068) has the full results.
 
-| | rnginx ÷ C |
-|---|--:|
-| requests per second, geometric mean of 35 scenarios | **0.95×** |
-| the same without `h1-sub-filter-sendfile`, where C is unusually slow | 0.92× |
-| CPU time per request | 1.06× |
+| | rnginx ÷ C, PGO | plain release build |
+|---|--:|--:|
+| requests per second, geometric mean of 35 scenarios | **1.08×** | 0.96× |
+| the same without `h1-sub-filter-sendfile`, where C is unusually slow | **1.03×** | 0.92× |
+| CPU time per request | **0.94×** | 1.06× |
 
-| Workload | Scenario | rnginx ÷ C |
-|---|---|--:|
-| static file, 1 MB | `h1-static-1m` | 1.01× |
-| static file, 1 KB | `h1-static-1k` | 1.12× |
-| `return 200` | `h1-return` | 0.94× |
-| HTTPS, 1 KB | `tls-h1-1k` | 0.94× |
-| TLS handshakes, RSA | `tls-handshake-rsa` | 0.96× |
-| gzip | `h1-gzip` | 0.98× |
-| HTTP/2 over TLS, 1 KB | `h2-tls-1k` | 1.04× |
-| HTTP/2 cleartext, 1 KB | `h2c-1k` | 1.44× |
-| HTTP/3, 1 KB | `h3-1k` | 0.63× |
-| reverse proxy, 1 KB, keepalive to the upstream | `proxy-1k-keepalive` | 0.69× |
-| reverse proxy, 100 KB | `proxy-100k` | 0.82× |
-| proxy cache hit | `proxy-cache-hit` | 0.96× |
-| gRPC | `grpc-pass` | 0.76× |
-| TCP proxy (stream) | `stream-tcp-proxy` | 0.94× |
-| TCP proxy (stream), bulk transfer | `stream-bulk-iperf` | 0.72× |
+| Workload | Scenario | rnginx ÷ C, PGO | plain |
+|---|---|--:|--:|
+| static file, 1 MB | `h1-static-1m` | **1.01×** | 1.01× |
+| static file, 1 KB | `h1-static-1k` | **1.28×** | 1.11× |
+| `return 200` | `h1-return` | **1.05×** | 0.94× |
+| HTTPS, 1 KB | `tls-h1-1k` | **1.08×** | 0.91× |
+| TLS handshakes, RSA | `tls-handshake-rsa` | **0.98×** | 0.96× |
+| gzip | `h1-gzip` | **1.00×** | 0.99× |
+| HTTP/2 over TLS, 1 KB | `h2-tls-1k` | **1.25×** | 1.08× |
+| HTTP/2 cleartext, 1 KB | `h2c-1k` | **1.70×** | 1.47× |
+| HTTP/3, 1 KB | `h3-1k` | **0.88×** | 0.64× |
+| reverse proxy, 1 KB, keepalive to the upstream | `proxy-1k-keepalive` | **0.84×** | 0.68× |
+| reverse proxy, 100 KB | `proxy-100k` | **0.90×** | 0.83× |
+| proxy cache hit | `proxy-cache-hit` | **1.11×** | 0.95× |
+| gRPC | `grpc-pass` | **0.92×** | 0.78× |
+| TCP proxy (stream) | `stream-tcp-proxy` | **0.99×** | 0.97× |
+| TCP proxy (stream), bulk transfer | `stream-bulk-iperf` | **0.96×** | 0.92× |
 
+- **Profile-guided optimization** makes rnginx 12% faster on these scenarios: the 40 MB binary carries every module, and the profile lays out the code that requests run together. It cuts user-space CPU per request by 20–40%.
 - **At parity:** large transfers, TLS handshakes and gzip, where most of the time goes to the kernel, OpenSSL or zlib.
-- **Ahead of C:** small static files and HTTP/2. With io_uring, one system call submits the reads and writes of many connections. With `sendfile on`, a static file of up to 16 KB goes out in one send with its header, where C makes a `writev()` and a `sendfile()` (and, with `tcp_nopush on`, two `setsockopt()` calls). The HTTP/2 code batches frames into fewer writes.
-- **Behind C:** proxied requests (0.66–0.87×), HTTP/3 (0.63×; its UDP sockets do not use io_uring) and `sub_filter` (0.77×). There rnginx spends more user-space CPU per request than C, on allocations and async layers. Bulk TCP proxying through the stream module is at 0.72× with io_uring, and near C's speed with epoll.
-- **With epoll** (`use epoll;`, or where the kernel does not allow io_uring, as in many containers), rnginx is at about 0.87× of C overall (the run of 2026-10-05, [bench/PLAN.md §1.6](bench/PLAN.md#16-after-phase-0-the-full-run-master-aabbd30)).
+- **Ahead of C:** small requests on HTTP/1.1 and HTTP/2, small static files, the proxy cache. With io_uring, one system call submits the reads and writes of many connections. With `sendfile on`, a static file of up to 16 KB goes out in one send with its header, where C makes a `writev()` and a `sendfile()` (and, with `tcp_nopush on`, two `setsockopt()` calls). The HTTP/2 code batches frames into fewer writes.
+- **Behind C:** proxied requests (0.80–0.93×), HTTP/3 (0.86–0.88×; its UDP sockets do not use io_uring) and `sub_filter` (0.89×). There rnginx spends more user-space CPU per request than C, on allocations and async layers ([docs/PERF_PLAN.md](docs/PERF_PLAN.md)).
+- **With epoll** (`use epoll;`, or where the kernel does not allow io_uring, as in many containers), the plain build is at about 0.87× of C overall (the run of 2026-10-05, [bench/PLAN.md §1.6](bench/PLAN.md#16-after-phase-0-the-full-run-master-aabbd30)).
 - **Memory per idle connection:** 2.5 KB for HTTP/1.1, against C's 0.56 KB. For TLS it is 1.1× C's, and for HTTP/2 1.5×.
 
 ## Memory safety
@@ -97,6 +98,8 @@ cargo build --release
 ```
 
 The binary is `target/release/nginx`. The release profile uses fat LTO and links jemalloc. To build with glibc's malloc instead, use `cargo build --release --no-default-features`.
+
+For the fastest binary, build with profile-guided optimization: `scripts/pgo-build.sh` builds an instrumented binary, runs the benchmark's scenarios through it, and builds `target/pgo/use/release/nginx` with the profile they leave. In the benchmark it handles 8–32% more requests per second than the plain release build. It takes about 10 minutes, and needs the rustup component `llvm-tools` and the benchmark harness ([bench/README.md](bench/README.md)).
 
 ## Running
 
@@ -152,6 +155,8 @@ To run the unit tests, use `cargo test --workspace`.
 | `bench/` | the benchmark harness against C nginx, its reports, and the plan to reach parity |
 | `docs/SAFETY.md` | how the port avoids `unsafe` code, and the differences from C that this causes |
 | `docs/IO_URING_PLAN.md` | the design of the io_uring event method, what it measured, and its status |
+| `docs/PERF_PLAN.md` | where rnginx's CPU time per request goes against C's, and the plan to cut it |
+| `scripts/pgo-build.sh` | the build with profile-guided optimization |
 | `CONVENTIONS.md` | rules for contributors |
 
 ## License

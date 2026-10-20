@@ -320,6 +320,81 @@ Every scenario of `bench.py` with C and master `6a3128d` alternating in each rep
 - Memory per idle connection: HTTP/1.1 2.52 KB (4.5× C; 2.33 on epoll), TLS 1.1×, h2 1.5×.
 - Run health: req/s spread above 10% between reps in 3 of the 94 server-scenario pairs, two of them C's; iperf3's connection resets at the end of `stream-bulk-iperf` are in both servers' error logs.
 
+### 1.8 With profile-guided optimization: the full run (master `bee4068`)
+Every scenario of `bench.py` with C, master `bee4068` and the same code built with profile-guided optimization (`scripts/pgo-build.sh`: an instrumented build trained on 27 of the scenarios, `docs/PERF_PLAN.md` §4), alternating in each rep, 3 reps, on 2026-10-20 (`results/plan2/full-pgo.jsonl`); no invalid runs. Ratios to C of the medians:
+
+| Geomean | master | **PGO** |
+|---|--:|--:|
+| 35 saturation scenarios (as §1.7) | 0.96× | **1.08×** |
+| the same without `h1-sub-filter-sendfile` | 0.92× | **1.03×** |
+| CPU per request, 35 saturation scenarios | 1.06× | **0.94×** |
+| PGO ÷ master per rep, 37 saturation scenarios | | **1.122** |
+
+| Scenario | C req/s | master | **PGO** | PGO ÷ master ¹ | CPU µs/req, C / master / PGO |
+|---|--:|--:|--:|--:|--:|
+| `h1-return` | 232k | 0.94× | **1.05×** | 1.107 | 8.6 / 9.2 / 8.1 |
+| `h1-static-1k` | 121k | 1.11× | **1.28×** | 1.146 | 16.4 / 14.8 / 12.8 |
+| `h1-static-100k` | 84.4k | 0.89× | **1.01×** | 1.129 | 23.7 / 26.5 / 23.4 |
+| `h1-static-1m` | 16.1k | 1.01× | **1.01×** | 1.001 | 56.1 / 63.0 / 58.5 |
+| `h1-conn-close` | 73.1k | 0.78× | **0.97×** | 1.269 | 27.1 / 34.9 / 28.0 |
+| `h1-2k-conns` | 115k | 1.01× | **1.14×** | 1.134 | 17.4 / 17.2 / 15.2 |
+| `h1-regex-rewrite` | 198k | 0.90× | **1.02×** | 1.135 | 10.1 / 11.2 / 9.9 |
+| `h1-access-log` | 115k | 1.11× | **1.24×** | 1.110 | 17.4 / 15.6 / 14.1 |
+| `h1-gzip` | 2.26k | 0.99× | **1.00×** | 1.007 | 886.2 / 896.8 / 890.4 |
+| `h1-sub-filter` | 7.36k | 0.78× | **0.89×** | 1.151 | 271.7 / 350.6 / 305.6 |
+| `h1-sub-filter-sendfile` | 1.50k | 3.82× | **4.37×** | 1.149 | 1276.5 / 348.6 / 304.3 |
+| `h1-limit-req` | 119k | 1.06× | **1.25×** | 1.169 | 16.7 / 15.8 / 13.4 |
+| `tls-h1-1k` | 102k | 0.91× | **1.08×** | 1.174 | 19.6 / 21.5 / 18.2 |
+| `tls-h1-1m` | 2.22k | 0.92× | **0.96×** | 1.045 | 901.6 / 980.9 / 940.1 |
+| `tls-resume-ecdsa` | 6.57k | 0.93× | **0.97×** | 1.047 | 304.2 / 328.1 / 313.4 |
+| `tls-handshake-ecdsa` | 4.17k | 1.00× | **1.00×** | 1.005 | 333.5 / 351.2 / 341.5 |
+| `tls-handshake-rsa` | 3.26k | 0.96× | **0.98×** | 1.020 | 612.8 / 634.8 / 622.7 |
+| `h2-tls-1k` | 127k | 1.08× | **1.25×** | 1.150 | 15.8 / 14.7 / 12.7 |
+| `h2-tls-100k` | 17.1k | 0.92× | **0.96×** | 1.050 | 116.8 / 127.2 / 121.2 |
+| `h2c-1k` | 108k | 1.47× | **1.70×** | 1.170 | 18.5 / 12.6 / 10.9 |
+| `h2c-return` ³ | 185k | 1.85× | **2.17×** | 1.181 | 10.8 / 5.8 / 5.0 |
+| `h2c-100k` ³ | 37.1k | 0.90× | **0.95×** | 1.054 | 53.9 / 59.8 / 56.5 |
+| `h2-tls-return` | 265k | 1.24× | **1.45×** | 1.173 | 7.5 / 6.1 / 5.2 |
+| `h3-1k` ² | 88.7k | 0.64× | **0.88×** | 1.380 | 22.5 / 35.3 / 25.6 |
+| `h3-100k` ² | 4.90k | 0.81× | **0.86×** | 1.066 | 406.9 / 502.1 / 471.1 |
+| `proxy-1k-keepalive` | 101k | 0.68× | **0.84×** | 1.248 | 19.7 / 29.0 / 23.5 |
+| `proxy-1k-no-keepalive` | 34.0k | 0.87× | **1.03×** | 1.166 | 58.6 / 67.1 / 57.2 |
+| `proxy-100k` | 18.1k | 0.83× | **0.90×** | 1.083 | 110.7 / 133.1 / 122.6 |
+| `proxy-1m` | 1.72k | 0.90× | **0.93×** | 1.043 | 1159.5 / 1295.6 / 1241.6 |
+| `proxy-post-10k` | 83.8k | 0.65× | **0.80×** | 1.227 | 23.8 / 36.5 / 29.8 |
+| `proxy-tls-terminate` | 76.7k | 0.69× | **0.87×** | 1.260 | 26.0 / 37.8 / 30.0 |
+| `proxy-to-tls-upstream` | 75.7k | 0.80× | **0.96×** | 1.197 | 26.4 / 32.9 / 27.5 |
+| `proxy-h2-frontend` | 71.6k | 0.89× | **1.08×** | 1.218 | 28.0 / 31.6 / 25.8 |
+| `proxy-cache-hit` | 99.7k | 0.95× | **1.11×** | 1.177 | 20.0 / 21.0 / 18.0 |
+| `proxy-h2-upstream` | 74.9k | 0.79× | **0.93×** | 1.182 | 26.7 / 33.8 / 28.6 |
+| `grpc-pass` | 63.4k | 0.78× | **0.92×** | 1.183 | 31.5 / 40.4 / 34.2 |
+| `fastcgi-1k` | 39.9k | 1.02× | **1.00×** | 0.983 | 31.4 / 41.7 / 38.3 |
+| `stream-tcp-proxy` | 144k | 0.97× | **0.99×** | 1.021 | 13.8 / 14.2 / 13.9 |
+| `stream-tls-terminate` | 126k | 0.92× | **0.98×** | 1.044 | 15.9 / 17.2 / 16.2 |
+| `stream-bulk-iperf` ² | 11.9 Gbit/s | 0.92× | **0.96×** | 1.048 | - |
+
+| Fixed rate, 10k req/s | C CPU % | master CPU ÷ C | **PGO** | p99 ms, C / PGO |
+|---|--:|--:|--:|--:|
+| `rate-h1-static-1k` | 18 | 1.10× | **0.96×** | 0.23 / 0.25 |
+| `rate-tls-1k` | 23 | 1.20× | **1.08×** | 0.32 / 0.37 |
+| `rate-h2-1k` | 21 | 1.43× | **1.18×** | 0.37 / 0.48 |
+| `rate-proxy-1k` | 21 | 1.53× | **1.30×** | 0.40 / 0.53 |
+
+| KB per idle connection | C | master | **PGO** |
+|---|--:|--:|--:|
+| `idle-10k-h1` | 0.55 | 2.53 | **2.54** |
+| `idle-10k-tls` | 14.99 | 16.81 | **16.82** |
+| `idle-10k-h2` | 15.45 | 23.49 | **23.50** |
+
+¹ Median of the per-rep ratios. ² Not in the saturation geomean (oha, iperf3). ³ Added after 2026-10-05, not in the 35.
+
+- The profile is worth **+12%** on its own, with no change of the code: the 35 go from 0.96× to **1.08×** C, CPU per request from 1.06× to **0.94×**. 20 of the 37 saturation scenarios are now at C or above, and 29 at 0.95× or more.
+- **Outside the training mix** (`h1-2k-conns`, `h1-static-1m`, `h1-sub-filter-sendfile`, `tls-h1-1m`, the handshakes, `h2-tls-100k`, `h2c-return`, `h2-tls-return`, `h3-100k`, `proxy-1m`, `proxy-h2-frontend` and the fixed-rate and memory scenarios) nothing loses: from +0% (the 1 MB file, the handshakes, where the kernel and OpenSSL do the work) to +22% (`proxy-h2-frontend`). The one scenario below 1.0 is `fastcgi-1k` (0.983), in the mix, limited by its Go backend.
+- The gain is user time: −20 to −40% (`docs/PERF_PLAN.md` §4), and 1–2.4 µs of kernel time where the code footprint is largest.
+- Still below 0.95× C: proxying (`proxy-1k-keepalive` 0.84×, `proxy-post-10k` 0.80×, `proxy-tls-terminate` 0.87×, `proxy-100k` 0.90×, `grpc-pass` 0.92×, `proxy-h2-upstream` and `proxy-1m` 0.93×), HTTP/3 (0.86–0.88×) and `h1-sub-filter` (0.89×): Phases A–C of `docs/PERF_PLAN.md`.
+- At a fixed 10k req/s rnginx uses 0.96–1.30× C's CPU (from 1.10–1.53×). Idle memory does not change.
+- Run health: req/s spread above 10% between reps in 6 of the 141 server-scenario pairs (`h1-conn-close` 19–27% for all three servers); iperf3's connection resets at the end of `stream-bulk-iperf` are in all three servers' error logs.
+
 ## 2. Target and how progress is measured
 
 **Target:**

@@ -55,4 +55,12 @@ cd "$B/tools"
 # the Rust build, then C nginx with its module list
 [ -x "$B/bin/nginx-rust" ] || { (cd "$R" && cargo build --release) && cp "$R/target/release/nginx" "$B/bin/nginx-rust"; }
 [ -x "$B/bin/nginx-c-O2" ] || "$B/build-c.sh"
+
+# the Rust build with profile-guided optimization, as released builds are
+# made (scripts/pgo-build.sh): its training runs the scenarios, with the C
+# build as their backend
+if [ ! -x "$B/bin/nginx-rust-pgo" ]; then
+    rustup component add llvm-tools
+    "$R/scripts/pgo-build.sh" -o "$B/bin/nginx-rust-pgo"
+fi
 echo "setup done"
