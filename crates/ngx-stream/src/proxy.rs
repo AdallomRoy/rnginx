@@ -1649,7 +1649,16 @@ async fn relay(r: &Relay, from_upstream: bool, mut out: VecDeque<Vec<u8>>) -> Fi
             // the other sessions of the worker unserved: each read uses up
             // the task's coop budget, and a spent budget yields to the
             // runtime, as the C event loop goes on to the other events
-            // after a handler returns
+            // after a handler returns. In io_uring mode the ring is flushed
+            // first: the runtime runs a yielding task again in the same
+            // turn (up to 61 times) and flushes the ring only between turns,
+            // so the operations of the other sessions waited behind tens of
+            // milliseconds of bulk data (iperf3's end-of-test message, a
+            // byte on its control connection: its server, which had read
+            // all the data meanwhile, waited 10 s for the rest of a block)
+            if !tokio::task::coop::has_budget_remaining() {
+                ngx_core::uring::flush();
+            }
             tokio::task::consume_budget().await;
 
             let n = match src.try_recv(&mut buf[..size]) {

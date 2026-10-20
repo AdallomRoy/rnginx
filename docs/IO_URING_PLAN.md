@@ -138,7 +138,11 @@ stay. We take the architecture, not the crate, for these reasons:
   - at the end of every LocalSet tick (`block_on_events`, next to the time
     update);
   - in `events_park` before the thread blocks;
-  - whenever the SQ is full.
+  - whenever the SQ is full;
+  - when the stream relay yields its spent coop budget. The LocalSet runs a
+    yielding task again in the same tick, up to 61 times, so a busy relay
+    held the other sessions' operations behind tens of milliseconds of bulk
+    data (iperf3's end-of-test byte, `docs/PERF_PLAN.md` §2.3).
 
   A flush with nothing queued and no taskrun flag makes no syscall. Under
   load this is one `io_uring_enter` per tick of up to 61 tasks.
